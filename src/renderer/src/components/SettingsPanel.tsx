@@ -539,7 +539,6 @@ function ProviderDetail({ providerId }: { providerId: string }) {
   }, [providerId, modelsList])
 
   if (!provider) return null
-  const isDefault = models.some((m) => m.id === defaultModel?.split('/')[1] && providerId === defaultModel?.split('/')[0])
   // 被隐藏的内置模型不消失，只是从这里挪到下面的「已隐藏」行 —— 没有这一步，旧工作区迁移来的
   // hiddenBuiltin 条目在 UI 上就是永不可见的黑洞
   const hiddenModels = models.filter((m) => m.hidden)
@@ -781,7 +780,6 @@ function ProviderDetail({ providerId }: { providerId: string }) {
             {testMessage}
           </span>
         )}
-        {isDefault && !defaultModel && null}
       </div>
     </div>
   )
