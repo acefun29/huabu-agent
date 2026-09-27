@@ -1,15 +1,11 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
-  AudioLines,
   Check,
   ChevronDown,
   ChevronRight,
   Eraser,
-  FileCode,
-  FileText,
   FolderOpen,
   GitFork,
-  Image as ImageIcon,
   Layers,
   MessageSquare,
   PenLine,
@@ -19,13 +15,13 @@ import {
   StickyNote,
   Tag as TagIcon,
   Trash2,
-  Video,
   X,
 } from 'lucide-react'
 import { AnimatePresence, motion } from 'motion/react'
-import type { AssetKind, MaterialLibrary } from '../types'
+import type { MaterialLibrary } from '../types'
 import { ASSET_IDS_MIME, LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
 import { useSettingsUi } from '../store/settingsStore'
+import { kindIcon } from './AssetNode'
 
 type SideTab = 'sessions' | 'libraries'
 
@@ -36,14 +32,6 @@ const SIDE_TABS: { key: SideTab; label: string; icon: ReactNode; tourKey: string
   { key: 'sessions', label: '会话', icon: <MessageSquare size={16} />, tourKey: 'rail-sessions' },
   { key: 'libraries', label: '素材库', icon: <Layers size={16} />, tourKey: 'rail-libraries' },
 ]
-
-function kindIcon(kind: AssetKind, size = 13) {
-  if (kind === 'image') return <ImageIcon size={size} />
-  if (kind === 'video') return <Video size={size} />
-  if (kind === 'audio') return <AudioLines size={size} />
-  if (kind === 'doc') return <FileText size={size} />
-  return <FileCode size={size} />
-}
 
 function formatDay(iso: string) {
   const d = new Date(iso)
