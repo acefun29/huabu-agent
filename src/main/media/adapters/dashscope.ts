@@ -137,7 +137,7 @@ export class DashScopeProvider implements MediaProviderAdapter {
     const kind = this.kindOf(model)
 
     const endpoint = kind === 'video' ? VIDEO_ENDPOINT : isNewImageProtocol(requestModel) ? IMAGE_GEN_ENDPOINT : IMAGE_ENDPOINT
-    const body = kind === 'video' ? videoBody(requestModel, input) : imageBody(requestModel, input)
+    const body = kind === 'video' ? await videoBody(requestModel, input) : await imageBody(requestModel, input)
     const response = await fetch(`${BASE_URL}${endpoint}`, {
       method: 'POST',
       headers: {
@@ -146,7 +146,9 @@ export class DashScopeProvider implements MediaProviderAdapter {
         'X-DashScope-Async': 'enable',
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      // 单请求 30s 硬超时：服务器不回包时中止，不让单个请求占死并发槽（下同）
+      signal: AbortSignal.timeout(30_000)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
@@ -174,7 +176,8 @@ export class DashScopeProvider implements MediaProviderAdapter {
     // jobId 里带着提交时的线上模型名（submit 处拼接），用于识别新协议图片的产物结构
     const requestModel = jobId.includes(JOB_SEP) ? jobId.slice(0, jobId.lastIndexOf(JOB_SEP)) : undefined
     const response = await fetch(`${BASE_URL}${TASK_ENDPOINT}/${encodeURIComponent(taskId)}`, {
-      headers: { Authorization: `Bearer ${key}` }
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(30_000)
     })
     if (!response.ok) {
       return { status: 'failed', message: `百炼状态查询失败（HTTP ${response.status}）` }
@@ -228,7 +231,8 @@ export class DashScopeProvider implements MediaProviderAdapter {
     try {
       await fetch(`${BASE_URL}${TASK_ENDPOINT}/${encodeURIComponent(taskId)}/cancel`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${key}` }
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(30_000)
       })
     } catch {
       // 网络异常时放弃远端取消
@@ -254,11 +258,11 @@ function isNewVideoParams(requestModel: string): boolean {
   return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 7))
 }
 
-function imageBody(requestModel: string, input: ProviderSubmitInput): Record<string, unknown> {
+async function imageBody(requestModel: string, input: ProviderSubmitInput): Promise<Record<string, unknown>> {
   if (isNewImageProtocol(requestModel)) {
     // 图生图（官方 API 参考）：content 追加 {image}，data URI 是官方支持的离线形态；
     // 有图输入时输出比例随最后一张输入图，不再传 size（传了反而可能与输入比例冲突）
-    const refDataUri = firstImageRefDataUri(input.refFiles)
+    const refDataUri = await firstImageRefDataUri(input.refFiles)
     const content: Record<string, unknown>[] = [{ text: input.prompt }]
     if (refDataUri) content.push({ image: refDataUri })
     return {
@@ -279,12 +283,12 @@ function imageBody(requestModel: string, input: ProviderSubmitInput): Record<str
   return { model: requestModel, input: { prompt: input.prompt }, parameters }
 }
 
-function videoBody(requestModel: string, input: ProviderSubmitInput): Record<string, unknown> {
+async function videoBody(requestModel: string, input: ProviderSubmitInput): Promise<Record<string, unknown>> {
   // 图生视频（wan2.7-i2v / wan3.0-video，官方 API 参考核实）：input 扩为 media 数组，
   // 首帧图吃 data URI；wan2.7-i2v 无 ratio 参数且 duration [2,15]，wan3.0-video [2,30]
   // 且支持 ratio（默认 adaptive —— 有首帧时自适应输入图，正是图生视频语义，故不传）
   if (isMediaVideoModel(requestModel)) {
-    const refDataUri = firstImageRefDataUri(input.refFiles)
+    const refDataUri = await firstImageRefDataUri(input.refFiles)
     const parameters: Record<string, unknown> = { n: 1 }
     if (input.width && input.height) {
       parameters.resolution = input.height >= 1000 ? '1080P' : '720P'

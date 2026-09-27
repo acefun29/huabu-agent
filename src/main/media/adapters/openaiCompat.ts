@@ -151,7 +151,9 @@ export class OpenAICompatProvider implements MediaProviderAdapter {
     const response = await fetch(`${this.baseUrl}/images/generations`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      // 同步生成端点：请求即生成，gpt-image 高质量档可超 30s，放宽到 5 分钟防误杀
+      signal: AbortSignal.timeout(300_000)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
@@ -183,7 +185,9 @@ export class OpenAICompatProvider implements MediaProviderAdapter {
         input: input.prompt,
         voice: this.config.models[requestModel]?.capabilities?.voices?.[0]?.id ?? 'alloy',
         response_format: 'mp3'
-      })
+      }),
+      // 同步生成端点：长文本 TTS 生成耗时随篇幅增长，放宽到 5 分钟防误杀
+      signal: AbortSignal.timeout(300_000)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')

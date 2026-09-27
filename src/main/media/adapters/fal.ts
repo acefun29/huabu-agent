@@ -109,7 +109,7 @@ export class FalGatewayProvider implements MediaProviderAdapter {
     }
     if (input.durationSeconds) body.duration = String(input.durationSeconds)
     // 参考图（垫图/首帧）：fal 的图生图/首帧模型普遍吃 image_url，data URI 是官方支持的离线形态
-    const refDataUri = firstImageRefDataUri(input.refFiles)
+    const refDataUri = await firstImageRefDataUri(input.refFiles)
     if (refDataUri) body.image_url = refDataUri
     const response = await fetch(`https://queue.fal.run/${requestModel}`, {
       method: 'POST',
@@ -117,7 +117,9 @@ export class FalGatewayProvider implements MediaProviderAdapter {
         Authorization: `Key ${key}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      // 单请求 30s 硬超时：服务器不回包时中止，不让单个请求占死并发槽（下同）
+      signal: AbortSignal.timeout(30_000)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
@@ -143,7 +145,10 @@ export class FalGatewayProvider implements MediaProviderAdapter {
   async poll(model: string, jobId: string): Promise<ProviderPollResult> {
     const key = await this.requireKey()
     const headers = { Authorization: `Key ${key}` }
-    const statusResponse = await fetch(FalGatewayProvider.statusUrl(jobId), { headers })
+    const statusResponse = await fetch(FalGatewayProvider.statusUrl(jobId), {
+      headers,
+      signal: AbortSignal.timeout(30_000)
+    })
     if (!statusResponse.ok) {
       return { status: 'failed', message: `fal.ai 状态查询失败（HTTP ${statusResponse.status}）` }
     }
@@ -163,7 +168,10 @@ export class FalGatewayProvider implements MediaProviderAdapter {
     if (status.status !== 'COMPLETED') {
       return { status: 'failed', message: `fal.ai 任务异常：${status.error ?? status.status ?? '未知状态'}` }
     }
-    const response = await fetch(FalGatewayProvider.responseUrl(jobId), { headers })
+    const response = await fetch(FalGatewayProvider.responseUrl(jobId), {
+      headers,
+      signal: AbortSignal.timeout(30_000)
+    })
     if (!response.ok) {
       return { status: 'failed', message: `fal.ai 结果获取失败（HTTP ${response.status}）` }
     }
@@ -222,7 +230,8 @@ export class FalGatewayProvider implements MediaProviderAdapter {
     try {
       await fetch(`https://queue.fal.run/${jobId.replace('|', '/requests/')}`, {
         method: 'DELETE',
-        headers: { Authorization: `Key ${key}` }
+        headers: { Authorization: `Key ${key}` },
+        signal: AbortSignal.timeout(30_000)
       })
     } catch {
       // 网络异常时放弃远端取消；编排层已落本地终态

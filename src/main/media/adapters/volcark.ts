@@ -137,13 +137,16 @@ export class VolcArkProvider implements MediaProviderAdapter {
       watermark: false
     }
     if (input.width && input.height) body.size = seedreamSize(input.width, input.height)
-    const refDataUri = firstImageRefDataUri(input.refFiles)
+    const refDataUri = await firstImageRefDataUri(input.refFiles)
     if (refDataUri) body.image = [refDataUri]
 
     const response = await fetch(`${BASE_URL}${IMAGES_ENDPOINT}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      // 同步生成端点：请求即生成，Seedream 高质量档可超 30s，放宽到 5 分钟防误杀；
+      // 异步任务制（视频提交/轮询）与其余接口仍 30s（见下）
+      signal: AbortSignal.timeout(300_000)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
@@ -188,7 +191,8 @@ export class VolcArkProvider implements MediaProviderAdapter {
     const response = await fetch(`${BASE_URL}${VIDEO_TASKS_ENDPOINT}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000)
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
@@ -212,7 +216,8 @@ export class VolcArkProvider implements MediaProviderAdapter {
     const key = await this.requireKey()
     const taskId = jobId.slice(VIDEO_JOB_PREFIX.length)
     const response = await fetch(`${BASE_URL}${VIDEO_TASKS_ENDPOINT}/${encodeURIComponent(taskId)}`, {
-      headers: { Authorization: `Bearer ${key}` }
+      headers: { Authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(30_000)
     })
     if (!response.ok) {
       return { status: 'failed', message: `方舟状态查询失败（HTTP ${response.status}）` }
@@ -253,7 +258,8 @@ export class VolcArkProvider implements MediaProviderAdapter {
     try {
       await fetch(`${BASE_URL}${VIDEO_TASKS_ENDPOINT}/${encodeURIComponent(taskId)}`, {
         method: 'DELETE',
-        headers: { Authorization: `Bearer ${key}` }
+        headers: { Authorization: `Bearer ${key}` },
+        signal: AbortSignal.timeout(30_000)
       })
     } catch {
       // 网络异常时放弃远端取消
