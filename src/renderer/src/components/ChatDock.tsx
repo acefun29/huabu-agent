@@ -20,6 +20,7 @@ import type { AssetKind, ChatMessage } from '../types'
 import type { ChatContextBreakdownInfo, ChatContextUsage, ChatHistoryImage } from '@shared/ipc'
 import { useCanvasStore } from '../store/canvasStore'
 import { bumpRender } from '../lib/perfProbe'
+import { compactTokens } from '../lib/format'
 import { ChatMessageBlocks } from './chat/ChatMessageBlocks'
 import { Composer } from './Composer'
 
@@ -31,16 +32,8 @@ function assetIcon(kind: AssetKind) {
   return <FileCode size={11} />
 }
 
-/** 上下文 token 紧凑显示（与 SettingsPanel.compactTokens 同一思路） */
-function formatTokens(value: number): string {
-  if (value >= 1_000_000) {
-    const m = value / 1_000_000
-    return `${m % 1 === 0 ? m : m.toFixed(1)}M`
-  }
-  if (value % 1024 === 0) return `${value / 1024}K`
-  if (value >= 1000) return `${Math.round(value / 1000)}K`
-  return String(value)
-}
+/** 上下文 token 紧凑显示：算法与设置面板共用（lib/format），0 也要显示成 "0" */
+const formatTokens = (value: number): string => compactTokens(value) ?? String(value)
 
 /** 压缩分隔条：本地合成（T2）与回放重建（T4）同形，摘要默认折叠 */
 const CompactionDivider = memo(function CompactionDivider({

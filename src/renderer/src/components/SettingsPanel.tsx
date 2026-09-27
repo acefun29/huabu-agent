@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Bot, Boxes, Check, CirclePlay, Copy, Moon, Palette, Pencil, PlugZap, Plus, RotateCcw, SlidersHorizontal, Sparkles, Sun, Trash2, Wand2, X } from 'lucide-react'
 import { useSettings, useSettingsUi, type McpServer } from '../store/settingsStore'
+import { compactTokens } from '../lib/format'
 import { useCanvasStore } from '../store/canvasStore'
 import type { ManagedModelInfo, MediaCatalogBrowseItem, MediaProviderType } from '@shared/ipc'
 import {
@@ -132,17 +133,6 @@ function GuideTab() {
  */
 const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._\-/:]*$/i
 
-/** 上下文窗口紧凑显示：128000 → 128K，65536 → 64K（整除 1024 时按二进制），1000000 → 1M */
-function compactTokens(value?: number): string | null {
-  if (!value || value <= 0) return null
-  if (value >= 1_000_000) {
-    const m = value / 1_000_000
-    return `${m % 1 === 0 ? m : m.toFixed(1)}M`
-  }
-  if (value % 1024 === 0) return `${value / 1024}K`
-  if (value >= 1000) return `${Math.round(value / 1000)}K`
-  return String(value)
-}
 
 /**
  * 协议下拉。选项直接来自 shared/chatApi 的白名单 —— 不在这里再抄一份数组，
