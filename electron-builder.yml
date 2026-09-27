@@ -1,0 +1,48 @@
+appId: dev.huabu.app
+productName: Huabu
+# 安装包最小化，打包时间换体积
+compression: maximum
+directories:
+  buildResources: build
+  output: release
+files:
+  - out/**
+  - package.json
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!docs/*'
+  - '!{.gitignore,.nvmrc,electron.vite.config.ts,tsconfig.json}'
+  - '!{.eslintrc,.prettierrc}'
+  # sourcemap 仅调试用，运行时不读取（@earendil-works 两包内约 10.4MB）
+  - '!**/*.map'
+  # pi-coding-agent 的文档/示例/变更日志，纯资料，运行时不读取
+  - '!node_modules/@earendil-works/pi-coding-agent/docs/**'
+  - '!node_modules/@earendil-works/pi-coding-agent/examples/**'
+  - '!node_modules/@earendil-works/pi-coding-agent/CHANGELOG.md'
+  # dist/bundle 仅被子路径 export ./rpc-entry 引用，应用只走主入口；若打包冒烟失败回退本条
+  - '!node_modules/@earendil-works/pi-coding-agent/dist/bundle/**'
+  # dist/modes/interactive 不可整体排除：pi 的 dist/core/agent-session.js 引用其 theme/theme.js
+  # （SDK 路径加载主题）。只排 TUI 专属的大 PNG 资产（2026-09-26 打包冒烟实测锁定）。
+  - '!node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/assets/**'
+  # esbuild/rolldown 是 vite 构建链依赖，被生产依赖树拖入，运行时用不到
+  - '!node_modules/@esbuild/**'
+  - '!node_modules/@rolldown/**'
+# M3 已验证（pnpm probe:asar PASS）：pi 是纯 JS、无原生模块，默认全量 asar 打包即可；
+# 后续引入真正的原生模块（如 M7 MCP 相关）时再按需补充 asarUnpack。
+npmRebuild: false
+win:
+  icon: build/icon.png
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  deleteAppDataOnUninstall: false
+  shortcutName: Huabu
+  artifactName: ${name}-${version}-setup.${ext}
+portable:
+  artifactName: ${name}-${version}-portable.${ext}

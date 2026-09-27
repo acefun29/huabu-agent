@@ -1,0 +1,289 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/typography';
+
+/* v2 原型的设计令牌（浅色 / 深色两套主题，全局一键切换） */
+:root {
+  --accent: #0b57d0;
+  --surface: #f7f7f8;
+  --surface-card: #ffffff;
+  --surface-chip: #e9eef6;
+  --surface-hover: #dde3ee;
+  --surface-input: #f0f1f3;
+  --skeleton: #e3e5e8;
+  --glass: rgba(255, 255, 255, 0.7);
+  --on-surface: #1f1f1f;
+  --on-surface-variant: #444746;
+  --on-surface-muted: #80868b;
+  --outline: rgba(0, 0, 0, 0.1);
+  --outline-soft: rgba(0, 0, 0, 0.05);
+  --active-tint: #f0f6ff;
+  --success-bg: #e6f4ea;
+  --success-text: #137333;
+  --success-dot: #34a853;
+  --danger: #b3261e;
+  --fab-bg: #1f1f1f;
+  --fab-text: #ffffff;
+  --toggle-off: #dadce0;
+  --grid-dot: #dadce0;
+  /* 悬浮 chrome（顶栏/图标栏/划选操作条）与对话坞抽屉的质感令牌（新原型同步） */
+  --chrome-bg: #ffffff;
+  --chrome-shadow: 0 8px 28px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --panel-float: rgba(255, 255, 255, 0.6);
+  --drawer-peek: rgba(255, 255, 255, 0.26);
+  --drawer-peek-bubble: rgba(233, 238, 246, 0.72);
+}
+
+[data-theme='dark'] {
+  --accent: #a8c7fa;
+  --surface: #131314;
+  --surface-card: #1e1f20;
+  --surface-chip: #2d2f31;
+  --surface-hover: #3a3c3f;
+  --surface-input: #282a2c;
+  --skeleton: #3a3c3f;
+  --glass: rgba(19, 19, 20, 0.72);
+  --on-surface: #e3e3e3;
+  --on-surface-variant: #c4c7c5;
+  --on-surface-muted: #8e918f;
+  --outline: rgba(255, 255, 255, 0.12);
+  --outline-soft: rgba(255, 255, 255, 0.06);
+  --active-tint: rgba(168, 199, 250, 0.12);
+  --success-bg: rgba(129, 201, 149, 0.15);
+  --success-text: #81c995;
+  --success-dot: #81c995;
+  --danger: #f2b8b5;
+  --fab-bg: #e3e3e3;
+  --fab-text: #1f1f1f;
+  --toggle-off: #444746;
+  --grid-dot: #2e3134;
+  --chrome-bg: #1e1f20;
+  --chrome-shadow: 0 8px 28px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.4);
+  --panel-float: rgba(24, 25, 26, 0.55);
+  --drawer-peek: rgba(19, 19, 20, 0.3);
+  --drawer-peek-bubble: rgba(45, 47, 49, 0.72);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family:
+    'Inter',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    'PingFang SC',
+    'Microsoft YaHei',
+    sans-serif;
+  background-color: var(--surface);
+  color: var(--on-surface);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease;
+}
+
+/* 会话消息区允许选中复制 */
+.markdown-body,
+textarea,
+.selectable {
+  user-select: text;
+}
+
+/* 深色模式下字标反白 */
+[data-theme='dark'] .brand-logo {
+  filter: invert(0.88);
+}
+
+/* 自绘标题栏：整条可拖拽移动窗口，内部按钮经 no-drag 豁免恢复点击 */
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+
+.titlebar-nodrag {
+  -webkit-app-region: no-drag;
+}
+
+/* 画布点阵网格：viewport 尺寸独立层，background-size/position 由 applyView 跟随 view 直写 */
+.dot-grid-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-color: var(--surface);
+  background-image: radial-gradient(circle, var(--grid-dot) 1.2px, transparent 1.2px);
+  background-size: 26px 26px;
+}
+
+/* ---- 画布性能契约（性能优化方案 P0-1）---- */
+
+/* 变换层：transform 由手势循环 / applyView 直写（非受控），React 不渲染它 */
+.canvas-transform {
+  transform-origin: 0 0;
+}
+
+/* 交互进行中的渲染降级（Figma 式 performance mode）：
+   关闭过渡/阴影/毛玻璃，并提示合成器把变换层提为独立层（纯合成器位移） */
+[data-interacting] .canvas-transform {
+  will-change: transform;
+}
+[data-interacting] .canvas-node {
+  transition: none !important;
+  box-shadow: none !important;
+}
+[data-interacting] .canvas-node .backdrop-blur,
+[data-interacting] .canvas-node .backdrop-blur-sm,
+[data-interacting] .canvas-node .backdrop-blur-md,
+[data-interacting] .canvas-node .backdrop-blur-xl,
+[data-interacting] .canvas-node .backdrop-blur-2xl {
+  backdrop-filter: none !important;
+}
+
+/* 自研节点拖拽中的卡片：transform 即时跟手，提前提升合成层 */
+.canvas-node-dragging {
+  will-change: transform;
+}
+
+/* 节点选中/激活描边：内贴覆盖层。
+   不能用 ring/outline 画在卡片自身——NodeFrame 的 content-visibility:auto
+   自带 paint containment，会把后代伸出节点框的描边裁掉（只剩四角月牙）；
+   覆盖层是卡片子元素，画在裁剪框之内，不受影响 */
+.node-ring-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  border-radius: 16px; /* 与卡片 rounded-2xl 对齐 */
+  border: 2px solid var(--accent);
+  pointer-events: none;
+}
+
+/* 指针拖拽参考投放的悬停高亮（CanvasWorkspace beginDrag 直写 class）：
+   同 node-ring-overlay 的道理，ring 画在 gen-node 内部伪元素，避免被
+   NodeFrame 的 content-visibility paint containment 裁成四角月牙 */
+[data-testid='gen-node'].gen-ref-hover::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  border-radius: 16px;
+  border: 2px solid var(--accent);
+  pointer-events: none;
+}
+
+/* 自研 resize 手柄（右下角，等价旧 react-rnd 的 bottomRight 18px 热区） */
+.node-resize-handle {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  touch-action: none;
+  z-index: 5;
+}
+
+/* 框选矩形：常驻 DOM，几何由手势直写 */
+.canvas-marquee {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: none;
+  pointer-events: none;
+  border: 1px dashed var(--accent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  z-index: 99999;
+}
+
+/* 右键菜单 / 弹层 / 确认框 / Toast 的入场动效（替代原型里的 motion 库） */
+.ctx-menu {
+  animation: huabu-pop 0.13s ease-out;
+  transform-origin: top left;
+}
+
+@keyframes huabu-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Toast 从下方浮现 */
+.fixed.bottom-28 {
+  animation: huabu-toast 0.18s ease-out;
+}
+
+@keyframes huabu-toast {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 12px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* 媒体查看器的缩放查看 */
+.viewer-image {
+  transition: transform 0.15s ease;
+  cursor: zoom-in;
+}
+.viewer-image:active {
+  transform: scale(1.6);
+  cursor: zoom-out;
+}
+
+/* 细滚动条，贴合原型的轻量视觉 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--toggle-off);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--on-surface-muted);
+}
+
+/* markdown 渲染的紧凑排版 */
+.markdown-body :first-child {
+  margin-top: 0;
+}
+
+.markdown-body :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p {
+  margin: 0.35em 0;
+}
+
+.markdown-body pre {
+  margin: 0.4em 0;
+  padding: 0.6em 0.8em;
+  border-radius: 8px;
+  background: var(--surface-input);
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+.markdown-body code {
+  font-size: 12px;
+}

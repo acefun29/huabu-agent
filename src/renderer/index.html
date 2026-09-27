@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP 说明：开发期需要允许 vite HMR 的内联脚本与 ws 连接，故不在这里写死 CSP；
+      生产环境的 CSP 由主进程在打包态注入（见 M10 打包与发布），
+      开发期的安全基线是 contextIsolation: true + nodeIntegration: false。
+    -->
+    <title>Huabu</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

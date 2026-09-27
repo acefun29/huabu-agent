@@ -1,0 +1,33 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+out/
+release/
+*.local
+
+# electron-builder
+*.exe
+*.dmg
+*.AppImage
+*.deb
+*.blockmap
+
+# logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# editor / os
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+
+# local env / secrets
+.env
+.env.local
+
+# workspace runtime data (开发期测试工作区)
+.workspaces/
