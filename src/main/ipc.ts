@@ -30,12 +30,13 @@ import {
   restoreBuiltinModel
 } from './models/overlay'
 import { copyIntoDir } from './workspace/store'
+import { atomicWriteSync } from './fsutil/atomic'
 import { buildMediaUrl } from './media/protocol'
 import { importToInbox, importToWorkspace, isInboxPath, listLibraries, inboxRoot, transferToLibrary, deleteAsset, renameAsset } from './assets/manager'
 import { setFileTags } from './assets/tagsIndex'
 import { categorizeFileName, MEDIA_ROOT_REL, normalizePath } from '../shared/assets'
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs'
-import { basename, dirname, extname, join, relative, resolve, sep } from 'path'
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs'
+import { basename, extname, join, relative, resolve, sep } from 'path'
 import { randomUUID } from 'crypto'
 import {
   IpcChannel,
@@ -364,11 +365,9 @@ export function registerIpcHandlers(): void {
       if (ext !== '.md' && ext !== '.txt') {
         throw new Error(`只支持写入 .md / .txt：${ext || '(无扩展名)'}`)
       }
-      mkdirSync(dirname(target), { recursive: true })
-      const tmp = `${target}.${process.pid}.tmp`
-      writeFileSync(tmp, content, 'utf8')
-      rmSync(target, { force: true })
-      renameSync(tmp, target)
+      // 原子写收口到 fsutil/atomic（父目录它内部自建）：此前手写的「先 rm 旧文件再改名」
+      // 在 rm 与 rename 之间崩溃会把原文件彻底丢掉，atomic 的 .bak 腾位法不会
+      atomicWriteSync(target, content)
       return { relPath: normalizePath(relative(dir, target)), bytes: Buffer.byteLength(content, 'utf8') }
     })
   })
@@ -535,6 +534,7 @@ export function registerIpcHandlers(): void {
       const settle = (accepted: boolean) => {
         if (settled) return
         settled = true
+        clearTimeout(timeout) // 超时兜底与回执/中止谁先到都收敛在同一路径，settle 幂等
         pendingApprovals.delete(requestId)
         resolvePromise(accepted)
         // 撤卡广播：用户点击（本窗口已 resolve）、中止清理都要让所有窗口收卡
@@ -547,6 +547,9 @@ export function registerIpcHandlers(): void {
         }
       }
       pendingApprovals.set(requestId, { nodeId, resolve: settle })
+      // 10 分钟兜底超时：回执与 signal 中止都不来的话（渲染端假死、事件丢失），
+      // Promise 永久悬挂会把 agent 工具的 execute 一起挂死；超时按拒绝处理并撤卡
+      const timeout = setTimeout(() => settle(false), 10 * 60 * 1000)
       for (const window of BrowserWindow.getAllWindows()) {
         try {
           window.webContents.send(IpcChannel.MediaConfirmRequest, {
@@ -1420,6 +1423,11 @@ export function registerIpcHandlers(): void {
       let target: string
       let displayName: string
       if (typeof request.base64 === 'string') {
+        // base64 通道在解码前先卡长度：渲染端异常可把数百 MB 文本灌进主进程，
+        // Buffer.from + 同步写盘会瞬时膨胀内存并冻结 UI
+        if (request.base64.length > 32 * 1024 * 1024) {
+          return invalidPayload('剪贴板图片超过 32MB 上限，已拒绝导入')
+        }
         const ext = request.mime?.includes('jpeg') ? '.jpg' : '.png'
         displayName = `clipboard-${randomUUID().slice(0, 8)}${ext}`
         target = join(dir, displayName)
