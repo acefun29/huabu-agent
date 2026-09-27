@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { Bot, Boxes, Check, CirclePlay, Copy, Moon, Palette, Pencil, PlugZap, Plus, RotateCcw, SlidersHorizontal, Sparkles, Sun, Trash2, Wand2, X } from 'lucide-react'
 import { useSettings, useSettingsUi, type McpServer } from '../store/settingsStore'
 import { compactTokens } from '../lib/format'
+import { useEsc } from '../lib/hooks'
 import { useCanvasStore } from '../store/canvasStore'
 import type { ManagedModelInfo, MediaCatalogBrowseItem, MediaProviderType } from '@shared/ipc'
 import {
@@ -191,17 +192,8 @@ function AddModelDialog({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  // Esc 只关本对话框：捕获阶段拦截，避免冒泡到设置面板把整个设置一起关掉
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation()
-        onClose()
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Esc 只关本对话框：捕获阶段拦截并吞掉，避免冒泡到设置面板把整个设置一起关掉
+  useEsc(true, onClose, { capture: true, swallow: true })
 
   const trimmedId = modelId.trim()
   const idValid = MODEL_ID_PATTERN.test(trimmedId)
@@ -376,16 +368,8 @@ function EditModelDialog({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation()
-        onClose()
-      }
-    }
-    window.addEventListener('keydown', onKey, true)
-    return () => window.removeEventListener('keydown', onKey, true)
-  }, [onClose])
+  // Esc 只关本对话框：捕获阶段拦截并吞掉，避免冒泡到设置面板把整个设置一起关掉
+  useEsc(true, onClose, { capture: true, swallow: true })
 
   const ctxNum = Number(contextWindow)
   const maxNum = Number(maxTokens)
@@ -1924,14 +1908,7 @@ export function SettingsPanel() {
   const { isOpen, closeSettings } = useSettingsUi()
   const [tab, setTab] = useState<TabKey>('providers')
 
-  useEffect(() => {
-    if (!isOpen) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeSettings()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [isOpen, closeSettings])
+  useEsc(isOpen, closeSettings)
 
   return (
     <>

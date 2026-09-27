@@ -1,7 +1,7 @@
-import { useEffect } from 'react'
 import { X } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
 import { assetSrc } from '../lib/media'
+import { useEsc } from '../lib/hooks'
 import type { AssetData, GenerateVersion } from '../types'
 
 /**
@@ -13,14 +13,7 @@ export function MediaViewer() {
   const node = useCanvasStore((s) => (s.viewer ? (s.nodes.find((n) => n.id === s.viewer!.nodeId) ?? null) : null))
   const closeViewer = useCanvasStore.getState().closeViewer
 
-  useEffect(() => {
-    if (!viewer) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeViewer()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [viewer, closeViewer])
+  useEsc(viewer !== null, closeViewer)
 
   if (!viewer || !node) return null
   const data = node.data as AssetData

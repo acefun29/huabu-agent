@@ -2,6 +2,7 @@ import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowUp, ChevronDown, FolderOpen, MessageSquare, Paperclip, ShieldAlert, SlashSquare, X } from 'lucide-react'
 import { ASSET_IDS_MIME, useCanvasStore } from '../store/canvasStore'
 import { hasBridge, useSettings } from '../store/settingsStore'
+import { useDismiss } from '../lib/hooks'
 import { THINKING_LEVEL_LABEL, type ChatModelOption, type MediaAccessMode, type ThinkingLevelName } from '@shared/ipc'
 import { KIND_LABEL, type AssetData, type CanvasNode } from '../types'
 import { filterCommands, isCommandInput } from '../lib/chatCommands'
@@ -101,37 +102,10 @@ export const Composer = memo(function Composer() {
   const attachRef = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    if (!attachOpen) return
-    const onDown = (e: MouseEvent) => {
-      if (attachRef.current && !attachRef.current.contains(e.target as Node)) setAttachOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setAttachOpen(false)
-    }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [attachOpen])
-
-  useEffect(() => {
-    if (!menuOpen) return
-    const onDown = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(null)
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMenuOpen(null)
-    }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [menuOpen])
+  // 附件面板 / 模型菜单的 outside-click + Esc 关闭（公共实现见 lib/hooks）
+  useDismiss(attachRef, attachOpen, () => setAttachOpen(false))
+  // menuOpen 是当前打开的菜单 id（string | null），非空即激活
+  useDismiss(menuRef, menuOpen !== null, () => setMenuOpen(null))
 
   // 访问模式当前值：挂载/切工作区时拉一次（切换成功后由 pickAccess 重拉回显）
   useEffect(() => {

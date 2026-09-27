@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react'
+import { useDismiss } from '../lib/hooks'
 
 export interface ContextMenuItem {
   /** 分组标题（不可点击） */
@@ -28,21 +29,12 @@ export function ContextMenu({
 }) {
   const ref = useRef<HTMLDivElement>(null)
 
+  // outside-click + Esc 关公共实现；wheel 滚动关闭是菜单特有行为，单独挂
+  useDismiss(ref, true, onClose)
   useEffect(() => {
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose()
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    window.addEventListener('wheel', onClose, { passive: true })
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-      window.removeEventListener('wheel', onClose)
-    }
+    const onWheel = () => onClose()
+    window.addEventListener('wheel', onWheel, { passive: true })
+    return () => window.removeEventListener('wheel', onWheel)
   }, [onClose])
 
   const estHeight = items.length * 34 + 16

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import { ChevronDown, FolderKanban, FolderOpen, Plus } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
+import { useDismiss } from '../lib/hooks'
 
 /** 左上角工作区快速切换器：最近目录 / 打开目录 / 新建工作区（一个工作区 = 一个目录 = 一张画布） */
 export function WorkspaceSwitcher() {
@@ -12,21 +13,7 @@ export function WorkspaceSwitcher() {
   const [name, setName] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    if (!open) return
-    const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setOpen(false)
-    }
-    window.addEventListener('mousedown', onDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [open])
+  useDismiss(rootRef, open, () => setOpen(false))
 
   const submitNew = () => {
     const n = name.trim()
