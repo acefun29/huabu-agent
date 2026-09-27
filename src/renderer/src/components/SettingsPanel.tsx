@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Bot, Boxes, Check, CirclePlay, Copy, Moon, Palette, Pencil, PlugZap, Plus, RotateCcw, SlidersHorizontal, Sparkles, Sun, Trash2, Wand2, X } from 'lucide-react'
-import { useSettings, type McpServer } from '../store/settingsStore'
+import { useSettings, useSettingsUi, type McpServer } from '../store/settingsStore'
 import { useCanvasStore } from '../store/canvasStore'
 import type { ManagedModelInfo, MediaCatalogBrowseItem, MediaProviderType } from '@shared/ipc'
 import {
@@ -85,7 +85,7 @@ const GESTURES: { gesture: string; desc: string }[] = [
 
 function GuideTab() {
   const openGuide = useCanvasStore.getState().openGuide
-  const { closeSettings } = useSettings()
+  const { closeSettings } = useSettingsUi()
   return (
     <div className="space-y-4" data-testid="guide-tab">
       <p className="text-xs leading-relaxed text-(--on-surface-muted)">
@@ -1933,7 +1933,7 @@ function AppearanceTab() {
 /* -------------------------------------------------------------------------- */
 
 export function SettingsPanel() {
-  const { isOpen, closeSettings } = useSettings()
+  const { isOpen, closeSettings } = useSettingsUi()
   const [tab, setTab] = useState<TabKey>('providers')
 
   useEffect(() => {

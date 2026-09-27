@@ -55,11 +55,19 @@ export interface ResolvedMediaModel {
   composite: string
 }
 
-interface SettingsState {
+/**
+ * 面板开合的 UI 层，走独立小 Context。
+ * 之前 isOpen 与全部数据域打在同一个 context value 里，开/关一次设置面板就会重建整个
+ * value，把画布上每张生成卡片（AssetNode）、Composer 等所有 useSettings 消费者全部重渲；
+ * 拆层后开关只重渲订阅 UI 层的组件（SessionSidebar / SettingsPanel 自身）。
+ */
+export interface SettingsUiState {
   isOpen: boolean
   openSettings: () => void
   closeSettings: () => void
+}
 
+interface SettingsState {
   /* ---------------- 对话供应商（真实 IPC） ---------------- */
   chatProviders: ProviderAuthInfo[]
   /** 可选对话模型清单（chat:runtime，含认证状态与推理档位；失败静默为空） */
@@ -166,6 +174,7 @@ function errorText(result: { ok: false; error: string } | { ok: true }): string 
 }
 
 const SettingsContext = createContext<SettingsState | null>(null)
+const SettingsUiContext = createContext<SettingsUiState | null>(null)
 
 export function SettingsProvider({ children }: { children: ReactNode }) {
   const [initial] = useState(loadPersistedUi)
@@ -414,11 +423,12 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     setAppearanceState((prev) => ({ ...prev, ...patch }))
   }, [])
 
+  // 面板开合的稳定回调：只进 UI 层 value，开/关面板不会牵动数据域 value 的重建
+  const openSettings = useCallback(() => setIsOpen(true), [])
+  const closeSettings = useCallback(() => setIsOpen(false), [])
+
   const value = useMemo<SettingsState>(
     () => ({
-      isOpen,
-      openSettings: () => setIsOpen(true),
-      closeSettings: () => setIsOpen(false),
       chatProviders,
       chatModels,
       credentialsHint,
@@ -463,7 +473,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setAppearance
     }),
     [
-      isOpen, chatProviders, chatModels, credentialsHint, chatLoaded, refreshChat, setApiKey, removeApiKey,
+      chatProviders, chatModels, credentialsHint, chatLoaded, refreshChat, setApiKey, removeApiKey,
       testProvider, defaultModel, setDefaultModel, modelsList, customAddProvider,
       customRemoveProvider, customAddModel, modelRemove, modelEdit, modelRestore,
       mediaProviders, mediaStatus, confirmVideo,
@@ -475,11 +485,28 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     ]
   )
 
-  return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>
+  // UI 层只依赖 isOpen（openSettings/closeSettings 恒定），面板开合不再重建数据域 value
+  const uiValue = useMemo<SettingsUiState>(
+    () => ({ isOpen, openSettings, closeSettings }),
+    [isOpen, openSettings, closeSettings]
+  )
+
+  return (
+    <SettingsContext.Provider value={value}>
+      <SettingsUiContext.Provider value={uiValue}>{children}</SettingsUiContext.Provider>
+    </SettingsContext.Provider>
+  )
 }
 
 export function useSettings(): SettingsState {
   const ctx = useContext(SettingsContext)
   if (!ctx) throw new Error('useSettings must be used within a SettingsProvider')
+  return ctx
+}
+
+/** 面板开合专用：只订阅 isOpen/openSettings/closeSettings，数据域变化不波及这层消费者 */
+export function useSettingsUi(): SettingsUiState {
+  const ctx = useContext(SettingsUiContext)
+  if (!ctx) throw new Error('useSettingsUi must be used within a SettingsProvider')
   return ctx
 }

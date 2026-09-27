@@ -25,7 +25,7 @@ import {
 import { AnimatePresence, motion } from 'motion/react'
 import type { AssetKind, MaterialLibrary } from '../types'
 import { ASSET_IDS_MIME, LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
-import { useSettings } from '../store/settingsStore'
+import { useSettingsUi } from '../store/settingsStore'
 
 type SideTab = 'sessions' | 'libraries'
 
@@ -78,7 +78,7 @@ export function SessionSidebar() {
   const libraries = useCanvasStore((s) => s.libraries)
   const { clearCanvas, switchSession, createSession, requestRemoveSession, forkSession, createLibrary, removeLibrary, importFromLibrary, createNote, renameAsset } =
     useCanvasStore.getState()
-  const { openSettings } = useSettings()
+  const { openSettings } = useSettingsUi()
   const [openTab, setOpenTab] = useState<SideTab | null>(null)
   const [creating, setCreating] = useState(false)
   const [libName, setLibName] = useState('')
