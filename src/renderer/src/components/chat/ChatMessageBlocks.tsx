@@ -143,7 +143,9 @@ function ToolCallCard({ toolCall }: { toolCall: ChatToolCallView }): JSX.Element
 /** 思维链块，默认折叠（推理模型先思考再说话，折叠保证首个正文 token 前有反馈） */
 function ThinkingBlock({ text, streaming }: { text: string; streaming: boolean }): JSX.Element {
   const [expanded, setExpanded] = useState(false)
-  const preview = text.replace(/\s+/g, ' ').slice(0, 48)
+  // 先截 200 字符再清洗：流式期间 text 可达几十 KB 且每 32ms 重渲一次，对全文跑正则纯浪费。
+  // 取舍：预览取自前 200 字符（首个非空白位置若更靠后，预览会比全文版略短），折叠态预览可接受。
+  const preview = text.slice(0, 200).replace(/\s+/g, ' ').slice(0, 48)
 
   return (
     <div data-testid="thinking-block" className="my-1.5 rounded-lg border border-(--outline-soft) bg-(--surface-chip)/50 text-xs">
