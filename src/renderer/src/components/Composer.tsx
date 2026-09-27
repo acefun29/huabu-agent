@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowUp, ChevronDown, FolderOpen, MessageSquare, Paperclip, ShieldAlert, SlashSquare, X } from 'lucide-react'
 import { ASSET_IDS_MIME, useCanvasStore } from '../store/canvasStore'
 import { hasBridge, useSettings } from '../store/settingsStore'
@@ -54,8 +54,12 @@ const levelLabel = (level: string) => THINKING_LEVEL_LABEL[level as ThinkingLeve
  * 生成提示词不在此处输入——直接在画布上的生成卡片里写。
  * 选中/拖入文件卡片即作为本轮上下文递给助手（只传绝对路径）；
  * 拖入电脑文件 = 临时引用（存工作区外的 inbox，不进素材库）。
+ *
+ * memo（零 props）：ChatDock 订阅流式 chatsMap（32ms 一次 flush，约 30Hz），
+ * 不 memo 的话本组件每次 flush 都全量重渲（modelGroups 构建等）；内部全是
+ * 自有 hook 订阅与事件回调，没有依赖「每次渲染都执行」的副作用，可安全 memo。
  */
-export function Composer() {
+export const Composer = memo(function Composer() {
   // 精确订阅：chips 用字符串 key 派生（引用稳定，选中集没变不重渲染）；actions 恒定引用
   const workspaceName = useCanvasStore((s) => s.workspace?.name ?? '未选择')
   const activeSession = useCanvasStore((s) => s.sessions.find((x) => x.id === s.activeSessionId) ?? null)
@@ -68,7 +72,8 @@ export function Composer() {
   const chipsKey = useCanvasStore((s) =>
     Array.from(new Set([...s.selectedAssetIds, ...s.injectedAssetIds]))
       .map((id) => {
-        const n = s.nodes.find((x) => x.id === id)
+        // 查 id 索引而非 nodes.find：selector 在每次 set 都会执行，find 是 O(k×n)
+        const n = s.nodesById.get(id)
         return n ? [id, n.data.name, n.data.kind, n.data.path ?? ''].join('\u0001') : ''
       })
       .join('\u0002')
@@ -586,4 +591,4 @@ export function Composer() {
       </div>
     </div>
   )
-}
+})

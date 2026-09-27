@@ -507,7 +507,8 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
   const kind = data.kind as MediaKind
   const refNamesKey = useCanvasStore((s) =>
     gen.refs.map((id) => {
-      const n = s.nodes.find((x) => x.id === id)
+      // 查 id 索引而非 nodes.find：selector 在每次 set 都会执行，find 是 O(k×n)
+      const n = s.nodesById.get(id)
       return n ? `${id}${(n.data as AssetData).name}` : ''
     }).join('')
   )

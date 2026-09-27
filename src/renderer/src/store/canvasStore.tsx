@@ -66,6 +66,9 @@ export { MEDIA_EXT, MEDIA_LABEL, LIBRARY_ASSET_MIME, ASSET_IDS_MIME, toolArgStri
 
 const CANVAS_SAVE_DEBOUNCE_MS = 800
 
+/** nodes → id 索引的统一重建口：所有写 nodes 的 set 点都必须带上一份（见 nodesById 注释） */
+const buildNodeIndex = (nodes: CanvasNode[]): Map<string, CanvasNode> => new Map(nodes.map((n) => [n.id, n]))
+
 interface ConfirmRequest {
   title: string
   body: string
@@ -105,6 +108,13 @@ export interface CanvasState {
 
   /* 画布内容（工作区公用，只有文件卡片）—— 低频：拖动/缩放结束才变 */
   nodes: CanvasNode[]
+  /**
+   * id → 节点索引（随 nodes 同步重建，见 buildNodeIndex）。selector 里 O(1) 查节点，
+   * 替代 s.nodes.find 的 O(k×n)：zustand v5 每次任何 set 都会执行 selector，
+   * 30Hz 流式 flush 下 find 扫描是纯浪费。Map 引用每次新建没关系——消费方
+   * selector 都返回 string key，靠字符串相等防重渲。
+   */
+  nodesById: Map<string, CanvasNode>
   view: ViewState
   setView: (patch: Partial<ViewState> | ((prev: ViewState) => ViewState)) => void
   selectedAssetIds: string[]
@@ -258,7 +268,10 @@ export const useCanvasStore = create<CanvasState>()(
 
     /** 节点集合的唯一修改口 */
     const applyNodes = (fn: (prev: CanvasNode[]) => CanvasNode[]) => {
-      set((s) => ({ nodes: fn(s.nodes) }))
+      set((s) => {
+        const nodes = fn(s.nodes)
+        return { nodes, nodesById: buildNodeIndex(nodes) }
+      })
     }
 
     const mutateNodeData = (id: string, fn: (data: AssetData) => AssetData) => {
@@ -420,6 +433,7 @@ export const useCanvasStore = create<CanvasState>()(
       hydrated = true
       set({
         nodes: restored,
+        nodesById: buildNodeIndex(restored),
         view: metaView ?? { x: 0, y: 0, scale: 1 },
         sessions: restoredSessions,
         chatsMap: chats,
@@ -514,6 +528,7 @@ export const useCanvasStore = create<CanvasState>()(
       workspace: null,
       recents: [],
       nodes: [],
+      nodesById: buildNodeIndex([]),
       view: { x: 0, y: 0, scale: 1 },
       selectedAssetIds: [],
       injectedAssetIds: [],
@@ -709,7 +724,11 @@ function installCanvasProbe() {
             } satisfies AssetData
           })
         }
-        useCanvasStore.setState((prev) => ({ nodes: [...prev.nodes, ...created] }))
+        // bench 直写 state 也要同步重建节点索引（与 applyNodes 同一契约）
+        useCanvasStore.setState((prev) => {
+          const nodes = [...prev.nodes, ...created]
+          return { nodes, nodesById: buildNodeIndex(nodes) }
+        })
         return ids
       },
       /** 以给定频率模拟一路流式输出（走真实渲染路径：blocks → markdown） */
