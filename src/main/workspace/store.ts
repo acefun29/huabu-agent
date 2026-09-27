@@ -1,5 +1,5 @@
 import { app, dialog } from 'electron'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from 'fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import type {
@@ -29,6 +29,7 @@ import {
   sanitizeModelOverrides,
   sanitizeUserProviders
 } from '../media/catalog/merge'
+import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
 
 /**
  * 工作区存储：一个工作区 = 一张画布 + 一个磁盘目录（开发计划 2.1）。
@@ -44,6 +45,20 @@ import {
  */
 
 const CANVAS_VERSIONS = [1, 2, 3] as const
+
+/**
+ * workspace.json 的读取缓存（key = 工作区目录）：readMeta 是热路径——每个
+ * huabu-media:// 协议请求都会经 mediaDir() 读一次 meta，不缓存的话反复读盘 + 解析。
+ *
+ * 放在模块级而不是 WorkspaceStore 实例字段：写路径除了实例方法 writeMeta，还有
+ * 模块级函数 writeChatSegment（host 与 models/overlay 都在调），后者拿不到实例
+ * 私有字段，而它的写盘同样要失效缓存。
+ *
+ * 正确性依据：读路径全在主进程单线程内；对 workspace.json 的写入全在本文件
+ * （writeMeta / writeChatSegment），写前显式失效；mtimeMs 双保险兜住进程外的
+ * 意外改动（用户手改、其他实例）。
+ */
+const metaCache = new Map<string, { mtimeMs: number; value: WorkspaceMetaFile }>()
 
 /** workspace.json 的 media.userProviders 条目（M11；用户自建供应商，文件持久化形态） */
 export interface WorkspaceMediaProviderConfig {
@@ -264,6 +279,11 @@ export class WorkspaceStore {
     }
     mkdirSync(join(dir, '.huabu', 'sessions'), { recursive: true })
 
+    // workspace.json 的首次读取点：先把崩溃可能遗留的 .bak 还原回来。原子写在
+    // 「旧文件已挪成 .bak、新文件未落位」之间被强杀的话，不还原直接读会把旧工作区
+    // 误判成从未初始化过，配置整段回默认
+    recoverAtomicBackup(join(dir, '.huabu', 'workspace.json'))
+
     const meta = this.readMeta(dir)
     const info: WorkspaceInfo = {
       path: dir,
@@ -307,14 +327,24 @@ export class WorkspaceStore {
 
   private readMeta(dir: string): WorkspaceMetaFile {
     const file = join(dir, '.huabu', 'workspace.json')
+    // 先 stat 拿 mtime：文件不存在（还没初始化的工作区）走缺省返回，且不缓存负结果
+    let mtimeMs: number
+    try {
+      mtimeMs = statSync(file).mtimeMs
+    } catch {
+      return { version: 1 }
+    }
+    const cached = metaCache.get(dir)
+    if (cached && cached.mtimeMs === mtimeMs) return cached.value
     let raw: Partial<WorkspaceMetaFile>
     try {
       raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<WorkspaceMetaFile>
     } catch {
+      // 文件在但读不出/解析失败（半写残留等瞬态）：按缺省处理，同样不缓存，下次重读
       return { version: 1 }
     }
     const chat = resolveChatSegment(dir, raw)
-    return {
+    const meta: WorkspaceMetaFile = {
       version: 1,
       // 顶层 defaultModel/hiddenModels **不回填**：它们是旧位置，只作为迁移输入被读取一次。
       // 读出来再写回去就是双轨（T1 刚清掉一次双轨），所以本方法唯一的输出形态是 chat 段。
@@ -322,6 +352,8 @@ export class WorkspaceStore {
       ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
       ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
     }
+    metaCache.set(dir, { mtimeMs, value: meta })
+    return meta
   }
 
   /**
@@ -417,6 +449,10 @@ export class WorkspaceStore {
 
   writeMeta(dir: string, meta: WorkspaceMetaFile): void {
     const file = join(dir, '.huabu', 'workspace.json')
+    // 写前先失效缓存：调用方（addLibrary 等）会原地改写 readMeta 返回的对象再传进来，
+    // 写盘若失败（磁盘满等），不能让缓存残留这个已被改写的脏对象；单线程内同步写，
+    // 失效与写盘之间没有别的读路径能插进来
+    metaCache.delete(dir)
     atomicWriteSync(file, JSON.stringify(meta, null, 2))
   }
 
@@ -593,6 +629,9 @@ export function writeChatSegment(dir: string, chat: WorkspaceChatConfig): void {
     ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
     ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
   }
+  // 本文件对 workspace.json 的另一条写路径：同样写前失效 metaCache。mtime 兜底在
+  // 粗粒度文件系统上可能吞掉同刻的两次变更，本文件内的写入就该显式失效
+  metaCache.delete(dir)
   atomicWriteSync(join(dir, '.huabu', 'workspace.json'), JSON.stringify(meta, null, 2))
 }
 
@@ -681,21 +720,9 @@ function normalizeDefaultRatio(raw: unknown): Pick<WorkspaceMediaConfig, 'defaul
     : {}
 }
 
-/** 原子写：同目录临时文件 + rename。强杀进程也不会留下半写的 JSON（M5 DoD 第 6 条） */
-export function atomicWriteSync(target: string, content: string): void {  const dir = dirname(target)
-  mkdirSync(dir, { recursive: true })
-  const tmp = join(dir, `.${basename(target)}.${process.pid}.tmp`)
-  writeFileSync(tmp, content, 'utf8')
-  try {
-    renameSync(tmp, target)
-  } catch (error) {
-    // Windows 上目标被占用时 rename 会失败，退化为先删再改，至少别把临时文件留下
-    rmSync(target, { force: true })
-    renameSync(tmp, target)
-    if (existsSync(tmp)) console.warn(`[workspace] 原子写回退后仍有临时文件：${tmp}`)
-    if (!existsSync(target)) throw error
-  }
-}
+/** 原子写已收口到 src/main/fsutil/atomic（tmp+rename；Windows 占用时挪 .bak 腾位，
+ * 绝不先删旧文件）。本文件此前的本地实现在 rename 失败时退化为 rm-then-rename，
+ * rm 与 rename 之间崩溃会把原文件彻底丢掉，已删除，改为从 fsutil/atomic 导入。 */
 
 /** copyFileSync 的目录自备版：导入媒体/资产时先把目标目录建好 */
 export function copyIntoDir(src: string, destDir: string, destName: string): string {

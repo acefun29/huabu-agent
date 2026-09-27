@@ -2,7 +2,7 @@ import { safeStorage } from 'electron'
 import { existsSync, mkdirSync, readFileSync } from 'fs'
 import { dirname } from 'path'
 import type { Credential, CredentialInfo, CredentialStore } from '@earendil-works/pi-ai'
-import { atomicWriteSync } from '../workspace/store'
+import { atomicWriteSync } from '../fsutil/atomic'
 
 /**
  * 工作区级加密凭据存储（M9 扩展）。
