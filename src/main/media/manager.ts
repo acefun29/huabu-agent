@@ -1,11 +1,12 @@
 import { randomUUID } from 'crypto'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'fs'
 import { basename, relative, resolve, sep } from 'path'
 import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
 import type { MediaArtifact, MediaGenerateRequest, MediaJobState, MediaJobStatus, MediaProviderInfo } from '../../shared/media'
 import { DEFAULT_MEDIA_CONCURRENCY, ratioToPixels } from '../../shared/media'
 import type { WorkspaceMediaConfig } from '../workspace/store'
+import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
 import type { AdapterProviderConfig } from './adapters/registry'
 import { imageSizeOf } from './imageSize'
 import type { ProviderSubmitInput } from './provider'
@@ -27,6 +28,9 @@ const POLL_BACKOFF = 1.5
 const POLL_MAX_MS = 10_000
 /** 整体超时：视频最长（网关排队+生成可达十几分钟） */
 const TIMEOUT_MS: Record<string, number> = { image: 240_000, audio: 300_000, video: 900_000 }
+
+/** jobs 账本里终态任务最多保留条数（按 updatedAt 淘汰更早的，防跨会话只进不出） */
+const TERMINAL_JOBS_KEEP = 50
 
 interface JobRecord {
   status: MediaJobStatus
@@ -335,7 +339,9 @@ export class MediaJobManager {
       const ext = extForUrl(poll.resultUrl, status.kind)
       target = this.resolveTargetPath(mediaDir, record, ext)
       const part = `${target}.part`
-      const response = await fetch(poll.resultUrl)
+      // 下载生成产物（图片/视频可达几十 MB）：超时放宽到 5 分钟，别误杀大文件下载；
+      // 其余接口请求是 30s（见各适配器），单个请求挂起不该占死并发槽
+      const response = await fetch(poll.resultUrl, { signal: AbortSignal.timeout(300_000) })
       if (!response.ok || !response.body) {
         throw new Error(`下载产物失败（HTTP ${response.status}）`)
       }
@@ -390,10 +396,18 @@ export class MediaJobManager {
     this.patch(record, patch)
   }
 
-  /** 统一的状态更新口：改记录、写 jobs.json、广播事件、唤醒等待者，四处永远一致 */
+  /** 统一的状态更新口：改记录、落账本（终态同步写/进度防抖写）、广播事件、唤醒等待者，四处永远一致 */
   private patch(record: JobRecord, patch: Partial<MediaJobStatus>): void {
     record.status = { ...record.status, ...patch, updatedAt: new Date().toISOString() }
-    this.persistJobs()
+    const state = record.status.state
+    if (state === 'succeeded' || state === 'failed' || state === 'cancelled') {
+      // 终态立即同步落盘：崩溃也不丢结果，因此无需退出钩子补写
+      this.evictTerminalJobs()
+      this.persistJobs()
+    } else {
+      // 非终态进度不逐次写盘：轮询期 1.2s~10s 一次 patch，500ms 防抖合并足够
+      this.schedulePersist()
+    }
     this.emit({ ...record.status })
     for (const waiter of this.waiters) {
       try {
@@ -482,6 +496,8 @@ export class MediaJobManager {
     const { mediaDir } = this.context()
     if (!mediaDir) return
     const file = resolve(mediaDir, 'jobs.json')
+    // 读前先做崩溃恢复：上次若停在「旧文件挪成 .bak、新文件未落位」之间，账本在此还原
+    recoverAtomicBackup(file)
     if (!existsSync(file)) return
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as { jobs?: MediaJobStatus[] }
@@ -521,7 +537,46 @@ export class MediaJobManager {
     }
   }
 
+  /**
+   * 淘汰历史终态任务：jobs Map 只进不出（重启后 reconcile 还会把旧账本灌回来），
+   * 终态记录按 updatedAt 降序只保留最近 TERMINAL_JOBS_KEEP 条，其余移除。
+   * running/pending 绝不动；只影响 jobs.json 账本与后续 list()/get() 查询，
+   * 不影响本次 patch 正在 emit 的事件。
+   */
+  private evictTerminalJobs(): void {
+    const terminal = [...this.jobs.values()]
+      .filter((job) => job.status.state === 'succeeded' || job.status.state === 'failed' || job.status.state === 'cancelled')
+      .sort((a, b) => b.status.updatedAt.localeCompare(a.status.updatedAt))
+    for (const job of terminal.slice(TERMINAL_JOBS_KEEP)) this.jobs.delete(job.status.jobId)
+  }
+
+  /** 进度防抖写盘的定时器与脏标记：500ms 窗口内的多次 patch 合并为一次写 */
+  private persistTimer: ReturnType<typeof setTimeout> | null = null
+  private persistDirty = false
+
+  private schedulePersist(): void {
+    this.persistDirty = true
+    if (this.persistTimer) return
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = null
+      if (!this.persistDirty) return
+      this.persistDirty = false
+      this.persistJobs()
+    }, 500)
+  }
+
+  /**
+   * 全量写任务账本。写盘策略：终态更新在 patch 里立即同步写（崩溃不丢结果，免去退出钩子），
+   * 非终态进度经 schedulePersist 500ms 防抖合并写。写入走 fsutil/atomic 的 tmp+rename
+   * （Windows 占用时旧文件挪 .bak 腾位），绝不先删旧文件再改名。
+   */
   private persistJobs(): void {
+    // 同步写已覆盖最新全量状态：取消已排期的防抖写，避免白写一遍
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = null
+    }
+    this.persistDirty = false
     const { mediaDir } = this.context()
     if (!mediaDir) return
     try {
@@ -532,10 +587,7 @@ export class MediaJobManager {
         savedAt: new Date().toISOString(),
         jobs: [...this.jobs.values()].map((job) => job.status)
       })
-      const tmp = `${file}.${process.pid}.tmp`
-      writeFileSyncSafe(tmp, payload)
-      rmSync(file, { force: true })
-      renameSync(tmp, file)
+      atomicWriteSync(file, payload)
     } catch (error) {
       console.warn(`[media-jobs] 任务账本写入失败：${String(error)}`)
     }
@@ -576,10 +628,4 @@ export function sanitizeArtifactName(raw: string | undefined): string | undefine
     .trim()
   if (!cleaned) return undefined
   return WINDOWS_RESERVED.test(cleaned) ? `${cleaned}_` : cleaned
-}
-
-function writeFileSyncSafe(target: string, content: string): void {
-  // 这里不复用 workspace/store 的 atomicWriteSync（会拉起 electron app 模块），
-  // 逻辑简单到不值得为此解耦，直接实现
-  writeFileSync(target, content, 'utf8')
 }

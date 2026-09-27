@@ -3,7 +3,9 @@
  *
  * 运行：pnpm tags-index:check
  *
- * tagsIndex.ts 只依赖 fs/path（纯 Node 可跑），这里在临时工作区里真写真读：
+ * tagsIndex.ts 只依赖 fs/path 与 fsutil/atomic（都是纯 Node 可跑），这里在临时工作区里
+ * 真写真读；两个源文件按 src/main 的相对布局（assets/ + fsutil/）转译落盘，保证
+ * tagsIndex.js 里的 require('../fsutil/atomic') 能解析：
  *   1. setFileTags 写入 → loadTagsIndex 读回一致；
  *   2. 清洗规则：去 # 前缀 / 去重 / 单条 12 字截断 / 最多 8 条 / 空白丢弃；
  *   3. 空标签数组 = 删除条目（索引里不留空键）；
@@ -19,6 +21,7 @@ import ts from 'typescript'
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const OUT_DIR = path.join(PROJECT_ROOT, 'out', 'tags-index-check-tmp')
 const SOURCE = path.join(PROJECT_ROOT, 'src', 'main', 'assets', 'tagsIndex.ts')
+const ATOMIC_SOURCE = path.join(PROJECT_ROOT, 'src', 'main', 'fsutil', 'atomic.ts')
 
 const results = []
 function check(name, fn) {
@@ -36,16 +39,22 @@ function assert(cond, message) {
 }
 
 fs.rmSync(OUT_DIR, { recursive: true, force: true })
-const { outputText, diagnostics } = ts.transpileModule(fs.readFileSync(SOURCE, 'utf8'), {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
-  fileName: SOURCE,
-  reportDiagnostics: true
-})
-const errors = (diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error)
-assert(errors.length === 0, `tagsIndex.ts 转译失败：${errors.map((d) => d.messageText).join('; ')}`)
-fs.mkdirSync(OUT_DIR, { recursive: true })
-const outFile = path.join(OUT_DIR, 'tagsIndex.js')
-fs.writeFileSync(outFile, outputText, 'utf8')
+function transpile(source, relOut) {
+  const { outputText, diagnostics } = ts.transpileModule(fs.readFileSync(source, 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
+    fileName: source,
+    reportDiagnostics: true
+  })
+  const errors = (diagnostics ?? []).filter((d) => d.category === ts.DiagnosticCategory.Error)
+  assert(errors.length === 0, `${path.basename(source)} 转译失败：${errors.map((d) => d.messageText).join('; ')}`)
+  const outFile = path.join(OUT_DIR, relOut)
+  fs.mkdirSync(path.dirname(outFile), { recursive: true })
+  fs.writeFileSync(outFile, outputText, 'utf8')
+  return outFile
+}
+// atomic 是 tagsIndex 的依赖，按 src/main 相对布局（assets/../fsutil/）一并转译
+transpile(ATOMIC_SOURCE, path.join('fsutil', 'atomic.js'))
+const outFile = transpile(SOURCE, path.join('assets', 'tagsIndex.js'))
 const { loadTagsIndex, setFileTags, cleanTags } = await import(`file://${outFile.replaceAll('\\', '/')}`)
 
 const WS = path.join(OUT_DIR, 'ws')
