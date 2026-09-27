@@ -29,7 +29,9 @@ import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, newNodeId, settingsBridgeRef, spa
 const bridges = new Map<string, ChatBridge>()
 const streams = new Map<string, ChatStreamState>()
 const baseLens = new Map<string, number>()
-const writeToolPaths = new Map<string, string>()
+/** write 工具的 toolCallId → 目标路径。值带 sessionId：agent_end / 删会话时按会话
+ * 清扫未配对条目（工具被 abort 时 tool_end 永不到达，否则 Map 单调增长） */
+const writeToolPaths = new Map<string, { sessionId: string; path: string }>()
 /** 历史已回放/已建过的会话（避免重复 replay 覆盖流式中的历史） */
 const historyLoaded = new Set<string>()
 
@@ -159,15 +161,22 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       for (const event of events) {
         if (event.type === 'agent_start') sawAgentStart = true
         state = reduceChatEvent(state, event)
-        // write 工具：tool_start 记下目标路径，tool_end 成功后钉产物卡片
+        // write 工具：tool_start 记下目标路径（带 sessionId 供清扫），tool_end 成功后钉产物卡片
         if (event.type === 'tool_start' && event.toolName === 'write') {
           const path = toolArgString(event.args as Record<string, unknown>, 'path')
-          if (path) writeToolPaths.set(event.toolCallId, path)
+          if (path) writeToolPaths.set(event.toolCallId, { sessionId, path })
         }
         if (event.type === 'tool_end' && event.toolName === 'write' && !event.isError) {
-          const path = writeToolPaths.get(event.toolCallId)
+          const entry = writeToolPaths.get(event.toolCallId)
           writeToolPaths.delete(event.toolCallId)
-          if (path) pinWrittenFile(sessionId, path)
+          if (entry) pinWrittenFile(sessionId, entry.path)
+        }
+        // 本轮收尾：agent_end 前还没被 tool_end 配对销掉的 write 条目必是 abort/中断遗留
+        //（事件流里 tool_end 一定先于 agent_end），按会话清扫，防止 Map 单调增长
+        if (event.type === 'agent_end') {
+          for (const [callId, entry] of writeToolPaths) {
+            if (entry.sessionId === sessionId) writeToolPaths.delete(callId)
+          }
         }
       }
       if (sawAgentStart) {
@@ -270,6 +279,8 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     historyLoaded.clear()
     pendingChatEvents.clear()
     draftMessageCache.clear()
+    // 切工作区：所有会话一并清空，write 路径条目（含旧 sessionId）没有留存价值
+    writeToolPaths.clear()
   }
 
   const setActiveSessionId = (id: string | null) => {
@@ -366,6 +377,13 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     streams.delete(id)
     baseLens.delete(id)
     historyLoaded.delete(id)
+    // 这三个缓存都按会话键持有引用（流式缓冲/draft→message 转换/未配对的 write 路径），
+    // 会话删了不清理就是单调泄漏；缓冲里的残余事件会在下次 flush 时自然跳过
+    pendingChatEvents.delete(id)
+    draftMessageCache.delete(id)
+    for (const [callId, entry] of writeToolPaths) {
+      if (entry.sessionId === id) writeToolPaths.delete(callId)
+    }
     let wasActive = false
     set((s) => {
       const chatsMap = { ...s.chatsMap }
