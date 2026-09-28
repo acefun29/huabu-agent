@@ -11,7 +11,8 @@
  * TEXT_EXTS / READ_FILE_MAX_BYTES（文本读写白名单与大小上限）。
  */
 import { ipcMain, shell } from 'electron'
-import { existsSync, readdirSync, readFileSync, statSync } from 'fs'
+import { existsSync, readFileSync, statSync } from 'fs'
+import { readdir, stat } from 'fs/promises'
 import { extname, join, relative, resolve, sep } from 'path'
 import {
   IpcChannel,
@@ -106,33 +107,34 @@ export function registerWorkspaceIpc(ctx: IpcContext): void {
   /** 工作区目录内不参与导入/编排的位置 */
   const SKIP_DIRS = new Set(['.huabu', '.git', 'node_modules', '.venv', 'dist', 'out', '.next'])
 
-  /** 递归收集工作区内可导入文件；深度与总量有上限，防止巨大目录拖垮 IPC */
-  function collectWorkspaceFiles(): WorkspaceFileInfo[] {
+  /** 递归收集工作区内可导入文件；深度与总量有上限，防止巨大目录拖垮 IPC。
+   * 异步遍历（fs.promises）：网络盘/慢磁盘上同步 readdir/stat 可能阻塞主进程数百 ms */
+  async function collectWorkspaceFiles(): Promise<WorkspaceFileInfo[]> {
     const dir = currentDir()
     if (!dir) throw new Error('尚未打开工作区')
     const out: WorkspaceFileInfo[] = []
-    const walk = (current: string, depth: number): void => {
+    const walk = async (current: string, depth: number): Promise<void> => {
       if (depth > 4 || out.length >= 800) return
-      let entries: string[] = []
+      let entries: string[]
       try {
-        entries = readdirSync(current)
+        entries = await readdir(current)
       } catch {
         return
       }
       for (const name of entries.sort()) {
         if (name.startsWith('.') && depth === 0) continue
         const full = join(current, name)
-        let stat
+        let info
         try {
-          stat = statSync(full)
+          info = await stat(full)
         } catch {
           continue
         }
-        if (stat.isDirectory()) {
-          if (!SKIP_DIRS.has(name)) walk(full, depth + 1)
+        if (info.isDirectory()) {
+          if (!SKIP_DIRS.has(name)) await walk(full, depth + 1)
           continue
         }
-        if (!stat.isFile()) continue
+        if (!info.isFile()) continue
         // 分类单一事实来源在 shared/assets.ts；清单只列认识的大类，'other' 不进导入菜单
         const { kind } = categorizeFileName(name)
         if (kind === 'other') continue
@@ -140,19 +142,26 @@ export function registerWorkspaceIpc(ctx: IpcContext): void {
           name,
           relPath: relative(dir, full).split(sep).join('/'),
           kind,
-          bytes: stat.size,
-          mtime: stat.mtime.toISOString()
+          bytes: info.size,
+          mtime: info.mtime.toISOString()
         })
         if (out.length >= 800) return
       }
     }
-    walk(dir, 0)
+    await walk(dir, 0)
     // 最近修改的排前面，导入菜单里优先看到刚产出的文件
     out.sort((a, b) => b.mtime.localeCompare(a.mtime))
     return out.slice(0, 800)
   }
 
-  ipcMain.handle(IpcChannel.WorkspaceFiles, () => guardSync(() => collectWorkspaceFiles()))
+  // 异步 handler：错误返回形态与 guardSync 一致（describe 收敛 + ok:false 包装）
+  ipcMain.handle(IpcChannel.WorkspaceFiles, async () => {
+    try {
+      return { ok: true as const, value: await collectWorkspaceFiles() }
+    } catch (error) {
+      return { ok: false as const, code: 'unknown' as const, error: describe(error) }
+    }
+  })
 
   /** 文本上下文注入的扩展名白名单与大小上限 */
   const TEXT_EXTS = new Set([
