@@ -2,7 +2,9 @@ import type {
   AgentSession,
   ModelRuntime
 } from '@earendil-works/pi-coding-agent'
-import { existsSync, readFileSync } from 'fs'
+import { existsSync } from 'fs'
+import { readFile, stat } from 'fs/promises'
+import { isAbsolute, relative } from 'path'
 import type {
   ChatContextBreakdownInfo,
   ChatContextUsage,
@@ -75,6 +77,15 @@ const TOOL_ALLOWLIST = ['ls', 'read', 'write']
 
 /** 回放缩略图的每会话上限（风险登记：base64 过 IPC 的体积防护），超出退化为 chip */
 const HISTORY_IMAGE_LIMIT = 24
+
+/* 会话 JSONL 的体积分层防护（readSessionHistory）：单行可达数 MB、整文件数十 MB 的
+ * base64 图块会让同步全读冻结主进程，故设硬顶拒绝 + 软顶跳行两道闸 */
+/** 硬顶：文件超过 64MB 直接拒绝加载，不读入内存 */
+const SESSION_FILE_HARD_LIMIT = 64 * 1024 * 1024
+/** 软顶：文件在 24MB~64MB 之间照常加载，但启用单行长度过滤 */
+const SESSION_FILE_SOFT_LIMIT = 24 * 1024 * 1024
+/** 单行过滤阈值：正常消息/工具行远小于此，超长行必是 base64 图块 */
+const SESSION_LINE_LIMIT = 512 * 1024
 
 type PiModule = typeof import('@earendil-works/pi-coding-agent')
 /** 从 ModelRuntime 的方法签名里提取 Model 类型，避免直接依赖 pi-ai 的运行时导出 */
@@ -553,15 +564,34 @@ export class AgentHost {
     }
     let entries: unknown[]
     try {
-      const lines = readFileSync(sessionFile, 'utf8').split('\n')
+      // 先 stat 拿大小再异步读：JSONL 里可能塞 base64 图块（单行可达数 MB、整文件数十 MB），
+      // 同步全读会让主进程在画布恢复时每个节点冻结数秒
+      const stats = await stat(sessionFile)
+      if (stats.size > SESSION_FILE_HARD_LIMIT) {
+        return fail('session_too_large', `会话文件超过 64MB，跳过加载：${sessionFile}`)
+      }
+      // 软顶之上启用单行过滤：正常消息/工具行远小于 512KB，超长行必是 base64 图块
+      const skipOversizeLines = stats.size > SESSION_FILE_SOFT_LIMIT
+      const lines = (await readFile(sessionFile, 'utf8')).split('\n')
       entries = []
+      let skippedOversize = 0
       for (const line of lines) {
+        // 长度过滤放在 trim 之前：超长行先跳过，省去对大字符串 trim 的复制开销
+        if (skipOversizeLines && line.length >= SESSION_LINE_LIMIT) {
+          skippedOversize += 1
+          continue
+        }
         if (!line.trim()) continue
         try {
           entries.push(JSON.parse(line) as unknown)
         } catch {
           continue // 坏行跳过，与旧实现一致：回放尽力而为
         }
+      }
+      if (skippedOversize > 0) {
+        console.warn(
+          `[agent-host] ${sessionFile} 超过软顶（24MB），已跳过 ${skippedOversize} 条 ≥512KB 的超长行（多为 base64 图块）`
+        )
       }
     } catch (error) {
       return fail('unknown', `读取会话历史失败：${describeError(error)}`)
@@ -1088,9 +1118,10 @@ export class AgentHost {
    * 返回释放数，供主进程日志与 M5 DoD 的 dispose 证据使用。
    */
   async disposeWorkspace(workspaceDir: string): Promise<number> {
-    const prefix = workspaceDir.endsWith('/') ? workspaceDir : workspaceDir + '/'
+    // 不能用 startsWith('workspaceDir + /') 前缀匹配：Windows 上会话 cwd 是反斜杠路径，
+    // 'E:\ws\sub'.startsWith('E:\ws/') 恒为 false，子目录会话会漏释放，故走 isWithinDir
     const targets = [...this.sessions.values()].filter(
-      (entry) => entry.cwd === workspaceDir || entry.cwd.startsWith(prefix)
+      (entry) => entry.cwd === workspaceDir || isWithinDir(workspaceDir, entry.cwd)
     )
     for (const entry of targets) {
       await this.disposeEntry(entry)
@@ -1152,6 +1183,19 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
       }
     )
   })
+}
+
+/**
+ * 判断 child 是否严格位于 parent 目录之内（不含 parent 自身，相等由调用方 === 兜底）。
+ *
+ * 为什么不用 startsWith 前缀匹配：Windows 上路径分隔符是反斜杠，
+ * 'E:\ws\sub'.startsWith('E:\ws/') 恒为 false。path.relative(parent, child)
+ * 在 child 越出 parent 时以 '..' 开头；Windows 跨盘符时直接返回绝对路径——
+ * 这两种都视为不在其内，相等时 relative 返回 ''，同样不算"在其内"。
+ */
+function isWithinDir(parent: string, child: string): boolean {
+  const rel = relative(parent, child)
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
 }
 
 /** 缩略一个图片槽位；解码失败退化为 chip（带源路径），不丢占位 */

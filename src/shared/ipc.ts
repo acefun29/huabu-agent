@@ -386,6 +386,8 @@ export type ChatErrorCode =
   /** 链路正常但模型调用失败（401、网络中断等） */
   | 'model_call_failed'
   | 'aborted'
+  /** 会话 JSONL 超过加载上限（硬顶 64MB），主进程跳过加载以免被冻结 */
+  | 'session_too_large'
   | 'unknown'
 
 /** 统一的请求返回包装：不靠抛错传递业务失败，避免渲染端只能拿到一句字符串 */
