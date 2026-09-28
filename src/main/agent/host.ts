@@ -2,9 +2,10 @@ import type {
   AgentSession,
   ModelRuntime
 } from '@earendil-works/pi-coding-agent'
-import { existsSync } from 'fs'
-import { readFile, stat } from 'fs/promises'
+import { createReadStream, existsSync } from 'fs'
+import { stat } from 'fs/promises'
 import { isAbsolute, relative } from 'path'
+import { createInterface as createLineReader } from 'readline'
 import type {
   ChatContextBreakdownInfo,
   ChatContextUsage,
@@ -572,21 +573,36 @@ export class AgentHost {
       }
       // 软顶之上启用单行过滤：正常消息/工具行远小于 512KB，超长行必是 base64 图块
       const skipOversizeLines = stats.size > SESSION_FILE_SOFT_LIMIT
-      const lines = (await readFile(sessionFile, 'utf8')).split('\n')
+      // 流式逐行读：24~64MB 的文件不再以整段字符串驻留内存。readline 迭代器对已缓冲的
+      // 行会在微任务里连发（不回事件循环），故每 1000 行 setImmediate 让出一次——
+      // 大文件解析期间聊天 delta / 任务事件得以穿插处理，而不是冻结主进程
       entries = []
       let skippedOversize = 0
-      for (const line of lines) {
-        // 长度过滤放在 trim 之前：超长行先跳过，省去对大字符串 trim 的复制开销
-        if (skipOversizeLines && line.length >= SESSION_LINE_LIMIT) {
-          skippedOversize += 1
-          continue
+      let lineCount = 0
+      const stream = createReadStream(sessionFile, { encoding: 'utf8' })
+      try {
+        const lines = createLineReader({ input: stream })
+        for await (const line of lines) {
+          lineCount += 1
+          if (lineCount % 1000 === 0) {
+            await new Promise<void>((resolve) => setImmediate(resolve))
+          }
+          // 长度过滤放在 trim 之前：超长行先跳过，省去对大字符串 trim 的复制开销
+          if (skipOversizeLines && line.length >= SESSION_LINE_LIMIT) {
+            skippedOversize += 1
+            continue
+          }
+          if (!line.trim()) continue
+          try {
+            entries.push(JSON.parse(line) as unknown)
+          } catch {
+            continue // 坏行跳过，与旧实现一致：回放尽力而为
+          }
         }
-        if (!line.trim()) continue
-        try {
-          entries.push(JSON.parse(line) as unknown)
-        } catch {
-          continue // 坏行跳过，与旧实现一致：回放尽力而为
-        }
+      } finally {
+        // 正常读完时流已自然结束，destroy 是无害兜底；中途出错（文件被删/占用）时靠它
+        // 释放 fd 防泄漏。错误本身经 for await 抛出，落进外层 catch 统一转 fail
+        stream.destroy()
       }
       if (skippedOversize > 0) {
         console.warn(
@@ -1192,9 +1208,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * 'E:\ws\sub'.startsWith('E:\ws/') 恒为 false。path.relative(parent, child)
  * 在 child 越出 parent 时以 '..' 开头；Windows 跨盘符时直接返回绝对路径——
  * 这两种都视为不在其内，相等时 relative 返回 ''，同样不算"在其内"。
+ *
+ * win32 下先把两侧归一小写再 relative：Windows 路径大小写不敏感，
+ * 而 path.win32.relative 的组件比较却是大小写敏感的（仅盘符除外），上游传入
+ * 'E:\WS' 与 'E:\ws\sub' 会得到以 '..' 开头的 rel 而漏判——disposeWorkspace
+ * 就会漏释放大小写漂移的子目录会话。posix 文件系统大小写敏感，保持原行为。
  */
 function isWithinDir(parent: string, child: string): boolean {
-  const rel = relative(parent, child)
+  const normalize = (dir: string): string => (process.platform === 'win32' ? dir.toLowerCase() : dir)
+  const rel = relative(normalize(parent), normalize(child))
   return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel)
 }
 
