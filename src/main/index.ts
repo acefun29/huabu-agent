@@ -51,9 +51,21 @@ function createMainWindow(): BrowserWindow {
     mainWindow.show()
   })
 
-  // 外部链接交给系统浏览器，禁止在应用内开新窗口
+  // 外部链接交给系统浏览器，禁止在应用内开新窗口。
+  // 协议白名单：file://、smb:// 等任意协议都能经聊天内容里的链接触发 openExternal，
+  // 只放行 http(s)；new URL 解析失败同样视为不安全。
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    void shell.openExternal(details.url)
+    let protocol = ''
+    try {
+      protocol = new URL(details.url).protocol
+    } catch {
+      // 解析失败保持空串，落入下方拒绝分支
+    }
+    if (protocol === 'https:' || protocol === 'http:') {
+      void shell.openExternal(details.url)
+    } else {
+      console.warn('[main] 拒绝非 http(s) 外链：' + details.url)
+    }
     return { action: 'deny' }
   })
 
