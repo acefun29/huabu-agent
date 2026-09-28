@@ -640,10 +640,20 @@ group('D2-生成与编排')
   const stFork = await storeState()
   const forkMeta = (stFork.sessions ?? []).find((s) => s.forkedFromId === chatId)
   const forkChatData = forkMeta ? stFork.chats[forkMeta.id] : null
+  // fork 双路径（环境自适应）：有凭据时母会话真实回复成功、写出了 JSONL → 走文件级
+  // 分叉（fork 自带 sessionFile，chatsMap.history 故意留空待切换时结构化回放，断言分叉
+  // 文件真实存在且非空）；无凭据时母会话发送即失败、无 JSONL → 退回「复制 UI 历史」
+  //（无 sessionFile，断言 history ≥ 1）。旧断言只认第二条路径，在有凭据的机器上必假失败。
+  const forkFileLevel = Boolean(forkMeta?.sessionFile)
   record(
-    'fork 保留全部历史且另起炉灶（无 sessionFile）',
-    Boolean(forkMeta && (forkChatData?.history?.length ?? 0) >= 1 && !forkMeta.sessionFile),
-    `history=${forkChatData?.history?.length}`
+    'fork 分叉生效（文件级或 UI 复制，随凭据环境自适应）',
+    Boolean(
+      forkMeta &&
+        (forkFileLevel
+          ? fs.existsSync(forkMeta.sessionFile) && fs.statSync(forkMeta.sessionFile).size > 0
+          : (forkChatData?.history?.length ?? 0) >= 1)
+    ),
+    forkFileLevel ? `file=${path.basename(forkMeta.sessionFile)}` : `history=${forkChatData?.history?.length}`
   )
   record(
     'fork 关系记录在会话元数据',

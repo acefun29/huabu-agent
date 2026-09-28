@@ -25,6 +25,10 @@ Thumbs.db
 .idea/
 *.swp
 
+# ZCode 会话产物
+.zcode/
+.zcodeignore
+
 # local env / secrets
 .env
 .env.local
