@@ -18,7 +18,8 @@ import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { type AssetData, type CanvasNode, type MediaKind, type ViewState } from '../types'
 import { kindIcon } from './AssetNode'
-import { NodeFrame, type NodeGestureApi } from './NodeFrame'
+import type { NodeGestureApi } from './NodeFrame'
+import { NodeLayer } from './canvas/NodeLayer'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import type { AssetLibraryFile } from '@shared/ipc'
 
@@ -121,11 +122,17 @@ function scheduleWrite(ref: { raf: number }, apply: () => void) {
  * 位移直写 DOM（rAF 合并），手势结束才把结果一次性提交进 store。
  * transform 层因此「非受控」：style.transform 永不出现在 JSX 里，只由 applyView 写入，
  * 任何上下文重渲染都不可能用手势中间态之外的旧 view 把画面踩回去。
+ *
+ * 渲染层拆分：nodes 数组的订阅下沉到 NodeLayer（canvas/NodeLayer.tsx）——单节点
+ * 变化（生成进度事件 / 拖拽提交 / 打标签）只重渲节点层，不再重跑本组件函数体；
+ * 主组件只保留「画布是否为空」的布尔派生，事件路径（右键菜单 / 框选命中）经
+ * getState 现取最新 nodes。
  */
 export function CanvasWorkspace() {
   bumpRender('workspace')
   // 精确订阅：流式对话（chatsMap 高频变化）不再波及画布；actions 是恒定引用，经 getState 取用
-  const nodes = useCanvasStore((s) => s.nodes)
+  // nodes 数组已下沉到 NodeLayer 订阅（见上），这里只留空画布引导用的布尔派生（引用稳定）
+  const hasNodes = useCanvasStore((s) => s.nodes.length > 0)
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
   const activeGenerateId = useCanvasStore((s) => s.activeGenerateId)
@@ -299,7 +306,9 @@ export function CanvasWorkspace() {
       const top = Math.min(start.y, p.y)
       const bottom = Math.max(start.y, p.y)
       // 只框选普通素材卡片（生成控制台卡片有自己的激活态，不参与引用选中）
-      return nodes
+      // 主组件已不订阅 nodes：手势回调里现取最新态（getState 既定模式，scheduleWrite
+      // 回调内同样成立），框选途中新钉入 / 被移动的卡片也能正确命中
+      return useCanvasStore.getState().nodes
         .filter((n) => !n.data.gen)
         .filter((n) => n.x < right && n.x + n.width > left && n.y < bottom && n.y + n.height > top)
         .map((n) => n.id)
@@ -559,7 +568,8 @@ export function CanvasWorkspace() {
             onClick: () => useCanvasStore.getState().importFromDirectory(f),
           })
         )),
-    ...(nodes.length > 0
+    // 菜单在事件触发时构建，nodes 现取最新态（主组件已不订阅 nodes）
+    ...(useCanvasStore.getState().nodes.length > 0
       ? [
           {
             label: '清空画布（不删除文件）',
@@ -663,7 +673,8 @@ export function CanvasWorkspace() {
     e.preventDefault()
     void useCanvasStore.getState().refreshDirFiles()
     const nodeId = (e.target as HTMLElement).closest('[data-node-id]')?.getAttribute('data-node-id')
-    const node = nodeId ? nodes.find((n) => n.id === nodeId) : undefined
+    // nodes 现取最新态（主组件已不订阅 nodes）；nodeItems 的入参节点由此得来
+    const node = nodeId ? useCanvasStore.getState().nodes.find((n) => n.id === nodeId) : undefined
     const at = toCanvas(e.clientX, e.clientY)
     setMenu({ x: e.clientX, y: e.clientY, items: node ? nodeItems(node) : canvasItems(at) })
   }
@@ -720,14 +731,8 @@ export function CanvasWorkspace() {
       {appearance.showGrid && <div ref={gridRef} aria-hidden="true" className="dot-grid-layer" />}
       {/* 变换层：transform 非受控（applyView / 手势 rAF 直写），React 不渲染 style.transform */}
       <div ref={transformRef} data-canvas-bg="true" className="canvas-transform absolute inset-0">
-        {nodes.map((node) => (
-          <NodeFrame
-            key={node.id}
-            node={node}
-            api={nodeGestureApi}
-            dimmed={Boolean(activeTag && !(node.data.tags ?? []).includes(activeTag))}
-          />
-        ))}
+        {/* 节点层：唯一的 nodes 订阅者（单节点变化只重渲这一层，不再波及主组件） */}
+        <NodeLayer api={nodeGestureApi} activeTag={activeTag} />
 
         {/* 框选矩形：常驻 DOM，几何由手势直写；盖在卡片之上、不拦截事件 */}
         <div ref={marqueeRef} className="canvas-marquee" style={{ display: 'none' }} />
@@ -736,8 +741,8 @@ export function CanvasWorkspace() {
       {/* 标签筛选条：聚合画布卡片标签，点击只亮带该标签的卡片 */}
       <TagFilterBar active={activeTag} onChange={setActiveTag} />
 
-      {/* 空画布引导：不拦截任何鼠标事件 */}
-      {nodes.length === 0 && (
+      {/* 空画布引导：不拦截任何鼠标事件（显隐由 hasNodes 布尔订阅驱动） */}
+      {!hasNodes && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="flex max-w-sm flex-col items-center gap-3 rounded-3xl bg-(--glass) px-8 py-7 text-center ring-1 ring-(--outline-soft) backdrop-blur">
             <MousePointer2 size={20} className="text-(--on-surface-muted)" />
