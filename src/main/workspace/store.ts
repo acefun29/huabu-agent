@@ -46,6 +46,21 @@ import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
 
 const CANVAS_VERSIONS = [1, 2, 3] as const
 
+/** canvas.json 写盘防抖窗口：合并窗口内的多次 invoke 为一次序列化 + 原子写 */
+const CANVAS_WRITE_DEBOUNCE_MS = 200
+
+/**
+ * canvas.json 的写盘防抖状态（与 metaCache 同理放模块级，last-write-wins）：
+ * 200ms 窗口内的多次 saveCanvas 合并为一次 stringify + 原子写——新调用只覆盖
+ * pending 快照、不重置定时器（合并而非顺延）。崩溃最多丢 200ms 的画布快照；
+ * 渲染端 autosave 已有 800ms 防抖，这里只防直接高频 invoke 的重复序列化。
+ *
+ * pending 连目标 file 一起捕获：到点写盘时 this.current 可能已切到别的工作区，
+ * 写盘目标必须锚定排期那一刻的画布文件，而不是当下正在打开的工作区。
+ */
+let canvasSaveTimer: ReturnType<typeof setTimeout> | null = null
+let canvasSavePending: { file: string; snapshot: CanvasSnapshot } | null = null
+
 /**
  * workspace.json 的读取缓存（key = 工作区目录）：readMeta 是热路径——每个
  * huabu-media:// 协议请求都会经 mediaDir() 读一次 meta，不缓存的话反复读盘 + 解析。
@@ -473,6 +488,12 @@ export class WorkspaceStore {
   /* canvas.json                                                              */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * 画布快照落盘（200ms 防抖合并写）：形状/节点数校验保持同步——invoke 当场把
+   * 非法输入抛回渲染端；序列化 + 原子写延迟到定时器合并执行。崩溃最多丢 200ms
+   * 的画布快照；渲染端 autosave 已有 800ms 防抖，这里只防直接高频 invoke 的
+   * 重复序列化与写盘。
+   */
   saveCanvas(snapshot: CanvasSnapshot): void {
     if (!this.current) throw new Error('尚未打开工作区，画布无处可存')
     if (!snapshot || !(CANVAS_VERSIONS as readonly number[]).includes(snapshot?.version) || !Array.isArray(snapshot.nodes)) {
@@ -482,11 +503,28 @@ export class WorkspaceStore {
     if (snapshot.nodes.length > 2000) {
       throw new Error(`画布节点数超过上限（${snapshot.nodes.length} > 2000）`)
     }
-    const serialized = JSON.stringify(snapshot)
-    if (serialized.length > 32 * 1024 * 1024) {
-      throw new Error('画布快照体积超过 32MB 上限')
-    }
-    atomicWriteSync(this.current.canvasFile, serialized)
+    // last-write-wins：pending 只留最新快照引用（渲染端每次传新对象），
+    // 已有定时器不重置——合并而非顺延
+    canvasSavePending = { file: this.current.canvasFile, snapshot }
+    if (canvasSaveTimer) return
+    canvasSaveTimer = setTimeout(() => {
+      canvasSaveTimer = null
+      const pending = canvasSavePending
+      canvasSavePending = null
+      if (!pending) return
+      try {
+        const serialized = JSON.stringify(pending.snapshot)
+        if (serialized.length > 32 * 1024 * 1024) {
+          console.error('[workspace] 画布快照体积超过 32MB 上限，已跳过本次写盘')
+          return
+        }
+        atomicWriteSync(pending.file, serialized)
+      } catch (error) {
+        // 防抖后写盘失败已无法抛回 invoke 调用方，只能记日志：宁可丢一拍，
+        // 也不能让定时器里的异常变成主进程未捕获错误
+        console.error('[workspace] canvas.json 写盘失败：', error)
+      }
+    }, CANVAS_WRITE_DEBOUNCE_MS)
   }
 
   loadCanvas(): CanvasSnapshot | null {
