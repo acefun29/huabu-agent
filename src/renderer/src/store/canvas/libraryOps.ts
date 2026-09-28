@@ -167,32 +167,34 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     for (const f of result.value.failed) showToast(`导入失败：${f.name}（${f.error}）`)
     const base = at ?? { x: 160, y: 140 }
     const createdIds: string[] = []
+    const created: CanvasNode[] = []
+    // 循环内只构建节点攒进 created，循环外一次 applyNodes 提交：
+    // 逐文件 set 会造成 N 轮渲染风暴 + N 次 autosave 防抖重置
     result.value.imported.forEach((asset, index) => {
       const id = newNodeId()
       createdIds.push(id)
       zCounter.current += 1
-      applyNodes((prev) => [
-        ...prev,
-        {
-          id,
-          type: 'asset',
-          x: base.x + index * 28,
-          y: base.y + index * 28,
-          width: 240,
-          height: 230,
-          zIndex: zCounter.current,
-          data: {
-            name: asset.name,
-            kind: asset.kind,
-            storage: 'ws',
-            path: asset.relPath,
-            mime: asset.mime,
-            bytes: asset.bytes,
-            meta: KIND_LABEL[asset.kind]
-          } satisfies AssetData
-        } satisfies CanvasNode
-      ])
+      created.push({
+        id,
+        type: 'asset',
+        x: base.x + index * 28,
+        y: base.y + index * 28,
+        width: 240,
+        height: 230,
+        zIndex: zCounter.current,
+        data: {
+          name: asset.name,
+          kind: asset.kind,
+          storage: 'ws',
+          path: asset.relPath,
+          mime: asset.mime,
+          bytes: asset.bytes,
+          meta: KIND_LABEL[asset.kind]
+        } satisfies AssetData
+      } satisfies CanvasNode)
     })
+    // 空列表跳过：与旧行为一致（imported 为空时不动 nodes，nodesById 由 applyNodes 内部重建）
+    if (created.length > 0) applyNodes((prev) => [...prev, ...created])
     set({ selectedAssetIds: createdIds })
     if (createdIds.length > 0) {
       showToast(`已把 ${createdIds.length} 个文件归档进素材库（assets/<分类>/）并钉到画布`)
