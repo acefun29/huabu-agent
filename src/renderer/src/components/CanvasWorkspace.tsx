@@ -305,22 +305,36 @@ export function CanvasWorkspace() {
         .map((n) => n.id)
     }
 
+    /** 最新框选角点：松手补算最后一次命中用（rAF 可能还没跑到就被取消） */
+    let latestPt = start
     const onMove = (ev: MouseEvent) => {
       if (Math.abs(ev.clientX - e.clientX) + Math.abs(ev.clientY - e.clientY) > 4) moved = true
+      // mousemove 只留最新坐标；命中检测（O(n) 两次 filter + 去重排序拼 key）合并进
+      // rAF，与画框位移同帧生效 —— 一帧内多个事件只算一次
       const p = toCanvas(ev.clientX, ev.clientY)
+      latestPt = p
       const current = p
-      scheduleWrite(write, () => paint(current))
-      const ids = Array.from(new Set([...baseIds, ...hitTest(p)]))
-      const key = ids.slice().sort().join('\u0000')
-      if (key !== lastKey) {
-        lastKey = key
-        useCanvasStore.getState().setAssetSelection(ids)
-      }
+      scheduleWrite(write, () => {
+        paint(current)
+        const ids = Array.from(new Set([...baseIds, ...hitTest(current)]))
+        const key = ids.slice().sort().join('\u0000')
+        if (key !== lastKey) {
+          lastKey = key
+          useCanvasStore.getState().setAssetSelection(ids)
+        }
+      })
     }
     const onUp = () => {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
       if (write.raf) cancelAnimationFrame(write.raf)
+      // 松手补算最后一次命中：快速甩动松手时它还压在未执行的 rAF 里，直接取消
+      // 会吞掉最后一段位移的框选结果（key 比较保证已生效时这里是空转）
+      if (moved) {
+        const ids = Array.from(new Set([...baseIds, ...hitTest(latestPt)]))
+        const key = ids.slice().sort().join('\u0000')
+        if (key !== lastKey) useCanvasStore.getState().setAssetSelection(ids)
+      }
       if (box) box.style.display = 'none'
       if (!moved && !additive) useCanvasStore.getState().setAssetSelection([])
     }
@@ -372,6 +386,8 @@ export function CanvasWorkspace() {
         const write = { raf: 0 }
         let dragging = false
         let latest = { x: node.x, y: node.y }
+        /** 最新指针位置（client 坐标）：松手补算参考投放命中用 */
+        let latestPointer = { x: e.clientX, y: e.clientY }
         // 参考投放（「+ 参考」）：拖动途中悬停到某张生成卡片上即高亮，松手把它加为
         // 参考（垫图 / 首帧）并弹回原位——本手势语义是「引用」不是「摆放」，与
         // HTML5 把手拖到生成卡片的 drop 同效（onDropRef 的自引用/去重规则一致）。
@@ -407,15 +423,22 @@ export function CanvasWorkspace() {
             y: start.y + (ev.clientY - start.cy) / scale,
           }
           const current = latest
-          setRefHover(hitRefTarget(ev.clientX, ev.clientY))
+          const pt = { x: ev.clientX, y: ev.clientY }
           scheduleWrite(write, () => {
             el.style.transform = `translate3d(${current.x}px, ${current.y}px, 0)`
+            // 参考投放命中检测合并进同一帧：elementsFromPoint 是强制命中测试，
+            // 且每个命中元素还要 O(n) 查 nodes —— 一帧内多个 mousemove 只算一次
+            setRefHover(hitRefTarget(pt.x, pt.y))
           })
         }
         const finish = () => {
           window.removeEventListener('mousemove', onMove)
           window.removeEventListener('mouseup', finish)
           if (write.raf) cancelAnimationFrame(write.raf)
+          // 松手补算最后一次命中：快速甩动松手时它还压在未执行的 rAF 里，直接取消
+          // 会漏判，把「悬停生成卡片松手 = 加参考」退化成普通摆放（setRefHover
+          // 内部有等值短路，命中已生效时这里是空转）
+          if (dragging) setRefHover(hitRefTarget(latestPointer.x, latestPointer.y))
           const droppedOn = refTarget
           setRefHover(null)
           if (dragging) {
