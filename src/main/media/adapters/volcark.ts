@@ -1,6 +1,7 @@
-import type { MediaKind, MediaModelInfo, MediaProviderType, ModelCapabilities } from '../../../shared/media'
-import type { MediaProviderAdapter, ProviderPollResult, ProviderSubmitInput } from '../provider'
-import { registerAdapter, type AdapterDeps, type AdapterModelConfig } from './registry'
+import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
+import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { registerAdapter, type AdapterDeps } from './registry'
+import { BaseGatewayProvider, buildModelRecord, nearestRatio } from './base'
 import { firstImageRefDataUri } from './refImage'
 
 /**
@@ -52,76 +53,20 @@ export interface VolcArkProviderConfig {
   authEnv?: string
 }
 
-export class VolcArkProvider implements MediaProviderAdapter {
-  readonly id: string
+export class VolcArkProvider extends BaseGatewayProvider<VolcArkModelConfig> {
   readonly type: MediaProviderType = 'gateway-volcark'
-  readonly label: string
-  readonly models: MediaModelInfo[]
 
   constructor(
-    private readonly config: VolcArkProviderConfig,
-    private readonly getKey: () => Promise<string | undefined>
+    config: VolcArkProviderConfig,
+    getKey: () => Promise<string | undefined>
   ) {
-    this.id = config.id ?? 'volcark'
-    this.label = config.label ?? '火山方舟'
-    this.models = Object.entries(config.models).map(([requestModel, model]) => {
-      const id = model.userId ?? requestModel
-      return {
-        id,
-        kind: model.kind,
-        label: model.label ?? id,
-        provider: this.id,
-        ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-        ...(model.status ? { status: model.status } : {}),
-        ...(model.costHint ? { costHint: model.costHint } : {})
-      }
-    })
-  }
-
-  isConfigured(): boolean {
-    // 同步上下文里只做保守判断；实际提交时 key 缺失会报可操作错误
-    return true
-  }
-
-  async isReady(): Promise<boolean> {
-    return Boolean(await this.getKey())
-  }
-
-  authHint(): string {
-    return this.config.authKey ? 'workspace-store' : `environment:${this.config.authEnv ?? 'ARK_KEY'}`
-  }
-
-  private async requireKey(): Promise<string> {
-    const key = await this.getKey()
-    if (!key) {
-      const env = this.config.authEnv ?? 'ARK_KEY'
-      throw new Error(
-        `provider ${this.id} 缺少凭据：请在设置面板录入 API Key，或设置环境变量 ${env} 后重启`
-      )
-    }
-    return key
-  }
-
-  /** 稳定 id → 线上模型 ID；找不到返回 undefined */
-  private requestModelOf(model: string): string | undefined {
-    for (const [requestModel, entry] of Object.entries(this.config.models)) {
-      if (entry.userId === model || requestModel === model) return requestModel
-    }
-    return undefined
-  }
-
-  private kindOf(model: string): MediaKind {
-    return (
-      this.models.find((m) => m.id === model)?.kind ??
-      Object.entries(this.config.models).find(([name]) => name === model)?.[1].kind ??
-      'image'
-    )
+    super(config, getKey, 'ARK_KEY', { id: 'volcark', label: '火山方舟' })
   }
 
   async submit(model: string, input: ProviderSubmitInput): Promise<string> {
     const key = await this.requireKey()
     const requestModel = this.requestModelOf(model)
-    if (!requestModel) throw new Error(`provider ${this.id} 下没有模型 ${model}（清单见 media:providers）`)
+    if (!requestModel) this.noSuchModel(model)
     const kind = this.kindOf(model)
     if (kind === 'video') return this.submitVideo(key, requestModel, input)
     return this.submitImage(key, requestModel, input)
@@ -150,10 +95,13 @@ export class VolcArkProvider implements MediaProviderAdapter {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`方舟认证失败（HTTP ${response.status}）：请检查 API Key 是否正确、模型是否已开通`)
-      }
-      throw new Error(`方舟提交失败（HTTP ${response.status}）：${text.slice(0, 300)}`)
+      throw this.httpErrorMessage(
+        response,
+        text,
+        '方舟认证失败',
+        '方舟提交失败',
+        '请检查 API Key 是否正确、模型是否已开通'
+      )
     }
     const data = (await response.json()) as { data?: { url?: string }[]; error?: { code?: string; message?: string } }
     const url = data.data?.[0]?.url
@@ -172,7 +120,7 @@ export class VolcArkProvider implements MediaProviderAdapter {
       if (input.durationSeconds) flags.push(`--duration ${Math.max(1, Math.round(input.durationSeconds))}`)
       if (input.width && input.height) {
         flags.push(`--resolution ${resolutionFor(input.height)}`)
-        flags.push(`--ratio ${ratioFor(input.width, input.height)}`)
+        flags.push(`--ratio ${nearestRatio(input.width, input.height)}`)
       }
       body = { model: requestModel, content: [{ type: 'text', text: [input.prompt, ...flags].join(' ') }] }
     } else {
@@ -185,7 +133,7 @@ export class VolcArkProvider implements MediaProviderAdapter {
       if (input.durationSeconds) body.duration = Math.max(4, Math.round(input.durationSeconds))
       if (input.width && input.height) {
         body.resolution = resolutionFor(input.height)
-        body.ratio = ratioFor(input.width, input.height)
+        body.ratio = nearestRatio(input.width, input.height)
       }
     }
     const response = await fetch(`${BASE_URL}${VIDEO_TASKS_ENDPOINT}`, {
@@ -196,10 +144,13 @@ export class VolcArkProvider implements MediaProviderAdapter {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`方舟认证失败（HTTP ${response.status}）：请检查 API Key 是否正确、模型是否已开通`)
-      }
-      throw new Error(`方舟提交失败（HTTP ${response.status}）：${text.slice(0, 300)}`)
+      throw this.httpErrorMessage(
+        response,
+        text,
+        '方舟认证失败',
+        '方舟提交失败',
+        '请检查 API Key 是否正确、模型是否已开通'
+      )
     }
     const data = (await response.json()) as { id?: string; error?: { message?: string } }
     if (!data.id) {
@@ -293,23 +244,6 @@ function resolutionFor(height: number): string {
   return '480p'
 }
 
-/** 画布宽高就近映射到 Seedance 支持的比例旗标 */
-function ratioFor(width: number, height: number): string {
-  const aspect = width / height
-  const table: [string, number][] = [
-    ['16:9', 16 / 9],
-    ['4:3', 4 / 3],
-    ['1:1', 1],
-    ['3:4', 3 / 4],
-    ['9:16', 9 / 16]
-  ]
-  let best = table[0]
-  for (const entry of table) {
-    if (Math.abs(entry[1] - aspect) < Math.abs(best[1] - aspect)) best = entry
-  }
-  return best[0]
-}
-
 registerAdapter(
   'gateway-volcark',
   (deps: AdapterDeps, config) =>
@@ -317,7 +251,7 @@ registerAdapter(
       {
         id: config.id,
         label: config.label,
-        models: volcArkModelRecord(config.models),
+        models: buildModelRecord<VolcArkModelConfig>(config.models),
         authKey: config.authKey,
         authEnv: config.authEnv
       },
@@ -325,19 +259,3 @@ registerAdapter(
     ),
   { defaultAuthEnv: 'ARK_KEY' }
 )
-
-/** 合并层的模型数组（稳定 id + 可选 requestModel）→ 适配器的远端模型配置表 */
-function volcArkModelRecord(models: readonly AdapterModelConfig[]): Record<string, VolcArkModelConfig> {
-  const record: Record<string, VolcArkModelConfig> = {}
-  for (const model of models) {
-    record[model.requestModel ?? model.id] = {
-      kind: model.kind,
-      userId: model.id,
-      ...(model.label ? { label: model.label } : {}),
-      ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-      ...(model.status ? { status: model.status } : {}),
-      ...(model.costHint ? { costHint: model.costHint } : {})
-    }
-  }
-  return record
-}

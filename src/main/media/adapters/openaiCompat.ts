@@ -1,9 +1,10 @@
 import { randomUUID } from 'crypto'
 import { mkdirSync, writeFileSync } from 'fs'
 import { resolve } from 'path'
-import type { MediaKind, MediaModelInfo, MediaProviderType, ModelCapabilities } from '../../../shared/media'
-import type { MediaProviderAdapter, ProviderPollResult, ProviderSubmitInput } from '../provider'
-import { registerAdapter, type AdapterDeps, type AdapterModelConfig } from './registry'
+import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
+import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { registerAdapter, type AdapterDeps } from './registry'
+import { BaseGatewayProvider, buildModelRecord } from './base'
 
 /**
  * OpenAI 兼容网关适配器（协议家族路线的第一块：一个适配器覆盖一片供应商）。
@@ -62,80 +63,24 @@ export interface OpenAICompatProviderConfig {
   authEnv?: string
 }
 
-export class OpenAICompatProvider implements MediaProviderAdapter {
-  readonly id: string
+export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelConfig> {
   readonly type: MediaProviderType = 'gateway-openai-compat'
-  readonly label: string
-  readonly models: MediaModelInfo[]
   private readonly baseUrl: string
 
   constructor(
-    private readonly config: OpenAICompatProviderConfig,
-    private readonly getKey: () => Promise<string | undefined>,
+    config: OpenAICompatProviderConfig,
+    getKey: () => Promise<string | undefined>,
     /** b64/二进制产物的临时落盘目录（当前工作区媒体目录） */
     private readonly tempDir: () => string | null
   ) {
-    this.id = config.id ?? 'openai-compat'
-    this.label = config.label ?? 'OpenAI 兼容网关'
+    super(config, getKey, 'OPENAI_API_KEY', { id: 'openai-compat', label: 'OpenAI 兼容网关' })
     this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
-    this.models = Object.entries(config.models).map(([requestModel, model]) => {
-      const id = model.userId ?? requestModel
-      return {
-        id,
-        kind: model.kind,
-        label: model.label ?? id,
-        provider: this.id,
-        ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-        ...(model.status ? { status: model.status } : {}),
-        ...(model.costHint ? { costHint: model.costHint } : {})
-      }
-    })
-  }
-
-  isConfigured(): boolean {
-    // 同步上下文里只做保守判断；实际提交时 key 缺失会报可操作错误
-    return true
-  }
-
-  async isReady(): Promise<boolean> {
-    return Boolean(await this.getKey())
-  }
-
-  authHint(): string {
-    return this.config.authKey ? 'workspace-store' : `environment:${this.config.authEnv ?? 'OPENAI_API_KEY'}`
-  }
-
-  private async requireKey(): Promise<string> {
-    const key = await this.getKey()
-    if (!key) {
-      const env = this.config.authEnv ?? 'OPENAI_API_KEY'
-      throw new Error(
-        `provider ${this.id} 缺少凭据：请在设置面板录入 API Key，或设置环境变量 ${env} 后重启`
-      )
-    }
-    return key
-  }
-
-  /** 稳定 id → 线上模型名；找不到返回 undefined */
-  private requestModelOf(model: string): string | undefined {
-    for (const [requestModel, entry] of Object.entries(this.config.models)) {
-      if (entry.userId === model || requestModel === model) return requestModel
-    }
-    return undefined
-  }
-
-  private kindOf(model: string): MediaKind {
-    return (
-      this.models.find((m) => m.id === model)?.kind ??
-      Object.entries(this.config.models).find(([name]) => name === model)?.[1].kind ??
-      'image'
-    )
   }
 
   async submit(model: string, input: ProviderSubmitInput): Promise<string> {
     const key = await this.requireKey()
     const requestModel = this.requestModelOf(model)
-    if (!requestModel) throw new Error(`provider ${this.id} 下没有模型 ${model}（清单见 media:providers）`)
+    if (!requestModel) this.noSuchModel(model)
     const kind = this.kindOf(model)
     return kind === 'audio' ? this.submitSpeech(key, requestModel, input) : this.submitImage(key, requestModel, input)
   }
@@ -157,10 +102,7 @@ export class OpenAICompatProvider implements MediaProviderAdapter {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`网关认证失败（HTTP ${response.status}）：请检查 API Key 是否正确`)
-      }
-      throw new Error(`图片生成失败（HTTP ${response.status}）：${text.slice(0, 300)}`)
+      throw this.httpErrorMessage(response, text, '网关认证失败', '图片生成失败')
     }
     const data = (await response.json()) as {
       data?: { url?: string; b64_json?: string }[]
@@ -191,10 +133,7 @@ export class OpenAICompatProvider implements MediaProviderAdapter {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`网关认证失败（HTTP ${response.status}）：请检查 API Key 是否正确`)
-      }
-      throw new Error(`语音合成失败（HTTP ${response.status}）：${text.slice(0, 300)}`)
+      throw this.httpErrorMessage(response, text, '网关认证失败', '语音合成失败')
     }
     const bytes = Buffer.from(await response.arrayBuffer())
     if (bytes.byteLength === 0) throw new Error('语音合成返回空响应')
@@ -241,7 +180,7 @@ registerAdapter(
       {
         id: config.id,
         label: config.label,
-        models: openAICompatModelRecord(config.models),
+        models: buildModelRecord<OpenAICompatModelConfig>(config.models),
         baseUrl: config.baseUrl,
         authKey: config.authKey,
         authEnv: config.authEnv
@@ -251,19 +190,3 @@ registerAdapter(
     ),
   { defaultAuthEnv: 'OPENAI_API_KEY' }
 )
-
-/** 合并层的模型数组（稳定 id + 可选 requestModel）→ 适配器的远端模型配置表 */
-function openAICompatModelRecord(models: readonly AdapterModelConfig[]): Record<string, OpenAICompatModelConfig> {
-  const record: Record<string, OpenAICompatModelConfig> = {}
-  for (const model of models) {
-    record[model.requestModel ?? model.id] = {
-      kind: model.kind,
-      userId: model.id,
-      ...(model.label ? { label: model.label } : {}),
-      ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-      ...(model.status ? { status: model.status } : {}),
-      ...(model.costHint ? { costHint: model.costHint } : {})
-    }
-  }
-  return record
-}

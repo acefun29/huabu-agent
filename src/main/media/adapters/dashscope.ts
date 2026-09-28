@@ -1,6 +1,7 @@
-import type { MediaKind, MediaModelInfo, MediaProviderType, ModelCapabilities } from '../../../shared/media'
-import type { MediaProviderAdapter, ProviderPollResult, ProviderSubmitInput } from '../provider'
-import { registerAdapter, type AdapterDeps, type AdapterModelConfig } from './registry'
+import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
+import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { registerAdapter, type AdapterDeps } from './registry'
+import { BaseGatewayProvider, buildModelRecord, nearestRatio } from './base'
 import { firstImageRefDataUri } from './refImage'
 
 /**
@@ -64,76 +65,20 @@ export interface DashScopeProviderConfig {
   authEnv?: string
 }
 
-export class DashScopeProvider implements MediaProviderAdapter {
-  readonly id: string
+export class DashScopeProvider extends BaseGatewayProvider<DashScopeModelConfig> {
   readonly type: MediaProviderType = 'gateway-dashscope'
-  readonly label: string
-  readonly models: MediaModelInfo[]
 
   constructor(
-    private readonly config: DashScopeProviderConfig,
-    private readonly getKey: () => Promise<string | undefined>
+    config: DashScopeProviderConfig,
+    getKey: () => Promise<string | undefined>
   ) {
-    this.id = config.id ?? 'dashscope'
-    this.label = config.label ?? '阿里云百炼'
-    this.models = Object.entries(config.models).map(([requestModel, model]) => {
-      const id = model.userId ?? requestModel
-      return {
-        id,
-        kind: model.kind,
-        label: model.label ?? id,
-        provider: this.id,
-        ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-        ...(model.status ? { status: model.status } : {}),
-        ...(model.costHint ? { costHint: model.costHint } : {})
-      }
-    })
-  }
-
-  isConfigured(): boolean {
-    // 同步上下文里只做保守判断；实际提交时 key 缺失会报可操作错误
-    return true
-  }
-
-  async isReady(): Promise<boolean> {
-    return Boolean(await this.getKey())
-  }
-
-  authHint(): string {
-    return this.config.authKey ? 'workspace-store' : `environment:${this.config.authEnv ?? 'DASHSCOPE_KEY'}`
-  }
-
-  private async requireKey(): Promise<string> {
-    const key = await this.getKey()
-    if (!key) {
-      const env = this.config.authEnv ?? 'DASHSCOPE_KEY'
-      throw new Error(
-        `provider ${this.id} 缺少凭据：请在设置面板录入 API Key，或设置环境变量 ${env} 后重启`
-      )
-    }
-    return key
-  }
-
-  /** 稳定 id → 线上模型名；找不到返回 undefined */
-  private requestModelOf(model: string): string | undefined {
-    for (const [requestModel, entry] of Object.entries(this.config.models)) {
-      if (entry.userId === model || requestModel === model) return requestModel
-    }
-    return undefined
-  }
-
-  private kindOf(model: string): MediaKind {
-    return (
-      this.models.find((m) => m.id === model)?.kind ??
-      Object.entries(this.config.models).find(([name]) => name === model)?.[1].kind ??
-      'image'
-    )
+    super(config, getKey, 'DASHSCOPE_KEY', { id: 'dashscope', label: '阿里云百炼' })
   }
 
   async submit(model: string, input: ProviderSubmitInput): Promise<string> {
     const key = await this.requireKey()
     const requestModel = this.requestModelOf(model)
-    if (!requestModel) throw new Error(`provider ${this.id} 下没有模型 ${model}（清单见 media:providers）`)
+    if (!requestModel) this.noSuchModel(model)
     const kind = this.kindOf(model)
 
     const endpoint = kind === 'video' ? VIDEO_ENDPOINT : isNewImageProtocol(requestModel) ? IMAGE_GEN_ENDPOINT : IMAGE_ENDPOINT
@@ -152,10 +97,13 @@ export class DashScopeProvider implements MediaProviderAdapter {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`百炼认证失败（HTTP ${response.status}）：请检查 API Key 是否正确、是否与北京地域匹配`)
-      }
-      throw new Error(`百炼提交失败（HTTP ${response.status}）：${text.slice(0, 300)}`)
+      throw this.httpErrorMessage(
+        response,
+        text,
+        '百炼认证失败',
+        '百炼提交失败',
+        '请检查 API Key 是否正确、是否与北京地域匹配'
+      )
     }
     const data = (await response.json()) as {
       output?: { task_id?: string }
@@ -313,7 +261,7 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
     // wan2.7 t2v 起：resolution + ratio + duration 整数 [2,15]（官方文档核实，无 size 字段）
     if (input.width && input.height) {
       parameters.resolution = input.height >= 1000 ? '1080P' : '720P'
-      parameters.ratio = nearestWanRatio(input.width, input.height)
+      parameters.ratio = nearestRatio(input.width, input.height)
     }
     if (input.durationSeconds) parameters.duration = clamp(Math.round(input.durationSeconds), 2, 15)
   } else {
@@ -353,23 +301,6 @@ function wan26PixelSize(width: number, height: number): string {
   return `${w}*${h}`
 }
 
-/** wan2.7 视频比例枚举（官方文档：16:9 / 9:16 / 1:1 / 4:3 / 3:4），就近映射 */
-function nearestWanRatio(width: number, height: number): string {
-  const aspect = width / height
-  const table: [string, number][] = [
-    ['16:9', 16 / 9],
-    ['4:3', 4 / 3],
-    ['1:1', 1],
-    ['3:4', 3 / 4],
-    ['9:16', 9 / 16]
-  ]
-  let best = table[0]
-  for (const entry of table) {
-    if (Math.abs(entry[1] - aspect) < Math.abs(best[1] - aspect)) best = entry
-  }
-  return best[0]
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.round(value)))
 }
@@ -381,7 +312,7 @@ registerAdapter(
       {
         id: config.id,
         label: config.label,
-        models: dashScopeModelRecord(config.models),
+        models: buildModelRecord<DashScopeModelConfig>(config.models),
         authKey: config.authKey,
         authEnv: config.authEnv
       },
@@ -389,19 +320,3 @@ registerAdapter(
     ),
   { defaultAuthEnv: 'DASHSCOPE_KEY' }
 )
-
-/** 合并层的模型数组（稳定 id + 可选 requestModel）→ 适配器的远端模型配置表 */
-function dashScopeModelRecord(models: readonly AdapterModelConfig[]): Record<string, DashScopeModelConfig> {
-  const record: Record<string, DashScopeModelConfig> = {}
-  for (const model of models) {
-    record[model.requestModel ?? model.id] = {
-      kind: model.kind,
-      userId: model.id,
-      ...(model.label ? { label: model.label } : {}),
-      ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-      ...(model.status ? { status: model.status } : {}),
-      ...(model.costHint ? { costHint: model.costHint } : {})
-    }
-  }
-  return record
-}

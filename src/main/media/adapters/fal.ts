@@ -1,6 +1,7 @@
-import type { MediaKind, MediaModelInfo, MediaProviderType, ModelCapabilities } from '../../../shared/media'
-import type { MediaProviderAdapter, ProviderPollResult, ProviderSubmitInput } from '../provider'
-import { registerAdapter, type AdapterDeps, type AdapterModelConfig } from './registry'
+import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
+import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { registerAdapter, type AdapterDeps } from './registry'
+import { BaseGatewayProvider, buildModelRecord } from './base'
 import { firstImageRefDataUri } from './refImage'
 
 /**
@@ -34,72 +35,20 @@ export interface FalProviderConfig {
   authEnv?: string
 }
 
-export class FalGatewayProvider implements MediaProviderAdapter {
-  readonly id: string
+export class FalGatewayProvider extends BaseGatewayProvider<FalModelConfig> {
   readonly type: MediaProviderType = 'gateway-fal'
-  readonly label: string
-  readonly models: MediaModelInfo[]
 
   constructor(
-    private readonly config: FalProviderConfig,
-    /** 读凭据（解密后的明文）。只在本层内存中出现，绝不进日志/IPC */
-    private readonly getKey: () => Promise<string | undefined>
+    config: FalProviderConfig,
+    getKey: () => Promise<string | undefined>
   ) {
-    this.id = config.id ?? 'fal'
-    this.label = config.label ?? 'fal.ai 网关'
-    // 对外暴露稳定 id（目录层承诺不改名），线上 slug 只在 submit 时解析 —— 用户配置
-    // 引用的是稳定 id，厂商改 slug 只动 remoteModel 字段
-    this.models = Object.entries(config.models).map(([requestModel, model]) => {
-      const id = model.userId ?? requestModel
-      return {
-        id,
-        kind: model.kind,
-        label: model.label ?? id,
-        provider: this.id,
-        ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-        ...(model.status ? { status: model.status } : {}),
-        ...(model.costHint ? { costHint: model.costHint } : {})
-      }
-    })
-  }
-
-  isConfigured(): boolean {
-    // 同步上下文里只做保守判断；实际提交时 key 缺失会报可操作错误
-    return true
-  }
-
-  async isReady(): Promise<boolean> {
-    return Boolean(await this.getKey())
-  }
-
-  authHint(): string {
-    // 由 manager 组装（需要异步），这里给静态占位
-    return this.config.authKey ? 'workspace-store' : `environment:${this.config.authEnv ?? 'FAL_KEY'}`
-  }
-
-  private async requireKey(): Promise<string> {
-    const key = await this.getKey()
-    if (!key) {
-      const env = this.config.authEnv ?? 'FAL_KEY'
-      throw new Error(
-        `provider ${this.id} 缺少凭据：请在设置面板录入 API Key，或设置环境变量 ${env} 后重启`
-      )
-    }
-    return key
-  }
-
-  /** 稳定 id → 线上 slug（提交与轮询 URL 用）；找不到返回 undefined */
-  private requestModelOf(model: string): string | undefined {
-    for (const [requestModel, entry] of Object.entries(this.config.models)) {
-      if (entry.userId === model || requestModel === model) return requestModel
-    }
-    return undefined
+    super(config, getKey, 'FAL_KEY', { id: 'fal', label: 'fal.ai 网关' })
   }
 
   async submit(model: string, input: ProviderSubmitInput): Promise<string> {
     const key = await this.requireKey()
     const requestModel = this.requestModelOf(model)
-    if (!requestModel) throw new Error(`provider ${this.id} 下没有模型 ${model}（清单见 media:providers）`)
+    if (!requestModel) this.noSuchModel(model)
     const body: Record<string, unknown> = { prompt: input.prompt }
     if (input.width || input.height) {
       body.image_size = {
@@ -123,10 +72,7 @@ export class FalGatewayProvider implements MediaProviderAdapter {
     })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
-      if (response.status === 401 || response.status === 403) {
-        throw new Error(`fal.ai 认证失败（HTTP ${response.status}）：请检查 API Key 是否正确`)
-      }
-      throw new Error(`fal.ai 提交失败（HTTP ${response.status}）：${text.slice(0, 300)}`)
+      throw this.httpErrorMessage(response, text, 'fal.ai 认证失败', 'fal.ai 提交失败')
     }
     const data = (await response.json()) as { request_id?: string; status_url?: string }
     if (!data.request_id) throw new Error(`fal.ai 响应缺少 request_id：${JSON.stringify(data).slice(0, 200)}`)
@@ -177,10 +123,7 @@ export class FalGatewayProvider implements MediaProviderAdapter {
     }
     const data = (await response.json()) as Record<string, unknown>
     // jobId 里存的是线上 slug；kind 仅作抽取兜底提示，按稳定 id 或线上 slug 都能对上
-    const kind =
-      this.models.find((m) => m.id === model)?.kind ??
-      Object.entries(this.config.models).find(([slug]) => slug === model)?.[1].kind ??
-      'image'
+    const kind = this.kindOf(model)
     const url = this.extractResultUrl(data, model, kind)
     if (!url) {
       return { status: 'failed', message: `fal.ai 结果里找不到产物 URL：${JSON.stringify(data).slice(0, 200)}` }
@@ -246,7 +189,10 @@ registerAdapter(
       {
         id: config.id,
         label: config.label,
-        models: falModelRecord(config.models),
+        // resultKey 透传（fal 特有：覆盖产物抽取路径），经基类 buildModelRecord 的 extra 钩子
+        models: buildModelRecord<FalModelConfig>(config.models, (model) => ({
+          ...(model.resultKey ? { resultKey: model.resultKey } : {})
+        })),
         authKey: config.authKey,
         authEnv: config.authEnv
       },
@@ -255,22 +201,3 @@ registerAdapter(
   // 用户配置未声明 authEnv 时的环境变量回退（原硬编码 FAL_KEY 的声明化）
   { defaultAuthEnv: 'FAL_KEY' }
 )
-
-/** 合并层的模型数组（稳定 id + 可选 requestModel）→ fal 适配器的远端模型配置表 */
-function falModelRecord(models: readonly AdapterModelConfig[]): Record<string, FalModelConfig> {
-  const record: Record<string, FalModelConfig> = {}
-  for (const model of models) {
-    const requestModel = model.requestModel ?? model.id
-    record[requestModel] = {
-      kind: model.kind,
-      // 目录/用户配置的稳定 id 随行保存：MediaModelInfo.id 用它，线上 slug 只做 URL
-      userId: model.id,
-      ...(model.label ? { label: model.label } : {}),
-      ...(model.resultKey ? { resultKey: model.resultKey } : {}),
-      ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-      ...(model.status ? { status: model.status } : {}),
-      ...(model.costHint ? { costHint: model.costHint } : {})
-    }
-  }
-  return record
-}
