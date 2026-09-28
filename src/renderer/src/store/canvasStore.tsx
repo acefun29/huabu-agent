@@ -825,7 +825,13 @@ function useCanvasBootstrap() {
 
 export function CanvasProvider({ children }: { children: ReactNode }) {
   // settings 仍是 Context：把最新实例交给 store action 跨域调用（resolveMediaModel / refreshAll 等）
-  settingsBridgeRef.current = useSettings()
+  const settings = useSettings()
+  // 渲染体里直接写 ref 是渲染期副作用（StrictMode 双渲染会双写），移到提交后同步；
+  // 不写依赖数组 = 每次渲染后都刷新为最新实例。卸载时刻意不清空：bridge 语义是
+  // 「最近一次挂载的实例」，清空反而让卸载瞬间在途的跨域调用读不到 settings。
+  useEffect(() => {
+    settingsBridgeRef.current = settings
+  })
   useCanvasBootstrap()
   return <>{children}</>
 }
