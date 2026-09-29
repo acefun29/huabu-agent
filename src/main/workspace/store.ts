@@ -62,6 +62,32 @@ let canvasSaveTimer: ReturnType<typeof setTimeout> | null = null
 let canvasSavePending: { file: string; snapshot: CanvasSnapshot } | null = null
 
 /**
+ * 立即冲刷未落盘的 pending 画布保存（防抖定时器与 loadCanvas 读前都会调用）：
+ * 取走 pending 并同步写盘。pending 为空时是空操作。
+ */
+function flushCanvasSave(): void {
+  if (canvasSaveTimer) {
+    clearTimeout(canvasSaveTimer)
+    canvasSaveTimer = null
+  }
+  const pending = canvasSavePending
+  canvasSavePending = null
+  if (!pending) return
+  try {
+    const serialized = JSON.stringify(pending.snapshot)
+    if (serialized.length > 32 * 1024 * 1024) {
+      console.error('[workspace] 画布快照体积超过 32MB 上限，已跳过本次写盘')
+      return
+    }
+    atomicWriteSync(pending.file, serialized)
+  } catch (error) {
+    // 防抖后写盘失败已无法抛回 invoke 调用方，只能记日志：宁可丢一拍，
+    // 也不能让定时器里的异常变成主进程未捕获错误
+    console.error('[workspace] canvas.json 写盘失败：', error)
+  }
+}
+
+/**
  * workspace.json 的读取缓存（key = 工作区目录）：readMeta 是热路径——每个
  * huabu-media:// 协议请求都会经 mediaDir() 读一次 meta，不缓存的话反复读盘 + 解析。
  *
@@ -507,28 +533,15 @@ export class WorkspaceStore {
     // 已有定时器不重置——合并而非顺延
     canvasSavePending = { file: this.current.canvasFile, snapshot }
     if (canvasSaveTimer) return
-    canvasSaveTimer = setTimeout(() => {
-      canvasSaveTimer = null
-      const pending = canvasSavePending
-      canvasSavePending = null
-      if (!pending) return
-      try {
-        const serialized = JSON.stringify(pending.snapshot)
-        if (serialized.length > 32 * 1024 * 1024) {
-          console.error('[workspace] 画布快照体积超过 32MB 上限，已跳过本次写盘')
-          return
-        }
-        atomicWriteSync(pending.file, serialized)
-      } catch (error) {
-        // 防抖后写盘失败已无法抛回 invoke 调用方，只能记日志：宁可丢一拍，
-        // 也不能让定时器里的异常变成主进程未捕获错误
-        console.error('[workspace] canvas.json 写盘失败：', error)
-      }
-    }, CANVAS_WRITE_DEBOUNCE_MS)
+    canvasSaveTimer = setTimeout(flushCanvasSave, CANVAS_WRITE_DEBOUNCE_MS)
   }
 
   loadCanvas(): CanvasSnapshot | null {
     if (!this.current) throw new Error('尚未打开工作区')
+    // 读前先冲刷未落盘的 pending 保存：saveCanvas 有 200ms 防抖窗口，
+    // 「保存后立刻读取」必须读到刚存的内容（e2e 的 canvas 往返用例与未来任何
+    // 直接 invoke 方都依赖读后写语义），不能让窗口内的 load 拿到旧文件
+    flushCanvasSave()
     if (!existsSync(this.current.canvasFile)) return null
     try {
       const raw = JSON.parse(readFileSync(this.current.canvasFile, 'utf8')) as CanvasSnapshot
