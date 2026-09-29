@@ -242,10 +242,19 @@ const api: HuabuApi = {
     /**
      * 拖拽/文件选择进来的 File 对象反查磁盘路径（webUtils），让主进程直接拷贝，
      * 不必把媒体字节整个搬过 IPC。纯浏览器环境（无 Electron）返回 undefined。
+     *
+     * 安全约束：这里是渲染端拿到「File → 真路径」的唯一出口。解析成功即 fire-and-forget
+     * send 登记给主进程（workspace:source-path-registered），导入类 handler 用
+     * consumeSourcePath 校验「确经拖拽」——否则被攻破的渲染端可伪造任意路径让主进程复制。
+     * 同一渲染进程的 send 先于后续 invoke 到达（IPC 消息保序），登记不会晚于导入校验。
      */
     pathForFile: (file: File): string | undefined => {
       try {
-        return webUtils.getPathForFile(file)
+        const path = webUtils.getPathForFile(file)
+        if (path) {
+          ipcRenderer.send(IpcChannel.WorkspaceSourcePathRegistered, path)
+        }
+        return path
       } catch {
         return undefined
       }

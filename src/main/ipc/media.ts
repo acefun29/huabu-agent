@@ -65,6 +65,7 @@ import {
 } from '../../shared/media'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString, ok } from './shared'
+import { consumeSourcePath } from './workspace'
 
 // ---------------------------------------------------------------- media 域：Agent 变更前确认（accessMode=confirm）
 
@@ -706,6 +707,11 @@ export function registerMediaIpc(ctx: IpcContext): void {
         target = join(dir, displayName)
         writeFileSync(target, Buffer.from(request.base64, 'base64'))
       } else if (typeof request.sourcePath === 'string') {
+        // 安全闸：sourcePath 只可能来自 preload pathForFile 的拖拽登记（未 resolve 的原样字符串）；
+        // 未登记的路径一律拒绝，堵住「伪造路径把任意用户文件复制进工作区」的口子
+        if (!consumeSourcePath(request.sourcePath)) {
+          return invalidPayload('导入路径未经过拖拽登记，已拒绝：请重新把文件拖入画布')
+        }
         const source = resolve(request.sourcePath)
         displayName = `${randomUUID().slice(0, 8)}-${sanitizeName(request.name ?? basename(source))}`
         target = copyIntoDir(source, dir, displayName)

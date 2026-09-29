@@ -82,6 +82,9 @@ export const IpcChannel = {
   WorkspaceCreate: 'workspace:create',
   /** 在系统文件管理器中显示工作区内的文件（shell.showItemInFile） */
   WorkspaceReveal: 'workspace:reveal',
+  /** 通知类（渲染进程 send，fire-and-forget）：preload pathForFile 解析出的拖拽源路径登记，
+   *  导入类 handler（media:import / asset:import-*）据 consumeSourcePath 校验「确经拖拽」 */
+  WorkspaceSourcePathRegistered: 'workspace:source-path-registered',
 
   /* ------------------------------------------------------------------ */
   /* settings 域（M9 扩展：应用内配置模型与凭据）                           */

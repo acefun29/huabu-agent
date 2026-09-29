@@ -4,11 +4,12 @@
  * 覆盖通道：workspace:state / workspace:open-dialog / workspace:open-path /
  * workspace:canvas-save / workspace:canvas-load / workspace:set-default-model /
  * workspace:create / workspace:files / workspace:read-file / workspace:write-file /
- * workspace:reveal。
+ * workspace:reveal / workspace:source-path-registered（拖拽源路径登记）。
  *
  * 域内局部（不进 IpcContext）：disposePreviousWorkspace（切换工作区释放旧会话）、
  * SKIP_DIRS / collectWorkspaceFiles（可导入文件清单收集）、
- * TEXT_EXTS / READ_FILE_MAX_BYTES（文本读写白名单与大小上限）。
+ * TEXT_EXTS / READ_FILE_MAX_BYTES（文本读写白名单与大小上限）、
+ * sourcePathRegistry / consumeSourcePath（拖拽登记表，media/asset 域导入闸消费）。
  */
 import { ipcMain, shell } from 'electron'
 import { existsSync, readFileSync, statSync } from 'fs'
@@ -27,10 +28,56 @@ import { isInboxPath } from '../assets/manager'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString } from './shared'
 
+// ---------------------------------------------------------------- 拖拽源路径登记（防伪造导入）
+
+/**
+ * 拖拽源路径登记表：path → 登记时间戳。
+ *
+ * 拖拽 File → 真路径的唯一出口是 preload 的 pathForFile（webUtils.getPathForFile），
+ * 它解析成功即 send 到 workspace:source-path-registered 登记到这里；media:import 与
+ * asset:import-canvas/temp 在消费 sourcePath 前先经 consumeSourcePath 校验「确经拖拽」，
+ * 渲染端被攻破也无法拿任意用户路径让主进程复制进工作区再借 Agent 外泄。
+ */
+const SOURCE_PATH_TTL_MS = 5 * 60 * 1000
+/** 登记集上限：一次拖拽可达数十文件，超限时清过期而不是无限增长 */
+const SOURCE_PATH_MAX = 1000
+const sourcePathRegistry = new Map<string, number>()
+
+/** 清掉登记表里超过 TTL 的过期项（登记超上限 / 消费未命中时顺手执行） */
+function pruneSourcePaths(now: number): void {
+  for (const [path, at] of sourcePathRegistry) {
+    if (now - at > SOURCE_PATH_TTL_MS) sourcePathRegistry.delete(path)
+  }
+}
+
+/**
+ * 消费一条登记路径：TTL 内 = 删除并返回 true（消费制，防同一登记被重复导入）；
+ * 未登记或已过期 = 顺手清过期后返回 false。
+ */
+export function consumeSourcePath(path: string): boolean {
+  if (typeof path !== 'string' || !path) return false
+  const now = Date.now()
+  const registeredAt = sourcePathRegistry.get(path)
+  if (registeredAt !== undefined) {
+    sourcePathRegistry.delete(path)
+    return now - registeredAt <= SOURCE_PATH_TTL_MS
+  }
+  pruneSourcePaths(now)
+  return false
+}
+
 export function registerWorkspaceIpc(ctx: IpcContext): void {
   const store = ctx.store
   const host = ctx.host
   const currentDir = ctx.currentDir
+
+  // 拖拽源路径登记（fire-and-forget send）：只登记非空字符串，超上限先清过期再落表
+  ipcMain.on(IpcChannel.WorkspaceSourcePathRegistered, (_event, path: unknown) => {
+    if (!isNonEmptyString(path)) return
+    const now = Date.now()
+    if (sourcePathRegistry.size >= SOURCE_PATH_MAX) pruneSourcePaths(now)
+    sourcePathRegistry.set(path, now)
+  })
 
   ipcMain.handle(IpcChannel.WorkspaceState, () => store.state())
 

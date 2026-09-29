@@ -20,6 +20,7 @@ import {
 import { setFileTags } from '../assets/tagsIndex'
 import type { IpcContext } from './shared'
 import { guardSync, invalidPayload, isNonEmptyString } from './shared'
+import { consumeSourcePath } from './workspace'
 
 export function registerAssetIpc(ctx: IpcContext): void {
   const store = ctx.store
@@ -31,10 +32,27 @@ export function registerAssetIpc(ctx: IpcContext): void {
     return Array.isArray(files) && files.length > 0 ? files : null
   }
 
+  /**
+   * 拖拽登记闸：files 里每条 sourcePath 都必须经 preload pathForFile 登记过
+   * （消费制，逐条删除防重复导入）；任一条未登记/已过期即整单拒绝。
+   */
+  const consumeRegisteredSourcePaths = (files: unknown[]): boolean => {
+    for (const file of files) {
+      const sourcePath = (file as { sourcePath?: unknown } | null)?.sourcePath
+      if (typeof sourcePath !== 'string' || !consumeSourcePath(sourcePath)) return false
+    }
+    return true
+  }
+
   /** @backend(import-canvas)：OS 文件归档进 <工作区>/assets/<分类>/ */
   ipcMain.handle(IpcChannel.AssetImportCanvas, (_event, payload: unknown) => {
     const files = asImportFiles(payload)
     if (!files) return invalidPayload('asset:import-canvas 需要 files 数组')
+    // 安全闸：sourcePath 只可能来自 preload pathForFile 的拖拽登记，
+    // 未登记的路径一律拒绝，堵住「伪造路径把任意用户文件复制进工作区」的口子
+    if (!consumeRegisteredSourcePaths(files)) {
+      return invalidPayload('导入路径未经过拖拽登记，已拒绝：请重新把文件拖入画布')
+    }
     return guardSync(() => {
       const dir = currentDir()
       if (!dir) throw new Error('尚未打开工作区')
@@ -48,6 +66,10 @@ export function registerAssetIpc(ctx: IpcContext): void {
   ipcMain.handle(IpcChannel.AssetImportTemp, (_event, payload: unknown) => {
     const files = asImportFiles(payload)
     if (!files) return invalidPayload('asset:import-temp 需要 files 数组')
+    // 安全闸：同 import-canvas，sourcePath 必须经过拖拽登记
+    if (!consumeRegisteredSourcePaths(files)) {
+      return invalidPayload('导入路径未经过拖拽登记，已拒绝：请重新把文件拖入画布')
+    }
     return guardSync(() => importToInbox(files))
   })
 
