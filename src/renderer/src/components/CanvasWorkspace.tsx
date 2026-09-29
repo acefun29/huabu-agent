@@ -16,12 +16,12 @@ import {
 import { LIBRARY_ASSET_MIME, MEDIA_LABEL, useCanvasStore } from '../store/canvasStore'
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
+import { parseLibraryEntryPayload } from '../lib/dragPayload'
 import { type AssetData, type CanvasNode, type MediaKind, type ViewState } from '../types'
 import { kindIcon } from './AssetNode'
 import type { NodeGestureApi } from './NodeFrame'
 import { NodeLayer } from './canvas/NodeLayer'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
-import type { AssetLibraryFile } from '@shared/ipc'
 
 interface MenuState {
   x: number
@@ -716,14 +716,14 @@ export function CanvasWorkspace() {
           return
         }
         // 素材库文件拖到画布 = 钉引用卡片在落点
+        // 通道命中就先 preventDefault（dragover 已放行本通道，不能把 drop 交给浏览器默认行为），
+        // 载荷解析+形状校验收口在 dragPayload（非法 = null，直接忽略）
         const raw = e.dataTransfer.getData(LIBRARY_ASSET_MIME)
         if (!raw) return
         e.preventDefault()
-        try {
-          const { libraryId, entry } = JSON.parse(raw) as { libraryId: string; entry: AssetLibraryFile }
-          useCanvasStore.getState().importFromLibrary(libraryId, entry, toCanvas(e.clientX, e.clientY))
-        } catch {
-          /* 非法载荷忽略 */
+        const payload = parseLibraryEntryPayload(e.dataTransfer)
+        if (payload) {
+          useCanvasStore.getState().importFromLibrary(payload.libraryId, payload.entry, toCanvas(e.clientX, e.clientY))
         }
       }}
     >

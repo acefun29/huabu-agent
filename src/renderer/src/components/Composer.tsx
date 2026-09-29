@@ -1,8 +1,9 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowUp, ChevronDown, FolderOpen, MessageSquare, Paperclip, ShieldAlert, SlashSquare, X } from 'lucide-react'
-import { ASSET_IDS_MIME, useCanvasStore } from '../store/canvasStore'
+import { useCanvasStore } from '../store/canvasStore'
 import { hasBridge, useSettings } from '../store/settingsStore'
 import { useDismiss } from '../lib/hooks'
+import { parseAssetIdsPayload, parseLegacyAssetPayload } from '../lib/dragPayload'
 import { THINKING_LEVEL_LABEL, type ChatModelOption, type MediaAccessMode, type ThinkingLevelName } from '@shared/ipc'
 import { KIND_LABEL, type AssetData, type CanvasNode } from '../types'
 import { filterCommands, isCommandInput } from '../lib/chatCommands'
@@ -226,17 +227,13 @@ export const Composer = memo(function Composer() {
           void dropFilesToComposer(Array.from(e.dataTransfer.files))
           return
         }
-        // 画布卡片整批拖入（划选后从任一选中卡片的把手拖出）
-        const batch = e.dataTransfer.getData(ASSET_IDS_MIME)
+        // 画布卡片整批拖入（划选后从任一选中卡片的把手拖出）；载荷解析收口在 dragPayload
+        const batch = parseAssetIdsPayload(e.dataTransfer)
         if (batch) {
-          try {
-            ;(JSON.parse(batch) as string[]).forEach((id) => injectAsset(id))
-          } catch {
-            /* 非法载荷忽略 */
-          }
+          batch.forEach((id) => injectAsset(id))
           return
         }
-        const id = e.dataTransfer.getData('application/x-huabu-asset')
+        const id = parseLegacyAssetPayload(e.dataTransfer)
         if (!id) return
         // 拖文件卡片进来 = 递给助手当本轮上下文
         injectAsset(id)

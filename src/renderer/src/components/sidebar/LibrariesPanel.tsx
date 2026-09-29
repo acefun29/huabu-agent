@@ -2,7 +2,13 @@ import { memo, useCallback, useMemo } from 'react'
 import { create } from 'zustand'
 import { Plus, Search, StickyNote, Tag as TagIcon, X } from 'lucide-react'
 import type { MaterialLibrary } from '../../types'
-import { ASSET_IDS_MIME, LIBRARY_ASSET_MIME, useCanvasStore } from '../../store/canvasStore'
+import { useCanvasStore } from '../../store/canvasStore'
+import {
+  dragSourceTypes,
+  parseAssetIdsPayload,
+  parseLegacyAssetPayload,
+  parseLibraryEntryPayload
+} from '../../lib/dragPayload'
 import { LibraryFileRow } from './LibraryFileRow'
 import { LibraryHeaderRow } from './LibraryHeaderRow'
 import { Stagger } from './Stagger'
@@ -74,15 +80,9 @@ export const useLibrariesPanelStore = create<LibrariesPanelState>()((set) => ({
 
 /* ---------------- 拖拽源识别：三种源都收（OS 文件=复制，画布卡/库条目=移动） ---------------- */
 
-const dragSources = (types: readonly string[]) => ({
-  osFiles: types.includes('Files'),
-  libraryEntry: types.includes(LIBRARY_ASSET_MIME),
-  canvasNodes: types.includes(ASSET_IDS_MIME) || types.includes('application/x-huabu-asset')
-})
-
 /** 是否为可归档拖拽（壳的 rail 素材库图标 hover 展开也用它判断，故导出） */
 export const isTransferDrag = (e: React.DragEvent): boolean => {
-  const k = dragSources(e.dataTransfer.types)
+  const k = dragSourceTypes(e.dataTransfer.types)
   return k.osFiles || k.libraryEntry || k.canvasNodes
 }
 
@@ -118,7 +118,7 @@ export const LibrariesPanel = memo(function LibrariesPanel({ onClose }: { onClos
     (e: React.DragEvent, lib: MaterialLibrary) => {
       if (!isTransferDrag(e)) return
       e.preventDefault()
-      const k = dragSources(e.dataTransfer.types)
+      const k = dragSourceTypes(e.dataTransfer.types)
       const verb: DropVerb = k.osFiles && !k.libraryEntry && !k.canvasNodes ? '复制' : '移动'
       e.dataTransfer.dropEffect = verb === '复制' ? 'copy' : 'move'
       hoverLibrary(lib.id, verb)
@@ -133,35 +133,24 @@ export const LibrariesPanel = memo(function LibrariesPanel({ onClose }: { onClos
       e.stopPropagation()
       clearDropTarget()
       const store = useCanvasStore.getState()
-      const k = dragSources(e.dataTransfer.types)
+      const k = dragSourceTypes(e.dataTransfer.types)
       if (k.osFiles && e.dataTransfer.files.length > 0) {
         void store.dropFilesToLibrary(Array.from(e.dataTransfer.files), lib.id)
         return
       }
       if (k.libraryEntry) {
-        try {
-          const { libraryId, entry } = JSON.parse(e.dataTransfer.getData(LIBRARY_ASSET_MIME)) as {
-            libraryId: string
-            entry: LibraryEntry
-          }
-          void store.moveLibraryFile(libraryId, entry, lib.id)
-        } catch {
-          /* 非法载荷忽略 */
-        }
+        // 载荷解析+形状校验收口在 dragPayload（非法 = null，直接忽略）
+        const payload = parseLibraryEntryPayload(e.dataTransfer)
+        if (payload) void store.moveLibraryFile(payload.libraryId, payload.entry, lib.id)
         return
       }
-      // 画布卡片：批量（ASSET_IDS_MIME）优先，单卡回退 application/x-huabu-asset
-      const idsRaw = e.dataTransfer.getData(ASSET_IDS_MIME)
-      try {
-        const ids = idsRaw ? (JSON.parse(idsRaw) as string[]) : []
-        if (Array.isArray(ids) && ids.length > 0) {
-          void store.moveAssetsToLibrary(ids, lib.id)
-          return
-        }
-      } catch {
-        /* 落到单卡通道 */
+      // 画布卡片：批量（ASSET_IDS_MIME）优先，单卡回退遗留通道（LEGACY_ASSET_MIME）
+      const ids = parseAssetIdsPayload(e.dataTransfer)
+      if (ids && ids.length > 0) {
+        void store.moveAssetsToLibrary(ids, lib.id)
+        return
       }
-      const single = e.dataTransfer.getData('application/x-huabu-asset')
+      const single = parseLegacyAssetPayload(e.dataTransfer)
       if (single) void store.moveAssetsToLibrary([single], lib.id)
     },
     [clearDropTarget]

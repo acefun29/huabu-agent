@@ -27,6 +27,8 @@ import ReactMarkdown from 'react-markdown'
 import { useCanvasStore } from '../store/canvasStore'
 import { useSettings } from '../store/settingsStore'
 import { ASSET_IDS_MIME, MEDIA_LABEL } from '../store/canvasStore'
+import { LEGACY_ASSET_MIME } from '../store/canvas/shared'
+import { parseLegacyAssetPayload } from '../lib/dragPayload'
 import { bumpRender } from '../lib/perfProbe'
 import { CARD_THUMB_SIZE, assetSrc, formatBytes } from '../lib/media'
 import { KIND_LABEL, type AssetData, type AssetKind, type CanvasNode, type GenerateVersion, type MediaKind } from '../types'
@@ -628,7 +630,7 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
       data-status={gen.status}
       onClick={() => setActiveGenerate(node.id)}
       onDragOver={(e) => {
-        if (e.dataTransfer.types.includes('application/x-huabu-asset')) {
+        if (e.dataTransfer.types.includes(LEGACY_ASSET_MIME)) {
           e.preventDefault()
           setDropOver(true)
         }
@@ -637,7 +639,8 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
       onDrop={(e) => {
         e.preventDefault()
         setDropOver(false)
-        const refId = e.dataTransfer.getData('application/x-huabu-asset')
+        // 遗留单卡通道：解析收口在 dragPayload（未命中/空串 = null）
+        const refId = parseLegacyAssetPayload(e.dataTransfer)
         if (refId) onDropRef(refId)
       }}
       className={`relative flex h-full w-full cursor-pointer flex-col overflow-hidden rounded-2xl bg-(--surface-card) transition-shadow ${

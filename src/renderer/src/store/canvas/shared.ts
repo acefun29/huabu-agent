@@ -23,6 +23,8 @@ export const MEDIA_LABEL: Record<MediaKind, string> = { image: '图片', video: 
 export const LIBRARY_ASSET_MIME = 'application/x-huabu-library-asset'
 /** 拖拽载荷 MIME：画布卡片 → 会话输入框 = 批量引用（JSON id 数组；会话侧只把绝对路径传给 Agent） */
 export const ASSET_IDS_MIME = 'application/x-huabu-assets'
+/** 遗留单卡通道（载荷 = 节点 id 字符串）：仍被生成卡加参考、输入框单卡注入消费，勿新增使用 */
+export const LEGACY_ASSET_MIME = 'application/x-huabu-asset'
 
 /** 纯浏览器打开 dev server（无 window.huabu）时的提示 */
 export const BRIDGE_UNAVAILABLE = 'IPC 未联通：请在 Electron 窗口内使用（浏览器里没有 Agent 运行时）'
