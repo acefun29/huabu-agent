@@ -35,3 +35,6 @@ Thumbs.db
 
 # workspace runtime data (开发期测试工作区)
 .workspaces/
+
+# 本地设计文档（不提交）
+docs/
