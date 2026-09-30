@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AudioLines,
   Eraser,
-  FileText,
   FolderOpen,
   Image as ImageIcon,
   MessageSquare,
@@ -18,7 +17,6 @@ import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
 import { type AssetData, type CanvasNode, type MediaKind, type ViewState } from '../types'
-import { kindIcon } from './AssetNode'
 import type { NodeGestureApi } from './NodeFrame'
 import { NodeLayer } from './canvas/NodeLayer'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
@@ -136,8 +134,6 @@ export function CanvasWorkspace() {
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
   const activeGenerateId = useCanvasStore((s) => s.activeGenerateId)
-  const libraries = useCanvasStore((s) => s.libraries)
-  const dirFiles = useCanvasStore((s) => s.dirFiles)
   const workspace = useCanvasStore((s) => s.workspace)
   const { appearance } = useSettings()
   const [menu, setMenu] = useState<MenuState | null>(null)
@@ -542,32 +538,12 @@ export function CanvasWorkspace() {
     // actions 经 getState 取用（恒定引用），依赖只剩数据
   }, [activeGenerateId, selectedAssetIds])
 
-  /** 画布空白处右键：新建生成卡片 / 从素材库钉引用 / 从工作目录导入 */
+  /** 画布空白处右键：新建生成卡片 / 清空画布 */
   const canvasItems = (at: { x: number; y: number }): ContextMenuItem[] => [
     { header: '新建生成卡片' },
     { label: '生成图片', icon: <ImageIcon size={13} />, onClick: () => useCanvasStore.getState().createGenerateNode('image', at) },
     { label: '生成视频', icon: <Video size={13} />, onClick: () => useCanvasStore.getState().createGenerateNode('video', at) },
     { label: '生成音频', icon: <AudioLines size={13} />, onClick: () => useCanvasStore.getState().createGenerateNode('audio', at) },
-    ...libraries
-      .filter((lib) => lib.files.length > 0)
-      .flatMap((lib): ContextMenuItem[] => [
-        { header: `素材库 · ${lib.name}`, separator: true },
-        ...lib.files.slice(0, 10).map((f) => ({
-          label: f.name,
-          icon: kindIcon(f.kind, 13),
-          onClick: () => useCanvasStore.getState().importFromLibrary(lib.id, f, at),
-        })),
-      ]),
-    { header: '从工作目录导入', separator: true },
-    ...(dirFiles.length === 0
-      ? [{ label: '（暂未读到文件，稍后重试）', icon: <FileText size={13} />, disabled: true } satisfies ContextMenuItem]
-      : dirFiles.slice(0, 10).map(
-          (f): ContextMenuItem => ({
-            label: f.path,
-            icon: kindIcon(f.kind, 13),
-            onClick: () => useCanvasStore.getState().importFromDirectory(f),
-          })
-        )),
     // 菜单在事件触发时构建，nodes 现取最新态（主组件已不订阅 nodes）
     ...(useCanvasStore.getState().nodes.length > 0
       ? [
@@ -671,7 +647,6 @@ export function CanvasWorkspace() {
 
   const onContextMenu = (e: React.MouseEvent) => {
     e.preventDefault()
-    void useCanvasStore.getState().refreshDirFiles()
     const nodeId = (e.target as HTMLElement).closest('[data-node-id]')?.getAttribute('data-node-id')
     // nodes 现取最新态（主组件已不订阅 nodes）；nodeItems 的入参节点由此得来
     const node = nodeId ? useCanvasStore.getState().nodes.find((n) => n.id === nodeId) : undefined
