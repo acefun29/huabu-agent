@@ -51,10 +51,11 @@ export function registerChatIpc(ctx: IpcContext): void {
     if (isNonEmptyString(request.sessionFile)) createRequest.sessionFile = request.sessionFile
     const current = store.currentWorkspace
 
-    // M13 + T7：会话注入媒体生成工具与 read_media（装配见 agent/mediaToolAssembly.ts）。
-    // submit = 提交 + 等待终态：工具 execute 阻塞到成功/失败/取消，期间经 onUpdate 推进度，
-    // 失败信息原样进工具结果（Agent 据此引导用户配置），不再有"提交即成功"的假反馈
-    const { mediaTools, readMediaTool } = assembleMediaTools(createRequest.nodeId, {
+    // M13 + T7 + 视频理解 M2/M3：会话注入媒体生成工具、read_media 与视频两工具
+    // （装配见 agent/mediaToolAssembly.ts）。submit = 提交 + 等待终态：工具 execute
+    // 阻塞到成功/失败/取消，期间经 onUpdate 推进度，失败信息原样进工具结果
+    // （Agent 据此引导用户配置），不再有"提交即成功"的假反馈
+    const { mediaTools, readMediaTool, videoTools } = assembleMediaTools(createRequest.nodeId, {
       store,
       mediaManager,
       requestApproval: requestMediaApproval,
@@ -67,7 +68,7 @@ export function registerChatIpc(ctx: IpcContext): void {
     return host.create(createRequest, {
       currentDir: current?.path ?? null,
       defaultModel: current?.defaultModel,
-      customTools: [...mediaTools, readMediaTool]
+      customTools: [...mediaTools, readMediaTool, ...videoTools]
     })
   })
 

@@ -8,7 +8,9 @@
  * 三个模块转译出来真调一遍 `execute`，夹具是磁盘上真的 PNG（nativeImage 现造），
  * 断言的是"回回来的图块能被解回去、而且确实被缩小了"，不是字符串长得像对的。
  *
- * 覆盖：无工作区 / 空参数 / 越界 / 不存在 / 文本转交 read / 视频音频不解码 /
+ * 覆盖：无工作区 / 空参数 / 越界 / 不存在 / 文本转交 read / 视频抽帧失败收敛 /
+ *      视频在无视觉模型下不回帧 / 视频真夹具成功路径（8 图块 + 时间戳清单） /
+ *      音频不解码 /
  *      模型无视觉不回图块 / 成功回图块并缩放 / 裸文件名按根优先级 / inbox 放行 /
  *      损坏文件不抛异常 / 超大文件在解码前拒。
  *
@@ -17,6 +19,7 @@
  * 是 GUI 子系统程序，stdout 不保证被父终端捕获）。
  */
 const { app, nativeImage } = require('electron')
+const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -111,6 +114,7 @@ void app
     transpileToTmp([
       path.join('src', 'shared', 'assets.ts'),
       path.join('src', 'main', 'media', 'artifactImage.ts'),
+      path.join('src', 'main', 'media', 'videoFrames.ts'),
       path.join('src', 'main', 'agent', 'readMediaTool.ts')
     ])
     const { createReadMediaTool } = require(path.join(TMP, 'src', 'main', 'agent', 'readMediaTool.js'))
@@ -137,6 +141,14 @@ void app
     mkdir(wsAbs('notes'))
     fs.writeFileSync(wsAbs('notes', 'doc.txt'), 'hello\n')
     fs.writeFileSync(wsAbs('clip.mp4'), 'fake video bytes')
+    // 真视频夹具：ffmpeg-static 自带二进制以 lavfi 现场生成（夹具零入库，与 t13 同惯例）。
+    // 用 mandelbrot：亮度真变化，不会被 M2 感知去重剔帧（testsrc2 亮度近似静态、会被剔到下限）
+    const realMp4 = wsAbs('real.mp4')
+    execFileSync(require('ffmpeg-static'), [
+      '-y', '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', 'mandelbrot=size=320x240:rate=10',
+      '-t', '6', '-pix_fmt', 'yuv420p', realMp4
+    ])
     fs.writeFileSync(wsAbs('notes', 'tone.wav'), 'fake audio bytes')
     fs.writeFileSync(wsAbs('assets', 'images', 'broken.png'), 'this is not a png')
     const hugePath = mediaAbs('huge.png')
@@ -222,14 +234,50 @@ void app
       return out.details.handedOff
     })
 
-    await check('视频 / 音频 ⇒ 只给文件信息并明说不解码（不靠猜画面）', async () => {
+    await check('视频（假字节夹具）⇒ 抽帧失败收敛为 video-decode-failed（不炸会话）', async () => {
       const video = await call('clip.mp4')
       assert(video.details.kind === 'video' && video.details.decoded === false, JSON.stringify(video.details))
-      assert(/不解码/.test(textOf(video)), '视频文案没说不解码')
+      assert(video.details.reason === 'video-decode-failed', `reason=${video.details.reason}`)
+      assert(imageBlocks(video).length === 0, '抽帧失败不该回图块')
+      assert(/抽取失败/.test(textOf(video)) && /MP4/.test(textOf(video)), '文案没给"重新导出 MP4"的自纠指引')
+      return video.details.reason
+    })
+
+    await check('视频在无视觉模型下 ⇒ 不抽帧不回图块（帧就是图片块，协议层会丢）', async () => {
+      vision = false
+      const out = await call('clip.mp4')
+      vision = true
+      assert(out.details.kind === 'video' && out.details.decoded === false, JSON.stringify(out.details))
+      assert(out.details.reason === 'model-no-vision', `reason=${out.details.reason}`)
+      assert(imageBlocks(out).length === 0, '声明不视觉还塞图块')
+      assert(/视觉/.test(textOf(out)), '没提示换成支持视觉的模型')
+      return out.details.reason
+    })
+
+    await check('视频（真夹具）⇒ 抽帧成功：8 图块 + 时间戳清单 + 引用约束', async () => {
+      const out = await call('real.mp4')
+      assert(out.details.ok === true && out.details.decoded === true, JSON.stringify(out.details))
+      assert(out.details.kind === 'video' && out.details.frames === 8, `details=${JSON.stringify(out.details)}`)
+      assert(out.details.durationSec > 5 && out.details.durationSec < 7, `时长=${out.details.durationSec}`)
+      const blocks = imageBlocks(out)
+      assert(blocks.length === out.details.frames, `图块数 ${blocks.length} ≠ details.frames ${out.details.frames}`)
+      for (const b of blocks) {
+        assert(b.mimeType === 'image/jpeg', `mimeType=${b.mimeType}`)
+        assert(!nativeImage.createFromBuffer(Buffer.from(b.data, 'base64')).isEmpty(), '帧 base64 解不回图片')
+      }
+      const text = textOf(out)
+      assert(/帧1=00:00/.test(text) && /帧8=00:0[56]/.test(text), `缺帧时间戳清单：${text.slice(0, 200)}`)
+      assert(/标注时间点/.test(text), '缺"引用画面标注时间点"约束')
+      assert(/均匀采样|场景切换/.test(text), '没说明采样策略')
+      return `${blocks.length} 图块 / 时长 ${out.details.durationSec}s / cached=${out.details.cached}`
+    })
+
+    await check('音频 ⇒ 只给文件信息并明说没有转写能力（不靠猜声音）', async () => {
       const audio = await call('notes/tone.wav')
       assert(audio.details.kind === 'audio' && audio.details.decoded === false, JSON.stringify(audio.details))
       assert(imageBlocks(audio).length === 0, '音频分支回了图块')
-      return 'video + audio 各一条'
+      assert(/ASR|转写/.test(textOf(audio)), '音频文案没说明没有语音转写')
+      return 'audio 明说读不了'
     })
 
     await check('当前模型无视觉 ⇒ 不回图块（协议层会丢，回了就是假象）', async () => {
@@ -311,8 +359,9 @@ void app
     })
 
     await check('源级回归锁：工具已接进 chat:create，提示词已指到 read_media', async () => {
-      const ipc = fs.readFileSync(path.join(PROJECT_ROOT, 'src', 'main', 'ipc.ts'), 'utf8')
-      assert(/customTools:\s*\[[^\]]*readMediaTool/.test(ipc), 'chat:create 没挂 read_media（引用契约只剩"发路径"那一半）')
+      // 装配在 src/main/ipc/chat.ts（M 拆分后从 ipc.ts 迁出），锁它而不是编排器
+      const chatIpc = fs.readFileSync(path.join(PROJECT_ROOT, 'src', 'main', 'ipc', 'chat.ts'), 'utf8')
+      assert(/customTools:\s*\[[^\]]*readMediaTool/.test(chatIpc), 'chat:create 没挂 read_media（引用契约只剩"发路径"那一半）')
       const prompt = fs.readFileSync(path.join(PROJECT_ROOT, 'src', 'shared', 'prompt.ts'), 'utf8')
       assert(prompt.includes('read_media'), '系统提示词没告诉 Agent 有 read_media')
       const host = fs.readFileSync(path.join(PROJECT_ROOT, 'src', 'main', 'agent', 'host.ts'), 'utf8')

@@ -49,6 +49,9 @@ export function MediaViewer() {
           <video
             data-testid="viewer-video"
             src={src}
+            /* 首帧海报走缩略图管线（与卡片同源）；生成失败时协议回退原文件，video 元素
+               对错误 poster 只是忽略，不影响播放 */
+            poster={assetSrc(data, 512) ?? undefined}
             controls
             autoPlay
             className="max-h-[74vh] max-w-[86vw] rounded-xl shadow-2xl"

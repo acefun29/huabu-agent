@@ -5,6 +5,7 @@ import { assetDirForKind } from '../../shared/assets'
 import { readArtifactAsBase64 } from '../media/artifactImage'
 import { createMediaTools, type MediaApprovalInfo } from './mediaTools'
 import { createReadMediaTool } from './readMediaTool'
+import { createVideoTools } from './videoTools'
 
 /**
  * Agent 会话的媒体工具装配（T12 从 ipc.ts chat:create 抽出，原本是 60 行闭包）。
@@ -203,15 +204,23 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
 
   // T7：引用契约的另一半 —— 按路径把图片交给 Agent 看。路径判定（允许哪些根、越界、
   // 分类）在 shared/assets.ts 的纯函数里，由 pnpm asset-path:check 断言；这里只给根目录。
+  const mediaRoots = () => {
+    const dir = deps.currentDir()
+    if (!dir) return null
+    const mediaDir = mediaContext().mediaDir ?? undefined
+    return { workspaceDir: dir, ...(mediaDir ? { mediaDir } : {}), inboxDir: deps.inboxRoot() }
+  }
   const readMediaTool = createReadMediaTool({
-    roots: () => {
-      const dir = deps.currentDir()
-      if (!dir) return null
-      const mediaDir = mediaContext().mediaDir ?? undefined
-      return { workspaceDir: dir, ...(mediaDir ? { mediaDir } : {}), inboxDir: deps.inboxRoot() }
-    },
+    roots: mediaRoots,
     supportsImageInput: () => deps.sessionModelSupportsImages(nodeId) ?? false
   })
 
-  return { mediaTools, readMediaTool }
+  // 视频理解 M2/M3：Agent 化两工具（粗扫定位 → 区间精读），与 read_media 共用同一套
+  // 根解析与视觉闸门；帧抽取在 media/videoFrames.ts（T13 探针覆盖）
+  const videoTools = createVideoTools({
+    roots: mediaRoots,
+    supportsImageInput: () => deps.sessionModelSupportsImages(nodeId) ?? false
+  })
+
+  return { mediaTools, readMediaTool, videoTools }
 }

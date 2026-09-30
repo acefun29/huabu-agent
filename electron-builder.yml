@@ -27,8 +27,12 @@ files:
   # esbuild/rolldown 是 vite 构建链依赖，被生产依赖树拖入，运行时用不到
   - '!node_modules/@esbuild/**'
   - '!node_modules/@rolldown/**'
-# M3 已验证（pnpm probe:asar PASS）：pi 是纯 JS、无原生模块，默认全量 asar 打包即可；
-# 后续引入真正的原生模块（如 M7 MCP 相关）时再按需补充 asarUnpack。
+# 视频抽帧（视频理解 M1）：ffmpeg-static 的静态二进制无法在 asar 内被子进程执行，需 unpack；
+# 这是仓库首个 unpack 先例（M3「纯 JS 全量 asar」结论的边界），包体约 +80MB/平台，
+# JS 入口仍在 asar 内，运行时由 videoFrames.ts 的 resolveFfmpegBinary 做 asar.unpacked 路径映射。
+asarUnpack:
+  - node_modules/ffmpeg-static/**
+# M3 已验证（pnpm probe:asar PASS）：pi 是纯 JS、无原生模块，默认全量 asar 打包即可。
 npmRebuild: false
 win:
   icon: build/icon.png

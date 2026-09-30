@@ -7,18 +7,21 @@
  * mediaManager/mediaContext/host）全部经窄接口注入 —— 本探针用 mock 依赖真调
  * assembleMediaTools，断言的是装配语义本身：
  *
- *   工具面：3 个生成工具 + read_media
+ *   工具面：3 个生成工具 + read_media + 视频两工具（skim_video / read_video_frames）
  *   submit 拼装：落库链 → outputDir 条件透传 / refPaths 空不传字段 / sourceChatId=nodeId /
  *               ratio·时长条件透传 / waitForCompletion 与进度转发
  *   失败分类：无可用模型 → 工具结果含可操作指引（不静默、不裸抛）
  *   现读语义（T2）：capabilities 与 confirmVideo 每次调用现读，改 mock 即时生效
  *   落库链直测：默认库 / 已删库回退公共库 / 再兜底画布素材 / 'none' / 'builtin-assets'
  *   read_media 接线：无工作区报 no-workspace；三根齐备时 inbox 放行
+ *   视频两工具（视频理解 M2/M3）：skim 粗扫/无视觉降级、read_video_frames 的
+ *   MM:SS 入参解析与区间/时间守卫（夹具 ffmpeg lavfi 现场生成，用完即清）
  *
  * 为什么要在 electron 里跑：装配链含 artifactImage（nativeImage），纯 Node 加载不了。
  * 不需要任何 API Key：mediaManager 是 mock，全程不碰网络。
  */
 const { app, nativeImage } = require('electron')
+const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
 const Module = require('node:module')
@@ -89,6 +92,19 @@ function writePng(absPath, width, height) {
   return absPath
 }
 
+/** 真 mp4 夹具（视频两工具用）：ffmpeg lavfi mandelbrot 现场生成 —— 亮度真变化不会被
+ *  感知去重误伤；640x480 让 skim 的 384px 降缩放真的在测"缩"。夹具零入库，用完即删。 */
+function writeVideoFixture(absPath) {
+  mkdir(path.dirname(absPath))
+  execFileSync(require('ffmpeg-static'), [
+    '-y', '-hide_banner', '-loglevel', 'error',
+    '-f', 'lavfi', '-i', 'mandelbrot=size=640x480:rate=10',
+    '-t', '6', '-pix_fmt', 'yuv420p', absPath
+  ])
+  assert(fs.existsSync(absPath) && fs.statSync(absPath).size > 10000, `视频夹具生成失败：${absPath}`)
+  return absPath
+}
+
 const startedAt = new Date().toISOString()
 
 void app
@@ -98,10 +114,14 @@ void app
       path.join('src', 'main', 'agent', 'mediaToolAssembly.ts'),
       path.join('src', 'main', 'agent', 'mediaTools.ts'),
       path.join('src', 'main', 'agent', 'readMediaTool.ts'),
+      path.join('src', 'main', 'agent', 'videoTools.ts'),
       path.join('src', 'main', 'media', 'artifactImage.ts'),
+      path.join('src', 'main', 'media', 'videoFrames.ts'),
       path.join('src', 'main', 'media', 'manager.ts'),
       path.join('src', 'main', 'media', 'provider.ts'),
       path.join('src', 'main', 'media', 'imageSize.ts'),
+      // manager.ts 依赖的原子写（1d60212 收口到 fsutil；漏登会让产物主名净化直测挂掉）
+      path.join('src', 'main', 'fsutil', 'atomic.ts'),
       path.join('src', 'shared', 'assets.ts'),
       path.join('src', 'shared', 'media.ts'),
       path.join('src', 'shared', 'mediaResolve.ts')
@@ -168,15 +188,15 @@ void app
         return approvalDecision !== false
       }
     }
-    const { mediaTools, readMediaTool } = assembly.assembleMediaTools(NODE, deps)
-    const byName = new Map([...mediaTools, readMediaTool].map((t) => [t.name, t]))
+    const { mediaTools, readMediaTool, videoTools } = assembly.assembleMediaTools(NODE, deps)
+    const byName = new Map([...mediaTools, readMediaTool, ...videoTools].map((t) => [t.name, t]))
     const imageTool = byName.get('generate_image')
 
-    await check('工具面齐备：3 个生成工具 + read_media', async () => {
-      for (const n of ['generate_image', 'generate_video', 'generate_audio', 'read_media']) {
+    await check('工具面齐备：3 个生成工具 + read_media + 视频两工具', async () => {
+      for (const n of ['generate_image', 'generate_video', 'generate_audio', 'read_media', 'skim_video', 'read_video_frames']) {
         assert(byName.has(n), `缺 ${n}`)
       }
-      return '4 个 customTool'
+      return '6 个 customTool'
     })
 
     await check('submit 拼装：落库链命中 ⇒ outputDir=库路径，sourceChatId=nodeId', async () => {
@@ -371,6 +391,68 @@ void app
       assert(threw && /没有可用的视频生成模型/.test(threw.message), `抛错形态不对：${threw}`)
       return '正反两路'
     })
+
+    /* ---------------- 视频两工具（视频理解 M2/M3）---------------- */
+    // 夹具：ffmpeg lavfi 现场 mandelbrot 6s（亮度真变化，不会被感知去重误伤），
+    // 放 inbox 根（与上面 upload.png 同款真实落盘路径），缓存会写到 /ws-root/.huabu/vframes
+    const skim = byName.get('skim_video')
+    const readFrames = byName.get('read_video_frames')
+    const clipAbs = writeVideoFixture('/inbox-root/2026-09/clip.mp4')
+    const blocksOf = (out) => (out?.content ?? []).filter((b) => b?.type === 'image')
+    const textOfOut = (out) => (out?.content ?? []).filter((b) => b?.type === 'text').map((b) => b.text).join('\n')
+
+    await check('skim_video：粗扫回低清帧 + 时间轴，且引导区间精读', async () => {
+      const out = await skim.execute('c20', { path: clipAbs })
+      assert(out.details.ok === true && out.details.decoded === true, JSON.stringify(out.details))
+      assert(out.details.frames >= 3 && out.details.frames <= 6, `帧数=${out.details.frames}`)
+      const blocks = blocksOf(out)
+      assert(blocks.length === out.details.frames, `图块数 ${blocks.length} ≠ details.frames`)
+      for (const b of blocks) {
+        const img = nativeImage.createFromBuffer(Buffer.from(b.data, 'base64'))
+        assert(!img.isEmpty(), '粗扫帧解不回')
+        assert(Math.max(...Object.values(img.getSize())) <= 384, `粗扫帧该 ≤384px`)
+      }
+      const text = textOfOut(out)
+      assert(/时长/.test(text) && /read_video_frames/.test(text), '没回时长或没引导区间精读')
+      assert(/帧1=00:0\d/.test(text), '缺帧时间戳清单')
+      return `${blocks.length} 帧 @384px + 时间轴`
+    })
+
+    await check('skim_video 无视觉模型 ⇒ 只回文本时间轴（帧回传也会被协议层丢）', async () => {
+      deps.sessionModelSupportsImages = () => false
+      const out = await skim.execute('c21', { path: clipAbs })
+      deps.sessionModelSupportsImages = () => true
+      assert(out.details.decoded === false, JSON.stringify(out.details))
+      assert(blocksOf(out).length === 0, '无视觉还塞帧图块')
+      assert(/时间点/.test(textOfOut(out)) && /视觉/.test(textOfOut(out)), '没保留时间轴价值或没提示换视觉模型')
+      return '元数据降级'
+    })
+
+    await check('read_video_frames：MM:SS 入参可解析，帧落在区间内', async () => {
+      const out = await readFrames.execute('c22', { path: clipAbs, t1: '00:01', t2: '00:03' })
+      assert(out.details.ok === true && out.details.decoded === true, JSON.stringify(out.details))
+      assert(out.details.t1 === 1 && out.details.t2 === 3, `t1/t2=${out.details.t1}/${out.details.t2}`)
+      const blocks = blocksOf(out)
+      assert(blocks.length === out.details.frames && out.details.frames >= 2, `帧数=${out.details.frames}`)
+      assert(/精读区间/.test(textOfOut(out)) && /区间外内容未读取/.test(textOfOut(out)), '缺区间边界声明')
+      return `${blocks.length} 帧落 [1,3]s`
+    })
+
+    await check('read_video_frames 守卫：乱时间 / 超宽区间 / 非视频路径', async () => {
+      const badTime = await readFrames.execute('c23', { path: clipAbs, t1: 'abc', t2: '00:03' })
+      assert(badTime.details.reason === 'bad-time', `reason=${badTime.details.reason}`)
+      const wide = await readFrames.execute('c24', { path: clipAbs, t1: '0', t2: '600' })
+      assert(wide.details.reason === 'range-too-wide', `reason=${wide.details.reason}`)
+      assert(/skim_video/.test(textOfOut(wide)), '超宽文案没引导回 skim')
+      const pngPath = writePng('/inbox-root/2026-09/not-video.png', 60, 40)
+      const notVideo = await readFrames.execute('c25', { path: pngPath })
+      assert(notVideo.details.reason === 'not-found-or-out-of-scope', `reason=${notVideo.details.reason}`)
+      return 'bad-time / range-too-wide / 非视频全拒'
+    })
+
+    // 清理：视频工具的缓存落在 /ws-root/.huabu（真实盘符根），不留垃圾
+    fs.rmSync('/ws-root/.huabu/vframes', { recursive: true, force: true })
+    fs.rmSync(clipAbs, { force: true })
 
     const pass = results.filter((r) => r.pass).length
     const allPass = pass === results.length

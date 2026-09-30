@@ -390,8 +390,20 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
           />
         )}
         {data.kind === 'video' && (
-          <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#2b2f36] to-[#454a54]">
-            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-white/90 shadow">
+          <div className="relative flex h-full w-full items-center justify-center bg-gradient-to-br from-[#2b2f36] to-[#454a54]">
+            {/* 真首帧：走缩略图管线（Windows 系统缩略图可出视频首帧；失败/不支持时协议回退原文件，
+                <img> 解码视频字节必失败 → onError 退回渐变占位，体验不劣化） */}
+            {src && !previewBroken && (
+              <img
+                src={src}
+                alt={data.name}
+                draggable={false}
+                decoding="async"
+                onError={() => setPreviewBroken(true)}
+                className="absolute inset-0 h-full w-full object-cover"
+              />
+            )}
+            <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-white/90 shadow">
               <Play size={16} className="ml-0.5 text-[#1f1f1f]" />
             </div>
           </div>

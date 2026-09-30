@@ -1,8 +1,15 @@
 import { existsSync, statSync } from 'fs'
+import { join } from 'path'
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { resolveMediaTarget, type MediaRoots } from '../../shared/assets'
 import { readImageFileAsBase64 } from '../media/artifactImage'
+import {
+  MAX_VIDEO_BYTES,
+  VIDEO_FRAME_MAX_EDGE,
+  extractVideoFrames,
+  formatMediaTime
+} from '../media/videoFrames'
 
 /**
  * `read_media(path)` —— 素材引用契约的另一半闭环（架构计划 T7）。
@@ -22,8 +29,9 @@ import { readImageFileAsBase64 } from '../media/artifactImage'
  *    越界检查不能只看字符串前缀，必须折叠 `..` 后再比 —— 那条规则写在纯函数侧。
  * 3. **文本类不重复实现**：`read` 已在工具白名单（host.ts 的 TOOL_ALLOWLIST），
  *    这里遇到文本就指过去，避免两套截断规则互相漂移。
- * 4. **一期不解码视频/音频**：仓库里没有探测能力（无 ffprobe），"猜一段视频里有什么"
- *    比明说读不了更坏。
+ * 4. **视频走本地抽帧（视频理解 M1）**：ffmpeg-static 定点 seek 抽关键帧、带时间戳回传
+ *    （media/videoFrames.ts，`pnpm probe:video-frames` 覆盖），所以任何声明图片输入的模型
+ *    都能"看"视频；音频一期仍不解码 —— 没有 ASR 能力，"猜一段音频里有什么"比明说读不了更坏。
  */
 
 export interface ReadMediaContext {
@@ -59,9 +67,9 @@ export function createReadMediaTool(ctx: ReadMediaContext): ToolDefinition {
     name: 'read_media',
     label: '读取素材',
     description:
-      '按路径读取工作区内的图片素材，并把图片交给你看（从而能描述画布卡片、生成产物或用户引用的图片内容）。' +
-      '参数是引用素材清单里的那条绝对路径（也接受工作区相对路径）。' +
-      '文本文件请用 read 工具；视频与音频本工具不解码，只会给出文件信息。',
+      '按路径读取工作区内的图片或视频素材，并把画面交给你看（图片直读；视频抽取带时间戳的关键帧），' +
+      '从而能描述画布卡片、生成产物或用户引用的素材内容。参数是引用素材清单里的那条绝对路径（也接受工作区相对路径）。' +
+      '文本文件请用 read 工具；音频只给出文件信息（一期无转写能力）。',
     parameters: Type.Object({
       path: Type.String({
         description: '图片文件路径：优先用引用清单里给出的绝对路径；相对路径按工作区解析'
@@ -107,14 +115,79 @@ export function createReadMediaTool(ctx: ReadMediaContext): ToolDefinition {
         }
       }
 
-      if (target.kind !== 'image') {
-        const label = target.kind === 'video' ? '视频' : target.kind === 'audio' ? '音频' : '该类型文件'
+      if (target.kind === 'audio') {
         return {
           content: [
             textBlock(
-              `${summary}\n这是${label}，本工具不解码音视频流，因此无法得知画面或声音内容。` +
-                `一期没有视频/音频转图片的能力；需要看内容请让用户提供关键帧截图，或改用图片素材。`
+              `${summary}\n这是音频文件，本工具一期没有语音转写（ASR）能力，无法得知声音内容。` +
+                `需要音频信息时，请让用户提供文字稿，或改用图片/视频素材。`
             )
+          ],
+          details: { ok: true, kind: 'audio', absPath: target.absPath, decoded: false }
+        }
+      }
+
+      if (target.kind === 'video') {
+        // 抽帧的产物就是图片块，视觉闸门与图片分支同源：不声明图片输入的模型收了也会被协议层丢
+        if (!ctx.supportsImageInput()) {
+          return {
+            content: [
+              textBlock(
+                `${summary}\n当前会话使用的模型没有声明图片输入能力，视频要先转成关键帧图片才能被理解，所以本工具没有回传画面 ——` +
+                  `回传了也会被协议层丢弃，那样只会得到一个"已看过视频"的假象。确实需要看画面时，请告诉用户把会话模型换成支持视觉的模型` +
+                  `（设置 → 模型供应商里该模型需带「视觉」标记），或让用户直接描述视频内容。`
+              )
+            ],
+            details: { ok: true, kind: 'video', absPath: target.absPath, decoded: false, reason: 'model-no-vision' }
+          }
+        }
+        if (size > MAX_VIDEO_BYTES) {
+          return {
+            content: [textBlock(`${summary}\n视频超过 ${humanBytes(MAX_VIDEO_BYTES)}，本工具不对超大视频做抽帧（解码耗时会占住会话）。请让用户裁剪或压缩后再试。`)],
+            details: { ok: true, kind: 'video', absPath: target.absPath, decoded: false, reason: 'too-large' }
+          }
+        }
+        const extraction = await extractVideoFrames(target.absPath, {
+          cacheDir: join(roots.workspaceDir, '.huabu', 'vframes')
+        })
+        if (!extraction.ok) {
+          return {
+            content: [
+              textBlock(
+                `${summary}\n视频关键帧抽取失败（${extraction.code}）。常见原因是编码不受支持或文件已损坏；` +
+                  `可以试着让用户重新导出为 MP4（H.264），或改用图片素材。`
+              )
+            ],
+            details: { ok: true, kind: 'video', absPath: target.absPath, decoded: false, reason: 'video-decode-failed' }
+          }
+        }
+        const set = extraction.value
+        const stamps = set.frames.map((f, i) => `帧${i + 1}=${formatMediaTime(f.ptsSec)}`).join('、')
+        return {
+          content: [
+            textBlock(
+              `${summary}\n时长 ${formatMediaTime(set.durationSec)}；已${set.sceneEnhanced ? '按场景切换 + 均匀采样' : '均匀采样'}抽取 ${set.frames.length} 个关键帧（最长边 ≤${VIDEO_FRAME_MAX_EDGE}px${set.deduped ? '，已剔除重复画面' : ''}），随本条结果按时间顺序附上，对应时间点：${stamps}。\n请基于实际画面回答，不要凭文件名猜测内容；引用画面时请标注时间点（如 00:23）。`
+            ),
+            ...set.frames.map((f) => ({ type: 'image' as const, data: f.data, mimeType: f.mimeType }))
+          ],
+          details: {
+            ok: true,
+            kind: 'video',
+            absPath: target.absPath,
+            decoded: true,
+            frames: set.frames.length,
+            durationSec: set.durationSec,
+            sceneEnhanced: set.sceneEnhanced,
+            deduped: set.deduped,
+            cached: set.cached
+          }
+        }
+      }
+
+      if (target.kind !== 'image') {
+        return {
+          content: [
+            textBlock(`${summary}\n该类型文件不在本工具的解读范围（图片/视频/音频之外）。文本内容请用 read 工具；其它格式请让用户说明用途。`)
           ],
           details: { ok: true, kind: target.kind, absPath: target.absPath, decoded: false }
         }
