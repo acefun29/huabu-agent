@@ -69,13 +69,20 @@ function labelFromArgs(args: ChatToolArgs, toolName: string): string {
  *
  * 注入段由 sendMessage 逐轮拼在正文后（`\n\n` + 载荷），头部来自
  * shared/injection.ts 的自产文本头。拆分是纯文本操作：找到最早的行首注入头，
- * 之前是正文、之后整段折叠。正文为空（理论不该发生）时不拆，整条按正文展示。
+ * 之前是正文、之后整段折叠。载荷总以 `\n\n` 拼在正文后，注入头前必有空行——
+ * 因此只有「前一行是空行」的注入头才认作切分点，用户正文里恰好有一行以
+ * `[素材库清单]` 开头的文本（前一行非空）不会被误拆；折叠占位形态
+ * （头 + 「（与上轮一致，未变化）」单行）同样按头前缀命中，无需特殊处理。
+ * 正文为空（理论不该发生）时不拆，整条按正文展示。
  */
 export function splitUserInjection(text: string): { body: string; contextPayload?: string } {
   if (!text) return { body: text }
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i += 1) {
     if (!isInjectionHeaderLine(lines[i])) continue
+    // 切分点收紧：注入头前必有空行（载荷以 `\n\n` 拼在正文后）；前一行非空的
+    // 注入头样式的行视为用户正文的一部分，不拆
+    if (i === 0 || lines[i - 1].trim() !== '') continue
     const body = lines
       .slice(0, i)
       .join('\n')
