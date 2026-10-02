@@ -16,6 +16,8 @@
  *   read_media 接线：无工作区报 no-workspace；三根齐备时 inbox 放行
  *   视频两工具（视频理解 M2/M3）：skim 粗扫/无视觉降级、read_video_frames 的
  *   MM:SS 入参解析与区间/时间守卫（夹具 ffmpeg lavfi 现场生成，用完即清）
+ *   generate_video 成功回传首帧（P2 多模态自检）：artifactDirRel/缺省两路拼径、
+ *   无视觉不抽帧、抽帧失败/宿主抛错降级纯文本、真实抽帧管线端到端（夹具用完即清）
  *
  * 为什么要在 electron 里跑：装配链含 artifactImage（nativeImage），纯 Node 加载不了。
  * 不需要任何 API Key：mediaManager 是 mock，全程不碰网络。
@@ -449,6 +451,134 @@ void app
       assert(notVideo.details.reason === 'not-found-or-out-of-scope', `reason=${notVideo.details.reason}`)
       return 'bad-time / range-too-wide / 非视频全拒'
     })
+
+    /* ---------------- generate_video 成功回传首帧（P2 多模态自检）---------------- */
+    // readVideoPosterAsBase64 在 assembleMediaTools 内联实现、不可注入，探针经转译产物的
+    // CJS 导出面替换其唯一依赖 extractVideoFrames（TS CommonJS 输出是调用点属性访问，
+    // 打补丁/还原都生效）；用完还原，不影响既有断言。posterCalls 记录入参，顺带锁死
+    // 装配层的拼径（artifactDirRel / 缺省回退 MEDIA_ROOT_REL）与抽帧参数契约。
+    const vfModule = require(path.join(TMP, 'src', 'main', 'media', 'videoFrames.js'))
+    const realExtract = vfModule.extractVideoFrames
+    const posterCalls = []
+    /** null = 透传真实现（端到端用）；{ok:true,value}|{ok:false,…} = 固定返回；Error = 抛错 */
+    let posterStub = null
+    vfModule.extractVideoFrames = async (absPath, opts) => {
+      posterCalls.push({ absPath, opts })
+      if (!posterStub) return realExtract(absPath, opts)
+      if (posterStub instanceof Error) throw posterStub
+      return posterStub
+    }
+    /** generate_video 的 mock 终态：succeeded 视频，artifactDirRel 是任务自带的落盘目录（可选） */
+    const setPosterVideoResult = (artifact, artifactDirRel) => {
+      waitForResult = {
+        jobId: 'job-poster', kind: 'video', state: 'succeeded', progress: 1,
+        prompt: 'p', provider: 'prov', model: 'prov/vid', updatedAt: 't',
+        ...(artifactDirRel ? { artifactDirRel } : {}),
+        artifact
+      }
+    }
+    const videoTool = byName.get('generate_video')
+    const posterVideoArtifact = { relPath: 'poster-1.mp4', name: 'poster-1.mp4', mime: 'video/mp4', bytes: 8 }
+
+    await check('generate_video 成功回传首帧：artifactDirRel 拼径 + image 块 + 文本说明', async () => {
+      const mockPng = writePng(path.join(TMP, 'poster-mock.png'), 8, 8)
+      const posterData = fs.readFileSync(mockPng).toString('base64')
+      posterStub = {
+        ok: true,
+        value: {
+          frames: [{ data: posterData, mimeType: 'image/png', ptsSec: 0.25 }],
+          durationSec: 4, cached: false, sceneEnhanced: false, deduped: false
+        }
+      }
+      setPosterVideoResult(posterVideoArtifact, 'assets/video')
+      const out = await videoTool.execute('c30', { prompt: 'p', confirmed: true })
+      const blocks = blocksOf(out)
+      assert(blocks.length === 1, `应附 1 个 image 块，实际 ${blocks.length}`)
+      assert(blocks[0].data === posterData && blocks[0].mimeType === 'image/png', 'image 块应是 poster 数据源返回的首帧')
+      const text = textOfOut(out)
+      assert(/首帧/.test(text), `成功文本没说明首帧：${text.slice(0, 120)}`)
+      assert(posterCalls.length === 1, `抽帧应恰好被调一次，实际 ${posterCalls.length}`)
+      assert(
+        posterCalls[0].absPath === path.join('/ws-root', 'assets/video', 'poster-1.mp4'),
+        `artifactDirRel 拼径不对：${posterCalls[0].absPath}`
+      )
+      assert(
+        posterCalls[0].opts.maxFrames === 2 && posterCalls[0].opts.maxEdge === 768,
+        `抽帧参数不对：${JSON.stringify(posterCalls[0].opts)}`
+      )
+      assert(
+        posterCalls[0].opts.cacheDir === path.join('/ws-root', '.huabu', 'vframes'),
+        `缓存目录不对：${posterCalls[0].opts.cacheDir}`
+      )
+      // 无 artifactDirRel 的历史任务 → 回退媒体产物目录根（MEDIA_ROOT_REL）
+      setPosterVideoResult(posterVideoArtifact, undefined)
+      const out2 = await videoTool.execute('c31', { prompt: 'p', confirmed: true })
+      assert(posterCalls.length === 2, '第二次成功也应触发抽帧')
+      assert(
+        posterCalls[1].absPath === path.join('/ws-root', '.huabu', 'media', 'poster-1.mp4'),
+        `缺省应回退 MEDIA_ROOT_REL：${posterCalls[1].absPath}`
+      )
+      assert(blocksOf(out2).length === 1, '回退路径也应附首帧')
+      return 'image 块 + 文本说明 + artifactDirRel/缺省两路拼径'
+    })
+
+    await check('generate_video 无视觉 ⇒ 不抽帧、纯文本成功', async () => {
+      deps.sessionModelSupportsImages = () => false
+      const before = posterCalls.length
+      setPosterVideoResult(posterVideoArtifact, 'assets/video')
+      const out = await videoTool.execute('c32', { prompt: 'p', confirmed: true })
+      deps.sessionModelSupportsImages = () => true
+      assert(posterCalls.length === before, '无视觉模型不应触发抽帧')
+      assert(blocksOf(out).length === 0, '无视觉不应有 image 块')
+      const text = textOfOut(out)
+      assert(/已生成成功/.test(text) && !/首帧/.test(text), `降级文本不对：${text.slice(0, 120)}`)
+      return '抽帧未触达 + 无 image 块'
+    })
+
+    await check('generate_video 抽帧失败/宿主抛错 ⇒ 降级纯文本，成功结果不受影响', async () => {
+      setPosterVideoResult(posterVideoArtifact, 'assets/video')
+      posterStub = { ok: false, code: 'probe-failed', error: 'mock：抽帧失败' }
+      const failOut = await videoTool.execute('c33', { prompt: 'p', confirmed: true })
+      const failText = textOfOut(failOut)
+      assert(/已生成成功/.test(failText) && !/首帧/.test(failText), `ok:false 降级文本不对：${failText.slice(0, 120)}`)
+      assert(blocksOf(failOut).length === 0, 'ok:false 不应附 image 块')
+      posterStub = new Error('mock：宿主抽帧实现抛错')
+      const throwOut = await videoTool.execute('c34', { prompt: 'p', confirmed: true })
+      const throwText = textOfOut(throwOut)
+      assert(/已生成成功/.test(throwText) && !/首帧/.test(throwText), `抛错降级文本不对：${throwText.slice(0, 120)}`)
+      assert(blocksOf(throwOut).length === 0, '宿主抛错不应附 image 块')
+      posterStub = null
+      return 'ok:false 与抛错两路都降级为成功文本'
+    })
+
+    // 端到端：不打补丁，真实 extractVideoFrames 跑通装配层——这条锁住"首帧回传真实生效"
+    // 而不是 mock 假绿（maxFrames=2 取第 1 帧的参数契约也在此被真实管线验证）。
+    // 夹具是亮度连续变化的 mandelbrot，不依赖场景帧数量，用完即清
+    await check('generate_video 首帧端到端：真实抽帧管线回传 1 帧 ≤768px JPEG', async () => {
+      const e2eAbs = writeVideoFixture('/ws-root/assets/video/poster-e2e.mp4')
+      try {
+        setPosterVideoResult(
+          { relPath: 'poster-e2e.mp4', name: 'poster-e2e.mp4', mime: 'video/mp4', bytes: fs.statSync(e2eAbs).size },
+          'assets/video'
+        )
+        posterStub = null
+        const out = await videoTool.execute('c35', { prompt: 'p', confirmed: true })
+        const blocks = blocksOf(out)
+        assert(blocks.length === 1, `真实管线应附 1 帧首帧，实际 ${blocks.length}`)
+        assert(blocks[0].mimeType === 'image/jpeg', `首帧 mime=${blocks[0].mimeType}`)
+        const img = nativeImage.createFromBuffer(Buffer.from(blocks[0].data, 'base64'))
+        assert(!img.isEmpty(), '真实首帧解不回')
+        const size = img.getSize()
+        assert(Math.max(size.width, size.height) <= 768, `首帧应 ≤768px：${size.width}×${size.height}`)
+        assert(/首帧/.test(textOfOut(out)), '端到端文本缺首帧说明')
+        return `真实抽帧回传 ${size.width}×${size.height}px JPEG`
+      } finally {
+        fs.rmSync('/ws-root/assets/video', { recursive: true, force: true })
+      }
+    })
+
+    // 还原补丁：后续不再有 generate_* 调用，纯粹防脏（缓存目录清理在下方统一做）
+    vfModule.extractVideoFrames = realExtract
 
     // 清理：视频工具的缓存落在 /ws-root/.huabu（真实盘符根），不留垃圾
     fs.rmSync('/ws-root/.huabu/vframes', { recursive: true, force: true })

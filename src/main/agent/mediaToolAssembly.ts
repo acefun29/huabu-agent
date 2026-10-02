@@ -1,8 +1,10 @@
+import { join } from 'path'
 import type { MediaJobStatus } from '@shared/ipc'
 import type { AdapterProviderConfig } from '../media/adapters'
 import { resolveMediaTarget } from '../../shared/mediaResolve'
-import { assetDirForKind } from '../../shared/assets'
+import { MEDIA_ROOT_REL, assetDirForKind } from '../../shared/assets'
 import { readArtifactAsBase64 } from '../media/artifactImage'
+import { extractVideoFrames } from '../media/videoFrames'
 import { createMediaTools, type MediaApprovalInfo } from './mediaTools'
 import { createReadMediaTool } from './readMediaTool'
 import { createVideoTools } from './videoTools'
@@ -199,6 +201,33 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
     readArtifactAsBase64: (relPath, maxEdge) => {
       const dir = mediaContext().mediaDir
       return dir ? readArtifactAsBase64(relPath, dir, maxEdge) : undefined
+    },
+    // 视频成功结果回传首帧关键帧（P2 多模态自检）：与 read_media/videoTools 同一套抽帧管线
+    // （media/videoFrames.ts）与缓存目录（.huabu/vframes）。首帧是增强项：无工作区/文件缺失/
+    // ffmpeg 失败/实现抛错一律返回 undefined，绝不连累 generate_video 的成功结果。
+    readVideoPosterAsBase64: async (artifact) => {
+      try {
+        const workspaceDir = deps.currentDir()
+        if (!workspaceDir) return undefined
+        // 目录用任务状态里记录的 artifactDirRel（提交时的实际落盘目录，相对工作区根）——
+        // media.outputDir 是随时可改的设置，按"当前配置"拼历史产物必错（见 MediaJobStatus.artifactDirRel）；
+        // 缺省回退媒体产物目录根 MEDIA_ROOT_REL
+        const absPath = join(workspaceDir, artifact.artifactDirRel ?? MEDIA_ROOT_REL, artifact.relPath)
+        // maxFrames=2 是抽帧管线的下限：videoFrames.ts 抽帧后有 extracted.length < 2 判失败的守卫，
+        // 传 1 必 ok:false（首帧永远回不来）；故传 2 取第 1 帧 —— "只回 1 帧"的意图不变，
+        // 多抽的那帧只进磁盘缓存，不进模型上下文
+        const result = await extractVideoFrames(absPath, {
+          maxFrames: 2,
+          maxEdge: 768, // 与 read_media 视频帧同档（videoFrames.VIDEO_FRAME_MAX_EDGE）
+          cacheDir: join(workspaceDir, '.huabu', 'vframes')
+        })
+        if (!result.ok || result.value.frames.length === 0) return undefined
+        const first = result.value.frames[0]
+        return { data: first.data, mimeType: first.mimeType }
+      } catch {
+        // 首帧是增强项，不许连累成功结果：任何异常都降级为"没有首帧"（纯文本成功结果）
+        return undefined
+      }
     }
   })
 
