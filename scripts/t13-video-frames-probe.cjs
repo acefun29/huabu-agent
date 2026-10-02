@@ -122,6 +122,18 @@ void app
     runFfmpeg(['-f', 'lavfi', '-i', 'smptehdbars=duration=3:size=640x480:rate=10', '-pix_fmt', 'yuv420p', bars3])
     const scenesMp4 = path.join(FIXTURE, 'scenes.mp4')
     runFfmpeg(['-i', mb3, '-i', bars3, '-filter_complex', '[0:v][1:v]concat=n=2:v=1[outv]', '-map', '[outv]', '-pix_fmt', 'yuv420p', scenesMp4])
+    // 密切镜夹具：8 段 ×2s 交替 mandelbrot/彩条（7 次硬切镜）。maxFrames=8 时 7 个
+    // 场景帧吃掉预算，收窄步进 slots=8-7=1 —— 除零守卫（Math.max(1, slots-1)）的回归靶
+    const mb2 = path.join(FIXTURE, 'mb2.mp4')
+    const bars2 = path.join(FIXTURE, 'bars2.mp4')
+    runFfmpeg(['-f', 'lavfi', '-i', 'mandelbrot=size=640x480:rate=10', '-t', '2', '-pix_fmt', 'yuv420p', mb2])
+    runFfmpeg(['-f', 'lavfi', '-i', 'smptehdbars=duration=2:size=640x480:rate=10', '-pix_fmt', 'yuv420p', bars2])
+    const denseScenesMp4 = path.join(FIXTURE, 'dense-scenes.mp4')
+    runFfmpeg([
+      '-i', mb2, '-i', bars2, '-i', mb2, '-i', bars2, '-i', mb2, '-i', bars2, '-i', mb2, '-i', bars2,
+      '-filter_complex', '[0:v][1:v][2:v][3:v][4:v][5:v][6:v][7:v]concat=n=8:v=1[outv]',
+      '-map', '[outv]', '-pix_fmt', 'yuv420p', denseScenesMp4
+    ])
     // 静态夹具：6 秒纯色（所有帧像素级一致，感知去重的靶子）
     const staticMp4 = path.join(FIXTURE, 'static.mp4')
     runFfmpeg(['-f', 'lavfi', '-i', 'color=c=0x2a2e36:s=320x240:d=6:r=10', '-pix_fmt', 'yuv420p', staticMp4])
@@ -262,6 +274,16 @@ void app
       const nearCut = out.value.frames.some((f) => Math.abs(f.ptsSec - 3) <= 1)
       assert(nearCut, `切镜边界附近没有帧：${out.value.frames.map((f) => f.ptsSec).join(', ')}`)
       return `${out.value.frames.length} 帧含切镜帧 @${out.value.frames.map((f) => f.ptsSec.toFixed(1)).join('s,')}s`
+    })
+
+    await check('密切镜夹具 ⇒ 7 切镜吃满预算后 slots=1 收窄不除零（回归）', async () => {
+      // 8 段 ×2s 交替 = 7 次硬切镜：maxFrames=8 时收窄步进 slots=8-7=1，修复前
+      // (i*(n-1))/(slots-1) 除零 → NaN 索引 → 后续 t.toFixed 抛 TypeError。放大预算隔离变量。
+      const out = await videoFrames.extractVideoFrames(denseScenesMp4, { cacheDir: CACHE, maxTotalBytes: ISOLATION_BUDGET })
+      assert(out.ok === true, `密切镜抽取失败：${out.ok ? '' : `${out.code}：${out.error}`}`)
+      assert(out.value.frames.length >= 2 && out.value.frames.length <= VIDEO_MAX_FRAMES, `帧数=${out.value.frames.length}`)
+      assert(out.value.frames.every((f) => f.ptsSec >= 0 && f.ptsSec <= 16), `帧越出 [0,16]：${out.value.frames.map((f) => f.ptsSec).join(',')}`)
+      return `${out.value.frames.length} 帧（sceneEnhanced=${out.value.sceneEnhanced}）@${out.value.frames.map((f) => f.ptsSec.toFixed(1)).join('s,')}s`
     })
 
     await check('区间抽取 ⇒ t1/t2/maxEdge/maxFrames 全部生效，帧都落在区间内', async () => {

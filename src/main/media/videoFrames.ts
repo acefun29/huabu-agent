@@ -282,9 +282,11 @@ export function mergeFrameTimes(
     if (candidates.length <= slots) {
       uniformSelected.push(...candidates)
     } else {
-      // 等距取整：从候选里按索引均分取样，两头必中，覆盖不失锚点
+      // 等距取整：从候选里按索引均分取样，两头必中，覆盖不失锚点。
+      // 分母钳到 ≥1：slots=1（场景帧吃掉 budget-1）时除零会产出 NaN 索引，
+      // undefined 混进时间点数组让后续 t.toFixed 抛 TypeError——单槽取首个候选即可
       for (let i = 0; i < slots; i++) {
-        uniformSelected.push(candidates[Math.round((i * (candidates.length - 1)) / (slots - 1))])
+        uniformSelected.push(candidates[Math.round((i * (candidates.length - 1)) / Math.max(1, slots - 1))])
       }
     }
   }
@@ -501,8 +503,10 @@ export async function extractVideoFrames(absPath: string, opts: ExtractVideoFram
       if (rest.length <= slots) {
         strided.push(...rest)
       } else {
+        // 分母钳到 ≥1：slots=1（maxFrames-1 个场景帧）时除零产出 NaN 索引，
+        // undefined 进时间点数组后 t.toFixed 抛 TypeError——单槽取首个候选即可
         for (let i = 0; i < slots; i++) {
-          strided.push(rest[Math.round((i * (rest.length - 1)) / (slots - 1))])
+          strided.push(rest[Math.round((i * (rest.length - 1)) / Math.max(1, slots - 1))])
         }
       }
     }
