@@ -1,6 +1,11 @@
 import { randomUUID } from 'crypto'
 import { basename, dirname, join, relative, resolve, sep } from 'path'
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'fs'
+// 约束与出处（性能优化 P0：素材/导入链路去同步 IO）：导入/清单/归档的文件操作一律走
+// fs/promises，主进程同步 IO（512MB 级 copyFile、逐文件 stat）会冻结全部 IPC/UI 数秒。
+// 留存的同步调用都有出处：renameAsset/deleteAsset 是单文件元数据操作（不在本次范围）、
+// inboxRoot 的 mkdirSync 只跑一次、uniqueNameInDir 仅 existsSync 元数据查询
+import { existsSync, mkdirSync, renameSync, rmSync, statSync } from 'fs'
+import { mkdir, readdir, rename, rm, stat } from 'fs/promises'
 import { app } from 'electron'
 import {
   ASSET_CATEGORIES,
@@ -75,7 +80,7 @@ function isImportItem(raw: unknown): raw is AssetImportItem {
  * @backend(import-canvas)：源文件按分类归档进工作区 assets/。
  * 逐文件独立容错：一个失败不影响其余（拖一堆文件时常见的部分成功场景）。
  */
-export function importToWorkspace(workspaceDir: string, files: unknown[]): AssetImportResult {
+export async function importToWorkspace(workspaceDir: string, files: unknown[]): Promise<AssetImportResult> {
   const imported: ImportedAsset[] = []
   const failed: { name: string; error: string }[] = []
   for (const raw of files) {
@@ -87,21 +92,21 @@ export function importToWorkspace(workspaceDir: string, files: unknown[]): Asset
     try {
       const source = resolve(raw.sourcePath)
       if (!existsSync(source)) throw new Error(`源文件不存在：${raw.sourcePath}`)
-      const stat = statSync(source)
-      if (!stat.isFile()) throw new Error('不是常规文件')
-      if (stat.size > MAX_IMPORT_BYTES) throw new Error(`文件过大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）`)
+      const st = await stat(source)
+      if (!st.isFile()) throw new Error('不是常规文件')
+      if (st.size > MAX_IMPORT_BYTES) throw new Error(`文件过大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）`)
 
       const { category, kind } = categorizeFileName(name)
       const destDir = resolve(workspaceDir, category.dir)
       let destName = name
       if (existsSync(join(destDir, destName))) destName = dedupeName(name)
-      const dest = copyIntoDir(source, destDir, destName)
+      const dest = await copyIntoDir(source, destDir, destName)
       imported.push({
         name: destName,
         kind,
         relPath: normalizePath(relative(workspaceDir, dest)),
         absPath: normalizePath(dest),
-        bytes: stat.size,
+        bytes: st.size,
         ...(typeof raw.mime === 'string' && raw.mime ? { mime: raw.mime } : {})
       })
     } catch (error) {
@@ -115,10 +120,10 @@ export function importToWorkspace(workspaceDir: string, files: unknown[]): Asset
  * @backend(import-temp)：源文件复制进临时收件箱（工作区之外），回传绝对路径。
  * 顺手清理超过保留天数的日期目录（拖文件时顺带做一次，不引入定时器）。
  */
-export function importToInbox(files: unknown[]): AssetImportResult {
+export async function importToInbox(files: unknown[]): Promise<AssetImportResult> {
   const dayDir = resolve(inboxRoot(), dateTag())
-  mkdirSync(dayDir, { recursive: true })
-  pruneInbox()
+  await mkdir(dayDir, { recursive: true })
+  await pruneInbox()
 
   const imported: ImportedAsset[] = []
   const failed: { name: string; error: string }[] = []
@@ -131,17 +136,17 @@ export function importToInbox(files: unknown[]): AssetImportResult {
     try {
       const source = resolve(raw.sourcePath)
       if (!existsSync(source)) throw new Error(`源文件不存在：${raw.sourcePath}`)
-      const stat = statSync(source)
-      if (!stat.isFile()) throw new Error('不是常规文件')
-      if (stat.size > MAX_IMPORT_BYTES) throw new Error(`文件过大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）`)
+      const st = await stat(source)
+      if (!st.isFile()) throw new Error('不是常规文件')
+      if (st.size > MAX_IMPORT_BYTES) throw new Error(`文件过大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）`)
 
-      const dest = copyIntoDir(source, dayDir, `${randomUUID()}-${name}`)
+      const dest = await copyIntoDir(source, dayDir, `${randomUUID()}-${name}`)
       const { kind } = categorizeFileName(name)
       imported.push({
         name,
         kind,
         absPath: normalizePath(dest),
-        bytes: stat.size,
+        bytes: st.size,
         ...(typeof raw.mime === 'string' && raw.mime ? { mime: raw.mime } : {})
       })
     } catch (error) {
@@ -151,26 +156,33 @@ export function importToInbox(files: unknown[]): AssetImportResult {
   return { imported, failed }
 }
 
-/** 清理超过 INBOX_KEEP_DAYS 天的收件箱日期目录 */
-function pruneInbox(now: Date = new Date()): void {
+/** 清理超过 INBOX_KEEP_DAYS 天的收件箱日期目录（readdir/rm 失败沿用同步版的整体上抛，由 handler 收敛） */
+async function pruneInbox(now: Date = new Date()): Promise<void> {
   const root = inboxRoot()
   const cutoff = new Date(now)
   cutoff.setDate(cutoff.getDate() - INBOX_KEEP_DAYS)
   const cutoffTag = dateTag(cutoff)
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
+  for (const entry of await readdir(root, { withFileTypes: true })) {
     // 只动符合 yyyymmdd 形态的目录，其余（用户的任何东西）不碰
     if (!entry.isDirectory() || !/^\d{8}$/.test(entry.name)) continue
     if (entry.name < cutoffTag) {
-      rmSync(join(root, entry.name), { recursive: true, force: true })
+      await rm(join(root, entry.name), { recursive: true, force: true })
     }
   }
 }
 
-/** 单目录扫描成 AssetLibraryFile 列表（不递归；素材库是扁平目录约定）。tags 从 .huabu/tags.json 合并 */
-function scanLibraryDir(absDir: string, workspaceDir: string, tagsIndex: Record<string, string[]>): AssetLibraryFile[] {
+/**
+ * 单目录扫描成 AssetLibraryFile 列表（不递归；素材库是扁平目录约定）。tags 从 .huabu/tags.json 合并。
+ * 全异步（fs/promises）：每库逐文件 stat，每库上限 200 文件 × 多目录，同步跑会冻结面板刷新。
+ */
+async function scanLibraryDir(
+  absDir: string,
+  workspaceDir: string,
+  tagsIndex: Record<string, string[]>
+): Promise<AssetLibraryFile[]> {
   if (!existsSync(absDir)) return []
   const out: AssetLibraryFile[] = []
-  for (const entry of readdirSync(absDir, { withFileTypes: true })) {
+  for (const entry of await readdir(absDir, { withFileTypes: true })) {
     if (!entry.isFile() || entry.name.startsWith('.')) continue
     const abs = join(absDir, entry.name)
     const { kind } = categorizeFileName(entry.name)
@@ -180,7 +192,7 @@ function scanLibraryDir(absDir: string, workspaceDir: string, tagsIndex: Record<
       kind,
       relPath,
       absPath: normalizePath(abs),
-      bytes: statSync(abs).size,
+      bytes: (await stat(abs)).size,
       ...(tagsIndex[relPath]?.length ? { tags: tagsIndex[relPath] } : {})
     })
     if (out.length >= MAX_LIBRARY_FILES) break
@@ -193,8 +205,9 @@ function scanLibraryDir(absDir: string, workspaceDir: string, tagsIndex: Record<
 /**
  * 素材库清单 = 内置 assets/ 合成库 + 命名库（workspace.json libraries 段）。
  * 内置库恒在首位且标记 builtin，渲染端据此隐藏删除按钮。
+ * 各目录逐个 await（顺序 = 返回顺序，内置库恒首位），不做并行以保持清单次序确定。
  */
-export function listLibraries(store: WorkspaceStore): AssetLibrariesInfo {
+export async function listLibraries(store: WorkspaceStore): Promise<AssetLibrariesInfo> {
   const dir = store.currentDir
   const libraries: AssetLibrary[] = []
   if (dir) {
@@ -204,7 +217,7 @@ export function listLibraries(store: WorkspaceStore): AssetLibrariesInfo {
     // 内置合成库：assets/ 根（分类归档的落盘点）。files 列各分类子目录的并集
     const assetFiles: AssetLibraryFile[] = []
     for (const category of [...ASSET_CATEGORIES, OTHER_CATEGORY]) {
-      assetFiles.push(...scanLibraryDir(resolve(root, category.dir), root, tagsIndex))
+      assetFiles.push(...(await scanLibraryDir(resolve(root, category.dir), root, tagsIndex)))
     }
     libraries.push({
       id: 'builtin-assets',
@@ -219,7 +232,7 @@ export function listLibraries(store: WorkspaceStore): AssetLibrariesInfo {
         name: lib.name,
         path: lib.path,
         ...(lib.isPublic ? { isPublic: true } : {}),
-        files: scanLibraryDir(resolve(root, lib.path), root, tagsIndex)
+        files: await scanLibraryDir(resolve(root, lib.path), root, tagsIndex)
       })
     }
   }
@@ -250,7 +263,11 @@ export function categoryAbsDir(workspaceDir: string, categoryId: string): string
 /** 内置合成库 id（listLibraries 的约定，两处必须一致） */
 const BUILTIN_LIBRARY_ID = 'builtin-assets'
 
-/** 目标目录不覆盖既有文件：name → name-2 / name-3 …，序号耗尽退回时间戳后缀 */
+/**
+ * 目标目录不覆盖既有文件：name → name-2 / name-3 …，序号耗尽退回时间戳后缀。
+ * 保持同步：只有 existsSync 元数据查询（无重 IO），且 renameAsset（单文件元数据操作，
+ * 不在本次异步化范围）同步依赖它 —— 异步化会连带破坏 renameAsset 与探针的直调约定。
+ */
 function uniqueNameInDir(destDir: string, name: string): string {
   if (!existsSync(join(destDir, name))) return name
   const dot = name.lastIndexOf('.')
@@ -281,10 +298,10 @@ function transferDestDir(root: string, namedDir: string | null, fileName: string
  * - 复制（copyFiles）：OS 外部文件 copy 进库目录（与 importToWorkspace 同一校验链，
  *   只是落点从「分类目录」换成「指定库目录」）。
  */
-export function transferToLibrary(
+export async function transferToLibrary(
   store: WorkspaceStore,
   request: { libraryId: string; movePaths?: string[]; copyFiles?: unknown[] }
-): AssetTransferResult {
+): Promise<AssetTransferResult> {
   const wsRoot = store.currentDir
   if (!wsRoot) throw new Error('尚未打开工作区')
   const root = resolve(wsRoot)
@@ -310,10 +327,11 @@ export function transferToLibrary(
       if (!existsSync(abs)) throw new Error('源文件不存在（可能已被移动或删除）')
       const destDir = transferDestDir(root, namedDir, name)
       if (resolve(destDir) === resolve(dirname(abs))) throw new Error('文件已在该素材库中')
-      mkdirSync(destDir, { recursive: true })
+      await mkdir(destDir, { recursive: true })
+      // uniqueNameInDir 保持同步（仅 existsSync 元数据探测，非大文件 copy/目录扫描一类重 IO）
       const finalName = uniqueNameInDir(destDir, name)
       const dest = join(destDir, finalName)
-      renameSync(abs, dest)
+      await rename(abs, dest)
       moved.push({
         from: normalizePath(rel),
         to: normalizePath(relative(root, dest)),
@@ -334,18 +352,19 @@ export function transferToLibrary(
     try {
       const source = resolve(raw.sourcePath)
       if (!existsSync(source)) throw new Error(`源文件不存在：${raw.sourcePath}`)
-      const stat = statSync(source)
-      if (!stat.isFile()) throw new Error('不是常规文件')
-      if (stat.size > MAX_IMPORT_BYTES) throw new Error(`文件过大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）`)
+      const st = await stat(source)
+      if (!st.isFile()) throw new Error('不是常规文件')
+      if (st.size > MAX_IMPORT_BYTES) throw new Error(`文件过大（>${MAX_IMPORT_BYTES / 1024 / 1024}MB）`)
       const destDir = transferDestDir(root, namedDir, name)
+      // uniqueNameInDir 保持同步（仅 existsSync 元数据探测，非大文件 copy/目录扫描一类重 IO）
       const finalName = uniqueNameInDir(destDir, name)
-      const dest = copyIntoDir(source, destDir, finalName)
+      const dest = await copyIntoDir(source, destDir, finalName)
       copied.push({
         name: finalName,
         kind: categorizeFileName(name).kind,
         relPath: normalizePath(relative(root, dest)),
         absPath: normalizePath(dest),
-        bytes: stat.size,
+        bytes: st.size,
         ...(typeof raw.mime === 'string' && raw.mime ? { mime: raw.mime } : {})
       })
     } catch (error) {

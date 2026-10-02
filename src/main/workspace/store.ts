@@ -1,5 +1,6 @@
 import { app, dialog } from 'electron'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, statSync } from 'fs'
+import { copyFile, mkdir } from 'fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import type {
@@ -775,10 +776,12 @@ function normalizeDefaultRatio(raw: unknown): Pick<WorkspaceMediaConfig, 'defaul
  * 绝不先删旧文件）。本文件此前的本地实现在 rename 失败时退化为 rm-then-rename，
  * rm 与 rename 之间崩溃会把原文件彻底丢掉，已删除，改为从 fsutil/atomic 导入。 */
 
-/** copyFileSync 的目录自备版：导入媒体/资产时先把目标目录建好 */
-export function copyIntoDir(src: string, destDir: string, destName: string): string {
-  mkdirSync(destDir, { recursive: true })
+/** copyFile 的目录自备版（fs/promises）：导入媒体/资产时先把目标目录建好。
+ * 收口为 async 的出处：同步 copy 允许到 512MB（MAX_IMPORT_BYTES），跑在主进程会
+ * 冻结全部 IPC/UI 数秒（性能优化 P0：素材/导入链路去同步 IO） */
+export async function copyIntoDir(src: string, destDir: string, destName: string): Promise<string> {
+  await mkdir(destDir, { recursive: true })
   const dest = join(destDir, destName)
-  copyFileSync(src, dest)
+  await copyFile(src, dest)
   return dest
 }

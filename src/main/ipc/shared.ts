@@ -2,7 +2,7 @@
  * IPC 各域共享的载荷校验助手、结果包装、跨窗口广播与依赖上下文。
  *
  * 自 src/main/ipc.ts 拆出（实现原样搬移）：
- * - 校验/包装助手：isNonEmptyString / asNodeRequest / invalidPayload / ok / describe / guardSync
+ * - 校验/包装助手：isNonEmptyString / asNodeRequest / invalidPayload / ok / describe / guardSync / guardAsync
  * - 广播：chat:event（AgentHost 的 onUpdate 回调）、asset:changed、media:job
  * - IpcContext：编排器（src/main/ipc.ts）组装后注入各域注册函数的依赖上下文
  *
@@ -50,6 +50,17 @@ function describe(error: unknown): string {
 function guardSync<T>(fn: () => T): ChatResult<T> {
   try {
     return { ok: true, value: fn() }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { ok: false, code: 'unknown', error: message.length > 500 ? `${message.slice(0, 500)}…` : message }
+  }
+}
+
+/** guardSync 的异步版（await 服务层 Promise）：素材导入/清单/归档异步化后的 handler 复用，
+ * 失败结果形态（500 字截断、code:'unknown'）与 guardSync 逐字一致 */
+async function guardAsync<T>(fn: () => Promise<T>): Promise<ChatResult<T>> {
+  try {
+    return { ok: true, value: await fn() }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     return { ok: false, code: 'unknown', error: message.length > 500 ? `${message.slice(0, 500)}…` : message }
@@ -120,5 +131,6 @@ export {
   invalidPayload,
   ok,
   describe,
-  guardSync
+  guardSync,
+  guardAsync
 }
