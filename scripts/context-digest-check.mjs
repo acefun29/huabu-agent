@@ -10,6 +10,8 @@
  *   T10 画布态势：空画布零注入 / 选中与注入态标注 / 生成卡状态与参数 / 卡片上限折叠
  *   T11 产物回喂：带 gen 的卡片附 genSummary（状态+提示词+参数+版本数）/ 长提示词截断
  *   载荷格式：buildReferencePayload 行尾附加 genSummary
+ *   逐轮去重（token 经济）：未变化摘要折叠占位 / genSummary 只在首次或变化时携带 /
+ *   不带新参数时行为与旧版逐字一致（向后兼容锁）
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -78,6 +80,7 @@ const collector = (await import(pathToFileURL(path.join(OUT_DIR, 'src', 'rendere
   (m) => m.default ?? m
 ))
 const promptMod = await import(pathToFileURL(path.join(OUT_DIR, 'src', 'renderer', 'src', 'harness', 'prompt.js')))
+const injectionMod = await import(pathToFileURL(path.join(OUT_DIR, 'src', 'shared', 'injection.js')))
 
 const WS = '/ws-root'
 /** 造卡片数据（只填 digest 用到的字段） */
@@ -281,6 +284,111 @@ check('buildReferencePayload ⇒ genSummary 附加在引用行尾', () => {
   ])
   assert(!plain.includes('（生成卡片'), '普通附件不应有括注')
   return '两形态'
+})
+
+/* ---------------- 逐轮去重（token 经济） ---------------- */
+
+check('向后兼容：不带新参数 ⇒ contextText 仍为两段全文拼接、genSummary 照带（旧版行为逐字一致）', () => {
+  const genCard = card('g', {
+    storage: 'ws', path: 'assets/images/cat.png',
+    gen: { prompt: '一只猫', refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
+  })
+  const nodes = [card('封面.png', { storage: 'ws', path: 'assets/images/封面.png' }), genCard]
+  const out = collector.collectRoundContext({
+    selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
+    nodes,
+    libraries: [lib('产品图库', ['libraries/产品图库/poster.png'])]
+  })
+  const expected = [
+    collector.buildLibraryDigest([lib('产品图库', ['libraries/产品图库/poster.png'])], WS),
+    collector.buildCanvasDigest(nodes, ['g'], [])
+  ].filter(Boolean).join('\n\n')
+  assert(out.contextText === expected, `contextText 与旧版全文拼接不一致：${out.contextText}`)
+  assert(!out.contextText.includes('（与上轮一致'), '不带新参数不应出现折叠占位')
+  assert(typeof out.attachments.find((a) => a.name === 'g')?.genSummary === 'string', '不带新参数 genSummary 应照带')
+  assert(out.digests.library.includes('poster.png') && out.digests.canvas.includes('封面.png'), 'digests 出参应为全文')
+  assert(out.genSummarySeen.g === 'succeeded|1|一只猫', `签名口径不符：${out.genSummarySeen.g}`)
+})
+
+check('去重：两段摘要与上轮一致 ⇒ 各折叠为「头+未变化」单行占位；digests 出参仍是全文', () => {
+  const nodes = [card('封面.png', { storage: 'ws', path: 'assets/images/封面.png' })]
+  const libraries = [lib('产品图库', ['libraries/产品图库/poster.png'])]
+  const first = collector.collectRoundContext({
+    selectedAssetIds: [], injectedAssetIds: [], nodes, tempAttachments: [], workspaceDir: WS, libraries
+  })
+  const second = collector.collectRoundContext({
+    selectedAssetIds: [], injectedAssetIds: [], nodes, tempAttachments: [], workspaceDir: WS, libraries,
+    previousDigests: first.digests
+  })
+  const libNote = `${injectionMod.LIBRARY_DIGEST_HEADER}${injectionMod.DIGEST_UNCHANGED_NOTE}`
+  const canvasNote = `${injectionMod.CANVAS_DIGEST_HEADER}${injectionMod.DIGEST_UNCHANGED_NOTE}`
+  assert(second.contextText.includes(libNote), `库清单段未折叠为占位：${second.contextText}`)
+  assert(second.contextText.includes(canvasNote), `画布态势段未折叠为占位：${second.contextText}`)
+  assert(!second.contextText.includes('poster.png'), '折叠后不应再含文件列表行')
+  assert(!second.contextText.includes('封面.png'), '折叠后不应再含卡片清单行')
+  // 两段各折叠为单行、段间仍以空行分隔（与全文形态同构）
+  assert(second.contextText === `${libNote}\n\n${canvasNote}`, `占位形态应为两段单行：${JSON.stringify(second.contextText)}`)
+  assert(
+    second.digests.library === first.digests.library && second.digests.canvas === first.digests.canvas,
+    'digests 出参应仍是全文（供下轮继续比较）'
+  )
+  assert(second.digests.library.includes('poster.png'), 'digests.library 存的应是全量而非占位')
+})
+
+check('去重：库清单变化、画布未变 ⇒ 库段全文 + 画布段占位（逐段独立判断）', () => {
+  const nodes = [card('封面.png', { storage: 'ws', path: 'assets/images/封面.png' })]
+  const first = collector.collectRoundContext({
+    selectedAssetIds: [], injectedAssetIds: [], nodes, tempAttachments: [], workspaceDir: WS,
+    libraries: [lib('库A', ['a/1.png'])]
+  })
+  const second = collector.collectRoundContext({
+    selectedAssetIds: [], injectedAssetIds: [], nodes, tempAttachments: [], workspaceDir: WS,
+    libraries: [lib('库B', ['b/2.png'])],
+    previousDigests: first.digests
+  })
+  assert(second.contextText.includes('库B / b/2.png'), '变化的库段应是全文')
+  assert(!second.contextText.includes('库A'), '旧库内容不应残留')
+  const canvasNote = `${injectionMod.CANVAS_DIGEST_HEADER}${injectionMod.DIGEST_UNCHANGED_NOTE}`
+  assert(second.contextText.endsWith(canvasNote), `未变的画布段应折叠为占位并排在最后：${second.contextText}`)
+})
+
+check('去重：genSummary 首轮带 ⇒ 签名一致二轮不带 ⇒ 改提示词后又带', () => {
+  const round = (prompt, seen) =>
+    collector.collectRoundContext({
+      selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
+      nodes: [
+        card('g', {
+          storage: 'ws', path: 'assets/images/cat.png',
+          gen: { prompt, refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
+        })
+      ],
+      libraries: [],
+      ...(seen ? { genSummarySeen: seen } : {})
+    })
+  const first = round('一只猫')
+  assert(first.attachments[0].genSummary?.includes('一只猫'), '首轮应携带 genSummary')
+  assert(first.genSummarySeen.g === 'succeeded|1|一只猫', `签名口径不符：${first.genSummarySeen.g}`)
+  const second = round('一只猫', first.genSummarySeen)
+  assert(second.attachments[0].genSummary === undefined, '签名一致不应重复携带 genSummary')
+  assert(second.genSummarySeen.g === 'succeeded|1|一只猫', '仍在附件集合里的卡片签名应保留在表中')
+  const third = round('一只狗', second.genSummarySeen)
+  assert(third.attachments[0].genSummary?.includes('一只狗'), '提示词变化应重新携带 genSummary')
+  assert(third.genSummarySeen.g === 'succeeded|1|一只狗', '签名应随内容更新')
+})
+
+check('去重：genSummary 签名表只含当前仍在附件集合里的卡片（离场即出局）', () => {
+  const gen = { prompt: 'x', refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
+  const withCard = collector.collectRoundContext({
+    selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
+    nodes: [card('g', { storage: 'ws', path: 'assets/images/x.png', gen })], libraries: []
+  })
+  assert(Object.keys(withCard.genSummarySeen).length === 1, '带产物的生成卡应在签名表里')
+  const withoutCard = collector.collectRoundContext({
+    selectedAssetIds: [], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
+    nodes: [card('g', { storage: 'ws', path: 'assets/images/x.png', gen })], libraries: [],
+    genSummarySeen: withCard.genSummarySeen
+  })
+  assert(Object.keys(withoutCard.genSummarySeen).length === 0, '不在附件集合里的卡片签名应出局')
 })
 
 const pass = results.filter((r) => r.pass).length

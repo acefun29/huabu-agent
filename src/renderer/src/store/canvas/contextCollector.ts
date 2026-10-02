@@ -1,7 +1,7 @@
 import type { AssetLibrary } from '@shared/ipc'
 import type { AssetData, AssetGen, CanvasNode, MessageAttachment } from '../../types'
 import { assetAbsPath } from '../../harness/assetCategories'
-import { CANVAS_DIGEST_HEADER, LIBRARY_DIGEST_HEADER } from '@shared/injection'
+import { CANVAS_DIGEST_HEADER, DIGEST_UNCHANGED_NOTE, LIBRARY_DIGEST_HEADER } from '@shared/injection'
 
 /**
  * 每轮发送前的上下文采集（T8 从 sendMessage 抽出；T9/T10/T11 的落点）。
@@ -18,7 +18,9 @@ import { CANVAS_DIGEST_HEADER, LIBRARY_DIGEST_HEADER } from '@shared/injection'
  *   含尚未产出产物的生成卡片（它们进不了引用载荷，但 Agent 应当知道它们存在）。
  *
  * 纯函数：输入是发送瞬间的状态快照，输出是附件与注入文本；不做 IPC、不读 store，
- * 因此能被 Node 自检直接断言（scripts/context-digest-check.mjs）。
+ * 因此能被 Node 自检直接断言（scripts/context-digest-check.mjs）。逐轮去重（token
+ * 经济）所需的跨轮状态（上轮摘要全文 / 已携带的 genSummary 签名）同样全部由调用方
+ * 传入、经出参整表交还，本模块不持有任何跨轮记忆。
  */
 
 export interface MessageContextInput {
@@ -37,13 +39,23 @@ export interface MessageContextInput {
 export interface RoundContextInput extends MessageContextInput {
   /** 素材库清单（store.libraries 快照；随 asset:changed 即时刷新） */
   libraries: AssetLibrary[]
+  /** 上轮注入的完整摘要全文（逐轮去重：与本轮全文一致则折叠为占位行；缺省 = 首轮，发全文） */
+  previousDigests?: { library?: string; canvas?: string }
+  /** 上轮已携带的 genSummary 签名表（卡片 id → 签名；缺省 = 首轮，全部携带） */
+  genSummarySeen?: Record<string, string>
 }
 
 export interface CollectedRoundContext {
   /** 随消息载荷发送的附件（仅路径；顺序 = 工作区素材在前、临时上传在后） */
   attachments: MessageAttachment[]
-  /** T9 素材库摘要 + T10 画布态势，拼进消息尾部；两者皆空时为空串（零冗余注入） */
+  /** T9 素材库摘要 + T10 画布态势，拼进消息尾部；两者皆空时为空串（零冗余注入）。
+   * 与上轮全文一致的段折叠为「头 + DIGEST_UNCHANGED_NOTE」单行占位（token 经济） */
   contextText: string
+  /** 本轮两段摘要的**完整全文**（供调用方存为下轮的 previousDigests；存全量而非占位） */
+  digests: { library: string; canvas: string }
+  /** 本轮已携带的 genSummary 签名表（卡片 id → 签名；只含当前仍在附件集合里的卡片，
+   * 调用方整表存回，离场的卡片自然出局） */
+  genSummarySeen: Record<string, string>
 }
 
 /* ---------------- 截断预算（T9/T10 共用，防上下文被清单吃掉） ---------------- */
@@ -59,24 +71,31 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
   const assetNodes = Array.from(new Set([...input.selectedAssetIds, ...input.injectedAssetIds]))
     .map((id) => input.nodes.find((n) => n.id === id))
     .filter((n): n is CanvasNode => Boolean(n))
+  // genSummary 逐轮去重（token 经济）：签名与上轮一致的卡片不再重复携带括注；
+  // 签名表输出整表交由调用方存回，只含本轮仍在附件集合里的卡片（离场即出局）
+  const seenGenSigs = input.genSummarySeen ?? {}
+  const carriedGenSigs: Record<string, string> = {}
   const attachments: MessageAttachment[] = [
     ...assetNodes
-      .map((n) => n.data)
-      .filter((d) => Boolean(d.path) && Boolean(d.storage))
-      .flatMap((d) => {
+      .map((n) => ({ nodeId: n.id, data: n.data }))
+      .filter(({ data }) => Boolean(data.path) && Boolean(data.storage))
+      .flatMap(({ nodeId, data }) => {
         // 解析口径唯一：media 形态的 path 相对产物目录（见 AssetData.pathRoot），
         // 直接按工作区根拼会得出 <工作区>/<裸文件名>，Agent 侧只表现为"引用文件不存在"
-        const absPath = assetAbsPath(d, input.workspaceDir)
+        const absPath = assetAbsPath(data, input.workspaceDir)
         if (!absPath) return []
+        const genSig = data.gen ? genSummarySignature(data.gen) : undefined
+        if (genSig !== undefined) carriedGenSigs[nodeId] = genSig
         return [
           {
             id: `att-${crypto.randomUUID()}`,
-            name: d.name,
-            kind: d.kind,
+            name: data.name,
+            kind: data.kind,
             absPath,
             origin: 'workspace-asset' as const,
-            // T11：生成卡片的产物回喂——Agent 拿到的不只是一个路径，还有这张卡片的来龙去脉
-            ...(d.gen ? { genSummary: genSummaryFor(d) } : {})
+            // T11：生成卡片的产物回喂——Agent 拿到的不只是一个路径，还有这张卡片的
+            // 来龙去脉；签名与上轮一致时省去 genSummary 括注（未变内容不逐轮重复计 token）
+            ...(data.gen && seenGenSigs[nodeId] !== genSig ? { genSummary: genSummaryFor(data) } : {})
           }
         ]
       }),
@@ -84,8 +103,25 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
   ]
   const libraryDigest = buildLibraryDigest(input.libraries, input.workspaceDir)
   const canvasDigest = buildCanvasDigest(input.nodes, input.selectedAssetIds, input.injectedAssetIds)
-  const contextText = [libraryDigest, canvasDigest].filter(Boolean).join('\n\n')
-  return { attachments, contextText }
+  // 摘要逐轮去重（token 经济）：与上轮全文一致的段折叠为「头 + 未变化后缀」单行占位
+  // （占位行仍以头前缀开头，isInjectionHeaderLine 按前缀匹配，回放拆分无需感知）；
+  // digests 出参始终存本轮全文，供调用方作为下轮的 previousDigests
+  const prev = input.previousDigests
+  const libraryPart =
+    libraryDigest !== '' && libraryDigest === prev?.library
+      ? `${LIBRARY_DIGEST_HEADER}${DIGEST_UNCHANGED_NOTE}`
+      : libraryDigest
+  const canvasPart =
+    canvasDigest !== '' && canvasDigest === prev?.canvas
+      ? `${CANVAS_DIGEST_HEADER}${DIGEST_UNCHANGED_NOTE}`
+      : canvasDigest
+  const contextText = [libraryPart, canvasPart].filter(Boolean).join('\n\n')
+  return {
+    attachments,
+    contextText,
+    digests: { library: libraryDigest, canvas: canvasDigest },
+    genSummarySeen: carriedGenSigs
+  }
 }
 
 /* ---------------- T11：生成卡片的产物回喂摘要 ---------------- */
@@ -112,6 +148,15 @@ function genSummaryFor(d: AssetData): string {
   ]
     .filter(Boolean)
     .join('，')
+}
+
+/**
+ * genSummary 的去重签名（逐轮 token 经济）：`状态|版本数|提示词`，覆盖 Agent 关心的
+ * 三类变化——状态流转（生成中→已完成）、版本追加、提示词改写；比例/模型等参数
+ * 微调不触发重发（genSummary 里的参数段随状态段一起出现，单独变化不值得重发整段）。
+ */
+function genSummarySignature(gen: AssetGen): string {
+  return `${gen.status}|${gen.versions.length}|${gen.prompt}`
 }
 
 /* ---------------- T9：素材库清单摘要 ---------------- */

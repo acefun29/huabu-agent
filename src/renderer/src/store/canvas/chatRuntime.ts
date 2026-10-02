@@ -34,6 +34,12 @@ const baseLens = new Map<string, number>()
 const writeToolPaths = new Map<string, { sessionId: string; path: string }>()
 /** 历史已回放/已建过的会话（避免重复 replay 覆盖流式中的历史） */
 const historyLoaded = new Set<string>()
+/** 逐轮注入去重（token 经济）的上轮摘要全文（key = sessionId）：存 collectRoundContext
+ * 返回的 digests **全量全文**（非占位），下轮采集时传入比较——一致则折叠为占位行 */
+const lastRoundDigests = new Map<string, { library?: string; canvas?: string }>()
+/** 逐轮注入去重的 genSummary 签名表（key = sessionId，卡片 id → 签名）：
+ * 签名与上轮一致的生成卡片不再重复携带 genSummary 括注 */
+const genSummarySeen = new Map<string, Record<string, string>>()
 
 /* ---------------- 流式事件批处理（P0-3）---------------- */
 /**
@@ -279,6 +285,9 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     historyLoaded.clear()
     pendingChatEvents.clear()
     draftMessageCache.clear()
+    // 切工作区：所有会话一并清空，逐轮注入去重状态也没有留存价值
+    lastRoundDigests.clear()
+    genSummarySeen.clear()
     // 切工作区：所有会话一并清空，write 路径条目（含旧 sessionId）没有留存价值
     writeToolPaths.clear()
   }
@@ -377,10 +386,12 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     streams.delete(id)
     baseLens.delete(id)
     historyLoaded.delete(id)
-    // 这三个缓存都按会话键持有引用（流式缓冲/draft→message 转换/未配对的 write 路径），
-    // 会话删了不清理就是单调泄漏；缓冲里的残余事件会在下次 flush 时自然跳过
+    // 这几个缓存都按会话键持有引用（流式缓冲/draft→message 转换/未配对的 write 路径/
+    // 逐轮注入去重状态），会话删了不清理就是单调泄漏；缓冲里的残余事件会在下次 flush 时自然跳过
     pendingChatEvents.delete(id)
     draftMessageCache.delete(id)
+    lastRoundDigests.delete(id)
+    genSummarySeen.delete(id)
     for (const [callId, entry] of writeToolPaths) {
       if (entry.sessionId === id) writeToolPaths.delete(callId)
     }
@@ -451,14 +462,25 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     // + T10 画布态势。全部逐轮动态注入（拼进消息文本），不进静态系统提示词；
     // @backend(payload)：只把路径与清单文本拼在消息后发给模型，文件内容不进上下文。
     const s = get()
-    const { attachments, contextText } = collectRoundContext({
+    // 逐轮去重（token 经济）：传入上轮摘要全文与 genSummary 签名表，返回的新状态整表
+    // 存回（digests 是全量全文、签名表只含本轮仍在附件集合里的卡片），供下一轮比较
+    const {
+      attachments,
+      contextText,
+      digests,
+      genSummarySeen: carriedGenSigs
+    } = collectRoundContext({
       selectedAssetIds: s.selectedAssetIds,
       injectedAssetIds: s.injectedAssetIds,
       nodes: s.nodes,
       tempAttachments: s.tempAttachments,
       workspaceDir: ws.path,
-      libraries: s.libraries
+      libraries: s.libraries,
+      previousDigests: lastRoundDigests.get(sid),
+      genSummarySeen: genSummarySeen.get(sid)
     })
+    lastRoundDigests.set(sid, digests)
+    genSummarySeen.set(sid, carriedGenSigs)
     // 发送时把当前选中的资产固化为「已注入」，之后即使取消选中，chip 仍保留
     set((prev) => ({
       injectedAssetIds: Array.from(new Set([...prev.injectedAssetIds, ...prev.selectedAssetIds])),

@@ -6,6 +6,7 @@
  * 用**真的 pi.buildContextEntries**（包根导出）驱动 main/agent/history.ts 的纯函数，
  * fixture JSONL entries 覆盖：
  * - 注入段拆分（[引用素材 · 共 N 项] 头 → 正文 / contextPayload 两段）；
+ *   拆分收紧（只有「空行 + 头」才是切分点；折叠占位单行载荷照常拆）；
  * - 工具卡配对（toolCallId → status/resultText；错误结果标 error；无结果的标失败）；
  * - 图片槽位登记（原图 base64 不出本层，带配对 toolCall 参数里的源路径 label）；
  * - 压缩截断 inContext 标记（压缩点之前的消息 inContext=false）；
@@ -250,6 +251,58 @@ check('splitUserInjection 边界：头在开头不拆、纯正文不拆', () => 
   assert(plain.body === '普通消息' && plain.contextPayload === undefined, '纯正文不拆')
   const split = history.splitUserInjection('正文\n\n[画布态势]（画布上共 1 张卡片）\n- 卡')
   assert(split.body === '正文' && split.contextPayload.startsWith('[画布态势]'), '画布态势头也应触发拆分')
+})
+
+/* ---------------- 拆分收紧：只有「空行 + 头」才是切分点 ---------------- */
+
+check('拆分收紧：正文中间以 [素材库清单] 开头的行且前一行非空 ⇒ 不拆，整段按正文', () => {
+  const built5 = history.buildSessionHistory(
+    [
+      {
+        type: 'message', id: 'n1', parentId: null, timestamp: 't',
+        message: { role: 'user', content: '下面这行是我自己打的：\n[素材库清单] 这个词是什么意思？', timestamp: 1 }
+      }
+    ],
+    buildWithPi
+  )
+  const user = built5.messages.find((m) => m.role === 'user')
+  assert(user, '应存在 user 消息')
+  assert(user.contextPayload === undefined, '前一行非空的注入头样式行不应触发拆分')
+  assert(user.text.includes('[素材库清单]'), '该行应保留在正文里')
+  // splitUserInjection 直测同形态（不经 pi，锁纯函数行为）
+  const direct = history.splitUserInjection('下面这行是我自己打的：\n[素材库清单] 这个词是什么意思？')
+  assert(direct.contextPayload === undefined && direct.body.includes('[素材库清单]'), '纯函数层同样不拆')
+})
+
+check('拆分收紧：正常载荷（空行 + 头）照常拆出 contextPayload', () => {
+  const built6 = history.buildSessionHistory(
+    [
+      {
+        type: 'message', id: 'n2', parentId: null, timestamp: 't',
+        message: { role: 'user', content: '改一版\n\n[素材库清单]（共 1 库；引用任一文件时请在消息中给出它的绝对路径）\n- 库 / x.png', timestamp: 1 }
+      }
+    ],
+    buildWithPi
+  )
+  const user = built6.messages.find((m) => m.role === 'user')
+  assert(user.contextPayload?.startsWith('[素材库清单]'), '空行后的注入头应照常拆分')
+  assert(user.text === '改一版', '正文应剥离注入段')
+})
+
+check('拆分收紧：占位形态载荷（头 + 未变化后缀单行）照常拆出', () => {
+  const payload = '[素材库清单]（与上轮一致，未变化）\n\n[画布态势]（与上轮一致，未变化）'
+  const built7 = history.buildSessionHistory(
+    [
+      {
+        type: 'message', id: 'n3', parentId: null, timestamp: 't',
+        message: { role: 'user', content: `继续\n\n${payload}`, timestamp: 1 }
+      }
+    ],
+    buildWithPi
+  )
+  const user = built7.messages.find((m) => m.role === 'user')
+  assert(user.contextPayload === payload, `折叠占位载荷应整段拆出：${JSON.stringify(user.contextPayload)}`)
+  assert(user.text === '继续', '正文应保留')
 })
 
 const failed = results.filter((r) => !r.pass)
