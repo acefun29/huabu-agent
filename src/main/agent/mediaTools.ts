@@ -87,6 +87,11 @@ export interface MediaToolContext {
   supportsImageInput?: () => boolean
   /** 读取媒体产物为缩放后的 base64（主进程内完成，路径越界返回 undefined） */
   readArtifactAsBase64?: (relPath: string, maxEdge?: number) => { data: string; mimeType: string } | undefined
+  /** 读取视频产物首帧关键帧为 base64（宿主在主进程抽帧；失败/不支持返回 undefined，绝不影响生成成功结果） */
+  readVideoPosterAsBase64?: (artifact: {
+    relPath: string
+    artifactDirRel?: string
+  }) => Promise<{ data: string; mimeType: string } | undefined>
 }
 
 const KIND_LABEL: Record<MediaKind, string> = {
@@ -341,16 +346,15 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         throw new Error(failureGuidance(kind, final.error ?? final.message, final.provider, final.model))
       }
 
-      // 成功：文本摘要必回；图片且对话模型支持视觉时附产物缩略图（多模态感知）
-      const text =
+      // 成功：文本摘要必回；产物画面且对话模型支持视觉时随结果附上（多模态感知）。
+      // images 为空 = 纯文本成功结果；附了画面就必须在文本里如实说明（文本基于真实结果）。
+      let text =
         `${KIND_LABEL[kind]}已生成成功（jobId=${final.jobId}，${final.provider}/${final.model}${paramsSummary(final)}）。` +
         `产物：${final.artifact.relPath}（${final.artifact.mime}` +
         `${final.artifact.width ? `，${final.artifact.width}×${final.artifact.height}px` : ''}` +
         `${final.artifact.durationSeconds ? `，${final.artifact.durationSeconds}s` : ''}），` +
-        `已作为媒体节点出现在画布上（来源标记为当前会话）。请基于以上真实结果回答用户。`
-      const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [
-        { type: 'text', text }
-      ]
+        `已作为媒体节点出现在画布上（来源标记为当前会话）。`
+      const images: Array<{ type: 'image'; data: string; mimeType: string }> = []
       if (
         kind === 'image' &&
         ctx.supportsImageInput?.() &&
@@ -358,10 +362,28 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         final.artifact.mime.startsWith('image/')
       ) {
         const image = ctx.readArtifactAsBase64(final.artifact.relPath)
-        if (image) content.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+        if (image) images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
       }
+      // 视频生成成本最高、动辄数分钟，成功后 Agent"看不到"产物就得再手动调 read_media：
+      // 抽 1 帧首帧随结果回传自检（P2）。抽帧挂在成功路径上，失败绝不能连累生成结果 ——
+      // 整段 try/catch，宿主实现抛错一律按"没有首帧"处理，文本原样（降级纯文本）。
+      if (kind === 'video' && ctx.supportsImageInput?.() && ctx.readVideoPosterAsBase64 && final.artifact) {
+        try {
+          const poster = await ctx.readVideoPosterAsBase64({
+            relPath: final.artifact.relPath,
+            ...(final.artifactDirRel ? { artifactDirRel: final.artifactDirRel } : {})
+          })
+          if (poster) {
+            images.push({ type: 'image', data: poster.data, mimeType: poster.mimeType })
+            text += '已随本条结果附上产物首帧关键帧，可据此确认画面；需要查看更多画面可用 read_media。'
+          }
+        } catch {
+          // 首帧是增强项：宿主抽帧抛错 → 降级为纯文本成功结果，不抛、不改文案
+        }
+      }
+      text += '请基于以上真实结果回答用户。'
       return {
-        content,
+        content: [{ type: 'text', text }, ...images],
         details: {
           submitted: true,
           jobId: final.jobId,
