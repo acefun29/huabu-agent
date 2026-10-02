@@ -1,6 +1,7 @@
-import { execFileSync, spawn } from 'child_process'
+import { spawn } from 'child_process'
 import { createHash } from 'crypto'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'fs'
+import { readFile, readdir, rm, stat } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
@@ -16,6 +17,9 @@ import { join } from 'path'
  * 3. **帧预算 8 不是拍脑袋**：每帧 base64 都会成为独立的 HistoryImageSlot（history.ts），
  *    回放缩略上限 HISTORY_IMAGE_LIMIT=24；且多帧必然把 toolResult 那行 JSONL 推过
  *    SESSION_LINE_LIMIT=512KB（host.ts 软顶后整行会被跳过）。8 帧 @768px 是两道闸的折中。
+ *    帧字节总量另有一道 VIDEO_FRAMES_TOTAL_BUDGET 闸（两遍法降档 + 尾部丢帧）：
+ *    8 帧 @768px JPEG q4 的 base64 总量通常 0.6-1.6MB，会顶穿单行软顶，会话文件
+ *    超 24MB 后这些行被整行跳过时连文本元数据一起丢，必须在抽帧层管住。
  * 4. **定点 seek 而不是全片解码**：每帧一次 `-ss <t> -i -frames:v 1`（关键帧定位 + 少量
  *    前向解码），长视频不会比短视频慢多少；场景切换扫描是唯一全解操作，仅 ≤120s 整段抽取做。
  * 5. **感知去重用 ffmpeg 自己当解码器（M2）**：16x16 灰度 rawvideo 走 stdout 管道回来算
@@ -28,6 +32,13 @@ export const VIDEO_MAX_FRAMES = 8
 
 /** read_media 默认帧最长边：视频帧是"看懂内容"不是"看清细节"，768 比 1024 省 ~40% token */
 export const VIDEO_FRAME_MAX_EDGE = 768
+
+/**
+ * 单次抽取的帧 JPEG 字节总量预算（base64 编码前的原始字节）：会话 JSONL 的单行软顶
+ * SESSION_LINE_LIMIT=512KB（host.ts）× base64 膨胀 3/4 ≈ 384KB —— 整条 toolResult
+ * 的全部帧 base64 要压回单行上限内，否则会话文件超 24MB 后回放整行跳过（见头注 3）。
+ */
+export const VIDEO_FRAMES_TOTAL_BUDGET = 384 * 1024
 
 /** 送进 ffmpeg 前的源文件闸门：>2GB 的视频定点 seek 也没救，直接拒 */
 export const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
@@ -61,8 +72,8 @@ export const VIDEO_CACHE_MAX_BYTES = 512 * 1024 * 1024
 const FRAME_SPAWN_TIMEOUT_MS = 20_000
 const EXTRACTION_BUDGET_MS = 60_000
 
-/** 缓存清单版本：抽取算法变了要旧缓存失效，递增它 */
-const CACHE_VERSION = 2
+/** 缓存清单版本：抽取算法变了要旧缓存失效，递增它。v3：新增帧体积预算两遍法（降档/丢帧） */
+const CACHE_VERSION = 3
 
 export interface VideoFrame {
   data: string
@@ -97,6 +108,11 @@ export interface ExtractVideoFramesOptions {
   maxEdge?: number
   /** 帧数预算，默认 VIDEO_MAX_FRAMES */
   maxFrames?: number
+  /**
+   * 帧字节总量预算（JPEG 原始字节，base64 前）：第一遍抽完若超预算，按面积比例降
+   * maxEdge 重抽一遍，仍超则从尾部丢帧（保底 ≥2 帧）。缺省 VIDEO_FRAMES_TOTAL_BUDGET。
+   */
+  maxTotalBytes?: number
 }
 
 /** 惰性取 ffmpeg-static 的二进制路径（CJS 字符串导出）。顶层 import 会让"包缺失"变成整个主进程的启动崩溃，这里收敛成 null */
@@ -197,18 +213,12 @@ function runFfmpeg(ffmpegPath: string, args: string[], timeoutMs: number): Promi
   })
 }
 
-/** 用 `ffmpeg -i`（无输出，退出码 1 属预期）从 stderr 探时长，不为此引 ffprobe */
-function probeDurationSec(ffmpegPath: string, absPath: string): number | null {
-  // execFileSync 而非异步：探测是抽帧的前置闸，调用方本来就是串行等待它
-  let stderr = ''
-  try {
-    execFileSync(ffmpegPath, ['-i', absPath], { stdio: ['ignore', 'ignore', 'pipe'], timeout: FRAME_SPAWN_TIMEOUT_MS })
-    // 正常应走到 catch（没给输出格式 ffmpeg 必报错退出），走到这说明行为变了，靠 stderr 兜底
-  } catch (error) {
-    const e = error as { stderr?: Buffer | string }
-    stderr = String(e.stderr ?? '')
-  }
-  const m = stderr.match(/Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/)
+/** 用 `ffmpeg -i`（无输出，退出码非 0 属预期）从 stderr 探时长，不为此引 ffprobe */
+async function probeDurationSec(ffmpegPath: string, absPath: string): Promise<number | null> {
+  // 必须走异步 runFfmpeg：同步 exec（execFileSync）会冻结主进程事件循环，所有 IPC/UI
+  // 停摆最长 20s；异步化后调用方只是串行 await，事件循环不被阻塞
+  const run = await runFfmpeg(ffmpegPath, ['-hide_banner', '-i', absPath], FRAME_SPAWN_TIMEOUT_MS)
+  const m = run.stderr.match(/Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/)
   if (!m) return null
   const sec = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])
   return Number.isFinite(sec) && sec > 0 ? sec : null
@@ -358,10 +368,10 @@ interface CacheManifest {
 }
 
 function cacheKey(absPath: string, stat: { mtimeMs: number; size: number }, opts: ExtractVideoFramesOptions): string {
-  // 源文件身份（路径+mtime+大小）× 抽取参数（版本+区间+边长+帧数）变了，缓存必须失效
+  // 源文件身份（路径+mtime+大小）× 抽取参数（版本+区间+边长+帧数+体积预算）变了，缓存必须失效
   return createHash('sha1')
     .update(
-      `${CACHE_VERSION}:${opts.t1 ?? 0}:${opts.t2 ?? 'end'}:${opts.maxEdge ?? VIDEO_FRAME_MAX_EDGE}:${opts.maxFrames ?? VIDEO_MAX_FRAMES}:${absPath}:${stat.mtimeMs}:${stat.size}`
+      `${CACHE_VERSION}:${opts.t1 ?? 0}:${opts.t2 ?? 'end'}:${opts.maxEdge ?? VIDEO_FRAME_MAX_EDGE}:${opts.maxFrames ?? VIDEO_MAX_FRAMES}:${opts.maxTotalBytes ?? VIDEO_FRAMES_TOTAL_BUDGET}:${absPath}:${stat.mtimeMs}:${stat.size}`
     )
     .digest('hex')
 }
@@ -389,24 +399,27 @@ function readCache(cacheDir: string, key: string): VideoFrameSet | null {
 /**
  * 帧缓存 LRU：总量超软顶时按目录 mtime 最旧先逐出。靠 manifest.totalBytes 记账，
  * 不做递归 du（大目录逐帧 stat 是 O(帧数) 的文件系统往返，记账一次写清更省）。
+ * 全程 fs/promises：清理跑在主进程里，同步 IO 会冻结事件循环（同 probeDurationSec）。
  * 清理失败静默 —— 缓存膨胀只是磁盘问题，不该影响抽帧结果。
  */
-export function pruneVideoFrameCache(cacheDir: string, maxBytes: number = VIDEO_CACHE_MAX_BYTES): { evicted: number } {
+export async function pruneVideoFrameCache(cacheDir: string, maxBytes: number = VIDEO_CACHE_MAX_BYTES): Promise<{ evicted: number }> {
   let entries: Array<{ dir: string; mtimeMs: number; bytes: number }>
   try {
-    entries = readdirSync(cacheDir)
-      .filter((name) => !name.endsWith('.tmp'))
-      .map((name) => {
-        const dir = join(cacheDir, name)
-        let bytes = 0
-        try {
-          const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8')) as CacheManifest
-          bytes = manifest.totalBytes ?? 0
-        } catch {
-          bytes = 0
-        }
-        return { dir, mtimeMs: statSync(dir).mtimeMs, bytes }
-      })
+    entries = await Promise.all(
+      (await readdir(cacheDir))
+        .filter((name) => !name.endsWith('.tmp'))
+        .map(async (name) => {
+          const dir = join(cacheDir, name)
+          let bytes = 0
+          try {
+            const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8')) as CacheManifest
+            bytes = manifest.totalBytes ?? 0
+          } catch {
+            bytes = 0
+          }
+          return { dir, mtimeMs: (await stat(dir)).mtimeMs, bytes }
+        })
+    )
   } catch {
     return { evicted: 0 }
   }
@@ -414,11 +427,15 @@ export function pruneVideoFrameCache(cacheDir: string, maxBytes: number = VIDEO_
   if (total <= maxBytes) return { evicted: 0 }
   entries.sort((a, b) => a.mtimeMs - b.mtimeMs)
   let evicted = 0
-  for (const e of entries) {
-    if (total <= maxBytes) break
-    rmSync(e.dir, { recursive: true, force: true })
-    total -= e.bytes
-    evicted += 1
+  try {
+    for (const e of entries) {
+      if (total <= maxBytes) break
+      await rm(e.dir, { recursive: true, force: true })
+      total -= e.bytes
+      evicted += 1
+    }
+  } catch {
+    // 逐出中途失败：返回已逐出数，不抛 —— 缓存问题不连累抽帧主链路
   }
   return { evicted }
 }
@@ -433,6 +450,7 @@ export async function extractVideoFrames(absPath: string, opts: ExtractVideoFram
 
   const maxEdge = Math.min(1024, Math.max(64, Math.round(opts.maxEdge ?? VIDEO_FRAME_MAX_EDGE)))
   const maxFrames = Math.min(24, Math.max(1, Math.round(opts.maxFrames ?? VIDEO_MAX_FRAMES)))
+  const maxTotalBytes = Math.max(1, Math.round(opts.maxTotalBytes ?? VIDEO_FRAMES_TOTAL_BUDGET))
 
   let stat: { mtimeMs: number; size: number }
   try {
@@ -450,7 +468,7 @@ export async function extractVideoFrames(absPath: string, opts: ExtractVideoFram
     if (hit) return { ok: true, value: hit }
   }
 
-  const durationSec = probeDurationSec(ffmpegPath, absPath)
+  const durationSec = await probeDurationSec(ffmpegPath, absPath)
   if (durationSec === null) {
     return { ok: false, code: 'probe-failed', error: 'ffmpeg 无法读取该视频的时长（格式不支持或文件损坏）' }
   }
@@ -511,49 +529,75 @@ export async function extractVideoFrames(absPath: string, opts: ExtractVideoFram
   rmSync(workDir, { recursive: true, force: true })
   mkdirSync(workDir, { recursive: true })
 
-  const extracted: Array<{ file: string; ptsSec: number }> = []
-  for (const t of selection.times) {
-    if (Date.now() > deadline - 5_000) break // 留 5s 给收尾，别在最后一帧上超时
-    const file = `frame_${String(extracted.length).padStart(2, '0')}.jpg`
-    const outPath = join(workDir, file)
-    const run = await runFfmpeg(
-      ffmpegPath,
-      [
-        '-y', '-hide_banner', '-loglevel', 'error',
-        '-ss', t.toFixed(3),
-        '-i', absPath,
-        '-frames:v', '1',
-        // 长边 ≤maxEdge 等比缩放：w/h 框住取小、保持宽高比、强制偶数（部分编码器要求）
-        '-vf', `scale=w=${maxEdge}:h=${maxEdge}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
-        '-q:v', '4',
-        outPath
-      ],
-      FRAME_SPAWN_TIMEOUT_MS
-    )
-    if (run.timedOut) break
-    if (run.code === 0 && existsSync(outPath) && statSync(outPath).size > 0) {
-      extracted.push({ file, ptsSec: t })
+  // 单遍抽取：同一批时间点（selection.times，两遍法之间完全不变）用给定最长边抽 JPEG。
+  // 帧必须先读进内存再做缓存提交 —— rename 会把 workDir 挪走，之后再读就找不到了。
+  const extractPass = async (
+    edge: number
+  ): Promise<{ extracted: Array<{ file: string; ptsSec: number }>; frames: VideoFrame[]; totalBytes: number }> => {
+    const passExtracted: Array<{ file: string; ptsSec: number }> = []
+    for (const t of selection.times) {
+      if (Date.now() > deadline - 5_000) break // 留 5s 给收尾，别在最后一帧上超时
+      const file = `frame_${String(passExtracted.length).padStart(2, '0')}.jpg`
+      const outPath = join(workDir, file)
+      const run = await runFfmpeg(
+        ffmpegPath,
+        [
+          '-y', '-hide_banner', '-loglevel', 'error',
+          '-ss', t.toFixed(3),
+          '-i', absPath,
+          '-frames:v', '1',
+          // 长边 ≤edge 等比缩放：w/h 框住取小、保持宽高比、强制偶数（部分编码器要求）
+          '-vf', `scale=w=${edge}:h=${edge}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+          '-q:v', '4',
+          outPath
+        ],
+        FRAME_SPAWN_TIMEOUT_MS
+      )
+      if (run.timedOut) break
+      if (run.code === 0 && existsSync(outPath) && statSync(outPath).size > 0) {
+        passExtracted.push({ file, ptsSec: t })
+      }
+      // 单帧失败（seek 落在坏区/流尾）跳过继续：只要凑够 ≥2 帧结果就可用
     }
-    // 单帧失败（seek 落在坏区/流尾）跳过继续：只要凑够 ≥2 帧结果就可用
+    let passTotalBytes = 0
+    const passFrames: VideoFrame[] = passExtracted.map((f) => {
+      const buf = readFileSync(join(workDir, f.file))
+      passTotalBytes += buf.length
+      return { data: buf.toString('base64'), mimeType: 'image/jpeg', ptsSec: f.ptsSec }
+    })
+    return { extracted: passExtracted, frames: passFrames, totalBytes: passTotalBytes }
   }
 
-  if (extracted.length < 2) {
+  let chosen = await extractPass(maxEdge)
+
+  if (chosen.extracted.length < 2) {
     const timedOutOverall = Date.now() >= deadline
     rmSync(workDir, { recursive: true, force: true })
     return {
       ok: false,
       code: timedOutOverall ? 'timeout' : 'extract-failed',
-      error: `只抽到 ${extracted.length} 帧（目标 ${selection.times.length}），视频可能损坏或编码不受支持`
+      error: `只抽到 ${chosen.extracted.length} 帧（目标 ${selection.times.length}），视频可能损坏或编码不受支持`
     }
   }
 
-  // 先把帧读进内存，再做缓存提交（rename 会把 workDir 挪走，之后再读就找不到了）
-  let totalBytes = 0
-  const frames: VideoFrame[] = extracted.map((f) => {
-    const buf = readFileSync(join(workDir, f.file))
-    totalBytes += buf.length
-    return { data: buf.toString('base64'), mimeType: 'image/jpeg', ptsSec: f.ptsSec }
-  })
+  // 两遍法体积预算：第一遍超预算且还有降档空间时，按 sqrt(预算/实际总量) 缩最长边重抽一遍
+  //（JPEG 字节 ∝ 像素数，像素 ∝ 边长²，sqrt 一步到位）；时间点选择逻辑完全不变，只是 JPEG 更小。
+  // 降不出更小的边（maxEdge 已 ≤256）就不白跑第二遍，直接走尾部丢帧。
+  if (chosen.totalBytes > maxTotalBytes) {
+    const scale = Math.sqrt(maxTotalBytes / chosen.totalBytes)
+    const reducedEdge = Math.max(256, Math.floor(maxEdge * scale))
+    if (reducedEdge < maxEdge) {
+      const second = await extractPass(reducedEdge)
+      if (second.extracted.length >= 2) chosen = second // 二遍撞上 deadline 只抽出 <2 帧时保第一遍
+    }
+  }
+
+  // 二遍后仍超预算：从尾部丢帧（丢的是最晚的时间点），保底 ≥2 帧 —— 行上限优先于满额覆盖
+  while (chosen.frames.length > 2 && chosen.totalBytes > maxTotalBytes) {
+    const last = chosen.frames.pop()!
+    chosen.extracted.pop()
+    chosen.totalBytes -= Buffer.byteLength(last.data, 'base64')
+  }
 
   if (opts.cacheDir) {
     const finalDir = join(opts.cacheDir, key)
@@ -563,8 +607,8 @@ export async function extractVideoFrames(absPath: string, opts: ExtractVideoFram
         durationSec,
         sceneEnhanced: merged.sceneTimes.length > 0,
         deduped: selection.deduped,
-        totalBytes,
-        frames: extracted
+        totalBytes: chosen.totalBytes,
+        frames: chosen.extracted
       }
       writeFileSync(join(workDir, 'manifest.json'), JSON.stringify(manifest), 'utf8')
       rmSync(finalDir, { recursive: true, force: true })
@@ -572,13 +616,19 @@ export async function extractVideoFrames(absPath: string, opts: ExtractVideoFram
     } catch {
       rmSync(workDir, { recursive: true, force: true }) // 缓存写失败不影响本次结果
     }
-    pruneVideoFrameCache(opts.cacheDir) // 记账后再清理，超软顶逐出最旧
+    await pruneVideoFrameCache(opts.cacheDir) // 记账后再清理，超软顶逐出最旧
   } else {
     rmSync(workDir, { recursive: true, force: true })
   }
 
   return {
     ok: true,
-    value: { frames, durationSec, cached: false, sceneEnhanced: merged.sceneTimes.length > 0, deduped: selection.deduped }
+    value: {
+      frames: chosen.frames,
+      durationSec,
+      cached: false,
+      sceneEnhanced: merged.sceneTimes.length > 0,
+      deduped: selection.deduped
+    }
   }
 }

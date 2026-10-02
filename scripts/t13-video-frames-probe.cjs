@@ -16,6 +16,7 @@
  *      selectDistinctFrames 纯函数（合成哈希） / 均匀采样（帧数、时间戳升序且在时长内、
  *      JPEG 可解回、最长边 ≤768） / 区间抽取（t1/t2/maxEdge 生效） / 静态视频感知去重 /
  *      场景切换增强（切镜边界附近必有帧） / 磁盘缓存命中（二次调用零 spawn） /
+ *      帧体积预算（默认/小预算总量收敛进预算或保底 2 帧、大预算不降档、cacheKey 含预算） /
  *      缓存 LRU 逐出 / 超大文件守卫 / 损坏文件收敛为失败码不抛异常。
  *
  * 不需要任何 API Key：全程不碰网络。
@@ -37,7 +38,12 @@ const RESULT_PATH = path.join(PROJECT_ROOT, 'out', 't13-video-frames-result.json
 /** 与 src/main/media/videoFrames.ts 常量同值（探针侧独立写死才有意义） */
 const VIDEO_MAX_FRAMES = 8
 const VIDEO_FRAME_MAX_EDGE = 768
+const VIDEO_FRAMES_TOTAL_BUDGET = 384 * 1024
 const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
+
+/** 聚焦采样/分辨率行为的用例显式放大体积预算到 8MB，隔离"预算降档改变帧分辨率"的变量
+ *  （motion.mp4 @768 q4 实测 ~233KB 未超默认 384KB 顶，放大是防御性的：断言不依赖编码器行为） */
+const ISOLATION_BUDGET = 8 * 1024 * 1024
 
 const results = []
 /** 必须 await：check 若不同步等 promise，异步分支会"空跑通过"，整份自检就废了 */
@@ -203,7 +209,9 @@ void app
       return '剔重/静态稀疏/动态满额三态全对'
     })
 
-    const first = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE })
+    // maxTotalBytes 放大到 8MB：本组用例聚焦采样行为（满额 8 帧、1280 源真降到 768），
+    // 默认 384KB 预算会把 mandelbrot 高熵帧降档/丢帧，污染断言；大预算=旧版行为
+    const first = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE, maxTotalBytes: ISOLATION_BUDGET })
     await check('动态夹具首次抽取 ⇒ 满额 8 帧、时长正确、cached=false、deduped=false', async () => {
       assert(first.ok === true, `抽取失败：${JSON.stringify(first)}`)
       assert(first.value.cached === false, '首次调用不该命中缓存')
@@ -232,7 +240,8 @@ void app
     })
 
     await check('二次调用 ⇒ 磁盘缓存命中（零 spawn，时间戳与首抽一致）', async () => {
-      const second = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE })
+      // 与首抽同参（含 maxTotalBytes）：cacheKey 已把预算纳入缓存身份
+      const second = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE, maxTotalBytes: ISOLATION_BUDGET })
       assert(second.ok === true && second.value.cached === true, `未命中缓存：${JSON.stringify(second.ok ? second.value.cached : second.code)}`)
       assert(second.value.frames.length === first.value.frames.length, '缓存帧数与首抽不一致')
       assert(
@@ -243,7 +252,9 @@ void app
     })
 
     await check('场景夹具 ⇒ sceneEnhanced，且 3s 切镜边界附近必有帧', async () => {
-      const out = await videoFrames.extractVideoFrames(scenesMp4, { cacheDir: CACHE })
+      // 放大预算隔离变量：本用例断言帧数下限与切镜帧存在，mandelbrot 段高熵帧在默认
+      // 384KB 预算下会被尾部丢帧干扰帧数断言（640x480 源 < 降档边长，降档本身也无效）
+      const out = await videoFrames.extractVideoFrames(scenesMp4, { cacheDir: CACHE, maxTotalBytes: ISOLATION_BUDGET })
       assert(out.ok === true, `场景夹具抽取失败：${JSON.stringify(out.code && out.error)}`)
       assert(out.value.sceneEnhanced === true, 'concat 硬切镜没被场景扫描捕获')
       // 帧数下限对齐去重下限（4）：mandelbrot 段帧距可能压线被剔，切镜帧本身必留（对断言真正重要的）
@@ -254,7 +265,8 @@ void app
     })
 
     await check('区间抽取 ⇒ t1/t2/maxEdge/maxFrames 全部生效，帧都落在区间内', async () => {
-      const out = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE, t1: 2, t2: 5, maxEdge: 384, maxFrames: 4 })
+      // 放大预算隔离变量：断言"最长边严格 === 384"，默认预算的降档会改写分辨率
+      const out = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE, t1: 2, t2: 5, maxEdge: 384, maxFrames: 4, maxTotalBytes: ISOLATION_BUDGET })
       assert(out.ok === true, `区间抽取失败：${JSON.stringify(out.ok ? out.value.frames.length : out.code)}`)
       assert(out.value.frames.length === 4, `帧数=${out.value.frames.length}`)
       assert(out.value.frames.every((f) => f.ptsSec >= 2 && f.ptsSec <= 5), `帧越出 [2,5]：${out.value.frames.map((f) => f.ptsSec).join(',')}`)
@@ -276,24 +288,84 @@ void app
       return `8 候选 → ${out.value.frames.length} 帧`
     })
 
+    // ---- 帧体积预算（P1）：默认 384KB 对齐会话 JSONL 单行软顶的换算，这里专测预算行为本身 ----
+    await check('帧体积预算 ⇒ 小预算（60KB）触发降档，总量收敛进预算或保底 2 帧，且缓存键含预算', async () => {
+      const budget = 60 * 1024
+      const opts = { cacheDir: CACHE, maxTotalBytes: budget }
+      const small = await videoFrames.extractVideoFrames(motionMp4, opts)
+      assert(small.ok === true, `小预算抽取失败：${JSON.stringify(small.ok ? small.value.frames.length : small.code)}`)
+      const totalBytes = small.value.frames.reduce((acc, f) => acc + Buffer.byteLength(f.data, 'base64'), 0)
+      assert(
+        totalBytes <= budget || small.value.frames.length === 2,
+        `总量 ${totalBytes}B 超预算且帧数 ${small.value.frames.length} ≠ 保底 2`
+      )
+      assert(small.value.frames.length >= 2, `保底下限被击穿：${small.value.frames.length}`)
+      for (const [i, f] of small.value.frames.entries()) {
+        const image = nativeImage.createFromBuffer(Buffer.from(f.data, 'base64'))
+        assert(!image.isEmpty(), `帧${i} 解不回`)
+        assert(f.ptsSec >= 0 && f.ptsSec <= small.value.durationSec, `帧${i} 时间点越界：${f.ptsSec}`)
+      }
+      // cacheKey 已纳入 maxTotalBytes：同参数二次调用必须命中，否则预算参数没进缓存身份
+      const again = await videoFrames.extractVideoFrames(motionMp4, opts)
+      assert(again.ok === true && again.value.cached === true, `同参数二次调用未命中缓存：${JSON.stringify(again.ok ? again.value.cached : again.code)}`)
+      return `${small.value.frames.length} 帧 / ${totalBytes}B（预算 ${budget}B），二次调用命中缓存`
+    })
+
+    await check('帧体积预算 ⇒ 默认预算（384KB）下总量收敛进预算（或保底 2 帧）且最长边 ≤768', async () => {
+      const out = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE })
+      assert(out.ok === true, `默认预算抽取失败：${JSON.stringify(out.ok ? out.value.frames.length : out.code)}`)
+      let totalBytes = 0
+      let prev = -1
+      for (const [i, f] of out.value.frames.entries()) {
+        totalBytes += Buffer.byteLength(f.data, 'base64')
+        const image = nativeImage.createFromBuffer(Buffer.from(f.data, 'base64'))
+        assert(!image.isEmpty(), `帧${i} base64 解不回图片`)
+        const { width, height } = image.getSize()
+        assert(Math.max(width, height) <= VIDEO_FRAME_MAX_EDGE, `帧${i} 最长边 ${Math.max(width, height)} > ${VIDEO_FRAME_MAX_EDGE}`)
+        assert(f.ptsSec > prev && f.ptsSec <= out.value.durationSec, `帧${i} 时间点异常：${f.ptsSec}`)
+        prev = f.ptsSec
+      }
+      // 收敛不变量对任何夹具/编码器都成立：超顶必然触发降档或尾部丢帧
+      assert(
+        totalBytes <= VIDEO_FRAMES_TOTAL_BUDGET || out.value.frames.length === 2,
+        `总量 ${totalBytes}B 超默认预算且帧数 ${out.value.frames.length} ≠ 保底 2`
+      )
+      return `${out.value.frames.length} 帧 / ${totalBytes}B（预算 ${VIDEO_FRAMES_TOTAL_BUDGET}B）`
+    })
+
+    await check('帧体积预算 ⇒ 大预算（8MB）行为与旧版一致：满额 8 帧不降档不丢帧', async () => {
+      const out = await videoFrames.extractVideoFrames(motionMp4, { cacheDir: CACHE, maxTotalBytes: ISOLATION_BUDGET })
+      assert(out.ok === true, `大预算抽取失败：${JSON.stringify(out.ok ? out.value.frames.length : out.code)}`)
+      assert(out.value.frames.length === VIDEO_MAX_FRAMES, `帧数=${out.value.frames.length}`)
+      let totalBytes = 0
+      for (const f of out.value.frames) {
+        totalBytes += Buffer.byteLength(f.data, 'base64')
+        const image = nativeImage.createFromBuffer(Buffer.from(f.data, 'base64'))
+        assert(!image.isEmpty(), '帧 base64 解不回图片')
+        const { width, height } = image.getSize()
+        assert(Math.max(width, height) === VIDEO_FRAME_MAX_EDGE, `1280 源该保持 ${VIDEO_FRAME_MAX_EDGE} 边：${Math.max(width, height)}`)
+      }
+      return `8 帧 / ${totalBytes}B（未触发降档/丢帧）`
+    })
+
     await check('缓存 LRU ⇒ 超软顶按 mtime 最旧先逐出，未超不动', async () => {
       const dir = path.join(FIXTURE, 'cache-lru')
       const mk = (name, bytes, ageHours) => {
         const d = path.join(dir, name)
         fs.mkdirSync(d, { recursive: true })
-        fs.writeFileSync(path.join(d, 'manifest.json'), JSON.stringify({ version: 2, totalBytes: bytes, frames: [] }))
+        fs.writeFileSync(path.join(d, 'manifest.json'), JSON.stringify({ version: 3, totalBytes: bytes, frames: [] }))
         const t = new Date(Date.now() - ageHours * 3600_000)
         fs.utimesSync(d, t, t)
       }
       mk('a', 100, 3)
       mk('b', 100, 2)
       mk('c', 100, 1)
-      const r1 = videoFrames.pruneVideoFrameCache(dir, 250)
+      const r1 = await videoFrames.pruneVideoFrameCache(dir, 250)
       assert(r1.evicted === 1 && !fs.existsSync(path.join(dir, 'a')), `该只逐出最旧 a：evicted=${r1.evicted}`)
       assert(fs.existsSync(path.join(dir, 'b')) && fs.existsSync(path.join(dir, 'c')), '不该动 b/c')
-      const r0 = videoFrames.pruneVideoFrameCache(dir, 250)
+      const r0 = await videoFrames.pruneVideoFrameCache(dir, 250)
       assert(r0.evicted === 0, `未超顶不该逐出：${r0.evicted}`)
-      const r2 = videoFrames.pruneVideoFrameCache(dir, 150)
+      const r2 = await videoFrames.pruneVideoFrameCache(dir, 150)
       assert(r2.evicted === 1 && !fs.existsSync(path.join(dir, 'b')), `该逐出次旧 b：evicted=${r2.evicted}`)
       assert(fs.existsSync(path.join(dir, 'c')), '最新的 c 不该被逐')
       return '两轮逐出全按 mtime 最旧先，幂等'
