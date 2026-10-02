@@ -66,7 +66,7 @@ function transpileToTmp(relSources) {
 }
 
 // manager.ts 值导入了 workspace/store（copyIntoDir）；真身拖 electron app 链，
-// 探针给同语义 stub（copyFileSync 的目录自备版，见 store.ts copyIntoDir）。
+// 探针给同语义 stub（fs/promises copyFile 的目录自备 async 版，见 store.ts copyIntoDir）。
 // stub 文件在 transpileToTmp（它会清空 TMP）之后写入。
 const origResolve = Module._resolveFilename
 Module._resolveFilename = function (request, parent, ...rest) {
@@ -81,10 +81,10 @@ function writeWorkspaceStoreStub() {
     path.join(TMP, 'stubs', 'workspace-store.js'),
     [
       "const fs = require('node:fs')",
-      'module.exports.copyIntoDir = function copyIntoDir(src, destDir, destName) {',
-      "  fs.mkdirSync(destDir, { recursive: true })",
+      'module.exports.copyIntoDir = async function copyIntoDir(src, destDir, destName) {',
+      '  await fs.promises.mkdir(destDir, { recursive: true })',
       "  const dest = require('node:path').join(destDir, destName)",
-      "  fs.copyFileSync(src, dest)",
+      '  await fs.promises.copyFile(src, dest)',
       '  return dest',
       '}',
       'module.exports.WorkspaceStore = class WorkspaceStore {}'
@@ -101,6 +101,8 @@ void app
     transpileToTmp([
       path.join('src', 'main', 'assets', 'manager.ts'),
       path.join('src', 'main', 'assets', 'tagsIndex.ts'),
+      // tagsIndex.ts 依赖的原子写（5604bc7 收口到 fsutil；漏登会在 require 阶段挂掉）
+      path.join('src', 'main', 'fsutil', 'atomic.ts'),
       path.join('src', 'shared', 'assets.ts'),
       path.join('src', 'shared', 'ipc.ts')
     ])
@@ -125,38 +127,38 @@ void app
       ]
     }
 
-    await check('移动：画布素材 → 命名库 = rename，原位置消失', () => {
-      const out = transferToLibrary(store, { libraryId: 'lib-a', movePaths: ['assets/images/poster.png'] })
+    await check('移动：画布素材 → 命名库 = rename，原位置消失', async () => {
+      const out = await transferToLibrary(store, { libraryId: 'lib-a', movePaths: ['assets/images/poster.png'] })
       assert(out.moved.length === 1 && out.failed.length === 0, JSON.stringify(out))
       assert(out.moved[0].to === '素材库/A/poster.png', `to=${out.moved[0].to}`)
       assert(existsRel('素材库/A/poster.png') && !existsRel('assets/images/poster.png'), '磁盘文件没有真正移动')
       return 'moved.to = 素材库/A/poster.png'
     })
 
-    await check('同库拦截：源目录 === 目标目录 → 单条失败，文件不动', () => {
-      const out = transferToLibrary(store, { libraryId: 'lib-b', movePaths: ['素材库/B/inside-b.png'] })
+    await check('同库拦截：源目录 === 目标目录 → 单条失败，文件不动', async () => {
+      const out = await transferToLibrary(store, { libraryId: 'lib-b', movePaths: ['素材库/B/inside-b.png'] })
       assert(out.moved.length === 0 && out.failed.length === 1, JSON.stringify(out))
       assert(/已在该素材库/.test(out.failed[0].error), `error=${out.failed[0].error}`)
       assert(existsRel('素材库/B/inside-b.png'), '文件不应被移动')
       return 'failed.info = 已在该素材库中'
     })
 
-    await check('重名序号：目标已有同名 → -2 后缀，两个文件都在', () => {
-      const out = transferToLibrary(store, { libraryId: 'lib-a', movePaths: ['assets/images/dup.png'] })
+    await check('重名序号：目标已有同名 → -2 后缀，两个文件都在', async () => {
+      const out = await transferToLibrary(store, { libraryId: 'lib-a', movePaths: ['assets/images/dup.png'] })
       assert(out.moved.length === 1, JSON.stringify(out))
       assert(out.moved[0].name === 'dup-2.png', `name=${out.moved[0].name}`)
       assert(existsRel('素材库/A/dup.png') && existsRel('素材库/A/dup-2.png'), '覆盖或丢了文件')
       return 'dup.png → dup-2.png'
     })
 
-    await check('越界拒绝：../ 逃出工作区 → 单条失败', () => {
-      const out = transferToLibrary(store, { libraryId: 'lib-a', movePaths: ['../ws/assets/images/nope.png'] })
+    await check('越界拒绝：../ 逃出工作区 → 单条失败', async () => {
+      const out = await transferToLibrary(store, { libraryId: 'lib-a', movePaths: ['../ws/assets/images/nope.png'] })
       assert(out.moved.length === 0 && out.failed.length === 1, JSON.stringify(out))
       return 'failed.info 含越界/不存在'
     })
 
-    await check('复制：OS 外部文件 → 进库目录，源文件仍在', () => {
-      const out = transferToLibrary(store, {
+    await check('复制：OS 外部文件 → 进库目录，源文件仍在', async () => {
+      const out = await transferToLibrary(store, {
         libraryId: 'lib-a',
         copyFiles: [{ sourcePath: outside, name: 'outside.txt' }]
       })
@@ -166,18 +168,18 @@ void app
       return 'copied.relPath = 素材库/A/outside.txt'
     })
 
-    await check('builtin 目标：按扩展名归位分类子目录', () => {
+    await check('builtin 目标：按扩展名归位分类子目录', async () => {
       write('素材库/B/shot.png', 'shot')
-      const out = transferToLibrary(store, { libraryId: 'builtin-assets', movePaths: ['素材库/B/shot.png'] })
+      const out = await transferToLibrary(store, { libraryId: 'builtin-assets', movePaths: ['素材库/B/shot.png'] })
       assert(out.moved.length === 1 && out.moved[0].to === 'assets/images/shot.png', JSON.stringify(out.moved))
       assert(existsRel('assets/images/shot.png'), '没落到 assets/images/')
       return 'shot.png → assets/images/shot.png'
     })
 
-    await check('幽灵库：libraryId 不存在 → 抛可操作错误', () => {
+    await check('幽灵库：libraryId 不存在 → 抛可操作错误', async () => {
       let threw = null
       try {
-        transferToLibrary(store, { libraryId: 'ghost', movePaths: ['assets/images/shot.png'] })
+        await transferToLibrary(store, { libraryId: 'ghost', movePaths: ['assets/images/shot.png'] })
       } catch (e) {
         threw = e
       }

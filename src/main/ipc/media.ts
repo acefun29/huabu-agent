@@ -17,7 +17,8 @@
  */
 import { BrowserWindow, ipcMain } from 'electron'
 import { randomUUID } from 'crypto'
-import { mkdirSync, statSync, writeFileSync } from 'fs'
+import { mkdirSync, statSync } from 'fs'
+import { writeFile } from 'fs/promises'
 import { basename, extname, join, resolve, sep } from 'path'
 import type { AgentHost } from '../agent/host'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
@@ -681,7 +682,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
    * sourcePath 来自 preload 的 webUtils.getPathForFile（不把文件字节搬过 IPC）；
    * 剪贴板图片没有磁盘路径，走 base64 兜底通道。
    */
-  ipcMain.handle(IpcChannel.MediaImport, (_event, payload: unknown): ChatResult<unknown> => {
+  ipcMain.handle(IpcChannel.MediaImport, async (_event, payload: unknown): Promise<ChatResult<unknown>> => {
     const request = payload as Partial<MediaImportRequest> | null
     const dir = store.mediaDir()
     if (!dir) return invalidPayload('尚未打开工作区')
@@ -698,14 +699,14 @@ export function registerMediaIpc(ctx: IpcContext): void {
       let displayName: string
       if (typeof request.base64 === 'string') {
         // base64 通道在解码前先卡长度：渲染端异常可把数百 MB 文本灌进主进程，
-        // Buffer.from + 同步写盘会瞬时膨胀内存并冻结 UI
+        // Buffer.from + 写盘会瞬时膨胀内存并冻结 UI（写盘已走 fs/promises）
         if (request.base64.length > 32 * 1024 * 1024) {
           return invalidPayload('剪贴板图片超过 32MB 上限，已拒绝导入')
         }
         const ext = request.mime?.includes('jpeg') ? '.jpg' : '.png'
         displayName = `clipboard-${randomUUID().slice(0, 8)}${ext}`
         target = join(dir, displayName)
-        writeFileSync(target, Buffer.from(request.base64, 'base64'))
+        await writeFile(target, Buffer.from(request.base64, 'base64'))
       } else if (typeof request.sourcePath === 'string') {
         // 安全闸：sourcePath 只可能来自 preload pathForFile 的拖拽登记（未 resolve 的原样字符串）；
         // 未登记的路径一律拒绝，堵住「伪造路径把任意用户文件复制进工作区」的口子
@@ -714,7 +715,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
         }
         const source = resolve(request.sourcePath)
         displayName = `${randomUUID().slice(0, 8)}-${sanitizeName(request.name ?? basename(source))}`
-        target = copyIntoDir(source, dir, displayName)
+        target = await copyIntoDir(source, dir, displayName)
       } else {
         return invalidPayload('media:import 需要 sourcePath 或 base64')
       }

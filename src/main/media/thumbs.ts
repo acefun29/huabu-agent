@@ -22,6 +22,29 @@ const statCache = new Map<string, { mtimeMs: number; size: number } | null>()
 const statPending = new Map<string, Promise<{ mtimeMs: number; size: number } | null>>()
 const STAT_TTL_MS = 30_000
 const statAt = new Map<string, number>()
+/** 缓存条目上限：statCache/statAt 原先只增不减，长会话扫过海量路径会无界增长（性能优化 P0） */
+const STAT_CACHE_MAX = 2000
+
+/** 统一的缓存插入口：写入后超限则按 statAt 淘汰最旧一条（O(n) 扫描，n ≤ 上限，代价可忽略） */
+function statCacheSet(absPath: string, value: { mtimeMs: number; size: number } | null): void {
+  statCache.set(absPath, value)
+  statAt.set(absPath, Date.now())
+  if (statCache.size > STAT_CACHE_MAX) {
+    let oldestKey: string | null = null
+    let oldestAt = Infinity
+    for (const key of statAt.keys()) {
+      const at = statAt.get(key) ?? 0
+      if (at < oldestAt) {
+        oldestAt = at
+        oldestKey = key
+      }
+    }
+    if (oldestKey) {
+      statCache.delete(oldestKey)
+      statAt.delete(oldestKey)
+    }
+  }
+}
 
 async function statCached(absPath: string): Promise<{ mtimeMs: number; size: number } | null> {
   const cached = statCache.get(absPath)
@@ -36,8 +59,7 @@ async function statCached(absPath: string): Promise<{ mtimeMs: number; size: num
     } catch {
       result = null
     }
-    statCache.set(absPath, result)
-    statAt.set(absPath, Date.now())
+    statCacheSet(absPath, result)
     statPending.delete(absPath)
     return result
   })()
@@ -76,8 +98,7 @@ export async function ensureThumbnail(
       const existing = await statCached(outPath)
       if (!existing) throw new Error('缩略图落盘失败')
     }
-    statCache.set(outPath, { mtimeMs: Date.now(), size: buffer.length })
-    statAt.set(outPath, Date.now())
+    statCacheSet(outPath, { mtimeMs: Date.now(), size: buffer.length })
     return outPath
   } catch {
     return null

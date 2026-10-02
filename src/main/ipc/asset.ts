@@ -19,7 +19,7 @@ import {
 } from '../assets/manager'
 import { setFileTags } from '../assets/tagsIndex'
 import type { IpcContext } from './shared'
-import { guardSync, invalidPayload, isNonEmptyString } from './shared'
+import { guardAsync, guardSync, invalidPayload, isNonEmptyString } from './shared'
 import { consumeSourcePath } from './workspace'
 
 export function registerAssetIpc(ctx: IpcContext): void {
@@ -44,8 +44,8 @@ export function registerAssetIpc(ctx: IpcContext): void {
     return true
   }
 
-  /** @backend(import-canvas)：OS 文件归档进 <工作区>/assets/<分类>/ */
-  ipcMain.handle(IpcChannel.AssetImportCanvas, (_event, payload: unknown) => {
+  /** @backend(import-canvas)：OS 文件归档进 <工作区>/assets/<分类>/（落盘走 fs/promises，handler 异步化） */
+  ipcMain.handle(IpcChannel.AssetImportCanvas, async (_event, payload: unknown) => {
     const files = asImportFiles(payload)
     if (!files) return invalidPayload('asset:import-canvas 需要 files 数组')
     // 安全闸：sourcePath 只可能来自 preload pathForFile 的拖拽登记，
@@ -53,28 +53,28 @@ export function registerAssetIpc(ctx: IpcContext): void {
     if (!consumeRegisteredSourcePaths(files)) {
       return invalidPayload('导入路径未经过拖拽登记，已拒绝：请重新把文件拖入画布')
     }
-    return guardSync(() => {
+    return guardAsync(async () => {
       const dir = currentDir()
       if (!dir) throw new Error('尚未打开工作区')
-      const result = importToWorkspace(dir, files)
+      const result = await importToWorkspace(dir, files)
       if (result.imported.length > 0) broadcastAssetChanged()
       return result
     })
   })
 
   /** @backend(import-temp)：OS 文件复制进 userData 收件箱（工作区之外），回传绝对路径 */
-  ipcMain.handle(IpcChannel.AssetImportTemp, (_event, payload: unknown) => {
+  ipcMain.handle(IpcChannel.AssetImportTemp, async (_event, payload: unknown) => {
     const files = asImportFiles(payload)
     if (!files) return invalidPayload('asset:import-temp 需要 files 数组')
     // 安全闸：同 import-canvas，sourcePath 必须经过拖拽登记
     if (!consumeRegisteredSourcePaths(files)) {
       return invalidPayload('导入路径未经过拖拽登记，已拒绝：请重新把文件拖入画布')
     }
-    return guardSync(() => importToInbox(files))
+    return guardAsync(() => importToInbox(files))
   })
 
-  /** 素材库清单：内置 assets/ 合成库 + workspace.json libraries 段的命名库 */
-  ipcMain.handle(IpcChannel.AssetLibraries, () => guardSync(() => listLibraries(store)))
+  /** 素材库清单：内置 assets/ 合成库 + workspace.json libraries 段的命名库（目录扫描异步化） */
+  ipcMain.handle(IpcChannel.AssetLibraries, () => guardAsync(() => listLibraries(store)))
 
   ipcMain.handle(IpcChannel.AssetLibraryCreate, (_event, payload: unknown) => {
     const name = (payload as { name?: unknown } | null)?.name
@@ -97,7 +97,7 @@ export function registerAssetIpc(ctx: IpcContext): void {
   })
 
   /** @backend(asset:transfer)：拖拽归档 —— 工作区内文件移动 / OS 外部文件复制到指定素材库 */
-  ipcMain.handle(IpcChannel.AssetTransfer, (_event, payload: unknown) => {
+  ipcMain.handle(IpcChannel.AssetTransfer, async (_event, payload: unknown) => {
     const request = payload as { libraryId?: unknown; movePaths?: unknown; copyFiles?: unknown } | null
     if (!isNonEmptyString(request?.libraryId)) return invalidPayload('asset:transfer 需要 libraryId')
     const movePaths = Array.isArray(request?.movePaths)
@@ -107,8 +107,8 @@ export function registerAssetIpc(ctx: IpcContext): void {
     if (movePaths.length === 0 && copyFiles.length === 0) {
       return invalidPayload('asset:transfer 需要 movePaths 或 copyFiles')
     }
-    return guardSync(() => {
-      const result = transferToLibrary(store, { libraryId: request!.libraryId as string, movePaths, copyFiles })
+    return guardAsync(async () => {
+      const result = await transferToLibrary(store, { libraryId: request!.libraryId as string, movePaths, copyFiles })
       if (result.moved.length > 0 || result.copied.length > 0) broadcastAssetChanged()
       return result
     })
