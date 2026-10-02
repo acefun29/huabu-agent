@@ -183,8 +183,13 @@ check('引用契约只走 assetAbsPath（禁止再在渲染端手拼卡片路径
   // T8 拆分后：解析入口在 contextCollector.ts（sendMessage 经 chatRuntime 调 collectRoundContext）
   const collector = path.join(PROJECT_ROOT, 'src', 'renderer', 'src', 'store', 'canvas', 'contextCollector.ts')
   const collectorText = fs.readFileSync(collector, 'utf8')
-  assert(collectorText.includes('assetAbsPath(d, input.workspaceDir)'), '引用契约没走 assetAbsPath（这次 bug 的修复点被回退了）')
-  assert(!/workspaceAbs\(\s*d\.path/.test(collectorText), '又出现 workspaceAbs(d.path …) 的手拼写法')
+  // 调用形态匹配（参数名无关）：意图是"解析必须走 assetAbsPath + 工作区根入参"，
+  // 锁死参数名会在重构改名时误报（genSummary 去重重命名 flatMap 参数时踩过）
+  assert(
+    /assetAbsPath\(\s*\w+\s*,\s*input\.workspaceDir\s*\)/.test(collectorText),
+    '引用契约没走 assetAbsPath（这次 bug 的修复点被回退了）'
+  )
+  assert(!/workspaceAbs\(\s*\w+\.path/.test(collectorText), '又出现 workspaceAbs(<卡片>.path …) 的手拼写法')
   const chatRuntime = path.join(PROJECT_ROOT, 'src', 'renderer', 'src', 'store', 'canvas', 'chatRuntime.ts')
   const runtimeText = fs.readFileSync(chatRuntime, 'utf8')
   assert(runtimeText.includes('collectRoundContext('), 'sendMessage 不再经采集器组装引用（契约被旁路了）')
