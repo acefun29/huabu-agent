@@ -2,7 +2,7 @@ import { app, dialog } from 'electron'
 import { existsSync, mkdirSync, readFileSync, statSync } from 'fs'
 import { copyFile, mkdir } from 'fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
-import { createHash, randomUUID } from 'crypto'
+import { randomUUID } from 'crypto'
 import type {
   CanvasSnapshot,
   WorkspaceInfo,
@@ -196,8 +196,19 @@ interface WorkspaceMetaFile {
    */
   chat?: WorkspaceChatConfig
   media?: WorkspaceMediaConfig
+  /**
+   * 工作区技能段（agentskills.io 规范，技能本体在 .huabu/skills/<name>/SKILL.md）：
+   * 这里只存禁用名单；清单每次现扫目录（与会话加载同源，防两套解析漂移）。
+   */
+  skills?: WorkspaceSkillsConfig
   /** 素材库映射（新原型同步）：名字 → 工作区内相对路径。公共库首个建库时播种 */
   libraries?: WorkspaceLibrary[]
+}
+
+/** workspace.json 的 skills 段 */
+export interface WorkspaceSkillsConfig {
+  /** 被禁用的技能名（= SKILL.md frontmatter name = 目录名） */
+  disabled?: string[]
 }
 
 /** workspace.json 的 libraries 段条目（素材库 = 名字 → 相对路径的映射，不复制文件） */
@@ -220,22 +231,9 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
 
-/** 工作区 id：路径的短哈希。凭据文件按它隔离，目录改名/移动后凭据需重新录入 */
-export function workspaceId(dir: string): string {
-  return createHash('sha256').update(resolve(dir).toLowerCase()).digest('hex').slice(0, 16)
-}
-
-/** 应用级状态目录（不是用户项目目录）：最近列表与加密凭据都放这里 */
-export function getAppStateDir(): string {
-  const dir = resolve(app.getPath('userData'), 'huabu-state')
-  mkdirSync(dir, { recursive: true })
-  return dir
-}
-
-/** 某工作区的凭据文件路径（safeStorage 加密），供 AgentHost 与诊断页共用 */
-export function getCredentialsFile(workspaceDir: string): string {
-  return join(getAppStateDir(), 'credentials', `${workspaceId(workspaceDir)}.credentials.json`)
-}
+/* 状态目录/凭据路径已拆到 stateDir.ts（轻量模块，避免无关闭包）；此处 re-export 保住既有引用 */
+export { getAppStateDir, workspaceId, getCredentialsFile } from './stateDir'
+import { getAppStateDir, getCredentialsFile } from './stateDir'
 
 export class WorkspaceStore {
   private current: WorkspaceInfo | null = null
@@ -392,6 +390,7 @@ export class WorkspaceStore {
       // 读出来再写回去就是双轨（T1 刚清掉一次双轨），所以本方法唯一的输出形态是 chat 段。
       ...(Object.keys(chat).length > 0 ? { chat } : {}),
       ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
+      ...(raw.skills !== undefined ? { skills: normalizeSkillsSegment(raw.skills) } : {}),
       ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
     }
     metaCache.set(dir, { mtimeMs, value: meta })
@@ -469,6 +468,23 @@ export class WorkspaceStore {
     meta.media = merged
     this.writeMeta(dir, meta)
     return merged
+  }
+
+  /** 当前工作区被禁用的技能名（未打开工作区 = 空名单） */
+  skillsDisabled(): string[] {
+    const dir = this.current?.path
+    return dir ? [...(this.readMeta(dir).skills?.disabled ?? [])] : []
+  }
+
+  /** 整表设置禁用技能名单（写 workspace.json skills 段；影响之后新建的会话） */
+  setSkillsDisabled(disabled: string[]): string[] {
+    if (!this.current) throw new Error('尚未打开工作区')
+    const cleaned = [...new Set(disabled.filter((name): name is string => typeof name === 'string' && name.length > 0))]
+    const dir = this.current.path
+    const meta = this.readMeta(dir)
+    meta.skills = cleaned.length > 0 ? { disabled: cleaned } : {}
+    this.writeMeta(dir, meta)
+    return cleaned
   }
 
   /**
@@ -770,6 +786,15 @@ function normalizeDefaultRatio(raw: unknown): Pick<WorkspaceMediaConfig, 'defaul
   return typeof raw === 'string' && (MEDIA_RATIOS as readonly string[]).includes(raw)
     ? { defaultRatio: raw as MediaRatio }
     : {}
+}
+
+/** skills 段读入归一化：只收 disabled 字符串数组，其余丢弃 */
+function normalizeSkillsSegment(raw: unknown): WorkspaceSkillsConfig {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const disabled = (raw as { disabled?: unknown }).disabled
+  if (!Array.isArray(disabled)) return {}
+  const cleaned = [...new Set(disabled.filter((name): name is string => typeof name === 'string' && name.length > 0))]
+  return cleaned.length > 0 ? { disabled: cleaned } : {}
 }
 
 /** 原子写已收口到 src/main/fsutil/atomic（tmp+rename；Windows 占用时挪 .bak 腾位，

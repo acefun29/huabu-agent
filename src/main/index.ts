@@ -1,6 +1,6 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
 import { join } from 'path'
-import { getAgentHost, getWorkspaceStore, registerIpcHandlers } from './ipc'
+import { getAgentHost, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
 import { IpcChannel } from '../shared/ipc'
 import { initMediaProtocol, registerMediaSchemePrivileged } from './media/protocol'
 import { inboxRoot } from './assets/manager'
@@ -131,4 +131,6 @@ app.on('window-all-closed', () => {
 // 而 Pi 的 unsubscribe / session.dispose 本身就是同步的（见 AgentHost.disposeAllSync）
 app.on('will-quit', () => {
   getAgentHost()?.disposeAllSync()
+  // MCP 子进程关停（关 stdin → 等 SDK 兜底 kill）；close 异步但触发即算完成职责
+  getMcpManager()?.disposeAll()
 })

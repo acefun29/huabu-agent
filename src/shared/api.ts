@@ -42,6 +42,10 @@ import type {
   MediaUserProviderInput,
   ProviderTestResult,
   SettingsProvidersInfo,
+  SettingsMcpSetRequest,
+  SettingsMcpStatusResult,
+  SettingsSkillsListResult,
+  SettingsSkillsSetDisabledRequest,
   WorkspaceFileInfo,
   WorkspaceReadFileResult,
   WorkspaceInfo,
@@ -250,6 +254,21 @@ export interface SettingsApi {
 
   /** 恢复被隐藏的内置模型 */
   modelRestore(providerId: string, modelId: string): Promise<ChatResult>
+
+  /** MCP 服务器清单 + 连接运行态（全局配置，不依赖工作区） */
+  mcpStatus(): Promise<ChatResult<SettingsMcpStatusResult>>
+
+  /** 整表替换 MCP 服务器配置（落盘 + 同步连接池），返回最新运行态 */
+  mcpSet(request: SettingsMcpSetRequest): Promise<ChatResult<SettingsMcpStatusResult>>
+
+  /** 工作区技能清单（扫描 .huabu/skills/；需要已打开工作区） */
+  skillsList(): Promise<ChatResult<SettingsSkillsListResult>>
+
+  /** 设置被禁用技能名单（写 workspace.json；影响之后新建的会话） */
+  skillsSetDisabled(request: SettingsSkillsSetDisabledRequest): Promise<ChatResult>
+
+  /** MCP 服务器连接状态变化事件（触发后应重新拉 mcpStatus 刷新徽章） */
+  onMcpStatus(listener: () => void): () => void
 }
 
 /** 媒体 API（M11/M12） */

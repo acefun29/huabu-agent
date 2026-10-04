@@ -14,6 +14,7 @@ import type { AgentHost } from '../agent/host'
 import type { WorkspaceStore } from '../workspace/store'
 import type { MediaJobManager } from '../media/manager'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
+import type { McpManager } from '../mcp/manager'
 import type { MediaContextReturnType } from './media'
 import {
   IpcChannel,
@@ -106,6 +107,19 @@ export function broadcastMediaJob(job: MediaJobStatus): void {
   }
 }
 
+/** MCP 服务器状态变化广播（连接中/已连接/失败），设置页徽章实时更新 */
+export function broadcastMcpStatus(): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    const contents = window.webContents
+    if (contents.isDestroyed()) continue
+    try {
+      contents.send(IpcChannel.McpStatusEvent, { at: new Date().toISOString() })
+    } catch (error) {
+      console.error(`[ipc] mcp:status 广播失败：${String(error)}`)
+    }
+  }
+}
+
 /**
  * 编排器注入各域注册函数的依赖上下文：store/host 为全局单例，
  * media 域运行时（mediaManager/mediaContext）与确认闸门在各域注册前创建。
@@ -123,6 +137,8 @@ export interface IpcContext {
     nodeId: string,
     signal: AbortSignal | undefined
   ) => Promise<boolean>
+  /** MCP 桥接池（全局单例；chat: create 装配工具，settings 域管理配置） */
+  mcpManager: McpManager
 }
 
 export {

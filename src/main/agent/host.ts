@@ -4,7 +4,8 @@ import type {
 } from '@earendil-works/pi-coding-agent'
 import { createReadStream, existsSync } from 'fs'
 import { stat } from 'fs/promises'
-import { isAbsolute, relative } from 'path'
+import { homedir } from 'os'
+import { isAbsolute, join, relative } from 'path'
 import { createInterface as createLineReader } from 'readline'
 import type {
   ChatContextBreakdownInfo,
@@ -394,6 +395,8 @@ export class AgentHost {
       defaultModel?: string
       /** M13：媒体生成工具（generate_image/video/audio），随会话注入 */
       customTools?: import('./mediaTools').ToolDefinitionLike[]
+      /** 工作区 skills.disabled 名单（settings:skills-set-disabled 写入）；这些技能不进新会话系统提示 */
+      disabledSkills?: string[]
     }
   ): Promise<ChatResult<ChatCreateInfo>> {
     const cwdResult = resolveSessionCwd(request.cwd, context?.currentDir ?? null)
@@ -445,11 +448,29 @@ export class AgentHost {
       // pi 只在 resourceLoader 缺省时自建并 reload；显式提供时 reload 是调用方责任
       // （sdk.ts：resourceLoader || (new DefaultResourceLoader(...), await reload())）。
       const settingsManager = pi.SettingsManager.create(cwd, pi.getAgentDir())
+      // 工作区技能（agentskills.io 规范）：.huabu/skills/ 交给 pi 原生加载器发现与
+      // 系统提示注入（<available_skills> XML）；disabledSkills 名单经 skillsOverride 过滤。
+      // 加载器与设置页 listSkills 同源（loadSkillsFromDir），不存在两套解析。
+      // 用户级技能目录 ~/.agents/skills（与 ZCode 共享）也一并注入；pi 原生默认目录
+      // （agentDir/skills 与 cwd/.pi/skills）由加载器自行扫描，无需在这里给。
+      const disabledSkills = new Set(context?.disabledSkills ?? [])
+      const extraSkillPaths = [join(homedir(), '.agents', 'skills'), join(cwd, '.huabu', 'skills')].filter(
+        (dir) => existsSync(dir)
+      )
       const resourceLoader = new pi.DefaultResourceLoader({
         cwd,
         agentDir: pi.getAgentDir(),
         settingsManager,
-        appendSystemPrompt: [buildAgentSystemPrompt(cwd)]
+        appendSystemPrompt: [buildAgentSystemPrompt(cwd)],
+        ...(extraSkillPaths.length > 0 ? { additionalSkillPaths: extraSkillPaths } : {}),
+        ...(extraSkillPaths.length > 0 && disabledSkills.size > 0
+          ? {
+              skillsOverride: (base: { skills: Array<{ name: string }> }) => ({
+                ...base,
+                skills: base.skills.filter((skill) => !disabledSkills.has(skill.name))
+              }) as never
+            }
+          : {})
       })
       await resourceLoader.reload()
 
@@ -507,6 +528,76 @@ export class AgentHost {
       console.error(`[agent-host] create 失败 nodeId=${nodeId}：${message}`)
       return fail(code, `创建会话失败：${message}`)
     }
+  }
+
+  /**
+   * 全量技能清单（settings:skills-list 数据源）：pi 未加载完成时返回空表
+   * （应用启动竞态下设置页拿到的就是"暂无技能"，下次刷新恢复）。
+   * 扫描顺序与会话加载一致（先来者优先，同名不重复）：pi 原生用户目录 →
+   * ~/.agents/skills（与 ZCode 共享）→ 工作区 .pi/skills → 工作区 .huabu/skills。
+   * 直接用 pi 的 loadSkillsFromDir——与 create() 会话注入同一条加载路径。
+   */
+  listSkills(workspaceDir: string): {
+    skills: Array<{ name: string; description: string; dir: string; source: 'user' | 'workspace'; invalid?: string }>
+    piReady: boolean
+  } {
+    const pi = this.pi
+    if (!pi) return { skills: [], piReady: false }
+    const home = homedir()
+    // 注：先声明再 filter——上下文类型不穿透方法调用的接收者，链式写法会把 'user' 放宽成 string
+    const skillSourceDirs: Array<{ dir: string; source: 'user' | 'workspace' }> = [
+      { dir: join(pi.getAgentDir(), 'skills'), source: 'user' },
+      { dir: join(home, '.agents', 'skills'), source: 'user' },
+      { dir: join(workspaceDir, '.pi', 'skills'), source: 'workspace' },
+      { dir: join(workspaceDir, '.huabu', 'skills'), source: 'workspace' }
+    ]
+    const sources = skillSourceDirs.filter((entry) => existsSync(entry.dir))
+    if (sources.length === 0) return { skills: [], piReady: true }
+
+    type Entry = { name: string; description: string; dir: string; source: 'user' | 'workspace'; invalid?: string }
+    const byPath = new Map<string, Entry>()
+    const byName = new Map<string, Entry>()
+    const displayDir = (baseDir: string): string =>
+      (baseDir.startsWith(home) ? baseDir.slice(home.length).replace(/\\/g, '/') : relative(workspaceDir, baseDir).replace(/\\/g, '/'))
+
+    for (const { dir, source } of sources) {
+      const { skills, diagnostics } = pi.loadSkillsFromDir({ dir, source })
+      for (const skill of skills) {
+        if (byName.has(skill.name)) continue // 同名技能先来者优先，与会话侧合并语义一致
+        const entry: Entry = {
+          name: skill.name,
+          description: skill.description ?? '',
+          dir: displayDir(skill.baseDir),
+          source
+        }
+        byPath.set(skill.filePath, entry)
+        byName.set(skill.name, entry)
+      }
+      // 诊断挂回：已加载条目补 invalid 原因；没加载出来的（frontmatter 缺字段等）
+      // 合成为占位条目，设置页才看得见「为什么我的技能没生效」
+      for (const diagnostic of diagnostics) {
+        if (!diagnostic.path) continue
+        const existing = byPath.get(diagnostic.path)
+        if (existing) {
+          if (!existing.invalid) existing.invalid = diagnostic.message
+          continue
+        }
+        const normalized = diagnostic.path.replace(/\\/g, '/')
+        if (!normalized.startsWith(dir.replace(/\\/g, '/'))) continue
+        const dirName = normalized.slice(dir.replace(/\\/g, '/').length + 1).split('/')[0]
+        if (!dirName) continue
+        const entry: Entry = {
+          name: dirName,
+          description: '',
+          dir: displayDir(join(dir, dirName)),
+          source,
+          invalid: diagnostic.message
+        }
+        byPath.set(diagnostic.path, entry)
+        if (!byName.has(entry.name)) byName.set(entry.name, entry)
+      }
+    }
+    return { skills: [...byName.values()], piReady: true }
   }
 
   /** 登记会话：订阅事件 → 翻译 → emit，并放进按 nodeId 索引的注册表 */

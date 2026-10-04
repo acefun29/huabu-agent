@@ -20,6 +20,7 @@ const EVENT_CHANNEL_ALLOWLIST: readonly string[] = [
   IpcChannel.MediaJobEvent,
   IpcChannel.MediaConfirmRequest,
   IpcChannel.MediaConfirmResolvedEvent,
+  IpcChannel.McpStatusEvent,
   IpcChannel.AssetChanged,
   IpcChannel.WindowStateChanged
 ]
@@ -192,7 +193,17 @@ const api: HuabuApi = {
       ipcRenderer.invoke(IpcChannel.SettingsModelRemove, { providerId, modelId }),
 
     modelRestore: (providerId, modelId) =>
-      ipcRenderer.invoke(IpcChannel.SettingsModelRestore, { providerId, modelId })
+      ipcRenderer.invoke(IpcChannel.SettingsModelRestore, { providerId, modelId }),
+
+    mcpStatus: () => ipcRenderer.invoke(IpcChannel.SettingsMcpStatus),
+
+    mcpSet: (request) => ipcRenderer.invoke(IpcChannel.SettingsMcpSet, request),
+
+    skillsList: () => ipcRenderer.invoke(IpcChannel.SettingsSkillsList),
+
+    skillsSetDisabled: (request) => ipcRenderer.invoke(IpcChannel.SettingsSkillsSetDisabled, request),
+
+    onMcpStatus: (listener) => subscribeRaw(IpcChannel.McpStatusEvent, () => listener())
   },
 
   media: {

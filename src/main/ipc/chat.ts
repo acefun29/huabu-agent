@@ -30,6 +30,7 @@ export function registerChatIpc(ctx: IpcContext): void {
   const mediaManager = ctx.mediaManager
   const mediaContext = ctx.mediaContext
   const requestMediaApproval = ctx.requestMediaApproval
+  const mcpManager = ctx.mcpManager
 
   ipcMain.handle(IpcChannel.ChatRuntime, () => {
     const dir = currentDir()
@@ -42,7 +43,7 @@ export function registerChatIpc(ctx: IpcContext): void {
     return host.runtime(dir)
   })
 
-  ipcMain.handle(IpcChannel.ChatCreate, (_event, payload: unknown) => {
+  ipcMain.handle(IpcChannel.ChatCreate, async (_event, payload: unknown) => {
     const request = payload as Partial<ChatCreateRequest> | null
     if (!isNonEmptyString(request?.nodeId)) return invalidPayload('chat:create 需要 nodeId')
     const createRequest: ChatCreateRequest = { nodeId: request.nodeId }
@@ -65,10 +66,16 @@ export function registerChatIpc(ctx: IpcContext): void {
       inboxRoot
     })
 
+    // MCP：全局启用的服务器工具（mcp_<server>_<tool>）。未就绪/失败的服务器被跳过
+    // （状态在设置页徽章可见），不让单个坏服务器拖死会话创建
+    const mcpTools = await mcpManager.assembleTools()
+
     return host.create(createRequest, {
       currentDir: current?.path ?? null,
       defaultModel: current?.defaultModel,
-      customTools: [...mediaTools, readMediaTool, ...videoTools]
+      customTools: [...mediaTools, readMediaTool, ...videoTools, ...mcpTools],
+      // 工作区技能禁用名单（写 workspace.json skills 段；读取同源，见 listWorkspaceSkills）
+      ...(current ? { disabledSkills: store.skillsDisabled() } : {})
     })
   })
 

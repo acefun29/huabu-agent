@@ -1,9 +1,11 @@
 import { AgentHost } from './agent/host'
 import { WorkspaceStore } from './workspace/store'
+import { McpManager } from './mcp/manager'
 import {
   broadcastAssetChanged,
   broadcastChatEvent,
   broadcastMediaJob,
+  broadcastMcpStatus,
   type IpcContext
 } from './ipc/shared'
 import { registerWindowAppIpc } from './ipc/windowApp'
@@ -25,6 +27,7 @@ import { registerSettingsIpc } from './ipc/settings'
 
 let agentHost: AgentHost | null = null
 let workspaceStore: WorkspaceStore | null = null
+let mcpManagerSingleton: McpManager | null = null
 
 /** 供主进程其它模块（如退出流程、媒体协议）访问；未注册时为 null */
 export function getAgentHost(): AgentHost | null {
@@ -33,6 +36,11 @@ export function getAgentHost(): AgentHost | null {
 
 export function getWorkspaceStore(): WorkspaceStore | null {
   return workspaceStore
+}
+
+/** 退出流程（will-quit）用：全量关停 MCP 子进程 */
+export function getMcpManager(): McpManager | null {
+  return mcpManagerSingleton
 }
 
 export function registerIpcHandlers(): void {
@@ -64,6 +72,11 @@ export function registerIpcHandlers(): void {
     broadcastMediaJob
   })
 
+  // MCP 桥接池（全局配置，跨工作区共享）：启动即 sync 预热，状态变化推 mcp:status
+  const mcpManager = new McpManager(broadcastMcpStatus)
+  mcpManagerSingleton = mcpManager
+  mcpManager.sync()
+
   const ctx: IpcContext = {
     store,
     host,
@@ -71,7 +84,8 @@ export function registerIpcHandlers(): void {
     broadcastAssetChanged,
     mediaManager,
     mediaContext,
-    requestMediaApproval
+    requestMediaApproval,
+    mcpManager
   }
 
   registerWindowAppIpc(ctx)
