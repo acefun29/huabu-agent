@@ -1,13 +1,13 @@
 // 设置面板「模型供应商」tab：供应商清单与详情、添加/编辑模型对话框（内部组件不导出，仅导出 ProvidersTab）
 
 import { useEffect, useState } from 'react'
-import { Check, Pencil, Plus, RotateCcw, Trash2, X } from 'lucide-react'
+import { Check, ExternalLink, Pencil, Plus, RotateCcw, Trash2, X } from 'lucide-react'
 import { useSettings } from '../../store/settingsStore'
 import { compactTokens } from '../../lib/format'
 import { useEsc } from '../../lib/hooks'
 import type { ManagedModelInfo } from '@shared/ipc'
 import { CHAT_API_LABEL, type ChatModelApi } from '@shared/chatApi'
-import { ApiSelect, Field, Row, Toggle, inputCls } from './ui'
+import { ApiSelect, Field, Row, Select, Toggle, inputCls } from './ui'
 
 /* -------------------------------------------------------------------------- */
 /* 模型供应商（对话；真实 IPC：凭据加密存储，零密钥过 IPC）                      */
@@ -19,6 +19,22 @@ import { ApiSelect, Field, Row, Toggle, inputCls } from './ui'
  * 不敏感只为本输入框的容错；主进程侧仍是严格纯 id，最终以主进程校验为准。
  */
 const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._\-/:]*$/i
+
+/**
+ * 各内置供应商「创建 / 管理 API Key」页面的官方直达地址（2026-10 逐家官网核实）。
+ * 注意两家已迁新域名：Anthropic 控制台 console.anthropic.com → platform.claude.com，
+ * 月之暗面 platform.moonshot.cn → platform.kimi.com（旧地址 301，这里直接链新址）。
+ * 自定义供应商无固定官网，不在表内也就不显示链接。链接走 <a target="_blank">，
+ * 由主窗口 setWindowOpenHandler 接管交给系统浏览器。
+ */
+const API_KEY_URLS: Record<string, { url: string; label: string }> = {
+  openai: { url: 'https://platform.openai.com/api-keys', label: 'OpenAI 平台' },
+  anthropic: { url: 'https://platform.claude.com/settings/keys', label: 'Anthropic 控制台' },
+  glm: { url: 'https://bigmodel.cn/usercenter/proj-mgmt/apikeys', label: '智谱 BigModel' },
+  deepseek: { url: 'https://platform.deepseek.com/api_keys', label: 'DeepSeek 开放平台' },
+  kimi: { url: 'https://platform.kimi.com/console/api-keys', label: 'Kimi 开放平台' },
+  qwen: { url: 'https://bailian.console.aliyun.com/?apiKey=1', label: '阿里云百炼' },
+}
 
 /**
  * 「添加模型」对话框：模型 ID + 显示名 + 上下文/最大输出 + 输入类型（图片）+ 推理开关。
@@ -345,6 +361,7 @@ function ProviderDetail({ providerId }: { providerId: string }) {
     modelRestore,
   } = useSettings()
   const provider = chatProviders.find((p) => p.id === providerId)
+  const keyUrl = API_KEY_URLS[providerId]
   const [keyInput, setKeyInput] = useState('')
   const [testMessage, setTestMessage] = useState<string | null>(null)
   const [testing, setTesting] = useState(false)
@@ -477,6 +494,19 @@ function ProviderDetail({ providerId }: { providerId: string }) {
         {provider.authLabel && (
           <div className="mt-1 text-[11px] text-(--on-surface-muted)">环境变量：{provider.authLabel}</div>
         )}
+        {keyUrl && (
+          <a
+            href={keyUrl.url}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium text-(--accent) transition-colors hover:underline"
+            title={`在系统浏览器打开 ${keyUrl.label} 的 API Key 页面`}
+            data-testid={`provider-apikey-link-${providerId}`}
+          >
+            <ExternalLink size={10} />
+            前往 {keyUrl.label} 创建 / 管理 API Key
+          </a>
+        )}
       </div>
 
       <div>
@@ -574,20 +604,16 @@ function ProviderDetail({ providerId }: { providerId: string }) {
       </div>
 
       <Field label="默认对话模型（新建会话继承；工作区级设置）">
-        <select
+        <Select
           value={defaultModel && defaultModel.startsWith(`${providerId}/`) ? defaultModel : ''}
-          onChange={(e) => void setDefaultModel(e.target.value || null)}
-          className={`${inputCls} cursor-pointer`}
-        >
-          <option value="">自动（首个有凭据的可用模型）</option>
-          {models
-            .filter((m) => !m.hidden)
-            .map((m) => (
-              <option key={m.id} value={`${providerId}/${m.id}`}>
-                {m.name}
-              </option>
-            ))}
-        </select>
+          onChange={(v) => void setDefaultModel(v || null)}
+          options={[
+            { value: '', label: '自动（首个有凭据的可用模型）' },
+            ...models
+              .filter((m) => !m.hidden)
+              .map((m) => ({ value: `${providerId}/${m.id}`, label: m.name })),
+          ]}
+        />
       </Field>
 
       <div className="flex items-center gap-2 pt-1">

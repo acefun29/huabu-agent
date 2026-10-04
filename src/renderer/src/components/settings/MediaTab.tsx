@@ -1,7 +1,7 @@
 // 设置面板「媒体生成」tab：生成默认值、新增供应商、全量模型库浏览、供应商详情（内部组件不导出，仅导出 MediaTab）
 
 import { useEffect, useState } from 'react'
-import { Plus, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { ExternalLink, Plus, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useSettings } from '../../store/settingsStore'
 import { useCanvasStore } from '../../store/canvasStore'
 import type { MediaCatalogBrowseItem, MediaProviderType } from '@shared/ipc'
@@ -16,7 +16,7 @@ import { matchBareModelId, shortModelLabel } from '@shared/mediaResolve'
 import { MEDIA_ROOT_REL } from '../../harness/assetCategories'
 import type { MediaKind } from '../../types'
 import { KIND_LABEL } from '../../types'
-import { Field, Toggle, inputCls } from './ui'
+import { Field, Select, Toggle, inputCls } from './ui'
 
 /* -------------------------------------------------------------------------- */
 /* 媒体生成（真实 IPC：workspace.json media 段 + 网关凭据）                     */
@@ -29,6 +29,19 @@ const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHi
   { value: 'gateway-dashscope', label: '阿里云百炼（异步任务）' },
   { value: 'gateway-volcark', label: '火山方舟' }
 ]
+
+/**
+ * 内置媒体供应商「创建 / 管理 API Key」页面的官方直达地址（2026-10 逐家官网核实）。
+ * openai / dashscope 与对话供应商同一家（复用已核实地址）；fal 由登录页 returnTo
+ * 证实 /dashboard/keys 为 Key 管理页；火山方舟为控制台「API Key 管理」深链（登录后直达）。
+ * 用户自建的 gateway-* 供应商无固定官网，不在表内也就不显示链接。
+ */
+const MEDIA_API_KEY_URLS: Record<string, { url: string; label: string }> = {
+  openai: { url: 'https://platform.openai.com/api-keys', label: 'OpenAI 平台' },
+  fal: { url: 'https://fal.ai/dashboard/keys', label: 'fal.ai' },
+  dashscope: { url: 'https://bailian.console.aliyun.com/?apiKey=1', label: '阿里云百炼' },
+  volcark: { url: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', label: '火山方舟' },
+}
 
 type MediaView = 'defaults' | 'add' | 'provider'
 
@@ -57,17 +70,11 @@ function MediaDefaultsView() {
       <div className="rounded-2xl bg-(--surface-card) p-4 ring-1 ring-(--outline-soft)">
         <div className="grid grid-cols-2 gap-x-4 gap-y-3">
           <Field label="Agent 使用的供应商">
-            <select
+            <Select
               value={agentProviderId}
-              onChange={(e) => void updateMediaConfig({ agentProvider: e.target.value })}
-              className={`${inputCls} cursor-pointer`}
-            >
-              {mediaProviders.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
+              onChange={(v) => void updateMediaConfig({ agentProvider: v })}
+              options={mediaProviders.map((p) => ({ value: p.id, label: p.label }))}
+            />
           </Field>
           {(['image', 'video', 'audio'] as MediaKind[]).map((kind) => {
             // 存储记法统一为 `provider:模型id` 复合串；旧工作区存的裸模型 id 在显示时兼容映射
@@ -78,37 +85,27 @@ function MediaDefaultsView() {
                 : (matchBareModelId(mediaProviders, stored, kind, agentProviderId)?.ref ?? '')
             return (
               <Field key={kind} label={`${KIND_LABEL[kind]}默认模型`}>
-                <select
+                <Select
                   value={selectValue}
-                  onChange={(e) =>
+                  onChange={(v) =>
                     void updateMediaConfig({
-                      agentModels: { ...mediaStatus?.agentModels, [kind]: e.target.value },
+                      agentModels: { ...mediaStatus?.agentModels, [kind]: v },
                     })
                   }
-                  className={`${inputCls} cursor-pointer`}
-                >
-                  <option value="">未指定（用供应商首个同类模型）</option>
-                  {mediaModelOptions(kind).map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
+                  options={[
+                    { value: '', label: '未指定（用供应商首个同类模型）' },
+                    ...mediaModelOptions(kind).map((m) => ({ value: m.id, label: m.label })),
+                  ]}
+                />
               </Field>
             )
           })}
           <Field label="新建卡片默认比例">
-            <select
+            <Select
               value={mediaStatus?.defaultRatio ?? DEFAULT_MEDIA_RATIO}
-              onChange={(e) => void updateMediaConfig({ defaultRatio: e.target.value as (typeof MEDIA_RATIOS)[number] })}
-              className={`${inputCls} cursor-pointer`}
-            >
-              {MEDIA_RATIOS.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
+              onChange={(v) => void updateMediaConfig({ defaultRatio: v as (typeof MEDIA_RATIOS)[number] })}
+              options={MEDIA_RATIOS.map((r) => ({ value: r, label: r }))}
+            />
           </Field>
           <Field label="默认时长（秒）">
             <input
@@ -131,27 +128,22 @@ function MediaDefaultsView() {
             />
           </Field>
           <Field label="默认落库素材库（生成产物的归档位置）">
-            <select
+            <Select
               value={defaultLibraryId}
-              onChange={(e) =>
-                void updateMediaConfig({ defaultLibraryId: e.target.value }).then((error) =>
+              onChange={(v) =>
+                void updateMediaConfig({ defaultLibraryId: v }).then((error) =>
                   setSaveHint(error ? `保存失败：${error}` : '默认落库已更新，对新生成生效')
                 )
               }
-              className={`${inputCls} cursor-pointer`}
-              data-testid="default-library-select"
-            >
-              <option value="builtin-assets">画布素材（按类型自动归类）</option>
-              {libraries
-                .filter((l) => !l.builtin)
-                .map((l) => (
-                  <option key={l.id} value={l.id}>
-                    {l.name}
-                    {l.isPublic ? '（公共库）' : ''}
-                  </option>
-                ))}
-              <option value="none">仅产物目录（不进素材库）</option>
-            </select>
+              testId="default-library-select"
+              options={[
+                { value: 'builtin-assets', label: '画布素材（按类型自动归类）' },
+                ...libraries
+                  .filter((l) => !l.builtin)
+                  .map((l) => ({ value: l.id, label: `${l.name}${l.isPublic ? '（公共库）' : ''}` })),
+                { value: 'none', label: '仅产物目录（不进素材库）' },
+              ]}
+            />
           </Field>
           <Field label="产物输出目录（未落素材库时的兜底；相对工作区根）">
             <div className="flex gap-1.5">
@@ -252,17 +244,11 @@ function MediaAddProviderView({
           <input value={npLabel} onChange={(e) => setNpLabel(e.target.value)} placeholder="硅基流动" className={inputCls} />
         </Field>
         <Field label="接入类型">
-          <select
+          <Select
             value={npType}
-            onChange={(e) => setNpType(e.target.value as MediaProviderType)}
-            className={`${inputCls} cursor-pointer`}
-          >
-            {ADAPTER_TYPE_OPTIONS.map((t) => (
-              <option key={t.value} value={t.value}>
-                {t.label}
-              </option>
-            ))}
-          </select>
+            onChange={(v) => setNpType(v as MediaProviderType)}
+            options={ADAPTER_TYPE_OPTIONS.map((t) => ({ value: t.value, label: t.label }))}
+          />
         </Field>
         {npType === 'gateway-openai-compat' ? (
           <Field label="Base URL（网关端点，留空 = 官方默认）">
@@ -281,15 +267,17 @@ function MediaAddProviderView({
         <Field label="首个模型 id（发给网关的标识）">
           <div className="flex gap-1.5">
             <input value={npModelId} onChange={(e) => setNpModelId(e.target.value)} placeholder="Kwai-Kolors/Kolors" className={inputCls} />
-            <select
+            <Select
+              hug
+              className="w-24 shrink-0"
               value={npModelKind}
-              onChange={(e) => setNpModelKind(e.target.value as MediaKind)}
-              className="w-24 shrink-0 cursor-pointer rounded-lg bg-(--surface-input) px-2 py-1.5 text-[13px] text-(--on-surface) outline-none transition focus:ring-2 focus:ring-(--accent)"
-            >
-              <option value="image">图片</option>
-              <option value="video">视频</option>
-              <option value="audio">音频</option>
-            </select>
+              onChange={(v) => setNpModelKind(v as MediaKind)}
+              options={[
+                { value: 'image', label: '图片' },
+                { value: 'video', label: '视频' },
+                { value: 'audio', label: '音频' },
+              ]}
+            />
           </div>
         </Field>
       </div>
@@ -470,6 +458,7 @@ function MediaProviderDetail({
   }, [providerId])
 
   if (!provider) return null
+  const keyUrl = MEDIA_API_KEY_URLS[provider.id]
   const agentProviderId = mediaStatus?.agentProvider ?? DEFAULT_MEDIA_PROVIDER
   /** 当前供应商名下被隐藏的内置模型（恢复入口用） */
   const hiddenModels = (mediaStatus?.hiddenBuiltin ?? []).filter((id) => id.startsWith(`${provider.id}/`))
@@ -542,6 +531,19 @@ function MediaProviderDetail({
           )}
         </div>
       </Field>
+      {keyUrl && (
+        <a
+          href={keyUrl.url}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="inline-flex items-center gap-1 text-[11px] font-medium text-(--accent) transition-colors hover:underline"
+          title={`在系统浏览器打开 ${keyUrl.label} 的 API Key 页面`}
+          data-testid={`media-apikey-link-${provider.id}`}
+        >
+          <ExternalLink size={10} />
+          前往 {keyUrl.label} 创建 / 管理 API Key
+        </a>
+      )}
 
       <div>
         <div className="mb-1.5 text-[11px] font-medium text-(--on-surface-variant)">可生成模型</div>
@@ -580,15 +582,16 @@ function MediaProviderDetail({
               placeholder="模型 id，如 doubao-seedream-5-0"
               className="w-40 bg-transparent text-[12px] outline-none placeholder:text-(--on-surface-muted)"
             />
-            <select
+            <Select
+              variant="ghost"
               value={nmKind}
-              onChange={(e) => setNmKind(e.target.value as MediaKind)}
-              className="cursor-pointer bg-transparent text-[11px] text-(--on-surface-muted) outline-none"
-            >
-              <option value="image">图片</option>
-              <option value="video">视频</option>
-              <option value="audio">音频</option>
-            </select>
+              onChange={(v) => setNmKind(v as MediaKind)}
+              options={[
+                { value: 'image', label: '图片' },
+                { value: 'video', label: '视频' },
+                { value: 'audio', label: '音频' },
+              ]}
+            />
             <button
               onClick={() => void submitNewModel()}
               disabled={!nmId.trim()}
