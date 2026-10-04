@@ -473,7 +473,7 @@ export function ChatDock() {
                 : undefined
             }
           >
-            <div ref={contentRef} className="space-y-3 py-1">
+            <div ref={contentRef} className="space-y-1.5 py-1">
               {history.map((m) => (
                 <MessageBubble key={m.id} m={m} expanded={expanded} />
               ))}
