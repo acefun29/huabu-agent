@@ -287,3 +287,9 @@ textarea,
 .markdown-body code {
   font-size: 12px;
 }
+
+/* 标签输入框（AssetNode TagRow）：Chromium 会给带 list 属性的输入框在右侧渲染一枚
+   浅色下拉箭头，在深色浮层上是发白残影，隐藏；键入时建议下拉仍照常弹出 */
+input[list='huabu-all-tags']::-webkit-calendar-picker-indicator {
+  display: none !important;
+}

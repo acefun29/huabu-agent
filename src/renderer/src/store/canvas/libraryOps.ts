@@ -33,6 +33,9 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     const result = await window.huabu.asset.libraries()
     if (!result.ok) return
     set({ libraries: result.value.libraries, inboxDir: result.value.inboxDir })
+    // 清单里带着每个文件的最新标签（主进程现扫 tags.json），顺手对齐画布卡片：
+    // 钉卡时漏带的旧卡片、标签的跨端/库面板改动都在这里补齐（syncCardTags 定义见标签段）
+    syncCardTags(result.value.libraries)
   }
 
   const refreshDirFiles = async () => {
@@ -95,15 +98,17 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
         width: 240,
         height: 230,
         zIndex: zCounter.current,
-        data: {
-          name: entry.name,
-          kind: entry.kind,
-          storage: 'ws',
-          path: entry.relPath,
-          libraryId: lib.id,
-          bytes: entry.bytes,
-          meta: KIND_LABEL[entry.kind]
-        } satisfies AssetData
+          data: {
+            name: entry.name,
+            kind: entry.kind,
+            storage: 'ws',
+            path: entry.relPath,
+            libraryId: lib.id,
+            bytes: entry.bytes,
+            meta: KIND_LABEL[entry.kind],
+            // 文件级标签随钉卡带入：卡片、右上角标签筛选、卡片详情读的都是 data.tags
+            ...(entry.tags?.length ? { tags: entry.tags } : {})
+          } satisfies AssetData
       } satisfies CanvasNode
     ])
     // 新钉的卡片自动选中 = 立刻递给助手
@@ -383,6 +388,38 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   /* ---------------- 标签与笔记（文件级元数据 + md 文档） ---------------- */
+
+  /**
+   * 库清单的文件级标签（真相 .huabu/tags.json，主进程每次现扫）对齐到画布卡片：
+   * 卡片、右上角标签筛选、卡片详情读的都是 data.tags，不在这里补齐它们就永远落后于真相。
+   * 只对齐库内文件（清单里没有的——inbox/工作区散文件——不动），标签已在卡片上的走无变化
+   * 快路径，避免每次 asset:changed 都重建节点触发渲染与落盘。
+   */
+  const syncCardTags = (libraries: MaterialLibrary[]) => {
+    const tagsByRel = new Map<string, string[]>()
+    for (const lib of libraries) {
+      for (const f of lib.files) {
+        if (f.tags?.length) tagsByRel.set(f.relPath, f.tags)
+      }
+    }
+    if (tagsByRel.size === 0) return
+    applyNodes((prev) => {
+      let touched = false
+      const next = prev.map((node) => {
+        const d = node.data
+        if (!d) return node
+        const tags = tagsByRel.get(nodeRelPath(d) ?? '')
+        if (!tags) return node
+        const current = d.tags
+        if (current !== undefined && current.length === tags.length && tags.every((t, i) => t === current[i])) {
+          return node
+        }
+        touched = true
+        return { ...node, data: { ...d, tags } }
+      })
+      return touched ? next : prev
+    })
+  }
 
   /**
    * 设置卡片标签：写主进程 .huabu/tags.json（清洗后的标签为准），卡片与素材库条目同源刷新。

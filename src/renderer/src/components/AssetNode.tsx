@@ -35,6 +35,7 @@ import { KIND_LABEL, type AssetData, type AssetKind, type CanvasNode, type Gener
 import { DEFAULT_MEDIA_DURATION_S, MEDIA_RATIOS } from '@shared/media'
 import { shortModelLabel } from '@shared/mediaResolve'
 import { ChipSelect, MenuGroup, MenuItem, MenuNote } from './Dropdown'
+import { Collapse } from './Collapse'
 
 /** 模型未声明能力时的兜底选项（目录里的模型都带 capabilities，这份只为用户自建模型兜底） */
 const FALLBACK_DURATIONS = [3, 5, 10, 15]
@@ -169,15 +170,28 @@ function useDocText(data: AssetData): string | null {
 }
 
 /**
- * 标签胶囊行：贴卡片底边，只在选中时出现——单选可增删（写 .huabu/tags.json，
- * 同一文件的多张卡同步），多选只读。输入框带全量标签建议（datalist）。
+ * 标签胶囊行：媒体卡嵌在选中信息浮层（深色渐变）里，文本卡并入名称底栏——
+ * 自身不做定位与底色。单选可增删（写 .huabu/tags.json，同一文件的多张卡同步），
+ * 多选只读。添加标签 = 独占一行的全宽输入框（回车添加 / Esc 取消 / 失焦提交），
+ * 带全量标签建议（datalist）。tone 决定配色（深色底=白色半透明胶囊）。
  */
-function TagRow({ node, data, single }: { node: CanvasNode; data: AssetData; single: boolean }) {
+function TagRow({
+  node,
+  data,
+  single,
+  tone = 'dark',
+}: {
+  node: CanvasNode
+  data: AssetData
+  single: boolean
+  tone?: 'dark' | 'light'
+}) {
   const setNodeTags = useCanvasStore((s) => s.setNodeTags)
   const showToast = useCanvasStore((s) => s.showToast)
   const [inputOpen, setInputOpen] = useState(false)
   const [input, setInput] = useState('')
   const tags = data.tags ?? []
+  const dark = tone === 'dark'
   const allTags = useMemo(() => {
     const seen = new Set<string>()
     for (const n of useCanvasStore.getState().nodes) for (const t of n.data.tags ?? []) seen.add(t)
@@ -200,16 +214,18 @@ function TagRow({ node, data, single }: { node: CanvasNode; data: AssetData; sin
 
   return (
     <div
-      className="tag-row absolute inset-x-0 bottom-0 z-20 flex max-h-[76px] flex-wrap items-center gap-1 overflow-y-auto border-t border-(--accent)/25 bg-(--panel-float)/95 px-2 py-1.5 backdrop-blur"
+      className="mt-1.5 flex max-h-[72px] flex-wrap items-center gap-1 overflow-y-auto"
       onClick={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
     >
-      <TagIcon size={10} className="shrink-0 text-(--on-surface-muted)" />
+      <TagIcon size={10} className={`shrink-0 ${dark ? 'text-white/70' : 'text-(--on-surface-muted)'}`} />
       {tags.map((t) => (
         <span
           key={t}
-          className="flex items-center gap-0.5 rounded-full bg-(--active-tint) py-0.5 pl-1.5 pr-1 text-[10px] font-medium text-(--accent)"
+          className={`flex items-center gap-0.5 rounded-full py-0.5 pl-1.5 pr-1 text-[10px] font-medium ${
+            dark ? 'bg-white/20 text-white' : 'bg-(--active-tint) text-(--accent)'
+          }`}
           title={single ? '标签（点 × 移除）' : '标签'}
         >
           {t}
@@ -219,7 +235,9 @@ function TagRow({ node, data, single }: { node: CanvasNode; data: AssetData; sin
                 e.stopPropagation()
                 void setNodeTags(node.id, tags.filter((x) => x !== t))
               }}
-              className="rounded-full p-px transition-colors hover:bg-(--accent) hover:text-white"
+              className={`rounded-full p-px transition-colors ${
+                dark ? 'hover:bg-white/40' : 'hover:bg-(--accent) hover:text-white'
+              }`}
               title="移除标签"
             >
               <X size={9} />
@@ -233,7 +251,11 @@ function TagRow({ node, data, single }: { node: CanvasNode; data: AssetData; sin
             e.stopPropagation()
             setInputOpen(true)
           }}
-          className="flex items-center gap-0.5 rounded-full border border-dashed border-(--outline) px-1.5 py-0.5 text-[10px] text-(--on-surface-muted) transition-colors hover:border-(--accent) hover:text-(--accent)"
+          className={`flex items-center gap-0.5 rounded-full border border-dashed px-1.5 py-0.5 text-[10px] transition-colors ${
+            dark
+              ? 'border-white/50 text-white/85 hover:border-white hover:text-white'
+              : 'border-(--outline) text-(--on-surface-muted) hover:border-(--accent) hover:text-(--accent)'
+          }`}
           title="添加标签"
         >
           <Plus size={9} />
@@ -255,11 +277,19 @@ function TagRow({ node, data, single }: { node: CanvasNode; data: AssetData; sin
             }
           }}
           onBlur={addTag}
-          placeholder="标签，Enter 确认"
-          className="w-24 rounded-full bg-(--surface-input) px-2 py-0.5 text-[10.5px] outline-none ring-1 ring-(--accent)/40 placeholder:text-(--on-surface-muted)"
+          placeholder="新标签，回车添加"
+          className={`w-24 rounded-full px-2 py-0.5 text-[10.5px] outline-none ring-1 transition-colors ${
+            dark
+              ? // 必须不透明：半透明深底会让媒体画面从胶囊里透出来（亮背景在两个圆角上
+                // 形成月牙状发白）。静止无描边，聚焦提亮一档 + 淡环
+                'bg-neutral-800 text-white ring-transparent placeholder:text-white/45 focus:bg-neutral-700 focus:ring-white/30'
+              : 'bg-(--surface-input) text-(--on-surface) ring-(--accent)/40 placeholder:text-(--on-surface-muted) focus:ring-(--accent)/70'
+          }`}
         />
       )}
-      {!single && tags.length === 0 && <span className="text-[10px] text-(--on-surface-muted)">无标签</span>}
+      {!single && tags.length === 0 && (
+        <span className={`text-[10px] ${dark ? 'text-white/60' : 'text-(--on-surface-muted)'}`}>无标签</span>
+      )}
       <datalist id="huabu-all-tags">
         {allTags.map((t) => (
           <option key={t} value={t} />
@@ -269,7 +299,12 @@ function TagRow({ node, data, single }: { node: CanvasNode; data: AssetData; sin
   )
 }
 
-/** 普通文件卡片：点击选中/取消（递给助手当参考），可多选；双击放大查看 */
+/**
+ * 普通文件卡片：点击选中/取消（递给助手当参考），可多选；双击放大查看。
+ * 媒体卡（图/视/音）走画框式沉浸：静置不显示任何文字，悬停浮出名称，选中后
+ * 名称与标签同在一张底部深色渐变浮层里；文本卡保留名称底栏（名字即身份），
+ * 选中后浮层只承载标签。
+ */
 const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: CanvasNode; data: AssetData }) {
   // 只订自己的选中布尔：框选时只有选中态翻盘的卡片重渲染
   const selected = useCanvasStore((s) => s.selectedAssetIds.includes(node.id))
@@ -317,7 +352,7 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
         e.stopPropagation()
         if (src && viewable) openViewer(node.id)
       }}
-      className={`relative flex h-full w-full cursor-pointer flex-col overflow-hidden rounded-2xl bg-(--surface-card) transition-shadow ${
+      className={`group relative flex h-full w-full cursor-pointer flex-col overflow-hidden rounded-2xl bg-(--surface-card) transition-shadow ${
         selected ? 'bg-(--active-tint) shadow-md' : 'shadow-sm hover:shadow-md'
       }`}
     >
@@ -329,7 +364,15 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
           </div>
         </>
       )}
-      <div className="absolute right-2 top-2 z-10 flex items-center gap-1">
+      {/* 悬浮操作：沉浸式隐藏——悬停或选中才浮现；隐藏时连点穿（pointer-events-none），
+          不可见按钮截胡点击会出现「点了没反应」的错觉 */}
+      <div
+        className={`absolute right-2 top-2 z-10 flex items-center gap-1 transition-opacity duration-150 ${
+          selected
+            ? 'opacity-100'
+            : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100'
+        }`}
+      >
         {editable && !editing && (
           <button
             onClick={(e) => {
@@ -484,27 +527,72 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
         )}
       </div>
 
-      <div className="shrink-0 border-t border-(--outline-soft) px-3 py-2">
-        <div className="flex items-center gap-2">
-          <span className="shrink-0 text-(--accent)">
-            {isEditableDoc(data) && isMd ? <StickyNote size={13} /> : kindIcon(data.kind)}
-          </span>
-          <span className="truncate text-[12px] font-medium" title={data.name}>
-            {data.name}
-          </span>
-          <span className="ml-auto shrink-0 text-[10px] text-(--on-surface-muted)">
-            {formatBytes(data.bytes) || data.meta || KIND_LABEL[data.kind]}
-          </span>
-        </div>
-        {data.path && (
-          <div className="mt-0.5 truncate pl-[21px] font-mono text-[10px] text-(--on-surface-muted)" title={data.path}>
-            {data.path}
+      {/* 选中信息浮层（媒体卡）：画框式沉浸——静置零文字，悬停浮出名称行，选中后
+          名称与标签同在这张深色渐变层里。z-[5]：压住媒体、让位于 z-10 的选中描边。 */}
+      {viewable && (
+        <div
+          data-testid="asset-info-scrim"
+          className={`absolute inset-x-0 bottom-0 z-[5] transition-all duration-200 motion-reduce:transition-none ${
+            selected
+              ? 'translate-y-0 opacity-100'
+              : 'translate-y-1.5 opacity-0 group-hover:translate-y-0 group-hover:opacity-100'
+          }`}
+        >
+          <div className="bg-gradient-to-t from-black/70 via-black/40 to-transparent px-2.5 pb-2 pt-7 text-white">
+            <div className="flex items-center gap-1.5">
+              <span className="shrink-0 text-white/80">{kindIcon(data.kind, 12)}</span>
+              <span className="min-w-0 truncate text-[12px] font-medium" title={data.path ?? data.name}>
+                {data.name}
+              </span>
+              <span className="ml-auto shrink-0 text-[10px] text-white/70">
+                {formatBytes(data.bytes) || data.meta || KIND_LABEL[data.kind]}
+              </span>
+            </div>
+            {/* 标签随选中平滑展开（高度生长 + 内容淡入），浮层不再瞬间撑高一截 */}
+            <Collapse open={selected}>
+              <div
+                className={`transition-opacity duration-150 motion-reduce:transition-none ${
+                  selected ? 'opacity-100' : 'opacity-0'
+                }`}
+              >
+                <TagRow node={node} data={data} single={selectedCount === 1} />
+              </div>
+            </Collapse>
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
-      {/* 标签胶囊：贴卡片底边，只在选中时出现（单选可编辑，多选只读） */}
-      {selected && <TagRow node={node} data={data} single={selected && selectedCount === 1} />}
+      {/* 文本/其他卡：名字与路径本身就是内容身份，保留底栏不沉浸；标签选中后并入底栏，
+          与名字同框展示。编辑态收起标签行，避免压缩编辑区。 */}
+      {!viewable && (
+        <div className="shrink-0 border-t border-(--outline-soft) px-3 py-2">
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 text-(--accent)">
+              {isEditableDoc(data) && isMd ? <StickyNote size={13} /> : kindIcon(data.kind)}
+            </span>
+            <span className="truncate text-[12px] font-medium" title={data.name}>
+              {data.name}
+            </span>
+            <span className="ml-auto shrink-0 text-[10px] text-(--on-surface-muted)">
+              {formatBytes(data.bytes) || data.meta || KIND_LABEL[data.kind]}
+            </span>
+          </div>
+          {data.path && (
+            <div className="mt-0.5 truncate pl-[21px] font-mono text-[10px] text-(--on-surface-muted)" title={data.path}>
+              {data.path}
+            </div>
+          )}
+          <Collapse open={selected && !editing}>
+            <div
+              className={`transition-opacity duration-150 motion-reduce:transition-none ${
+                selected && !editing ? 'opacity-100' : 'opacity-0'
+              }`}
+            >
+              <TagRow node={node} data={data} single={selectedCount === 1} tone="light" />
+            </div>
+          </Collapse>
+        </div>
+      )}
     </div>
   )
 })
