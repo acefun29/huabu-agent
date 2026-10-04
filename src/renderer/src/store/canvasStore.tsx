@@ -203,6 +203,8 @@ export interface CanvasState {
   createSession: (title?: string) => string
   forkSession: (sourceId: string) => Promise<void>
   requestRemoveSession: (id: string) => void
+  /** 批量删除：任一所选带历史则统一确认一次；onDone 在移除完成后回调（确认取消则不触发） */
+  requestRemoveSessions: (ids: string[], onDone?: () => void) => void
   renameSession: (id: string, title: string) => void
   /** 会话中途切换模型（已建会话即时生效；未建会话暂存到创建时） */
   setSessionModel: (sessionId: string, modelId: string) => Promise<void>

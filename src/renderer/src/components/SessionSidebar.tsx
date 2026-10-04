@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { Eraser, Layers, MessageSquare, Plus, Settings, X } from 'lucide-react'
+import { Check, Eraser, ListChecks, Layers, MessageSquare, Plus, Settings, Trash2 } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
 import { useSettingsUi } from '../store/settingsStore'
 import { isTransferDrag, LibrariesPanel, useLibrariesPanelStore } from './sidebar/LibrariesPanel'
@@ -18,7 +18,7 @@ const SIDE_TABS: { key: SideTab; label: string; icon: ReactNode; tourKey: string
  * 一列竖向图标按钮，点某个图标不挤压画布，而是在旁边浮出一块圆角半透明面板，装载该图标对应的内容
  * （会话目录 / 素材库清单）。再点一次、点面板外、或按 Esc 收起；画布宽度始终不变。
  *
- * 拆分后壳只保留低频状态（面板开合、清空两步确认）；会话/素材库面板下沉到 sidebar/ 下的
+ * 拆分后壳只保留低频状态（面板开合、清空两步确认、会话批量管理）；会话/素材库面板下沉到 sidebar/ 下的
  * SessionsPanel / LibrariesPanel —— 搜索、重命名、拖拽悬停等高频击键只重渲对应面板，
  * 画布节点增删（nodes.length）也不再重渲面板内容。
  */
@@ -31,6 +31,9 @@ export function SessionSidebar() {
   const [openTab, setOpenTab] = useState<SideTab | null>(null)
   /** 清空画布两步确认：第一次点击进入确认态，3 秒内再点才执行 */
   const [clearArmed, setClearArmed] = useState(false)
+  /** 会话批量管理：多选删除；选中集只在管理态有意义 */
+  const [manageMode, setManageMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set())
   const railRef = useRef<HTMLElement>(null)
   const panelRef = useRef<HTMLElement>(null)
   const clearTimer = useRef<number | null>(null)
@@ -56,6 +59,39 @@ export function SessionSidebar() {
     clearCanvas()
   }
 
+  /** 退出批量管理并清空选中（关面板/切页/Esc/完成后共用） */
+  const exitManage = useCallback(() => {
+    setManageMode(false)
+    setSelectedIds(new Set())
+  }, [])
+
+  // 关面板或切到素材库页时退出批量管理（选中集只在会话页有意义）
+  useEffect(() => {
+    if (openTab !== 'sessions') exitManage()
+  }, [openTab, exitManage])
+
+  const onToggleSelect = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  const allSelected = sessionCount > 0 && selectedIds.size >= sessionCount
+  const onToggleAll = useCallback(() => {
+    // 全选动作读 getState()：壳只订会话数，不因清单内容变化重渲
+    setSelectedIds(allSelected ? new Set() : new Set(useCanvasStore.getState().sessions.map((s) => s.id)))
+  }, [allSelected])
+
+  const onBatchRemove = useCallback(() => {
+    const ids = [...selectedIds]
+    if (ids.length === 0) return
+    // 确认弹窗由 store 接管；移除完成后经 onDone 退出管理态，取消则保留多选
+    useCanvasStore.getState().requestRemoveSessions(ids, exitManage)
+  }, [selectedIds, exitManage])
+
   // 面板打开时：点面板/图标栏之外任意处、或按 Esc 收起。
   // 手写双 ref 监听而不用 lib/hooks 的 useDismiss：rail 与 panel 是两个都算“内部”的元素，单 ref 的 dismiss hook 不适用
   useEffect(() => {
@@ -66,6 +102,11 @@ export function SessionSidebar() {
       setOpenTab(null)
     }
     const onKey = (e: KeyboardEvent) => {
+      // 批量管理态下 Esc 先退出管理，再按才收起整个面板
+      if (e.key === 'Escape' && manageMode) {
+        exitManage()
+        return
+      }
       if (e.key === 'Escape') setOpenTab(null)
     }
     window.addEventListener('mousedown', onDown)
@@ -74,7 +115,7 @@ export function SessionSidebar() {
       window.removeEventListener('mousedown', onDown)
       window.removeEventListener('keydown', onKey)
     }
-  }, [openTab])
+  }, [openTab, manageMode, exitManage])
 
   /** 会话行点击：切换会话并收起面板（回调恒定 → memo 的 SessionsPanel 不因壳重渲而重渲） */
   const onSwitchSession = useCallback(
@@ -180,43 +221,89 @@ export function SessionSidebar() {
             style={{ transformOrigin: 'left center', willChange: 'transform, opacity' }}
             className="absolute left-[72px] top-[56px] z-40 flex max-h-[min(620px,calc(100%-68px))] w-[304px] flex-col overflow-hidden rounded-3xl bg-(--panel-float) shadow-[0_18px_50px_rgba(0,0,0,0.16)] ring-1 ring-(--outline) backdrop-blur-2xl"
           >
-            {/* 面板头部 */}
+            {/* 面板头部（会话页在批量管理态换成：已选计数 + 全选/删除/完成） */}
             <div className="flex shrink-0 items-center gap-2 px-4 pb-2.5 pt-3.5">
-              <span className="min-w-0 truncate text-[13px] font-semibold">
-                {activeTab.label}
-                {openTab === 'sessions' && (
-                  <span className="ml-1.5 text-[11px] font-normal text-(--on-surface-muted)">{sessionCount} 段</span>
-                )}
-              </span>
-              {openTab === 'sessions' ? (
-                <button
-                  data-testid="create-session"
-                  onClick={() => createSession()}
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
-                  title="新建会话"
-                >
-                  <Plus size={14} />
-                </button>
+              {openTab === 'sessions' && manageMode ? (
+                <>
+                  <span className="min-w-0 flex-1 truncate text-[13px] font-semibold">
+                    批量管理
+                    <span className="ml-1.5 text-[11px] font-normal text-(--on-surface-muted)">
+                      已选 {selectedIds.size}/{sessionCount} 段
+                    </span>
+                  </span>
+                  <button
+                    data-testid="session-select-all"
+                    onClick={onToggleAll}
+                    className="shrink-0 rounded-full px-2 py-1 text-[11px] font-medium text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
+                    title="全选 / 取消全选"
+                  >
+                    {allSelected ? '取消全选' : '全选'}
+                  </button>
+                  <button
+                    data-testid="session-batch-remove"
+                    onClick={onBatchRemove}
+                    disabled={selectedIds.size === 0}
+                    className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-colors ${
+                      selectedIds.size === 0
+                        ? 'cursor-default text-(--on-surface-muted) opacity-40'
+                        : 'text-(--danger) hover:bg-(--danger)/10'
+                    }`}
+                    title="删除所选会话（不删除素材文件）"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                  <button
+                    onClick={exitManage}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
+                    title="完成批量管理"
+                  >
+                    <Check size={14} />
+                  </button>
+                </>
               ) : (
-                <button
-                  // 新建素材库的 creating 状态在 LibrariesPanel 的文件级 store，头部按钮跨组件直调
-                  onClick={() => useLibrariesPanelStore.getState().setCreating(true)}
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
-                  title="新建素材库"
-                >
-                  <Plus size={14} />
-                </button>
+                <>
+                  <span className="min-w-0 truncate text-[13px] font-semibold">
+                    {activeTab.label}
+                    {openTab === 'sessions' && (
+                      <span className="ml-1.5 text-[11px] font-normal text-(--on-surface-muted)">{sessionCount} 段</span>
+                    )}
+                  </span>
+                  {openTab === 'sessions' ? (
+                    <>
+                      <button
+                        data-testid="create-session"
+                        onClick={() => createSession()}
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
+                        title="新建会话"
+                      >
+                        <Plus size={14} />
+                      </button>
+                      {sessionCount > 0 && (
+                        <button
+                          data-testid="session-manage"
+                          onClick={() => setManageMode(true)}
+                          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
+                          title="批量管理会话（多选删除）"
+                        >
+                          <ListChecks size={14} />
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <button
+                      // 新建素材库的 creating 状态在 LibrariesPanel 的文件级 store，头部按钮跨组件直调
+                      onClick={() => useLibrariesPanelStore.getState().setCreating(true)}
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-variant) transition-colors hover:bg-(--surface-chip) hover:text-(--accent)"
+                      title="新建素材库"
+                    >
+                      <Plus size={14} />
+                    </button>
+                  )}
+                </>
               )}
-              <button
-                onClick={() => setOpenTab(null)}
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-(--on-surface-muted) transition-colors hover:bg-(--surface-chip) hover:text-(--on-surface)"
-                title="收起面板（Esc）"
-              >
-                <X size={13} />
-              </button>
             </div>
 
-            {/* 面板内容：切页时轻微交叉淡入 */}
+            {/* 面板内容：切页时轻微交叉淡入；pt 给首个胶囊留出 ring 描边的绘制空间（描边画在边框外，紧贴容器会被 overflow 裁掉顶边） */}
             <AnimatePresence mode="wait" initial={false}>
               <motion.div
                 key={openTab}
@@ -225,9 +312,18 @@ export function SessionSidebar() {
                 exit={{ opacity: 0, y: -8 }}
                 transition={{ duration: 0.15, ease: [0.2, 0.8, 0.2, 1] }}
                 data-scrollable=""
-                className="min-h-0 flex-1 overflow-y-auto px-2 pb-3"
+                className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 pt-2.5"
               >
-                {openTab === 'sessions' ? <SessionsPanel onSwitch={onSwitchSession} /> : <LibrariesPanel onClose={onClosePanel} />}
+                {openTab === 'sessions' ? (
+                  <SessionsPanel
+                    onSwitch={onSwitchSession}
+                    manageMode={manageMode}
+                    selectedIds={selectedIds}
+                    onToggleSelect={onToggleSelect}
+                  />
+                ) : (
+                  <LibrariesPanel onClose={onClosePanel} />
+                )}
               </motion.div>
             </AnimatePresence>
           </motion.section>

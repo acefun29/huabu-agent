@@ -379,8 +379,8 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     showToast(`已从「${source.title}」分叉出新会话（源会话尚未开始对话，无历史可携带）`)
   }
 
-  /** 执行删除会话：释放桥与主进程会话，清单与历史槽一并移除 */
-  const performRemoveSession = (id: string) => {
+  /** 执行删除会话：释放桥与主进程会话，清单与历史槽一并移除；批量路径传 silent 自己汇总提示 */
+  const performRemoveSession = (id: string, opts?: { silent?: boolean }) => {
     bridges.get(id)?.dispose()
     bridges.delete(id)
     streams.delete(id)
@@ -405,7 +405,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       return { sessions, chatsMap, activeSessionId: nextActive, ...recomputeChatDerived(chatsMap, nextActive) }
     })
     if (wasActive) clearTransient()
-    showToast('已删除会话（对话历史移除；画布与素材文件不受影响）')
+    if (!opts?.silent) showToast('已删除会话（对话历史移除；画布与素材文件不受影响）')
   }
 
   /** 删除入口：有历史的会话先确认（JSONL 还在磁盘，但清单移除后 UI 上找不回） */
@@ -426,6 +426,37 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       return
     }
     performRemoveSession(id)
+  }
+
+  /**
+   * 批量删除入口：与单个入口同一裁决 —— 任一所选带历史就统一确认一次（JSONL 还在磁盘，
+   * 但清单移除后 UI 上找不回），全是空历史的直接删。onDone 在移除真正完成后回调
+   * （确认被取消则不触发，调用方据此保留多选状态）。
+   */
+  const requestRemoveSessions = (ids: string[], onDone?: () => void) => {
+    const metas = ids
+      .map((id) => get().sessions.find((s) => s.id === id))
+      .filter((m): m is SessionMeta => Boolean(m))
+    if (metas.length === 0) return
+    const remove = () => {
+      metas.forEach((m) => performRemoveSession(m.id, { silent: true }))
+      showToast(`已删除 ${metas.length} 个会话（对话历史移除；画布与素材文件不受影响）`)
+      onDone?.()
+    }
+    const hasHistory = metas.some((m) => (get().chatsMap[m.id]?.history.length ?? 0) > 0)
+    if (hasHistory) {
+      set({
+        confirm: {
+          title: `删除 ${metas.length} 个会话？`,
+          body: '这些对话将从会话列表移除（Agent 写入工作目录的文件与画布卡片都不受影响）。',
+          confirmLabel: '删除所选',
+          danger: true,
+          onConfirm: remove
+        }
+      })
+      return
+    }
+    remove()
   }
 
   const renameSession = (id: string, title: string) => {
@@ -639,6 +670,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     switchSession,
     forkSession,
     requestRemoveSession,
+    requestRemoveSessions,
     renameSession,
     sendMessage,
     stopChat,
