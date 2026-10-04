@@ -146,6 +146,8 @@ const api: HuabuApi = {
 
     create: (name) => ipcRenderer.invoke(IpcChannel.WorkspaceCreate, { name }),
 
+    deleteWorkspaces: (paths) => ipcRenderer.invoke(IpcChannel.WorkspaceDelete, { paths }),
+
     files: () => ipcRenderer.invoke(IpcChannel.WorkspaceFiles),
 
     readFile: (relPath) => ipcRenderer.invoke(IpcChannel.WorkspaceReadFile, { relPath }),

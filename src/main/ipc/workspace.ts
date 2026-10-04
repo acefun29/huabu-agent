@@ -267,6 +267,17 @@ export function registerWorkspaceIpc(ctx: IpcContext): void {
     })
   })
 
+  ipcMain.handle(IpcChannel.WorkspaceDelete, async (_event, payload: unknown) => {
+    const paths = (payload as { paths?: unknown } | null)?.paths
+    if (!Array.isArray(paths)) return invalidPayload('workspace:delete 需要 paths 字符串数组')
+    try {
+      const value = await store.deleteWorkspaces(paths.filter(isNonEmptyString))
+      return { ok: true as const, value }
+    } catch (error) {
+      return { ok: false as const, code: 'unknown' as const, error: describe(error) }
+    }
+  })
+
   ipcMain.handle(IpcChannel.WorkspaceReveal, (_event, payload: unknown) => {
     const relPath = (payload as { relPath?: unknown } | null)?.relPath
     if (!isNonEmptyString(relPath)) return invalidPayload('workspace:reveal 需要 relPath')

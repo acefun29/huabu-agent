@@ -82,6 +82,8 @@ export const IpcChannel = {
   WorkspaceCreate: 'workspace:create',
   /** 在系统文件管理器中显示工作区内的文件（shell.showItemInFile） */
   WorkspaceReveal: 'workspace:reveal',
+  /** 批量删除工作区：目录移入系统回收站并移出最近列表（当前打开的工作区拒绝删除） */
+  WorkspaceDelete: 'workspace:delete',
   /** 通知类（渲染进程 send，fire-and-forget）：preload pathForFile 解析出的拖拽源路径登记，
    *  导入类 handler（media:import / asset:import-*）据 consumeSourcePath 校验「确经拖拽」 */
   WorkspaceSourcePathRegistered: 'workspace:source-path-registered',
@@ -695,6 +697,21 @@ export interface WorkspaceOpenResult {
   workspace?: WorkspaceInfo
   /** 打开新工作区时被释放的会话数（切换 dispose 的可观察证据） */
   disposedSessions: number
+}
+
+/** 批量删除工作区时的单条失败（路径非法/使用中/回收站失败等），不影响其余条目 */
+export interface WorkspaceDeleteFailure {
+  path: string
+  error: string
+}
+
+export interface WorkspaceDeleteResult {
+  /** 成功移入回收站（或目录本已消失、仅清理登记）的工作区 */
+  removed: WorkspaceSummary[]
+  /** 逐条失败明细 */
+  failures: WorkspaceDeleteFailure[]
+  /** 删除后的最新最近列表（渲染端直接 setState，免二次往返） */
+  recents: WorkspaceSummary[]
 }
 
 /**

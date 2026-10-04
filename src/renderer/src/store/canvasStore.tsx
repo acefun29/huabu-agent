@@ -6,6 +6,7 @@ import type {
   ChatContextBreakdownInfo,
   MediaConfirmPayload,
   MediaJobStatus,
+  WorkspaceDeleteResult,
   WorkspaceInfo
 } from '@shared/ipc'
 import { useSettings } from './settingsStore'
@@ -105,6 +106,8 @@ export interface CanvasState {
   openDirDialog: () => Promise<void>
   openWorkspace: (path: string) => Promise<void>
   createWorkspace: (name: string) => Promise<void>
+  /** 批量删除工作区：目录移入回收站并移出最近列表；当前工作区由主进程拒绝 */
+  deleteWorkspaces: (paths: string[]) => Promise<WorkspaceDeleteResult | null>
 
   /* 画布内容（工作区公用，只有文件卡片）—— 低频：拖动/缩放结束才变 */
   nodes: CanvasNode[]
@@ -523,6 +526,26 @@ export const useCanvasStore = create<CanvasState>()(
       showToast(`已创建工作区 ${result.value.workspace.name}`)
     }
 
+    const deleteWorkspaces = async (paths: string[]): Promise<WorkspaceDeleteResult | null> => {
+      if (!BRIDGE_AVAILABLE || paths.length === 0) return null
+      const result = await window.huabu.workspace.deleteWorkspaces(paths)
+      if (!result.ok) {
+        showToast(`删除工作区失败：${result.error}`)
+        return null
+      }
+      // 最近列表以主进程回传为准（渲染端可能有未落盘的本地改动，不做本地增删）
+      set({ recents: result.value.recents })
+      const { removed, failures } = result.value
+      if (failures.length > 0) {
+        showToast(
+          `已删除 ${removed.length} 个工作区，${failures.length} 个失败：${failures[0].error}${failures.length > 1 ? ' 等' : ''}`
+        )
+      } else {
+        showToast(`已删除 ${removed.length} 个工作区（目录已移入回收站，可恢复）`)
+      }
+      return result.value
+    }
+
     return {
       /* ---- state ---- */
       booted: false,
@@ -556,6 +579,7 @@ export const useCanvasStore = create<CanvasState>()(
       openDirDialog,
       openWorkspace,
       createWorkspace,
+      deleteWorkspaces,
       setView,
       ...node,
       ...job,

@@ -50,6 +50,7 @@ import type {
   WorkspaceReadFileResult,
   WorkspaceInfo,
   WorkspaceOpenResult,
+  WorkspaceDeleteResult,
   WorkspaceStateInfo,
   CanvasSnapshot,
   WindowStateInfo
@@ -188,6 +189,12 @@ export interface WorkspaceApi {
 
   /** 在工作区根目录下新建子目录并切换（「新建工作区」） */
   create(name: string): Promise<ChatResult<{ workspace: WorkspaceInfo }>>
+
+  /**
+   * 批量删除工作区：目录移入系统回收站并移出最近列表。
+   * 当前打开的工作区与最近列表外的路径由主进程拒绝；逐条失败不影响其余条目。
+   */
+  deleteWorkspaces(paths: string[]): Promise<ChatResult<WorkspaceDeleteResult>>
 
   /** 列出工作区内可导入文件（跳过 .huabu/.git/node_modules，按修改时间倒序） */
   files(): Promise<ChatResult<WorkspaceFileInfo[]>>

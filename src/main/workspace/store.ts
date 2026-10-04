@@ -1,10 +1,13 @@
-import { app, dialog } from 'electron'
+import { app, dialog, shell } from 'electron'
 import { existsSync, mkdirSync, readFileSync, statSync } from 'fs'
 import { copyFile, mkdir } from 'fs/promises'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
+import { homedir } from 'os'
 import { randomUUID } from 'crypto'
 import type {
   CanvasSnapshot,
+  WorkspaceDeleteFailure,
+  WorkspaceDeleteResult,
   WorkspaceInfo,
   WorkspaceOpenResult,
   WorkspaceStateInfo,
@@ -590,6 +593,51 @@ export class WorkspaceStore {
       throw new Error(`工作区名称越界：${name}`)
     }
     return this.openByPath(dir)
+  }
+
+  /**
+   * 批量删除工作区：目录移入系统回收站（shell.trashItem，可恢复）并移出最近列表；
+   * 目录已消失的条目只清登记。守卫拒绝而不是静默跳过：
+   * - 只删最近列表里登记过的工作区（渲染端伪造的任意路径不收）
+   * - 当前打开的工作区不可删（会话/凭据都锚在上面，先切走再删）
+   * - 盘符根 / 用户主目录 / 工作区根目录这类「一锅端」位置一律拒绝
+   * 单条失败（被占用、无回收站等）不影响其余条目，逐条回传给调用方汇总提示。
+   */
+  async deleteWorkspaces(paths: string[]): Promise<WorkspaceDeleteResult> {
+    const removed: WorkspaceSummary[] = []
+    const failures: WorkspaceDeleteFailure[] = []
+    for (const raw of paths) {
+      const dir = isNonEmptyString(raw) ? resolve(raw) : ''
+      const entry = dir ? this.recents.find((item) => item.path === dir) : undefined
+      if (!entry) {
+        failures.push({ path: String(raw), error: '不在工作区最近列表中' })
+        continue
+      }
+      const guard = this.deleteGuard(dir)
+      if (guard) {
+        failures.push({ path: dir, error: guard })
+        continue
+      }
+      try {
+        if (existsSync(dir)) await shell.trashItem(dir)
+        removed.push(entry)
+        this.recents = this.recents.filter((item) => item.path !== dir)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        failures.push({ path: dir, error: `移入回收站失败：${message}` })
+      }
+    }
+    if (removed.length > 0) this.persistRecents()
+    return { removed, failures, recents: [...this.recents] }
+  }
+
+  /** 删除守卫：返回拒绝原因文案；null = 放行 */
+  private deleteGuard(dir: string): string | null {
+    if (this.current && dir === this.current.path) return '正在使用中，请先切换到其他工作区'
+    if (dir === dirname(dir)) return '不能删除盘符根目录'
+    if (dir === resolve(homedir())) return '不能删除用户主目录'
+    if (dir === resolve(this.workspacesRoot())) return '不能删除工作区根目录'
+    return null
   }
 }
 
