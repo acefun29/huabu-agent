@@ -288,6 +288,72 @@ textarea,
   font-size: 12px;
 }
 
+/* Tailwind preflight 会把标题/列表重置成普通文本样式，这里按紧凑档恢复
+   md 语素的视觉差异（笔记卡与会话消息共用 .markdown-body） */
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  font-weight: 600;
+  margin: 0.55em 0 0.3em;
+  line-height: 1.35;
+}
+.markdown-body h1 {
+  font-size: 1.3em;
+}
+.markdown-body h2 {
+  font-size: 1.18em;
+}
+.markdown-body h3 {
+  font-size: 1.08em;
+}
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  font-size: 1em;
+}
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0.35em 0;
+  padding-left: 1.4em;
+}
+.markdown-body ul {
+  list-style: disc;
+}
+.markdown-body ol {
+  list-style: decimal;
+}
+.markdown-body li {
+  margin: 0.12em 0;
+}
+.markdown-body li > ul,
+.markdown-body li > ol {
+  margin: 0.12em 0;
+}
+.markdown-body strong {
+  font-weight: 600;
+}
+.markdown-body blockquote {
+  margin: 0.4em 0;
+  padding-left: 0.7em;
+  border-left: 3px solid var(--outline);
+  color: var(--on-surface-variant);
+}
+.markdown-body hr {
+  border: 0;
+  border-top: 1px solid var(--outline);
+  margin: 0.6em 0;
+}
+.markdown-body a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.markdown-body input[type='checkbox'] {
+  margin-right: 0.35em;
+}
+
 /* 标签输入框（AssetNode TagRow）：Chromium 会给带 list 属性的输入框在右侧渲染一枚
    浅色下拉箭头，在深色浮层上是发白残影，隐藏；键入时建议下拉仍照常弹出 */
 input[list='huabu-all-tags']::-webkit-calendar-picker-indicator {

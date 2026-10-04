@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowDown,
   Check,
@@ -149,23 +149,26 @@ function isEditableDoc(data: AssetData): boolean {
 }
 
 /**
- * 文档卡的文本内容（懒加载一次，随 path 变化重读）。
+ * 文档卡的文本内容（懒加载一次，随 path 变化重读；nonce 供保存成功后强制刷新）。
  * 读 workspace:read-file（主进程有白名单与 512KB 截断）；失败静默回退骨架预览。
  */
-function useDocText(data: AssetData): string | null {
+function useDocText(data: AssetData, nonce = 0): string | null {
   const want = isTextDoc(data)
   const [text, setText] = useState<string | null>(null)
+  const lastPath = useRef<string | null>(null)
   useEffect(() => {
     if (!want || !data.path || !window.huabu?.workspace) return
     let alive = true
-    setText(null)
+    // 换文件才清空回骨架；nonce 刷新（保存后）保留旧文本直到新内容到达，避免闪骨架
+    if (lastPath.current !== data.path) setText(null)
+    lastPath.current = data.path
     void window.huabu.workspace.readFile(data.path).then((result) => {
       if (alive && result.ok) setText(result.value.text)
     })
     return () => {
       alive = false
     }
-  }, [want, data.path])
+  }, [want, data.path, nonce])
   return want ? text : null
 }
 
@@ -313,7 +316,9 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
   const src = assetSrc(data, CARD_THUMB_SIZE)
   const [previewBroken, setPreviewBroken] = useState(false)
   const viewable = data.kind === 'image' || data.kind === 'video' || data.kind === 'audio'
-  const docText = useDocText(data)
+  /** 保存成功后 +1：驱动 useDocText 重读文件，卡片展示立即反映新内容 */
+  const [docNonce, setDocNonce] = useState(0)
+  const docText = useDocText(data, docNonce)
   const editable = isEditableDoc(data)
   const isMd = /\.md$/i.test(data.name)
   const [editing, setEditing] = useState(false)
@@ -338,6 +343,7 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
       showToast(`保存失败：${result.error}`)
       return
     }
+    setDocNonce((n) => n + 1)
     setEditing(false)
     updateNode(node.id, { data: { ...data, meta: `${draft.split('\n').length} 行` } })
     showToast(`已保存「${data.name}」（${isMd ? 'md 笔记' : '文本'}）`)
@@ -352,7 +358,7 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
         e.stopPropagation()
         if (src && viewable) openViewer(node.id)
       }}
-      className={`group relative flex h-full w-full cursor-pointer flex-col overflow-hidden rounded-2xl bg-(--surface-card) transition-shadow ${
+      className={`group relative flex h-full w-full cursor-pointer flex-col overflow-hidden rounded-2xl bg-(--surface-card) transition-shadow transform-gpu ${
         selected ? 'bg-(--active-tint) shadow-md' : 'shadow-sm hover:shadow-md'
       }`}
     >
@@ -527,27 +533,43 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
         )}
       </div>
 
-      {/* 选中信息浮层（媒体卡）：画框式沉浸——静置零文字，悬停浮出名称行，选中后
-          名称与标签同在这张深色渐变层里。z-[5]：压住媒体、让位于 z-10 的选中描边。 */}
-      {viewable && (
+      {/* 选中信息浮层：所有卡型统一「画框式沉浸」——静置零文字，悬停浮出名称行，选中后
+          名称与标签同在这层里。媒体卡深色渐变压在画面上，文本卡用卡面渐变压在正文上；
+          编辑态（文本卡）整体卸载，把整卡让给编辑器。z-[5]：压住媒体、让位于 z-10 的选中描边。 */}
+      {!editing && (
         <div
           data-testid="asset-info-scrim"
-          className={`absolute inset-x-0 bottom-0 z-[5] transition-all duration-200 motion-reduce:transition-none ${
-            selected
-              ? 'translate-y-0 opacity-100'
-              : 'translate-y-1.5 opacity-0 group-hover:translate-y-0 group-hover:opacity-100'
+          className={`absolute inset-x-0 bottom-0 z-[5] rounded-b-2xl transition-opacity duration-200 motion-reduce:transition-none ${
+            selected ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
           }`}
         >
-          <div className="bg-gradient-to-t from-black/70 via-black/40 to-transparent px-2.5 pb-2 pt-7 text-white">
+          <div
+            className={`rounded-b-2xl ${
+              viewable
+                ? 'bg-gradient-to-t from-black/70 via-black/40 to-transparent px-2.5 pb-2 pt-7 text-white'
+                : 'bg-gradient-to-t from-(--surface-input) via-(--surface-input)/90 to-transparent px-3 pb-2 pt-7'
+            }`}
+          >
             <div className="flex items-center gap-1.5">
-              <span className="shrink-0 text-white/80">{kindIcon(data.kind, 12)}</span>
-              <span className="min-w-0 truncate text-[12px] font-medium" title={data.path ?? data.name}>
+              <span className={`shrink-0 ${viewable ? 'text-white/80' : 'text-(--accent)'}`}>
+                {viewable
+                  ? kindIcon(data.kind, 12)
+                  : isEditableDoc(data) && isMd
+                    ? <StickyNote size={13} />
+                    : kindIcon(data.kind)}
+              </span>
+              <span className="min-w-0 truncate text-[12px] font-medium" title={viewable ? (data.path ?? data.name) : data.name}>
                 {data.name}
               </span>
-              <span className="ml-auto shrink-0 text-[10px] text-white/70">
+              <span className={`ml-auto shrink-0 text-[10px] ${viewable ? 'text-white/70' : 'text-(--on-surface-muted)'}`}>
                 {formatBytes(data.bytes) || data.meta || KIND_LABEL[data.kind]}
               </span>
             </div>
+            {data.path && !viewable && (
+              <div className="mt-0.5 truncate pl-[21px] font-mono text-[10px] text-(--on-surface-muted)" title={data.path}>
+                {data.path}
+              </div>
+            )}
             {/* 标签随选中平滑展开（高度生长 + 内容淡入），浮层不再瞬间撑高一截 */}
             <Collapse open={selected}>
               <div
@@ -555,42 +577,10 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
                   selected ? 'opacity-100' : 'opacity-0'
                 }`}
               >
-                <TagRow node={node} data={data} single={selectedCount === 1} />
+                <TagRow node={node} data={data} single={selectedCount === 1} tone={viewable ? undefined : 'light'} />
               </div>
             </Collapse>
           </div>
-        </div>
-      )}
-
-      {/* 文本/其他卡：名字与路径本身就是内容身份，保留底栏不沉浸；标签选中后并入底栏，
-          与名字同框展示。编辑态收起标签行，避免压缩编辑区。 */}
-      {!viewable && (
-        <div className="shrink-0 border-t border-(--outline-soft) px-3 py-2">
-          <div className="flex items-center gap-2">
-            <span className="shrink-0 text-(--accent)">
-              {isEditableDoc(data) && isMd ? <StickyNote size={13} /> : kindIcon(data.kind)}
-            </span>
-            <span className="truncate text-[12px] font-medium" title={data.name}>
-              {data.name}
-            </span>
-            <span className="ml-auto shrink-0 text-[10px] text-(--on-surface-muted)">
-              {formatBytes(data.bytes) || data.meta || KIND_LABEL[data.kind]}
-            </span>
-          </div>
-          {data.path && (
-            <div className="mt-0.5 truncate pl-[21px] font-mono text-[10px] text-(--on-surface-muted)" title={data.path}>
-              {data.path}
-            </div>
-          )}
-          <Collapse open={selected && !editing}>
-            <div
-              className={`transition-opacity duration-150 motion-reduce:transition-none ${
-                selected && !editing ? 'opacity-100' : 'opacity-0'
-              }`}
-            >
-              <TagRow node={node} data={data} single={selectedCount === 1} tone="light" />
-            </div>
-          </Collapse>
         </div>
       )}
     </div>
