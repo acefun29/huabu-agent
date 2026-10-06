@@ -356,16 +356,6 @@ export function draftToMessage(draft: ChatDraft): ChatMessage {
   return message
 }
 
-/** 结束原因的语义分组，决定显示「完成 / 已中止 / 出错」 */
-export function stopReasonKind(reason?: ChatStopReason): 'pending' | 'done' | 'aborted' | 'error' {
-  if (!reason || reason === 'pending') return 'pending'
-  if (reason === 'aborted') return 'aborted'
-  if (reason === 'error') return 'error'
-  // stop / length / toolUse / deferred 都是正常结束。
-  // toolUse 尤其不能当异常：它只表示「这条消息以工具调用收尾，后面还有 turn」
-  return 'done'
-}
-
 /**
  * 压缩分隔条的稳定 id：djb2(摘要 + token 数字段)。
  *

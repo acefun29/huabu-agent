@@ -1,5 +1,5 @@
 import type { CustomModelInput, CustomProviderInput, ModelEditInput } from '../../shared/ipc'
-import type { ChatUserProviderConfig, WorkspaceChatConfig } from './types'
+import type { WorkspaceChatConfig } from './types'
 import {
   applyAddModel,
   applyAddProvider,
@@ -28,12 +28,6 @@ function mutate(dir: string, apply: (chat: WorkspaceChatConfig) => void): Worksp
   apply(chat)
   writeChatSegment(dir, pruneChatConfig(chat))
   return readChatConfig(dir)
-}
-
-/** 设置页的「自定义供应商」清单（覆盖层原样，含还没挂模型的条目） */
-export function listUserProviders(dir: string): ChatUserProviderConfig[] {
-  if (!dir) return []
-  return [...(readChatConfig(dir).userProviders ?? [])]
 }
 
 export function addCustomProvider(dir: string, input: CustomProviderInput): WorkspaceChatConfig {

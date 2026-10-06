@@ -11,16 +11,5 @@ import './openaiCompat'
 import './minimax'
 import './tencent'
 
-export {
-  adapterDefaultAuthEnv,
-  createAdapters,
-  getAdapterTypes,
-  isRegisteredAdapterType,
-  registerAdapter
-} from './registry'
-export type { AdapterDeps, AdapterFactory, AdapterModelConfig, AdapterProviderConfig } from './registry'
-export { DashScopeProvider } from './dashscope'
-export { VolcArkProvider } from './volcark'
-export { OpenAICompatProvider } from './openaiCompat'
-export { MiniMaxProvider } from './minimax'
-export { TencentHunyuanProvider } from './tencent'
+export { createAdapters, getAdapterTypes, isRegisteredAdapterType } from './registry'
+export type { AdapterDeps, AdapterProviderConfig } from './registry'

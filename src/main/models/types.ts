@@ -141,12 +141,6 @@ export interface RegistrationPayload {
   models: RegistrationModelInput[]
 }
 
-/** merge 阶段的诊断（坏数据只 warn 不炸，参照 media/catalog/merge.ts 的 warn 约定） */
-export interface MergeDiagnostic {
-  path: string
-  message: string
-}
-
 /* ---------------- workspace.json `chat` 覆盖层（store.ts 引用这批类型） ---------------- */
 
 /** 用户自建模型的原始条目（坏数据由 sanitize 逐字段清洗） */

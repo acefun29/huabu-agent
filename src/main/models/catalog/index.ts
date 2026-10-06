@@ -31,28 +31,11 @@ import openai from './providers/openai'
  */
 export const BUILTIN_CHAT_PROVIDERS: ChatProviderDef[] = [deepseek, kimi, glm, qwen, anthropic, openai]
 
-export { defineProvider } from './define'
-export type {
-  ChatCompatFor,
-  ChatModelApi,
-  ChatModelDef,
-  ChatModelOverride,
-  ChatProviderAuth,
-  ChatProviderDef,
-  ChatUserModelConfig,
-  ChatUserProviderConfig,
-  EffectiveChatModel,
-  EffectiveChatProvider,
-  RegistrationModelInput,
-  RegistrationPayload,
-  WorkspaceChatConfig
-} from '../types'
 export { CHAT_MODEL_APIS, isChatModelApi } from '../types'
 export {
   mergeChatCatalog,
   validateBuiltinCatalog,
   sanitizeUserProviders,
-  sanitizeUserProvider,
   sanitizeHiddenBuiltin,
   sanitizeModelOverrides,
   PROVIDER_ID_PATTERN,

@@ -1,6 +1,5 @@
 import { safeStorage } from 'electron'
-import { existsSync, mkdirSync, readFileSync } from 'fs'
-import { dirname } from 'path'
+import { existsSync, readFileSync } from 'fs'
 import type { Credential, CredentialInfo, CredentialStore } from '@earendil-works/pi-ai'
 import { atomicWriteSync } from '../fsutil/atomic'
 
@@ -131,16 +130,4 @@ export class SafeStorageCredentialStore implements CredentialStore {
     const size = readFileSync(this.file).byteLength
     return `${this.file}（${size} 字节，密文存储）`
   }
-}
-
-/** 供测试探针验证「磁盘上为密文」：读原始文件，返回是否含有明文 key 形态的字符串 */
-export function credentialFileLooksEncrypted(file: string): { exists: boolean; plaintextHit: boolean } {
-  if (!existsSync(file)) return { exists: false, plaintextHit: false }
-  const raw = readFileSync(file, 'utf8')
-  return { exists: true, plaintextHit: /sk-[A-Za-z0-9_-]{16,}/.test(raw) }
-}
-
-/** 确保凭据目录存在（启动时预热，避免首次写入时目录不存在） */
-export function ensureCredentialsDir(file: string): void {
-  mkdirSync(dirname(file), { recursive: true })
 }

@@ -211,5 +211,3 @@ export function createNodeOps(deps: NodeOpsDeps) {
     undo
   }
 }
-
-export type NodeOps = ReturnType<typeof createNodeOps>

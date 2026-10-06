@@ -584,5 +584,3 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     renameAsset
   }
 }
-
-export type LibraryOps = ReturnType<typeof createLibraryOps>

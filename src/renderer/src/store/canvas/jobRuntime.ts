@@ -353,5 +353,3 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
     requestClearGenerateVersions
   }
 }
-
-export type JobRuntime = ReturnType<typeof createJobRuntime>

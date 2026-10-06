@@ -711,5 +711,3 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     replayChatHistory
   }
 }
-
-export type ChatRuntime = ReturnType<typeof createChatRuntime>

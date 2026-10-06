@@ -250,12 +250,6 @@ export function isInboxPath(absPath: string): boolean {
   return resolved === root || resolved.startsWith(root + sep)
 }
 
-/** 供外部拿到「某分类目录的绝对路径」（媒体落库等场景） */
-export function categoryAbsDir(workspaceDir: string, categoryId: string): string {
-  const category = [...ASSET_CATEGORIES, OTHER_CATEGORY].find((c) => c.id === categoryId)
-  return resolve(workspaceDir, category?.dir ?? OTHER_CATEGORY.dir)
-}
-
 /* -------------------------------------------------------------------------- */
 /* 拖拽归档（asset:transfer）                                                   */
 /* -------------------------------------------------------------------------- */

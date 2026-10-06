@@ -12,16 +12,4 @@
  *   （asset:import-canvas，main/assets/manager.ts），重名加时间戳；
  * - @backend(abs-path)：workspaceAbs 用真实工作区目录拼接，统一 '/' 分隔。
  */
-export {
-  ASSET_CATEGORIES,
-  OTHER_CATEGORY,
-  CODE_EXTS,
-  categorizeFileName,
-  dedupeName,
-  normalizePath,
-  workspaceAbs,
-  assetAbsPath,
-  MEDIA_ROOT_REL,
-  type AssetCategory,
-  type AssetKindName
-} from '@shared/assets'
+export { normalizePath, assetAbsPath, MEDIA_ROOT_REL } from '@shared/assets'

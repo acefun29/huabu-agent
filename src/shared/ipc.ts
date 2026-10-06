@@ -223,8 +223,6 @@ export const IpcChannel = {
   AssetChanged: 'asset:changed'
 } as const
 
-export type IpcChannelValue = (typeof IpcChannel)[keyof typeof IpcChannel]
-
 /** app:version 的返回结构 */
 export interface AppVersionInfo {
   /** package.json 中的应用版本 */
@@ -1034,13 +1032,9 @@ export interface ModelEditInput {
 /* -------------------------------------------------------------------------- */
 
 export type {
-  MediaKind,
-  MediaModelInfo,
   MediaProviderInfo,
   MediaProviderType,
   MediaGenerateRequest,
-  MediaJobState,
-  MediaArtifact,
   MediaJobStatus,
   MediaImportRequest,
   MediaImportResult,
@@ -1066,12 +1060,6 @@ export interface MediaConfirmPayload {
   durationSeconds?: number
   /** 参考图（垫图/首帧）数量 */
   refCount?: number
-}
-
-/** media:confirm-resolve 请求 */
-export interface MediaConfirmResolveRequest {
-  requestId: string
-  accepted: boolean
 }
 
 /* -------------------------------------------------------------------------- */

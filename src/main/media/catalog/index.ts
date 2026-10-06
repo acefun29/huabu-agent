@@ -18,7 +18,5 @@ import tencent from './providers/tencent'
 
 export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [dashscope, volcark, openai, minimax, tencent]
 
-export { defineProvider } from './define'
-export type { BuiltinModelDef, BuiltinProviderAuth, BuiltinProviderDef, CatalogBrowseModel } from './types'
 export { browseCatalog } from './browse'
-export { mergeCatalog, sanitizeCapabilities, sanitizeUserProvider, sanitizeUserProviders, PROVIDER_ID_PATTERN, MODEL_ID_PATTERN } from './merge'
+export { mergeCatalog, sanitizeCapabilities, sanitizeUserProvider, PROVIDER_ID_PATTERN, MODEL_ID_PATTERN } from './merge'

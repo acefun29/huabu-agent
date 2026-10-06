@@ -38,7 +38,7 @@ import {
 } from './canvas/shared'
 
 /* 对外契约（T8 拆分前就有的导出符号，消费者按此引用；实现已移入 store/canvas/*） */
-export { MEDIA_EXT, MEDIA_LABEL, LIBRARY_ASSET_MIME, ASSET_IDS_MIME, toolArgString } from './canvas/shared'
+export { MEDIA_LABEL, LIBRARY_ASSET_MIME, ASSET_IDS_MIME } from './canvas/shared'
 
 /**
  * 画布状态（huabuai-proto-v2 最新版数据模型的真实数据层）—— T8 起为装配层。

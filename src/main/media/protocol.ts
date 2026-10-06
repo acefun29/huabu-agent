@@ -219,21 +219,3 @@ export function buildMediaUrl(relPath: string): string {
     .map(encodeURIComponent)
     .join('/')}`
 }
-
-/** 构建工作区文件 URL（huabu-media://ws/<相对工作区根路径>） */
-export function buildWorkspaceUrl(relPath: string): string {
-  const normalized = relPath.split('\\').join('/')
-  return `${MEDIA_SCHEME}://ws/${normalized
-    .split('/')
-    .map(encodeURIComponent)
-    .join('/')}`
-}
-
-/** 构建临时收件箱文件 URL（huabu-media://inbox/<相对收件箱根路径>） */
-export function buildInboxUrl(relPath: string): string {
-  const normalized = relPath.split('\\').join('/')
-  return `${MEDIA_SCHEME}://inbox/${normalized
-    .split('/')
-    .map(encodeURIComponent)
-    .join('/')}`
-}

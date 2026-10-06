@@ -233,7 +233,7 @@ function isNonEmptyString(value: unknown): value is string {
 }
 
 /* 状态目录/凭据路径已拆到 stateDir.ts（轻量模块，避免无关闭包）；此处 re-export 保住既有引用 */
-export { getAppStateDir, workspaceId, getCredentialsFile } from './stateDir'
+export { getCredentialsFile } from './stateDir'
 import { getAppStateDir, getCredentialsFile } from './stateDir'
 
 export class WorkspaceStore {

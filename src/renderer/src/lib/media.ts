@@ -35,20 +35,6 @@ export function assetSrc(data: Pick<AssetData, 'storage' | 'path' | 'pathRoot'>,
   return `huabu-media://${host}/${encoded}`
 }
 
-/** 临时附件（inbox 绝对路径）→ 可预览 src；inboxDir 来自 asset:libraries 的返回 */
-export function inboxSrc(absPath: string, inboxDir: string | null): string | null {
-  if (!inboxDir) return null
-  const root = inboxDir.replace(/\\/g, '/').replace(/\/+$/, '') + '/'
-  const normalized = absPath.replace(/\\/g, '/')
-  if (!normalized.startsWith(root)) return null
-  const rel = normalized.slice(root.length)
-  const encoded = rel
-    .split('/')
-    .map(encodeURIComponent)
-    .join('/')
-  return `huabu-media://inbox/${encoded}`
-}
-
 /** 人类可读的体积（KB/MB） */
 export function formatBytes(bytes?: number): string {
   if (!bytes || bytes <= 0) return ''

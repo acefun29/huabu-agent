@@ -16,7 +16,6 @@ import type { useSettings } from '../settingsStore'
 /** 内置「画布素材」合成库的固定 id（主进程 listLibraries 用同名值；落库链做 kind 映射） */
 export const BUILTIN_LIBRARY = 'builtin-assets'
 
-export const MEDIA_EXT: Record<MediaKind, string> = { image: 'png', video: 'mp4', audio: 'mp3' }
 export const MEDIA_LABEL: Record<MediaKind, string> = { image: '图片', video: '视频', audio: '音频' }
 
 /** 拖拽载荷 MIME：素材库文件 → 画布 = 钉一张引用卡片 */
