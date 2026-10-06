@@ -3,7 +3,7 @@ import { readFile } from 'fs/promises'
 /**
  * 网关适配器共用的参考图（垫图/首帧）装载工具。
  *
- * 从 fal 适配器抽出：本地图片文件 → base64 data URI，是各家「image_url/image 类
+ * 从队列网关适配器抽出：本地图片文件 → base64 data URI，是各家「image_url/image 类
  * 参数吃公网 URL 或 base64」形态里唯一离线可用的官方支持形态；超出大小上限或
  * 读取失败的参考图跳过（不阻塞纯文生生成的提交）。
  *

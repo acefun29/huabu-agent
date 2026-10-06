@@ -19,7 +19,7 @@ export interface ProviderSubmitInput {
   width?: number
   height?: number
   durationSeconds?: number
-  /** 参考文件（垫图/首帧）绝对路径。mock 忽略；fal 把首个图片参考转 data URI 附到请求 */
+  /** 参考文件（垫图/首帧）绝对路径。mock 忽略；真实网关把首个图片参考转 data URI 附到请求 */
   refFiles?: string[]
 }
 

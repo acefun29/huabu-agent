@@ -140,7 +140,8 @@ export function registerSettingsIpc(ctx: IpcContext): void {
         ...(typeof request.contextWindow === 'number' ? { contextWindow: request.contextWindow } : {}),
         ...(typeof request.maxTokens === 'number' ? { maxTokens: request.maxTokens } : {}),
         ...(request.reasoning === true ? { reasoning: true } : {}),
-        ...(Array.isArray(request.input_modalities) ? { input_modalities: request.input_modalities } : {})
+        ...(Array.isArray(request.input_modalities) ? { input_modalities: request.input_modalities } : {}),
+        ...(Array.isArray(request.thinkingLevels) ? { thinkingLevels: request.thinkingLevels } : {})
       })
       return await afterChatConfigChange(dir)
     } catch (error) {
@@ -171,7 +172,8 @@ export function registerSettingsIpc(ctx: IpcContext): void {
       name: isNonEmptyString(request.name) ? request.name : undefined,
       ...(typeof request.contextWindow === 'number' ? { contextWindow: request.contextWindow } : {}),
       ...(typeof request.maxTokens === 'number' ? { maxTokens: request.maxTokens } : {}),
-      ...(request.reasoning !== undefined ? { reasoning: request.reasoning } : {})
+      ...(request.reasoning !== undefined ? { reasoning: request.reasoning } : {}),
+      ...(Array.isArray(request.thinkingLevels) ? { thinkingLevels: request.thinkingLevels } : {})
     }
     try {
       // 落点由覆盖层判定（自建条目直接改；内置条目 = 改名进 modelOverrides、

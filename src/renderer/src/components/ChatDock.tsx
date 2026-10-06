@@ -82,28 +82,6 @@ const CompactionDivider = memo(function CompactionDivider({
   )
 })
 
-/** 用户消息里的注入段折叠（回放拆分产物：正文在上，注入的清单/态势默认收起） */
-function UserContextPayload({ payload }: { payload: string }) {
-  const [expanded, setExpanded] = useState(false)
-  return (
-    <div className="mt-1.5 border-t border-dashed border-(--outline-soft) pt-1.5">
-      <button
-        onClick={() => setExpanded((v) => !v)}
-        className="flex items-center gap-1 text-[10.5px] text-(--on-surface-muted)"
-        title={expanded ? '收起本轮注入的上下文' : '展开本轮注入的上下文'}
-      >
-        <ChevronRight size={10} className={`transition-transform ${expanded ? 'rotate-90' : ''}`} />
-        本轮注入的上下文
-      </button>
-      {expanded && (
-        <div className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-left text-[10.5px] text-(--on-surface-variant)" data-scrollable="">
-          {payload}
-        </div>
-      )}
-    </div>
-  )
-}
-
 /** 回放图片：缩略图或退化 chip（带源路径） */
 function ReplayImages({ images, alignEnd }: { images: ChatHistoryImage[]; alignEnd?: boolean }) {
   if (images.length === 0) return null
@@ -171,7 +149,6 @@ const MessageBubble = memo(function MessageBubble({ m, expanded }: { m: ChatMess
             </div>
           )}
           {m.content}
-          {m.contextPayload && <UserContextPayload payload={m.contextPayload} />}
         </div>
       </div>
     )
@@ -393,8 +370,14 @@ export function ChatDock() {
           >
             <span className="absolute left-1/2 top-[5px] h-1 w-9 -translate-x-1/2 rounded-full bg-(--outline)" />
             <MessageSquare size={12} className="mt-1 shrink-0 text-(--accent)" />
-            <span className="mt-1 min-w-0 flex-1 truncate text-[11px] font-medium text-(--on-surface-muted)">
+            <span
+              className="mt-1 min-w-0 flex-1 truncate text-[11px] font-medium text-(--on-surface-muted)"
+              title={session ? `会话 ID：${session.id}${session.sessionFile ? `\n会话文件：${session.sessionFile}` : ''}` : undefined}
+            >
               {session?.title ?? '对话'} · {fullHistory.length} 条
+              {session ? (
+                <span className="ml-1 font-mono text-[9.5px] font-normal tracking-tight opacity-70">#{session.id.slice(0, 6)}</span>
+              ) : null}
               {running ? ' · 生成中…' : ''}
               {compacting ? ' · 正在压缩上下文…' : ''}
             </span>

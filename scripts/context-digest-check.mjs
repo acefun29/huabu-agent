@@ -209,7 +209,7 @@ check('T11 带 gen 的卡片 ⇒ attachment 附 genSummary（状态/提示词/�
         gen: {
           prompt: 'a cute cat poster',
           refs: [],
-          params: { ratio: '3:4', model: 'fal/flux-2-flash' },
+          params: { ratio: '3:4', model: 'dashscope/wan2.7-image' },
           status: 'succeeded',
           progress: 1,
           versions: [{ id: 'v1' }, { id: 'v2' }],
@@ -224,7 +224,7 @@ check('T11 带 gen 的卡片 ⇒ attachment 附 genSummary（状态/提示词/�
   assert(typeof s === 'string' && s.length > 0, 'genSummary 缺失')
   assert(s.includes('a cute cat poster'), '缺提示词')
   assert(s.includes('3:4'), '缺比例')
-  assert(s.includes('fal/flux-2-flash'), '缺模型')
+  assert(s.includes('dashscope/wan2.7-image'), '缺模型')
   assert(s.includes('共 2 版'), '缺版本数')
   return s.slice(0, 60)
 })

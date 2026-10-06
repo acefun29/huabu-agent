@@ -1,8 +1,12 @@
 import type {
   CustomModelInput,
   CustomProviderInput,
-  ModelEditInput
+  ModelEditInput,
+  ThinkingLevelName
 } from '../../shared/ipc'
+// 刻意值导入不用 shared/ipc（那边连着 electron）：本文件必须保持纯 Node 可加载
+// （chat-catalog:check 直接跑它）。与 shared/ipc 的 THINKING_LEVELS 同源同序，改一处必改两处
+const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
 import type { ChatUserModelConfig, ChatUserProviderConfig, WorkspaceChatConfig } from './types'
 import {
   BUILTIN_CHAT_PROVIDERS,
@@ -33,6 +37,25 @@ import {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
+}
+
+/**
+ * 档位子集 → thinkingLevelMap（唯一转换处）：选中的恒等映射、未选中的显式置 null。
+ * off 不进映射 —— openai-completions 下 off = 不发 reasoning_effort，恒可用；
+ * 进了映射反而会在 pi 的 getSupportedThinkingLevels 里把 off 排除掉。
+ * 非法档位名丢弃；全非法时返回 undefined（等价于没写映射 = 全档可用）。
+ */
+type ExcludingOff = Exclude<ThinkingLevelName, 'off'>
+function levelsToThinkingLevelMap(levels: string[] | undefined): Record<string, string | null> | undefined {
+  if (!Array.isArray(levels)) return undefined
+  const selected = new Set(levels.filter((l): l is ThinkingLevelName => (THINKING_LEVELS as readonly string[]).includes(l) && l !== 'off'))
+  if (selected.size === 0) return undefined
+  const map = {} as Record<ExcludingOff, string | null>
+  for (const level of THINKING_LEVELS) {
+    if (level === 'off') continue
+    map[level] = selected.has(level) ? level : null
+  }
+  return map
 }
 
 function entry(chat: WorkspaceChatConfig, providerId: string): ChatUserProviderConfig | undefined {
@@ -134,6 +157,15 @@ export function applyAddModel(chat: WorkspaceChatConfig, input: CustomModelInput
   if (input.maxTokens && input.maxTokens > 0) model.maxTokens = Math.round(input.maxTokens)
   if (input.reasoning !== undefined) model.reasoning = input.reasoning
   if (input.input_modalities?.length) model.input = [...new Set(input.input_modalities)]
+  // 档位声明（仅 completions 有意义；responses/anthropic 的档位语义不同，不从这里收敛）。
+  // 只在推理模型下落盘：非推理模型的映射是死配置
+  if (
+    (input.reasoning === true || (input.reasoning === undefined && model.reasoning === true)) &&
+    (input.api === undefined || input.api === '' || input.api === 'openai-completions')
+  ) {
+    const map = levelsToThinkingLevelMap(input.thinkingLevels)
+    if (map) model.thinkingLevelMap = map
+  }
   // 模型级协议：缺省=跟随供应商。一个网关同时暴露 /chat/completions 与 /responses 时才有意义，
   // 所以它是可选项而不参与必填校验，但给了就必须是白名单内的一项（写错会静默按 completions 走）
   if (input.api !== undefined && input.api !== '') {
@@ -215,6 +247,14 @@ export function applyEditModel(chat: WorkspaceChatConfig, input: ModelEditInput)
       else delete entryModel.name
     }
     Object.assign(entryModel, capabilities)
+    // 档位声明整组替换：给了数组就重算映射；空数组或关闭推理 = 清除（非推理/未声明回退全档可用）
+    if (Array.isArray(input.thinkingLevels)) {
+      const map = levelsToThinkingLevelMap(input.thinkingLevels)
+      if (map && entryModel.reasoning !== false) entryModel.thinkingLevelMap = map
+      else delete entryModel.thinkingLevelMap
+    } else if (input.reasoning === false) {
+      delete entryModel.thinkingLevelMap
+    }
     if (index >= 0) list[index] = entryModel
     else list.push(entryModel)
     target.models = list
@@ -234,6 +274,12 @@ export function applyEditModel(chat: WorkspaceChatConfig, input: ModelEditInput)
     const index = list.findIndex((m) => m.id === input.modelId)
     const patch: ChatUserModelConfig = index >= 0 ? { ...list[index] } : { id: input.modelId }
     Object.assign(patch, capabilities)
+    // 内置模型的档位声明走同 id 补丁（merge.ts 的 patchBuiltinModel 会合并 thinkingLevelMap）
+    if (Array.isArray(input.thinkingLevels)) {
+      const map = levelsToThinkingLevelMap(input.thinkingLevels)
+      if (map && patch.reasoning !== false) patch.thinkingLevelMap = map
+      else delete patch.thinkingLevelMap
+    }
     if (index >= 0) list[index] = patch
     else list.push(patch)
     target.models = list

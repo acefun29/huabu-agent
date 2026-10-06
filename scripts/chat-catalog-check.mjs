@@ -732,6 +732,42 @@ async function main() {
     assert(m2.contextWindow === 128000 && m2.maxTokens === 8192, `自定义模型缺省值不对：${m2.contextWindow}/${m2.maxTokens}`)
   })
 
+  await checkAsync('推理档位声明 → thinkingLevelMap；用户模型注册带保守 compat 默认', async () => {
+    // 档位子集落盘成映射：选中恒等、未选中置 null、off 不进映射
+    let chat = apply({}, (c) => overlay.applyAddProvider(c, { providerId: 'gw', baseUrl: 'https://gw.example.com/v1' }))
+    chat = apply(chat, (c) =>
+      overlay.applyAddModel(c, { providerId: 'gw', id: 'm1', reasoning: true, thinkingLevels: ['low', 'medium', 'xhigh'] })
+    )
+    const manager = quiet(() => new ChatModelManager({ credentials: fakeStore(), config: chat }))
+    const map = manager.providers().find((p) => p.id === 'gw').models.find((m) => m.id === 'm1').thinkingLevelMap ?? {}
+    assert(map.low === 'low' && map.medium === 'medium' && map.xhigh === 'xhigh', `选中档位应恒等映射：${JSON.stringify(map)}`)
+    assert(map.high === null && map.minimal === null && map.max === null, `未选中档位应置 null：${JSON.stringify(map)}`)
+    assert(!('off' in map), 'off 不应进映射（openai-completions 下 off = 不发 effort，进映射会被当成不支持）')
+
+    // 编辑整组替换 + 关推理清除
+    chat = apply(chat, (c) =>
+      overlay.applyEditModel(c, { providerId: 'gw', modelId: 'm1', reasoning: true, thinkingLevels: ['medium'] })
+    )
+    const afterEdit = quiet(() => new ChatModelManager({ credentials: fakeStore(), config: chat }))
+      .providers()
+      .find((p) => p.id === 'gw')
+      .models.find((m) => m.id === 'm1').thinkingLevelMap
+    assert(afterEdit?.medium === 'medium' && afterEdit?.low === null, `编辑后映射应整组替换：${JSON.stringify(afterEdit)}`)
+    chat = apply(chat, (c) => overlay.applyEditModel(c, { providerId: 'gw', modelId: 'm1', reasoning: false, thinkingLevels: [] }))
+    const afterOff = quiet(() => new ChatModelManager({ credentials: fakeStore(), config: chat }))
+      .providers()
+      .find((p) => p.id === 'gw')
+      .models.find((m) => m.id === 'm1')
+    assert(!afterOff.thinkingLevelMap, '关掉推理后映射应清除')
+
+    // 用户模型注册载荷的 compat 默认：未知网关收不了 developer 角色 / max_completion_tokens / store
+    const regs = await quietAsync(() => manager.registrations())
+    const payload = regs.find((r) => r.providerId === 'gw').payload.models.find((m) => m.id === 'm1')
+    assert(payload.compat && payload.compat.supportsDeveloperRole === false, '用户模型注册应默认关掉 developer 角色')
+    assert(payload.compat.maxTokensField === 'max_tokens', '用户模型注册应默认用 max_tokens 字段')
+    assert(payload.compat.supportsStore === false, '用户模型注册应默认不发 store')
+  })
+
   check('内置供应商：改 baseUrl 传导到全部模型，删覆盖条目=恢复官方默认', () => {
     let chat = apply({}, (c) =>
       overlay.applyAddProvider(c, { providerId: 'deepseek', name: 'DeepSeek 镜像', baseUrl: 'https://mirror.example.com' })

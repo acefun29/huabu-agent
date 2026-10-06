@@ -25,22 +25,24 @@ import { Field, Select, Toggle, inputCls } from './ui'
 /** 新增供应商可用的适配器类型（与主进程注册表对应；新增类型时两处同步） */
 const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHint?: string }[] = [
   { value: 'gateway-openai-compat', label: 'OpenAI 兼容（图片 / 语音合成）', baseUrlHint: 'https://api.openai.com/v1' },
-  { value: 'gateway-fal', label: 'fal.ai 队列网关' },
   { value: 'gateway-dashscope', label: '阿里云百炼（异步任务）' },
-  { value: 'gateway-volcark', label: '火山方舟' }
+  { value: 'gateway-volcark', label: '火山方舟' },
+  { value: 'gateway-minimax', label: 'MiniMax（海螺视频 / 图片）' },
+  { value: 'gateway-tencent', label: '腾讯混元（生图 / 生视频）' }
 ]
 
 /**
  * 内置媒体供应商「创建 / 管理 API Key」页面的官方直达地址（2026-10 逐家官网核实）。
- * openai / dashscope 与对话供应商同一家（复用已核实地址）；fal 由登录页 returnTo
- * 证实 /dashboard/keys 为 Key 管理页；火山方舟为控制台「API Key 管理」深链（登录后直达）。
+ * openai / dashscope 与对话供应商同一家（复用已核实地址）；火山方舟为控制台
+ * 「API Key 管理」深链（登录后直达）；MiniMax / 腾讯云为各自控制台密钥页。
  * 用户自建的 gateway-* 供应商无固定官网，不在表内也就不显示链接。
  */
 const MEDIA_API_KEY_URLS: Record<string, { url: string; label: string }> = {
   openai: { url: 'https://platform.openai.com/api-keys', label: 'OpenAI 平台' },
-  fal: { url: 'https://fal.ai/dashboard/keys', label: 'fal.ai' },
   dashscope: { url: 'https://bailian.console.aliyun.com/?apiKey=1', label: '阿里云百炼' },
   volcark: { url: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', label: '火山方舟' },
+  minimax: { url: 'https://platform.minimaxi.com/user-center/basic-information/interface-key', label: 'MiniMax 开放平台' },
+  tencent: { url: 'https://console.cloud.tencent.com/cam/capi', label: '腾讯云（API 密钥管理）' },
 }
 
 type MediaView = 'defaults' | 'add' | 'provider'

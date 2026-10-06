@@ -115,6 +115,8 @@ void app
     transpileToTmp([
       path.join('src', 'main', 'agent', 'mediaToolAssembly.ts'),
       path.join('src', 'main', 'agent', 'mediaTools.ts'),
+      // mediaTools.ts 引用其 MEDIA_SRC_MARKER（产物路径标记行）
+      path.join('src', 'main', 'agent', 'contextEviction.ts'),
       path.join('src', 'main', 'agent', 'readMediaTool.ts'),
       path.join('src', 'main', 'agent', 'videoTools.ts'),
       path.join('src', 'main', 'media', 'artifactImage.ts'),

@@ -115,6 +115,7 @@ void app
       path.join('src', 'shared', 'assets.ts'),
       path.join('src', 'main', 'media', 'artifactImage.ts'),
       path.join('src', 'main', 'media', 'videoFrames.ts'),
+      path.join('src', 'main', 'agent', 'contextEviction.ts'),
       path.join('src', 'main', 'agent', 'readMediaTool.ts')
     ])
     const { createReadMediaTool } = require(path.join(TMP, 'src', 'main', 'agent', 'readMediaTool.js'))

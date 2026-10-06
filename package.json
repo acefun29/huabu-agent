@@ -47,6 +47,8 @@
     "probe:video-frames": "electron scripts/t13-video-frames-probe.cjs",
     "probe:history-thumbs": "electron scripts/history-thumbs-probe.cjs",
     "probe:workspace-delete": "electron scripts/workspace-delete-probe.cjs",
+    "probe:context-eviction": "node scripts/context-eviction-probe.cjs",
+    "probe:thinking-level": "electron scripts/thinking-level-probe.cjs",
     "chat-catalog:check": "node scripts/chat-catalog-check.mjs",
     "chat-catalog:wire": "node scripts/t4-wire-capture.mjs",
     "test:scenario": "node scripts/full-scenario.mjs",

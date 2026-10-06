@@ -113,7 +113,7 @@ export interface WorkspaceMediaProviderConfig {
   label?: string
   /** 凭据存储键后缀（safeStorage 存储 media:<authKey>），缺省 = id */
   authKey?: string
-  /** 环境变量名（缺省按适配器约定，gateway-fal 为 FAL_KEY），已录入存储 Key 时优先 */
+  /** 环境变量名（缺省按适配器约定，gateway-dashscope 为 DASHSCOPE_KEY），已录入存储 Key 时优先 */
   authEnv?: string
   /** 网关基址（协议家族适配器用，如 gateway-openai-compat）；缺省 = 适配器官方默认 */
   baseUrl?: string
@@ -124,8 +124,6 @@ export interface WorkspaceMediaProviderConfig {
     {
       kind: 'image' | 'video' | 'audio'
       label?: string
-      /** 覆盖产物 URL 抽取路径（默认按 images/videos/audio[0].url） */
-      resultKey?: string
       /** 能力元数据（比例/时长档位等，浏览目录「添加」时透传；驱动渲染端参数面板） */
       capabilities?: ModelCapabilities
       /** 一句人话的成本提示，展示在参数面板 */
@@ -134,7 +132,7 @@ export interface WorkspaceMediaProviderConfig {
   >
 }
 
-/** 对内置模型（按用户可见 id，如 'fal/veo3.1'）的展示覆盖 */
+/** 对内置模型（按用户可见 id，如 'dashscope/wan2.7-image'）的展示覆盖 */
 export interface MediaModelOverride {
   label?: string
 }
@@ -157,7 +155,7 @@ export interface WorkspaceMediaConfig {
    * confirm = 变更前确认（所有生成提交前弹确认卡，取代视频对话闸门）。缺省 full。
    */
   accessMode?: 'full' | 'confirm'
-  /** Agent 媒体工具使用的 provider（缺省 fal：内置目录真实网关） */
+  /** Agent 媒体工具使用的 provider（缺省走内置目录真实网关） */
   agentProvider?: string
   /**
    * 各 kind 的默认模型，记法统一为 `provider:模型id` 复合串（可跨供应商指定）。
@@ -165,7 +163,7 @@ export interface WorkspaceMediaConfig {
    */
   agentModels?: Partial<Record<'image' | 'video' | 'audio', string>>
   userProviders?: WorkspaceMediaProviderConfig[]
-  /** 被用户隐藏的内置模型 id（如 'fal/veo3.1'） */
+  /** 被用户隐藏的内置模型 id（如 'dashscope/wan2.7-image'） */
   hiddenBuiltin?: string[]
   /** 对内置模型的展示覆盖（按用户可见模型 id） */
   modelOverrides?: Record<string, MediaModelOverride>

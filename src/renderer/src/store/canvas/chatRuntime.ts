@@ -41,6 +41,18 @@ const lastRoundDigests = new Map<string, { library?: string; canvas?: string }>(
  * 签名与上轮一致的生成卡片不再重复携带 genSummary 括注 */
 const genSummarySeen = new Map<string, Record<string, string>>()
 
+/** 默认占位标题：命中即视为「还没按实际对话起过名」，首发消息/历史回放时自动命名 */
+const DEFAULT_SESSION_TITLES = new Set(['新会话', '新对话'])
+
+/** 从用户消息派生会话标题：取第一行非空文本，与 createSession 同款 16 字截断 */
+const deriveTitleFromText = (text: string): string => {
+  const firstLine = text
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line.length > 0)
+  return (firstLine ?? '').slice(0, 16) || '新会话'
+}
+
 /* ---------------- 流式事件批处理（P0-3）---------------- */
 /**
  * delta 事件逐个进 store 的成本（reduce 重建 + 全量 draftToMessage + setState）在
@@ -268,6 +280,14 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       ...(m.stopReason === 'error' ? { errorMessage: '（历史消息此前生成失败）' } : {})
     }))
     patchChat(sessionId, (chat) => ({ ...chat, history: messages }))
+    // 旧会话回填命名：仍是占位名的会话按历史里首条用户消息补一个实际标题
+    //（功能上线前的存量会话；手动改过名/自动命名过的标题不动）
+    const meta = get().sessions.find((x) => x.id === sessionId)
+    if (meta && DEFAULT_SESSION_TITLES.has(meta.title)) {
+      const firstUser = result.value.messages.find((m) => m.role === 'user')
+      const derived = firstUser ? deriveTitleFromText(firstUser.text) : undefined
+      if (derived && !DEFAULT_SESSION_TITLES.has(derived)) renameSession(sessionId, derived)
+    }
   }
 
   /** 会话历史落定了才算 loaded（fork 复制历史、切换回放都依赖它） */
@@ -484,6 +504,12 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     if (!sid || !get().sessions.some((s) => s.id === sid)) {
       // 无当前会话 → 自动新建，标题取这句话的开头
       sid = createSession(trimmed)
+    } else {
+      // 自动命名：点 + 预建的占位名会话在首次发问时按实际内容起名（手动改过名的不动）
+      const meta = get().sessions.find((s) => s.id === sid)
+      if (meta && DEFAULT_SESSION_TITLES.has(meta.title)) {
+        renameSession(sid, deriveTitleFromText(trimmed))
+      }
     }
     const chat = get().chatsMap[sid]
     if (chat?.running) return

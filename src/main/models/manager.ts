@@ -177,7 +177,7 @@ export class ChatModelManager {
           baseUrl: provider.baseUrl,
           api: provider.api,
           ...(apiKey ? { apiKey } : {}),
-          models: provider.models.map(toRegistrationModel)
+          models: provider.models.map((model) => toRegistrationModel(model, provider.source))
         }
       })
     }
@@ -249,7 +249,7 @@ export class ChatModelManager {
   }
 }
 
-function toRegistrationModel(model: EffectiveChatModel): RegistrationModelInput {
+function toRegistrationModel(model: EffectiveChatModel, source: EffectiveChatProvider['source']): RegistrationModelInput {
   return {
     id: model.id,
     name: model.label,
@@ -261,6 +261,13 @@ function toRegistrationModel(model: EffectiveChatModel): RegistrationModelInput 
     cost: model.cost,
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
-    ...(model.compat ? { compat: model.compat } : {})
+    ...(model.compat ? { compat: model.compat } : {}),
+    // 用户自建模型跑在未知网关上：pi 对陌生 baseUrl 按「真 OpenAI」处理（developer 角色、
+    // max_completion_tokens、store 参数），严格的 OpenAI 兼容网关会整单拒收（实测报
+    // 「Unexpected message role」）。默认收敛到通用兼容形态：system 角色 + max_tokens +
+    // 不带 store；内置目录模型都显式写了 compat，不受这组默认影响
+    ...(source === 'user' && !model.compat && model.api === 'openai-completions'
+      ? { compat: { supportsDeveloperRole: false, supportsStore: false, maxTokensField: 'max_tokens' as const } }
+      : {})
   }
 }

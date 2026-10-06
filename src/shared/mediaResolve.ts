@@ -44,7 +44,7 @@ export interface MediaResolveInput {
 
 export interface ResolvedMediaTarget {
   provider: string
-  /** 命中模型的稳定 id（如 'fal/veo3.1'） */
+  /** 命中模型的稳定 id（如 'dashscope/wan2.7-image'） */
   model: string
   /** `provider:模型id` 复合串——卡片参数与设置存储的统一记法 */
   ref: string
@@ -66,8 +66,8 @@ export function parseModelRef(ref: string): { provider: string; model: string } 
 }
 
 /**
- * 展示用模型名：内置目录的模型 id 自带供应商前缀（'fal/veo3.1'），
- * 与供应商名并列展示时剥掉前缀，避免 'fal / fal/veo3.1' 的重复观感。
+ * 展示用模型名：内置目录的模型 id 自带供应商前缀（'dashscope/wan2.7-image'），
+ * 与供应商名并列展示时剥掉前缀，避免 '阿里云百炼 / dashscope/wan2.7-image' 的重复观感。
  */
 export function shortModelLabel(provider: string, model: string): string {
   return model.startsWith(`${provider}/`) ? model.slice(provider.length + 1) : model

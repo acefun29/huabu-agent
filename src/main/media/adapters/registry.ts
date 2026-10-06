@@ -5,7 +5,7 @@ import type { MediaProviderAdapter } from '../provider'
  * 适配器注册表：MediaProviderType → 工厂。
  *
  * 消灭 ipc.ts 里「if 链逐个 new」的硬编码工厂：每个适配器文件末尾自注册
- * （`registerAdapter('gateway-fal', …)`），adapters/index.ts 只做 barrel import。
+ * （`registerAdapter('gateway-dashscope', …)`），adapters/index.ts 只做 barrel import。
  * 新增供应商类型 = 新增一个适配器文件 + barrel 里加一行 import，不触碰 ipc.ts。
  *
  * `MediaProviderType` union 的唯一声明处在 shared/media.ts；这里的 Map 是它的
@@ -20,7 +20,6 @@ export interface AdapterModelConfig {
   label?: string
   /** 实际发给网关/厂商的模型标识；缺省 = id */
   requestModel?: string
-  resultKey?: string
   /** 以下为目录层能力元数据透传（MediaModelInfo 同名字段，渲染端渐进消费） */
   capabilities?: import('../../../shared/media').ModelCapabilities
   status?: 'stable' | 'beta' | 'deprecated'
@@ -64,7 +63,7 @@ export type AdapterFactory = (deps: AdapterDeps, config: AdapterProviderConfig) 
 
 /** 适配器自描述元数据（注册时声明，宿主与合并层按此取默认值，不写死厂商约定） */
 export interface AdapterMeta {
-  /** 用户配置未声明 authEnv 时的默认环境变量名（如 gateway-fal → FAL_KEY） */
+  /** 用户配置未声明 authEnv 时的默认环境变量名（如 gateway-dashscope → DASHSCOPE_KEY） */
   defaultAuthEnv?: string
 }
 

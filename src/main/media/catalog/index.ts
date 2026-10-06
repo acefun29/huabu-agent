@@ -1,8 +1,9 @@
 import type { BuiltinProviderDef } from './types'
-import fal from './providers/fal'
 import dashscope from './providers/dashscope'
 import volcark from './providers/volcark'
 import openai from './providers/openai'
+import minimax from './providers/minimax'
+import tencent from './providers/tencent'
 
 /**
  * 内置媒体模型目录（catalog 架构 §2 目录层）。
@@ -15,7 +16,7 @@ import openai from './providers/openai'
  * auth.env 命名约定、能力档位升序、逐供应商 dry-run 实例化。
  */
 
-export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [fal, dashscope, volcark, openai]
+export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [dashscope, volcark, openai, minimax, tencent]
 
 export { defineProvider } from './define'
 export type { BuiltinModelDef, BuiltinProviderAuth, BuiltinProviderDef, CatalogBrowseModel } from './types'

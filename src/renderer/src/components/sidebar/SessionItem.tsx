@@ -44,6 +44,7 @@ export const SessionItem = memo(function SessionItem({
       data-testid="session-item"
       data-selected={managing && selected ? 'true' : undefined}
       onClick={() => (managing ? onToggleSelect?.(s.id) : onSwitch(s.id))}
+      title={`${s.title}\n会话 ID：${s.id}${s.sessionFile ? `\n会话文件：${s.sessionFile}` : ''}`}
       className={`group mb-0.5 cursor-pointer rounded-2xl px-3 py-2 transition-colors ${
         managing
           ? selected
@@ -112,6 +113,18 @@ export const SessionItem = memo(function SessionItem({
         ) : (
           <span>{formatDay(s.createdAt)} 创建</span>
         )}
+        {/* 独立会话 ID（短码）：jobs.json 的 sourceChatId 与日志里的 nodeId 就是它，
+            排查问题时按此对号；悬停行可见完整 ID 与会话文件 */}
+        <span
+          className="ml-auto shrink-0 font-mono text-[9px] tracking-tight opacity-75"
+          title={`会话 ID：${s.id}`}
+          onClick={(e) => {
+            e.stopPropagation()
+            void navigator.clipboard?.writeText(s.id)
+          }}
+        >
+          #{s.id.slice(0, 6)}
+        </span>
       </div>
     </div>
   )

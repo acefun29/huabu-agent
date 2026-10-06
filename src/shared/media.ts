@@ -19,12 +19,12 @@ export type MediaAccessMode = 'full' | 'confirm'
 /**
  * 媒体域默认值与比例的**唯一声明处**。
  *
- * 此前 'fal' / '16:9' / 5s / 并发 3 散在 ipc.ts、canvasStore、SettingsPanel 五处，
+ * 此前 '16:9' / 5s / 并发 3 散在 ipc.ts、canvasStore、SettingsPanel 五处，
  * 改一处忘其余；主进程与渲染端一律从这里取。
  */
 export const MEDIA_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9'] as const
 export type MediaRatio = (typeof MEDIA_RATIOS)[number]
-export const DEFAULT_MEDIA_PROVIDER = 'fal'
+export const DEFAULT_MEDIA_PROVIDER = 'dashscope'
 export const DEFAULT_MEDIA_RATIO: MediaRatio = '16:9'
 /** 新建生成卡片 / Agent 工具的默认时长（秒） */
 export const DEFAULT_MEDIA_DURATION_S = 5
@@ -51,13 +51,34 @@ export function ratioToPixels(ratio: MediaRatio): { width: number; height: numbe
 }
 
 /**
+ * 实际宽高 → 最接近的声明比例（工具结果回显与画布节点展示用）。
+ * 产物像素是事实源（图生图等场景可能不按请求比例出图），比例标签从它反推；
+ * 宽高缺失/非法时返回 undefined，调用方退回请求值展示。
+ */
+export function nearestMediaRatio(width: number, height: number): MediaRatio | undefined {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined
+  const aspect = width / height
+  let best: MediaRatio = MEDIA_RATIOS[0]
+  let bestDiff = Infinity
+  for (const ratio of MEDIA_RATIOS) {
+    const [w, h] = ratio.split(':').map(Number) as [number, number]
+    const diff = Math.abs(w / h - aspect)
+    if (diff < bestDiff) {
+      best = ratio
+      bestDiff = diff
+    }
+  }
+  return best
+}
+
+/**
  * 适配器类型 union 的**唯一声明处**（built-in catalog 架构）。
  *
  * workspace/store.ts 与 shared/ipc.ts 一律从这里引用，不再各自手写 union；
  * 每个类型必须在 src/main/media/adapters/registry.ts 里注册了工厂（catalog:check 校验），
  * 不允许出现「声明了类型却没有实现」的幽灵条目。
  */
-export type MediaProviderType = 'gateway-fal' | 'gateway-dashscope' | 'gateway-volcark' | 'gateway-openai-compat'
+export type MediaProviderType = 'gateway-dashscope' | 'gateway-volcark' | 'gateway-openai-compat' | 'gateway-minimax' | 'gateway-tencent'
 
 /** 模型能力元数据：驱动渲染端参数面板（能力驱动化渐进迁移，见 catalog 设计 §3.2） */
 export interface ModelCapabilities {
@@ -80,7 +101,7 @@ export interface ModelCapabilities {
 
 /** 单个可生成的媒体模型（来自 provider 配置/内置目录，数据驱动：新增模型=加一行数据） */
 export interface MediaModelInfo {
-  /** 稳定模型 id（内置目录形态为 `provider/模型名`，如 `fal/veo3.1`）；跨进程引用用 `provider:模型id` 复合串（见 mediaResolve.toModelRef） */
+  /** 稳定模型 id（内置目录形态为 `provider/模型名`，如 `dashscope/wan2.7-image`）；跨进程引用用 `provider:模型id` 复合串（见 mediaResolve.toModelRef） */
   id: string
   kind: MediaKind
   /** 展示名 */

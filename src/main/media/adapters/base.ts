@@ -1,21 +1,22 @@
 import type { MediaKind, MediaModelInfo, MediaProviderType, ModelCapabilities } from '../../../shared/media'
+import { nearestMediaRatio } from '../../../shared/media'
 import type { MediaProviderAdapter, ProviderPollResult, ProviderSubmitInput } from '../provider'
 import type { AdapterModelConfig } from './registry'
 
 /**
- * 网关适配器公共基类（fal / dashscope / volcark / openaiCompat 四家的公约数）。
+ * 网关适配器公共基类（dashscope / volcark / openaiCompat / minimax / tencent 的公约数）。
  *
- * 收敛四份逐字重复的实现：模型目录映射（config.models → MediaModelInfo[]）、
+ * 收敛各份逐字重复的实现：模型目录映射（config.models → MediaModelInfo[]）、
  * 凭据方法组（isConfigured/isReady/authHint/requireKey）、模型查找
  * （requestModelOf/kindOf）、「没有模型」与 HTTP 非 2xx 的错误形态。
  *
- * 必须留在子类的协议差异不要上提：fal 的 Authorization: Key 头/两跳 poll/resultKey
- * 点路径；dashscope 的 X-DashScope-Async 头与按 wan 版本分形态的 body/产物；
- * volcark 的同步图片 submit（300s 超时）/legacy --flag 视频；openaiCompat 的可变
- * baseUrl 与 oc-url|/oc-file| 双通道 jobId。
+ * 必须留在子类的协议差异不要上提：dashscope 的 X-DashScope-Async 头与按 wan 版本
+ * 分形态的 body/产物；volcark 的同步图片 submit（300s 超时）/legacy --flag 视频；
+ * openaiCompat 的可变 baseUrl 与 oc-url|/oc-file| 双通道 jobId；minimax 的
+ * 视频异步任务两跳；tencent 的 TC3-HMAC-SHA256 签名与异步任务轮询。
  */
 
-/** 四家模型配置的公共形状（fal 额外多 resultKey，见 fal.ts） */
+/** 网关模型配置的公共形状（各子类的 XxxModelConfig 与其结构兼容） */
 export interface GatewayModelConfig {
   kind: MediaKind
   /** 目录层的稳定用户可见 id；缺省 = 用线上模型标识兜底 */
@@ -43,7 +44,7 @@ export abstract class BaseGatewayProvider<TModelConfig extends GatewayModelConfi
   readonly label: string
   readonly models: MediaModelInfo[]
 
-  /** 子类按协议差异读取的原始配置（如 openaiCompat 的 voices、fal 的 resultKey 都在 models 里） */
+  /** 子类按协议差异读取的原始配置（如 openaiCompat 的 voices 都在 models 里） */
   protected readonly config: GatewayProviderConfig<TModelConfig>
   protected readonly getKey: () => Promise<string | undefined>
   /** config.authEnv 未声明时的环境变量回退名：authHint/requireKey 单点取用，消灭三处重复 */
@@ -78,7 +79,7 @@ export abstract class BaseGatewayProvider<TModelConfig extends GatewayModelConfi
     })
   }
 
-  /** 各子类保持自己的字面量（gateway-fal / gateway-dashscope / …） */
+  /** 各子类保持自己的字面量（gateway-dashscope / gateway-volcark / …） */
   abstract readonly type: MediaProviderType
 
   /** 提交/轮询的协议差异必须留在子类（header、body 形态、超时值、jobId 编码各不相同） */
@@ -135,8 +136,8 @@ export abstract class BaseGatewayProvider<TModelConfig extends GatewayModelConfi
   /**
    * 网关 HTTP 非 2xx → 可操作 Error：401/403 归因为认证，其余附上响应体前 300 字符。
    * 文案参数逐字来自原各家的错误模板，拼接后与历史文案一致：
-   * - authPrefix：如 'fal.ai 认证失败' / '百炼认证失败'
-   * - failPrefix：如 'fal.ai 提交失败' / '图片生成失败'
+   * - authPrefix：如 '百炼认证失败' / '方舟认证失败'
+   * - failPrefix：如 '百炼提交失败' / '图片生成失败'
    * - authSuffix：认证失败的检查提示尾巴，缺省 = 通用「请检查 API Key 是否正确」
    *   （百炼的「是否与北京地域匹配」、方舟的「模型是否已开通」由调用点传完整尾巴）
    */
@@ -157,8 +158,8 @@ export abstract class BaseGatewayProvider<TModelConfig extends GatewayModelConfi
 /**
  * 合并层的模型数组（稳定 id + 可选 requestModel）→ 适配器的远端模型配置表。
  *
- * 公共字段以 dashscope/volcark/openaiCompat 的三份同构实现为基准；fal 的 resultKey
- * 差异用 extra 钩子吸收（展开位置与其原实现一致：label 之后、capabilities 之前）。
+ * 公共字段以 dashscope/volcark/openaiCompat 的三份同构实现为基准；子类特有字段
+ * （如 minimax 的模板 id 映射）用 extra 钩子吸收（展开位置：label 之后、capabilities 之前）。
  */
 export function buildModelRecord<TModelConfig extends GatewayModelConfig>(
   models: readonly AdapterModelConfig[],
@@ -183,19 +184,7 @@ export function buildModelRecord<TModelConfig extends GatewayModelConfig>(
   return record
 }
 
-/** 宽高就近映射到网关支持的比例枚举（16:9 / 9:16 / 1:1 / 4:3 / 3:4），dashscope 与 volcark 共用 */
+/** 宽高就近映射到网关支持的比例枚举（dashscope 与 volcark 视频参数用）；换算表在 shared 唯一声明 */
 export function nearestRatio(width: number, height: number): string {
-  const aspect = width / height
-  const table: [string, number][] = [
-    ['16:9', 16 / 9],
-    ['4:3', 4 / 3],
-    ['1:1', 1],
-    ['3:4', 3 / 4],
-    ['9:16', 9 / 16]
-  ]
-  let best = table[0]
-  for (const entry of table) {
-    if (Math.abs(entry[1] - aspect) < Math.abs(best[1] - aspect)) best = entry
-  }
-  return best[0]
+  return nearestMediaRatio(width, height) ?? '16:9'
 }

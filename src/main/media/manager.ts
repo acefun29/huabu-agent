@@ -34,7 +34,7 @@ const TERMINAL_JOBS_KEEP = 50
 
 interface JobRecord {
   status: MediaJobStatus
-  /** provider 侧任务标识（fal 为 `model|request_id`） */
+  /** provider 侧任务标识（如 minimax 为 `mm-video|task_id`、dashscope 为 `model|task_id`） */
   remoteId?: string
   adapter: MediaProviderAdapter
   /** 规范化的生成参数（runJob 提交时用） */

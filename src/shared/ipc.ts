@@ -840,6 +840,12 @@ export interface CustomModelInput {
   input_modalities?: Array<'text' | 'image'>
   /** 模型级协议；缺省 = 跟随供应商。用于一个网关同时暴露多种端点形态的场合 */
   api?: string
+  /**
+   * 推理模型支持的思考档位（THINKING_LEVELS 去 off 的子集；缺省 = 按全档可用处理）。
+   * 落盘转成 thinkingLevelMap（选中恒等映射、未选中置 null）：会话档位选择器据此收敛，
+   * pi 只会发出网关真的接受的 reasoning_effort 值
+   */
+  thinkingLevels?: string[]
 }
 
 export interface CustomProviderInput {
@@ -1008,6 +1014,8 @@ export interface ManagedModelInfo {
   input?: Array<'text' | 'image'>
   contextWindow?: number
   maxTokens?: number
+  /** 推理模型支持的思考档位（deriveThinkingLevels 派生；编辑对话框据此预填） */
+  thinkingLevels?: string[]
 }
 
 export interface ModelEditInput {
@@ -1017,6 +1025,8 @@ export interface ModelEditInput {
   contextWindow?: number
   maxTokens?: number
   reasoning?: boolean
+  /** 同 CustomModelInput.thinkingLevels；编辑时整组替换，空数组 = 清除声明（回退全档可用） */
+  thinkingLevels?: string[]
 }
 
 /* -------------------------------------------------------------------------- */

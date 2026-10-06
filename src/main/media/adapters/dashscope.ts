@@ -5,7 +5,7 @@ import { BaseGatewayProvider, buildModelRecord, nearestRatio } from './base'
 import { firstImageRefDataUri } from './refImage'
 
 /**
- * 阿里云百炼（DashScope）适配器：异步任务制（与 fal 的队列制是两种网关形态）。
+ * 阿里云百炼（DashScope）适配器：异步任务制（与 openaiCompat 的同步制是两种网关形态）。
  *
  * 协议（2026-09 对照 help.aliyun.com/zh/model-studio 官方文档核实）：
  * - 图片（wan2.5 及以下旧协议）：POST /api/v1/services/aigc/text2image/image-synthesis
@@ -28,7 +28,9 @@ import { firstImageRefDataUri } from './refImage'
  * - 图生图 wan2.6-image / wan2.7-image(-pro)：与文生图共用 image-generation/generation
  *   端点，content 数组追加 {image: <URL 或 data URI>} 即为图生图；官方支持
  *   "data:{MIME};base64,{base64_data}"（wan2.7 单图 ≤20MB，宽高 [240,8000]，wan2.7 可 0-9 张）；
- *   有图输入时输出宽高比与最后一张输入图一致，故该场景不再传 size。
+ *   有图输入时输出比例缺省随最后一张输入图；调用方显式给了比例（width/height）时必须传
+ *   size 覆盖，否则竖版请求会静默出成参考图的横版（官方允许显式 size，编辑模式像素
+ *   窗口 [768²,2048²] 包含本适配器的归一窗口）；未指定比例时不传 size，保持随参考图。
  * - 图生视频 wan2.7-i2v / wan3.0-video(-prime)：input 从 {prompt} 扩为
  *   {prompt, media:[{type:'first_frame', url}]}，url 同样吃 Base64 data URI（≤20MB）；
  *   wan2.7-i2v 无 ratio 参数、duration [2,15]；wan3.0-video 支持 ratio（默认 adaptive）
@@ -41,7 +43,7 @@ const IMAGE_GEN_ENDPOINT = '/api/v1/services/aigc/image-generation/generation'
 const VIDEO_ENDPOINT = '/api/v1/services/aigc/video-generation/video-synthesis'
 const TASK_ENDPOINT = '/api/v1/tasks'
 
-/** jobId 里的分隔符：slug|task_id（与 fal 同构，状态地址由 slug 无关、仅 task_id 决定） */
+/** jobId 里的分隔符：slug|task_id（状态地址由 slug 无关、仅 task_id 决定） */
 const JOB_SEP = '|'
 
 export interface DashScopeModelConfig {
@@ -208,18 +210,21 @@ function isNewVideoParams(requestModel: string): boolean {
 
 async function imageBody(requestModel: string, input: ProviderSubmitInput): Promise<Record<string, unknown>> {
   if (isNewImageProtocol(requestModel)) {
-    // 图生图（官方 API 参考）：content 追加 {image}，data URI 是官方支持的离线形态；
-    // 有图输入时输出比例随最后一张输入图，不再传 size（传了反而可能与输入比例冲突）
+    // 图生图（官方 API 参考）：content 追加 {image}，data URI 是官方支持的离线形态。
+    // 编辑模式缺省输出比例随最后一张输入图 —— 调用方显式给了比例（width/height）时
+    // 必须传 size 覆盖，否则 3:4/9:16 的竖版请求会静默出成参考图的横版；
+    // 未指定比例时不传 size，保持「随参考图」的图生图缺省语义。
     const refDataUri = await firstImageRefDataUri(input.refFiles)
     const content: Record<string, unknown>[] = [{ text: input.prompt }]
     if (refDataUri) content.push({ image: refDataUri })
     return {
       model: requestModel,
       input: { messages: [{ role: 'user', content }] },
-      // wan2.6/2.7 size 仍是「宽*高」；无图时按画布尺寸归一，图生图时比例交给输入图
+      // wan2.6/2.7 size 仍是「宽*高」，按画布尺寸归一到总像素 [1280²,1440²] 窗口
+      //（官方编辑模式窗口 [768²,2048²] 更大，包含本窗口，显式 size 对图生图同样合法）
       parameters: {
         n: 1,
-        ...(!refDataUri && input.width && input.height ? { size: wan26PixelSize(input.width, input.height) } : {})
+        ...(input.width && input.height ? { size: wan26PixelSize(input.width, input.height) } : {})
       }
     }
   }

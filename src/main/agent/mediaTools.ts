@@ -1,6 +1,7 @@
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO, MEDIA_RATIOS, type MediaAccessMode, type MediaJobStatus, type MediaKind, type MediaRatio, type ModelCapabilities } from '../../shared/media'
+import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO, MEDIA_RATIOS, nearestMediaRatio, type MediaAccessMode, type MediaJobStatus, type MediaKind, type MediaRatio, type ModelCapabilities } from '../../shared/media'
+import { MEDIA_SRC_MARKER } from './contextEviction'
 
 /** 宿主持有的工具定义（pi 的 ToolDefinition，类型擦除后无运行时依赖） */
 export type ToolDefinitionLike = ToolDefinition
@@ -190,8 +191,21 @@ function failureGuidance(kind: MediaKind, error: string | undefined, provider?: 
 
 function paramsSummary(final: MediaJobStatus): string {
   const parts: string[] = []
-  if (final.params?.ratio) parts.push(`比例 ${final.params.ratio}`)
-  if (final.params?.width && final.params?.height) parts.push(`${final.params.width}×${final.params.height}px`)
+  // 比例与像素以落盘产物为准（图生图等场景可能不按请求比例出图），请求值仅在与实际不一致时并列标注；
+  // 产物尺寸缺席（音频/尺寸解析失败）时退回请求参数 —— 那已是没有更准事实源的下策
+  const dims =
+    final.artifact?.width && final.artifact?.height
+      ? { width: final.artifact.width, height: final.artifact.height }
+      : undefined
+  const actualRatio = dims ? nearestMediaRatio(dims.width, dims.height) : undefined
+  if (actualRatio && dims) {
+    const requested = final.params?.ratio
+    parts.push(requested && requested !== actualRatio ? `比例 ${actualRatio}（请求 ${requested}）` : `比例 ${actualRatio}`)
+    parts.push(`实际 ${dims.width}×${dims.height}px`)
+  } else {
+    if (final.params?.ratio) parts.push(`比例 ${final.params.ratio}`)
+    if (final.params?.width && final.params?.height) parts.push(`${final.params.width}×${final.params.height}px`)
+  }
   if (final.params?.durationSeconds) parts.push(`时长 ${final.params.durationSeconds}s`)
   return parts.length ? `，实际参数：${parts.join(' / ')}` : ''
 }
@@ -381,6 +395,9 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
           // 首帧是增强项：宿主抽帧抛错 → 降级为纯文本成功结果，不抛、不改文案
         }
       }
+      // 附了图的结果带路径标记行：历史淘汰层按它提取锚点路径（contextEviction）。
+      // 图片产物与视频首帧同源（都是 final.artifact），一条标记即可覆盖整组图块
+      if (images.length > 0) text += `\n${MEDIA_SRC_MARKER}${final.artifact.relPath}]`
       text += '请基于以上真实结果回答用户。'
       return {
         content: [{ type: 'text', text }, ...images],

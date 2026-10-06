@@ -184,7 +184,7 @@ async function main() {
       {
         id: 'acme',
         label: 'ACME 网关',
-        adapter: 'gateway-fal',
+        adapter: 'gateway-dashscope',
         auth: { env: 'ACME_KEY', label: 'ACME Key', helpUrl: 'https://example.com/keys' },
         models: [
           { id: 'acme/img', kind: 'image', label: 'ACME 图' },
@@ -210,17 +210,17 @@ async function main() {
     assert(noHide[0].authKey === 'acme' && noHide[0].authEnv === 'ACME_KEY', '内置 auth 缺省化失败')
   })
 
-  check('合并层回归：同名覆盖合并模型子集 + 异 id 追加 + FAL_KEY 缺省', () => {
+  check('合并层回归：同名覆盖合并模型子集 + 异 id 追加 + 默认 authEnv 回退', () => {
     const effective = mergeCatalog([], {
       userProviders: [
-        { id: 'my-fal', type: 'gateway-fal', models: { 'fal-ai/flux/dev': { kind: 'image', label: 'FLUX dev' } } },
-        { id: 'my-fal-noenv', type: 'gateway-fal', authEnv: 'MY_KEY', models: { 'fal-ai/x': { kind: 'video' } } }
+        { id: 'my-oai', type: 'gateway-openai-compat', models: { 'gpt-image-1': { kind: 'image', label: 'GPT Image' } } },
+        { id: 'my-oai-noenv', type: 'gateway-openai-compat', authEnv: 'MY_KEY', models: { 'gpt-image-x': { kind: 'video' } } }
       ]
     })
     assert(effective.length === 2, `应追加 2 个用户供应商，实际 ${effective.length}`)
     const first = effective[0]
-    assert(first.source === 'user' && first.authKey === 'my-fal', '用户供应商 authKey 缺省 = id')
-    assert(first.authEnv === 'FAL_KEY', `gateway-fal 未声明 authEnv 时应回退 FAL_KEY，实际 ${first.authEnv}`)
+    assert(first.source === 'user' && first.authKey === 'my-oai', '用户供应商 authKey 缺省 = id')
+    assert(first.authEnv === 'OPENAI_API_KEY', `gateway-openai-compat 未声明 authEnv 时应回退 OPENAI_API_KEY，实际 ${first.authEnv}`)
     assert(first.models[0].requestModel === undefined || first.models[0].requestModel === first.models[0].id, '用户模型 requestModel 应等于 id')
     assert(effective[1].authEnv === 'MY_KEY', '用户显式 authEnv 未生效')
   })
@@ -234,12 +234,12 @@ async function main() {
         userProviders: [
           'not-an-object',
           { id: 'bad type', type: 'gateway-replicate', models: {} },
-          { id: 'no-models', type: 'gateway-fal' },
-          { id: 'bad-model', type: 'gateway-fal', models: { 'ok/model': { kind: 'sticker' } } },
+          { id: 'no-models', type: 'gateway-openai-compat' },
+          { id: 'bad-model', type: 'gateway-openai-compat', models: { 'ok/model': { kind: 'sticker' } } },
           {
             id: 'good',
-            type: 'gateway-fal',
-            models: { 'fal-ai/good': { kind: 'image', label: '好模型', resultKey: 'images[0].url' } }
+            type: 'gateway-openai-compat',
+            models: { 'good/model': { kind: 'image', label: '好模型' } }
           }
         ]
       })
@@ -276,24 +276,24 @@ async function main() {
     }
   })
 
-  check('dry-run 实例化 gateway-fal（含 resultKey/label 透传）', () => {
+  check('dry-run 实例化 gateway-openai-compat（label/模型透传）', () => {
     const effective = mergeCatalog([], {
       userProviders: [
         {
-          id: 'dry-fal',
-          label: 'Dry fal',
-          type: 'gateway-fal',
-          authKey: 'dry-fal',
-          models: { 'fal-ai/veo3': { kind: 'video', label: 'Veo 3', resultKey: 'video.url' } }
+          id: 'dry-oai',
+          label: 'Dry OpenAI',
+          type: 'gateway-openai-compat',
+          authKey: 'dry-oai',
+          models: { 'gpt-image-1': { kind: 'image', label: 'GPT Image' } }
         }
       ]
     })
     const created = adapters.createAdapters(effective, dummyDeps)
     assert(created.length === 1, '应实例化 1 个适配器')
     const adapter = created[0]
-    assert(adapter.id === 'dry-fal' && adapter.type === 'gateway-fal', '实例 id/type 不符')
-    assert(adapter.label === 'Dry fal', '实例 label 不符')
-    assert(adapter.models.length === 1 && adapter.models[0].id === 'fal-ai/veo3' && adapter.models[0].label === 'Veo 3', '模型清单透传失败')
+    assert(adapter.id === 'dry-oai' && adapter.type === 'gateway-openai-compat', '实例 id/type 不符')
+    assert(adapter.label === 'Dry OpenAI', '实例 label 不符')
+    assert(adapter.models.length === 1 && adapter.models[0].id === 'gpt-image-1' && adapter.models[0].label === 'GPT Image', '模型清单透传失败')
     assert(adapter.isConfigured() === true, 'isConfigured 应可调用（同步保守判断）')
     assert(typeof adapter.authHint() === 'string' && adapter.authHint().length > 0, 'authHint 应非空')
   })
@@ -327,12 +327,18 @@ async function main() {
       assert(c.body.input.messages[0].content.length === 1 && c.body.input.messages[0].content[0].text === 'p', '文生图 content 应只有 text')
       assert(typeof c.body.parameters.size === 'string', '文生图应带 size')
 
-      // ② wan2.7-image 图生图：content 追加 {image: dataURI}，size 让位（比例随输入图）
+      // ② wan2.7-image 图生图（显式比例）：content 追加 {image: dataURI}，size 必须显式传入
+      //   覆盖编辑模式「缺省随输入图比例」——不传 size 时竖版请求会静默出成参考图的横版
       await adapter.submit('dashscope/wan2.7-image', { prompt: 'p', width: 1024, height: 1024, refFiles: [refPng] })
       c = calls.at(-1)
       const content = c.body.input.messages[0].content
       assert(content.length === 2 && content[1].image.startsWith('data:image/png;base64,'), `图生图 content 不对：${JSON.stringify(content).slice(0, 120)}`)
-      assert(c.body.parameters.size === undefined, '图生图不应传 size（输出比例随最后一张输入图）')
+      assert(typeof c.body.parameters.size === 'string', '图生图显式比例必须传 size（缺省才随输入图比例）')
+
+      // ②' wan2.7-image 图生图（未指定比例）：不传 size，保持输出比例随参考图的缺省语义
+      await adapter.submit('dashscope/wan2.7-image', { prompt: 'p', refFiles: [refPng] })
+      c = calls.at(-1)
+      assert(c.body.parameters.size === undefined, '图生图未指定比例不应传 size（输出随参考图）')
 
       // ③ wan2.7-i2v：input.media[{type:'first_frame',url:dataURI}]、无 ratio、duration clamp [2,15]
       await adapter.submit('dashscope/wan2.7-i2v', { prompt: 'p', width: 1024, height: 1024, durationSeconds: 99, refFiles: [refPng] })
@@ -363,11 +369,126 @@ async function main() {
     }
   })
 
+  await checkAsync('minimax 图生图/视频协议形态（2026-10 官方 API 参考核实的 body 断言）', async () => {
+    const effective = mergeCatalog(BUILTIN_PROVIDERS.filter((p) => p.id === 'minimax'), {})
+    const created = adapters.createAdapters(effective, { mediaDir: () => null, resolveKey: async () => 'sk-dry' })
+    const adapter = created[0]
+    assert(adapter.id === 'minimax', 'minimax 适配器未实例化')
+
+    const calls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const urlText = String(url)
+      // 查询端点回终态成功（不记入 calls）；提交端点抓 body 回 task_id/图片成功体
+      if (urlText.includes('/v2/query/video_generation/')) {
+        return new Response(JSON.stringify({ task: { status: 'succeeded', content: { url: 'https://cdn/x.png' } } }), { status: 200 })
+      }
+      calls.push({ url: urlText, body: JSON.parse(init?.body ?? '{}') })
+      return new Response(JSON.stringify({ base_resp: { status_code: 0 }, data: { image_urls: ['https://cdn/x.png'] }, task_id: 't-1' }), { status: 200 })
+    }
+    const refPng = path.join(OUT_DIR, 'ref-fixture.png')
+    fs.mkdirSync(path.dirname(refPng), { recursive: true })
+    fs.writeFileSync(refPng, Buffer.from('89504e47', 'hex'))
+
+    try {
+      // ① image-01 文生图：同步端点、aspect_ratio 直用应用比例枚举
+      await adapter.submit('minimax/image-01', { prompt: 'p', ratio: '3:4', width: 864, height: 1152 })
+      let c = calls.at(-1)
+      assert(c.url === 'https://api.minimaxi.com/v1/image_generation', `端点不对：${c.url}`)
+      assert(c.body.model === 'image-01' && c.body.aspect_ratio === '3:4', `aspect_ratio 未生效：${JSON.stringify(c.body)}`)
+      assert(c.body.response_format === 'url' && c.body.subject_reference === undefined, '文生图不应带垫图')
+
+      // ② image-01 垫图：subject_reference[{character, image_file:dataURI}]
+      await adapter.submit('minimax/image-01', { prompt: 'p', ratio: '1:1', refFiles: [refPng] })
+      c = calls.at(-1)
+      const ref = c.body.subject_reference?.[0]
+      assert(ref?.type === 'character' && ref?.image_file?.startsWith('data:image/png;base64,'), `垫图形态不对：${JSON.stringify(c.body.subject_reference)}`)
+
+      // ③ H3 文生视频：t2v ratio 必传、duration clamp 到 15、分辨率按高度归档
+      await adapter.submit('minimax/h3', { prompt: 'p', ratio: '16:9', width: 1280, height: 720, durationSeconds: 99 })
+      c = calls.at(-1)
+      assert(c.url === 'https://api.minimaxi.com/v2/video_generation', `视频端点不对：${c.url}`)
+      assert(c.body.model === 'MiniMax-H3' && c.body.resolution === '768P', `分辨率归档不对：${JSON.stringify(c.body)}`)
+      assert(c.body.duration === 15, `duration 应 clamp 到 15：${c.body.duration}`)
+      assert(c.body.ratio === '16:9' && c.body.content.length === 1, 't2v 必须带 ratio 且 content 只有 text')
+
+      // ④ H3-Max 图生视频：首帧 image_url + role，ratio 不传（官方按 adaptive 处理），duration clamp [5,15]
+      await adapter.submit('minimax/h3-max', { prompt: 'p', ratio: '3:4', width: 864, height: 1152, durationSeconds: 2, refFiles: [refPng] })
+      c = calls.at(-1)
+      assert(c.body.model === 'MiniMax-H3-Max' && c.body.resolution === '768P', 'H3-Max 分辨率应为 768P')
+      assert(c.body.duration === 5, `H3-Max duration 应 clamp 到 5：${c.body.duration}`)
+      const frame = c.body.content[1]
+      assert(frame?.type === 'image_url' && frame?.role === 'first_frame' && frame?.image_url?.url?.startsWith('data:image/png;base64,'), `首帧形态不对：${JSON.stringify(frame)}`)
+      assert(c.body.ratio === undefined, 'i2v 不应传 ratio（官方按 adaptive 处理）')
+
+      // ⑤ poll：视频 succeeded → content.url
+      const polled = await adapter.poll('minimax/h3', 'mm-video|t-1')
+      assert(polled.status === 'succeeded' && polled.resultUrl === 'https://cdn/x.png', `poll 形态不对：${JSON.stringify(polled)}`)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  await checkAsync('tencent 生图/生视频协议形态（2026-10 官方 API 参考核实的 body 断言）', async () => {
+    const effective = mergeCatalog(BUILTIN_PROVIDERS.filter((p) => p.id === 'tencent'), {})
+    const created = adapters.createAdapters(effective, { mediaDir: () => null, resolveKey: async () => 'AKID:secret' })
+    const adapter = created[0]
+    assert(adapter.id === 'tencent', 'tencent 适配器未实例化')
+
+    const calls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const urlText = String(url)
+      const action = String(init?.headers?.['X-TC-Action'] ?? '')
+      // 查询端点按 Action 回终态成功；提交端点抓 body 回 JobId
+      if (action === 'QueryHunyuanImageJob') {
+        return new Response(JSON.stringify({ Response: { JobStatusCode: 5, ResultImage: ['https://cdn/x.png'] } }), { status: 200 })
+      }
+      calls.push({ url: urlText, headers: init?.headers ?? {}, body: JSON.parse(init?.body ?? '{}') })
+      return new Response(JSON.stringify({ Response: { JobId: 'job-1', RequestId: 'r' } }), { status: 200 })
+    }
+    const refPng = path.join(OUT_DIR, 'ref-fixture.png')
+    fs.mkdirSync(path.dirname(refPng), { recursive: true })
+    fs.writeFileSync(refPng, Buffer.from('89504e47', 'hex'))
+
+    try {
+      // ① 混元生图：hunyuan 域名 + TC3 签名头 + Resolution「宽:高」映射
+      const longPrompt = '字'.repeat(1500)
+      await adapter.submit('tencent/hunyuan-image', { prompt: longPrompt, ratio: '9:16', width: 720, height: 1280 })
+      let c = calls.at(-1)
+      assert(c.url === 'https://hunyuan.tencentcloudapi.com/', `生图域名不对：${c.url}`)
+      assert(String(c.headers['X-TC-Action']) === 'SubmitHunyuanImageJob' && String(c.headers['X-TC-Version']) === '2023-09-01', `Action/Version 不对：${JSON.stringify(c.headers)}`)
+      assert(String(c.headers.Authorization ?? '').startsWith('TC3-HMAC-SHA256 Credential=AKID/'), 'TC3 签名头形态不对')
+      assert(c.body.Resolution === '768:1280', `比例映射不对：${c.body.Resolution}`)
+      assert([...c.body.Prompt].length === 1024, `Prompt 应按码点截断到 1024：${[...c.body.Prompt].length}`)
+
+      // ② 混元生图垫图：ContentImage.Base64 为裸 base64；9:16 在参考图场景归档到 768:1024
+      await adapter.submit('tencent/hunyuan-image', { prompt: 'p', ratio: '9:16', refFiles: [refPng] })
+      c = calls.at(-1)
+      const rawBase64 = Buffer.from('89504e47', 'hex').toString('base64')
+      assert(c.body.ContentImage?.Base64 === rawBase64, `参考图应为裸 base64：${JSON.stringify(c.body.ContentImage)}`)
+      assert(c.body.Resolution === '768:1024', `参考图场景 9:16 应归档 3:4：${c.body.Resolution}`)
+
+      // ③ 混元生视频：vclm 域名 + Prompt 截断 200 + 720p；jobId 可查询
+      await adapter.submit('tencent/hunyuan-video', { prompt: '字'.repeat(300) })
+      c = calls.at(-1)
+      assert(c.url === 'https://vclm.tencentcloudapi.com/', `视频域名不对：${c.url}`)
+      assert(String(c.headers['X-TC-Action']) === 'SubmitHunyuanToVideoJob' && String(c.headers['X-TC-Version']) === '2024-05-23', '视频 Action/Version 不对')
+      assert([...c.body.Prompt].length === 200 && c.body.Resolution === '720p', `视频参数不对：${JSON.stringify(c.body)}`)
+
+      // ④ poll：生图完成态 → ResultImage[0]
+      const polled = await adapter.poll('tencent/hunyuan-image', 'tc-img|job-1')
+      assert(polled.status === 'succeeded' && polled.resultUrl === 'https://cdn/x.png', `poll 形态不对：${JSON.stringify(polled)}`)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   /* ---------------- 2b. 全量浏览目录（设置页「浏览完整模型库」数据源） ---------------- */
 
   const { browseCatalog } = catalog
   check('浏览目录：无目录供应商返回空数组', () => {
-    assert(browseCatalog('fal').length === 0 && browseCatalog('nonexistent').length === 0, 'fal/不存在供应商应返回空数组')
+    assert(browseCatalog('nope').length === 0 && browseCatalog('nonexistent').length === 0, '不存在供应商应返回空数组')
   })
 
   check('合并层回归：用户模型的 capabilities/costHint 清洗与透传', () => {

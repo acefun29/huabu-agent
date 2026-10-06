@@ -3,6 +3,7 @@ import { join } from 'path'
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { resolveMediaTarget, type MediaRoots } from '../../shared/assets'
+import { MEDIA_SRC_MARKER } from './contextEviction'
 import {
   MAX_VIDEO_BYTES,
   extractVideoFrames,
@@ -143,7 +144,7 @@ export function createVideoTools(ctx: VideoToolsContext): ToolDefinition[] {
       const header =
         `${summary}\n时长 ${formatMediaTime(set.durationSec)}；已粗扫 ${set.frames.length} 个低分辨率关键帧覆盖全片，时间点：${stamps}。\n` +
         (vision
-          ? `帧已随本条结果附上。基于粗扫定位到感兴趣的区间后，用 read_video_frames(path, t1, t2) 高清精读该区间；引用画面请标注时间点（MM:SS）。`
+          ? `帧已随本条结果附上。基于粗扫定位到感兴趣的区间后，用 read_video_frames(path, t1, t2) 高清精读该区间；引用画面请标注时间点（MM:SS）。\n${MEDIA_SRC_MARKER}${absPath}]`
           : `当前会话模型没有声明图片输入能力，帧图块没有回传（回传也会被协议层丢弃）。可基于时间轴与文件信息做初步判断，精读画面需要换支持视觉的模型。`)
       return {
         content: [
@@ -248,7 +249,7 @@ export function createVideoTools(ctx: VideoToolsContext): ToolDefinition[] {
       return {
         content: [
           textBlock(
-            `${summary}\n精读区间 ${range}（时长上限 ${READ_RANGE_LIMIT_SEC / 60} 分钟内）：已抽取 ${set.frames.length} 帧（最长边 ≤${p?.hi_res === true ? READ_MAX_EDGE_HI : READ_MAX_EDGE}px${set.deduped ? '，已剔除重复画面' : ''}），对应时间点：${stamps}。\n请基于实际画面回答；引用画面请标注时间点（MM:SS）。区间外内容未读取，不要对其下结论。`
+            `${summary}\n精读区间 ${range}（时长上限 ${READ_RANGE_LIMIT_SEC / 60} 分钟内）：已抽取 ${set.frames.length} 帧（最长边 ≤${p?.hi_res === true ? READ_MAX_EDGE_HI : READ_MAX_EDGE}px${set.deduped ? '，已剔除重复画面' : ''}），对应时间点：${stamps}。\n请基于实际画面回答；引用画面请标注时间点（MM:SS）。区间外内容未读取，不要对其下结论。\n${MEDIA_SRC_MARKER}${absPath}]`
           ),
           ...set.frames.map((f) => ({ type: 'image' as const, data: f.data, mimeType: f.mimeType }))
         ],

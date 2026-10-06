@@ -32,7 +32,7 @@ export default defineProvider({
       kind: 'image',
       label: '通义万相 2.7 图像生成与编辑',
       remoteModel: 'wan2.7-image',
-      costHint: '按张计费（文生图/图生图统一；挂参考图即图生图，输出比例随参考图）',
+      costHint: '按张计费（文生图/图生图统一；图生图指定比例时按比例出图，未指定则随参考图）',
       capabilities: {
         ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
         maxRefImages: 1
@@ -43,7 +43,7 @@ export default defineProvider({
       kind: 'image',
       label: '通义万相 2.7 图像生成与编辑 Pro',
       remoteModel: 'wan2.7-image-pro',
-      costHint: '按张计费（专业版：文生图 4K / 编辑 2K）',
+      costHint: '按张计费（专业版：文生图 4K / 编辑 2K；图生图指定比例时按比例出图，未指定则随参考图）',
       capabilities: {
         ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
         maxRefImages: 1

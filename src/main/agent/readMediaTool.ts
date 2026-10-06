@@ -4,6 +4,7 @@ import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { resolveMediaTarget, type MediaRoots } from '../../shared/assets'
 import { readImageFileAsBase64 } from '../media/artifactImage'
+import { MEDIA_SRC_MARKER } from './contextEviction'
 import {
   MAX_VIDEO_BYTES,
   VIDEO_FRAME_MAX_EDGE,
@@ -166,7 +167,7 @@ export function createReadMediaTool(ctx: ReadMediaContext): ToolDefinition {
         return {
           content: [
             textBlock(
-              `${summary}\n时长 ${formatMediaTime(set.durationSec)}；已${set.sceneEnhanced ? '按场景切换 + 均匀采样' : '均匀采样'}抽取 ${set.frames.length} 个关键帧（最长边 ≤${VIDEO_FRAME_MAX_EDGE}px${set.deduped ? '，已剔除重复画面' : ''}），随本条结果按时间顺序附上，对应时间点：${stamps}。\n请基于实际画面回答，不要凭文件名猜测内容；引用画面时请标注时间点（如 00:23）。`
+              `${summary}\n时长 ${formatMediaTime(set.durationSec)}；已${set.sceneEnhanced ? '按场景切换 + 均匀采样' : '均匀采样'}抽取 ${set.frames.length} 个关键帧（最长边 ≤${VIDEO_FRAME_MAX_EDGE}px${set.deduped ? '，已剔除重复画面' : ''}），随本条结果按时间顺序附上，对应时间点：${stamps}。\n请基于实际画面回答，不要凭文件名猜测内容；引用画面时请标注时间点（如 00:23）。\n${MEDIA_SRC_MARKER}${target.absPath}]`
             ),
             ...set.frames.map((f) => ({ type: 'image' as const, data: f.data, mimeType: f.mimeType }))
           ],
@@ -221,10 +222,11 @@ export function createReadMediaTool(ctx: ReadMediaContext): ToolDefinition {
         }
       }
 
-      // 元数据 + 图块一起回：图块给"看见"，文本给可引用的路径与尺寸（多轮后图被压缩掉时仍有凭据）
+      // 元数据 + 图块一起回：图块给"看见"，文本给可引用的路径与尺寸（多轮后图被压缩掉时仍有凭据）；
+      // 标记行供历史淘汰层提取锚点路径（contextEviction）
       return {
         content: [
-          textBlock(`${summary}\n原图 ${image.width}×${image.height}px，已缩到 ${READ_MEDIA_MAX_EDGE}px 内以 JPEG 随本条结果附上，请基于实际画面回答，不要凭文件名猜测内容。`),
+          textBlock(`${summary}\n原图 ${image.width}×${image.height}px，已缩到 ${READ_MEDIA_MAX_EDGE}px 内以 JPEG 随本条结果附上，请基于实际画面回答，不要凭文件名猜测内容。\n${MEDIA_SRC_MARKER}${target.absPath}]`),
           { type: 'image', data: image.data, mimeType: image.mimeType }
         ],
         details: { ok: true, kind: 'image', absPath: target.absPath, decoded: true, width: image.width, height: image.height }

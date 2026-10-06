@@ -35,6 +35,7 @@ import type {
 import { THINKING_LEVELS } from '../../shared/ipc'
 import { EventTranslator, toContextUsageEvent } from './serialize'
 import { CUSTOM_COMPACTION_INSTRUCTIONS } from './compaction'
+import { evictAllImages } from './contextEviction'
 import { computeContextBreakdown } from './breakdown'
 import { buildSessionHistory, type BuiltHistory, type HistoryImageSlot } from './history'
 import { makeHistoryThumbnail } from './historyThumbs'
@@ -478,8 +479,16 @@ export class AgentHost {
         cwd,
         modelRuntime: runtimeEntry.value.modelRuntime,
         model: picked.model,
-        // 初始思考档位；pi 会按模型能力 clamp（ThinkingLevel 是 pi 的枚举串，这里收窄不过类型关）
-        ...(request.thinkingLevel ? { thinkingLevel: request.thinkingLevel as never } : {}),
+        // 初始思考档位；pi 会按模型能力 clamp（ThinkingLevel 是 pi 的枚举串，这里收窄不过类型关）。
+        // 新会话未指定时显式给 pi 内置默认 medium：pi 否则会读机器全局默认
+        // （~/.pi/agent/settings.json 的 defaultThinkingLevel，与其他 pi 系工具共用，
+        // 实机出现过 "max" → clamp 成 high → 网关拒收），huabu 的会话默认不该被它劫持。
+        // 重绑旧会话不传：让 pi 从会话历史恢复该会话上次的档位
+        ...(request.thinkingLevel
+          ? { thinkingLevel: request.thinkingLevel as never }
+          : request.sessionFile
+            ? {}
+            : { thinkingLevel: 'medium' as never }),
         // 会话 JSONL 落到工作区的 .huabu/sessions/，与开发计划 3.4 的目录约定一致
         sessionManager,
         settingsManager,
@@ -498,6 +507,14 @@ export class AgentHost {
 
       const boundFile = sessionManager.getSessionFile() ?? sessionFile
       this.registerSession(nodeId, session, cwd, picked.id, boundFile)
+
+      // 历史图片淘汰（执行点二，image-context-eviction-plan.md）：createAgentSession
+      // 已把 JSONL 历史装进 agent.state.messages，base64 图块原样回内存，重启/重绑后
+      // 立即淘汰一轮，规则与发问前一致（结果幂等）
+      const evictedOnLoad = evictAllImages(session.agent.state.messages)
+      if (evictedOnLoad > 0) {
+        console.log(`[agent-host] 历史图片淘汰 nodeId=${nodeId} evicted=${evictedOnLoad}`)
+      }
 
       const info: ChatCreateInfo = {
         nodeId,
@@ -887,7 +904,13 @@ export class AgentHost {
     const picked = await this.pickModel(runtimeEntry, this.modelManager(runtimeEntry), request.modelId)
     if ('code' in picked) return fail(picked.code, picked.error)
     try {
+      const previousLevel = entry.session.thinkingLevel
       await entry.session.setModel(picked.model)
+      // pi 的 setModel 用「全局默认档位」覆盖会话当前档位（_getThinkingLevelForModelSwitch：
+      // per-model 设置 → settingsManager.getDefaultThinkingLevel()，兜底才是当前值）——
+      // 全局文件与其他 pi 系工具共用，实机出现过 max→clamp 成 high 的劫持。用户在会话里
+      // 选的档位应当跟随会话：这里显式回设，setThinkingLevel 会按新模型 clamp 到最近支持档
+      entry.session.setThinkingLevel(previousLevel as never)
       entry.modelId = picked.id
       return ok({
         modelId: picked.id,
@@ -987,6 +1010,7 @@ export class AgentHost {
         input?: Array<'text' | 'image'>
         contextWindow?: number
         maxTokens?: number
+        thinkingLevels?: string[]
       }>
     >
   > {
@@ -1004,7 +1028,8 @@ export class AgentHost {
         reasoning: model.reasoning,
         input: model.input,
         contextWindow: model.contextWindow,
-        maxTokens: model.maxTokens
+        maxTokens: model.maxTokens,
+        ...(model.reasoning ? { thinkingLevels: deriveThinkingLevels(model) } : {})
       }))
     )
   }
@@ -1128,6 +1153,13 @@ export class AgentHost {
     }
 
     try {
+      // 历史图片淘汰（执行点一，image-context-eviction-plan.md）：此刻本轮新消息尚未
+      // 进入列表，历史里的图全部换成路径锚点；本轮 agentic 流程中产生的图全程真图，
+      // 下一轮发问前才被淘汰。必须原地改写——整体重赋值会与 pi 内部引用脱钩
+      const evicted = evictAllImages(entry.session.agent.state.messages)
+      if (evicted > 0) {
+        console.log(`[agent-host] 历史图片淘汰 nodeId=${entry.nodeId} evicted=${evicted}`)
+      }
       // 不 await：让事件流驱动 UI。失败经 host_error + agent_end(stopReason='error') 表达
       void Promise.resolve(entry.session.prompt(text)).catch((error) => {
         console.error(`[agent-host] prompt 失败 nodeId=${entry.nodeId}：${describeError(error)}`)

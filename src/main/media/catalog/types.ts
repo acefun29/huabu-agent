@@ -13,18 +13,16 @@ import type { MediaKind, MediaProviderType } from '../../../shared/media'
 
 /** 单个内置模型定义（目录文件里的纯数据） */
 export interface BuiltinModelDef {
-  /** 面向用户的稳定 id，合入后不得改名（用户配置会引用它），如 'fal/veo3.1' */
+  /** 面向用户的稳定 id，合入后不得改名（用户配置会引用它），如 'dashscope/wan2.7-image' */
   id: string
   kind: MediaKind
   label: string
-  /** 实际发给网关/厂商的模型路径，如 'fal-ai/veo3'；缺省 = id 去掉 provider 前缀 */
+  /** 实际发给网关/厂商的模型路径，如 'wan2.7-image'；缺省 = id 去掉 provider 前缀 */
   remoteModel?: string
   /** 能力元数据：驱动渲染端参数面板 */
   capabilities?: import('../../../shared/media').ModelCapabilities
   /** 生命周期：beta 显示标记；deprecated 不出现在新建入口、老任务仍可回放 */
   status?: 'stable' | 'beta' | 'deprecated'
-  /** 适配器特有的抽取/行为微调，如 fal 的 resultKey */
-  adapterHints?: Record<string, unknown>
   /** 一句人话的成本提示（'约 $0.4/秒'），展示在参数面板，帮助用户避坑 */
   costHint?: string
 }
@@ -33,9 +31,9 @@ export interface BuiltinModelDef {
 export interface BuiltinProviderAuth {
   /** 凭据存储键后缀（safeStorage media:<key>）；缺省 = 使用 provider id */
   key?: string
-  /** 环境变量回退名，符合 <VENDOR>_KEY 命名约定（如 FAL_KEY） */
+  /** 环境变量回退名，符合 <VENDOR>_KEY 命名约定（如 DASHSCOPE_KEY） */
   env: string
-  /** Key 录入框的展示名（'fal.ai API Key'） */
+  /** Key 录入框的展示名（'阿里云百炼 API Key'） */
   label: string
   /** 申请/管理 Key 的官方入口 */
   helpUrl: string
@@ -43,7 +41,7 @@ export interface BuiltinProviderAuth {
 
 /** 单个内置供应商定义（一个供应商一个目录文件） */
 export interface BuiltinProviderDef {
-  /** 用户可见的稳定 id（'fal' | 'elevenlabs' | …），与用户自建供应商同一命名空间 */
+  /** 用户可见的稳定 id（'dashscope' | 'volcark' | …），与用户自建供应商同一命名空间 */
   id: string
   label: string
   /** 适配器类型，必须在 adapters/registry 里已注册（catalog:check 校验） */

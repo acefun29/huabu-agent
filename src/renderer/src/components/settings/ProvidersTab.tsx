@@ -5,7 +5,8 @@ import { Check, ExternalLink, Pencil, Plus, RotateCcw, Trash2, X } from 'lucide-
 import { useSettings } from '../../store/settingsStore'
 import { compactTokens } from '../../lib/format'
 import { useEsc } from '../../lib/hooks'
-import type { ManagedModelInfo } from '@shared/ipc'
+import type { ManagedModelInfo, ThinkingLevelName } from '@shared/ipc'
+import { THINKING_LEVEL_LABEL } from '@shared/ipc'
 import { CHAT_API_LABEL, type ChatModelApi } from '@shared/chatApi'
 import { ApiSelect, Field, Row, Select, Toggle, inputCls } from './ui'
 
@@ -19,6 +20,48 @@ import { ApiSelect, Field, Row, Select, Toggle, inputCls } from './ui'
  * 不敏感只为本输入框的容错；主进程侧仍是严格纯 id，最终以主进程校验为准。
  */
 const MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._\-/:]*$/i
+
+/** 档位声明的可选集（off 由「推理模型」开关表达，不进列表）；顺序即 THINKING_LEVELS 顺序 */
+const EFFORT_LEVELS: readonly ThinkingLevelName[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+const ALL_EFFORT_LEVELS: ThinkingLevelName[] = [...EFFORT_LEVELS]
+
+/**
+ * 推理模型的「支持的思考档位」多选：勾选的档位会话里才可选，请求只发这些值。
+ * 场景：网关对 reasoning_effort 的取值各不相同（报错会给出支持列表，如
+ * 「Supported types are xhigh, medium, and low」），按报错勾上对应档位即可。
+ */
+function ThinkingLevelsField({
+  value,
+  onChange,
+}: {
+  value: ThinkingLevelName[]
+  onChange: (next: ThinkingLevelName[]) => void
+}) {
+  return (
+    <Field label="支持的思考档位（网关不认的档位会报错，按报错勾选；会话档位菜单只显示勾选项）">
+      <div className="flex flex-wrap gap-1.5">
+        {EFFORT_LEVELS.map((level) => {
+          const active = value.includes(level)
+          return (
+            <button
+              key={level}
+              type="button"
+              onClick={() => onChange(active ? value.filter((l) => l !== level) : [...value, level])}
+              className={`flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] transition-colors ${
+                active
+                  ? 'bg-(--surface-chip) text-(--on-surface) ring-1 ring-(--accent)'
+                  : 'bg-(--surface-input) text-(--on-surface-muted) hover:bg-(--outline-soft)'
+              }`}
+            >
+              {active && <Check size={12} className="text-(--accent)" />}
+              {THINKING_LEVEL_LABEL[level]}
+            </button>
+          )
+        })}
+      </div>
+    </Field>
+  )
+}
 
 /**
  * 各内置供应商「创建 / 管理 API Key」页面的官方直达地址（2026-10 逐家官网核实）。
@@ -57,6 +100,9 @@ function AddModelDialog({
   const [supportsImage, setSupportsImage] = useState(false)
   const [reasoning, setReasoning] = useState(false)
   const [api, setApi] = useState<ChatModelApi | ''>('')
+  // 档位声明只对 completions 形态有意义（responses/anthropic 的档位语义不同）
+  const effortRelevant = api === '' || api === 'openai-completions'
+  const [thinkingLevels, setThinkingLevels] = useState<ThinkingLevelName[]>(ALL_EFFORT_LEVELS)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -69,7 +115,8 @@ function AddModelDialog({
   const maxNum = Number(maxTokens)
   const canSubmit =
     idValid && !submitting && (contextWindow.trim() === '' || (Number.isFinite(ctxNum) && ctxNum > 0)) &&
-    (maxTokens.trim() === '' || (Number.isFinite(maxNum) && maxNum > 0))
+    (maxTokens.trim() === '' || (Number.isFinite(maxNum) && maxNum > 0)) &&
+    (!reasoning || !effortRelevant || thinkingLevels.length > 0)
 
   const submit = async () => {
     if (!canSubmit) return
@@ -83,7 +130,8 @@ function AddModelDialog({
       ...(maxTokens.trim() ? { maxTokens: Math.round(maxNum) } : {}),
       ...(reasoning ? { reasoning: true } : {}),
       ...(api ? { api } : {}),
-      input_modalities: supportsImage ? ['text', 'image'] : ['text']
+      input_modalities: supportsImage ? ['text', 'image'] : ['text'],
+      ...(reasoning && effortRelevant ? { thinkingLevels } : {})
     })
     setSubmitting(false)
     if (err) {
@@ -182,6 +230,8 @@ function AddModelDialog({
             control={<Toggle checked={reasoning} onChange={setReasoning} />}
           />
 
+          {reasoning && effortRelevant && <ThinkingLevelsField value={thinkingLevels} onChange={setThinkingLevels} />}
+
           <Field label="协议（仅当一个网关同时暴露多种端点形态时才需要单独指定）">
             <ApiSelect value={api} onChange={setApi} allowFollow testId="add-model-api" />
           </Field>
@@ -233,6 +283,10 @@ function EditModelDialog({
   const [contextWindow, setContextWindow] = useState(model.contextWindow ? String(model.contextWindow) : '')
   const [maxTokens, setMaxTokens] = useState(model.maxTokens ? String(model.maxTokens) : '')
   const [reasoning, setReasoning] = useState(model.reasoning)
+  // 预填：目录已声明档位 → 勾选集；未声明（undefined/空）→ 全档（与主进程「无映射 = 全档」语义一致）
+  const [thinkingLevels, setThinkingLevels] = useState<ThinkingLevelName[]>(
+    model.thinkingLevels && model.thinkingLevels.length > 0 ? (model.thinkingLevels as ThinkingLevelName[]) : ALL_EFFORT_LEVELS
+  )
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -244,7 +298,8 @@ function EditModelDialog({
   const canSubmit =
     !submitting &&
     (contextWindow.trim() === '' || (Number.isFinite(ctxNum) && ctxNum > 0)) &&
-    (maxTokens.trim() === '' || (Number.isFinite(maxNum) && maxNum > 0))
+    (maxTokens.trim() === '' || (Number.isFinite(maxNum) && maxNum > 0)) &&
+    (!reasoning || thinkingLevels.length > 0)
 
   const submit = async () => {
     if (!canSubmit) return
@@ -256,7 +311,9 @@ function EditModelDialog({
       name: name.trim(),
       ...(contextWindow.trim() ? { contextWindow: Math.round(ctxNum) } : {}),
       ...(maxTokens.trim() ? { maxTokens: Math.round(maxNum) } : {}),
-      reasoning
+      reasoning,
+      // 档位整组替换：开推理带勾选集，关推理给空数组让主进程清掉映射
+      thinkingLevels: reasoning ? thinkingLevels : []
     })
     setSubmitting(false)
     if (err) {
@@ -318,6 +375,9 @@ function EditModelDialog({
             desc="关掉就不再期待思考输出；改上下文/最大输出只影响压缩阈值与输出上限"
             control={<Toggle checked={reasoning} onChange={setReasoning} />}
           />
+
+          {reasoning && <ThinkingLevelsField value={thinkingLevels} onChange={setThinkingLevels} />}
+
           {model.source === 'builtin' && (
             <div className="text-[11px] leading-relaxed text-(--on-surface-muted)">
               内置模型改的是覆盖层（能力进补丁条目、名字进 modelOverrides），恢复默认只要把这一栏清空。
@@ -544,20 +604,30 @@ function ProviderDetail({ providerId }: { providerId: string }) {
                     <span className="rounded-full bg-(--accent) px-1.5 text-[9px] text-white">默认</span>
                   )}
                   {m.source === 'custom' && (
-                    <button
-                      onClick={() => void removeModel(m)}
-                      className="flex h-4 w-4 items-center justify-center rounded-full text-(--on-surface-muted) opacity-0 transition-opacity hover:bg-(--outline-soft) hover:text-(--danger) group-hover/model:opacity-100"
-                      title="删除该自定义模型"
-                    >
-                      <X size={10} />
-                    </button>
+                    <>
+                      <button
+                        onClick={() => setEditingModel(m)}
+                        className="flex h-4 w-4 items-center justify-center rounded-full text-(--on-surface-muted) opacity-0 transition-opacity hover:bg-(--outline-soft) hover:text-(--on-surface) group-hover/model:opacity-100"
+                        title="编辑（改名 / 上下文 / 最大输出 / 推理与思考档位）"
+                        data-testid={`model-edit-${m.id}`}
+                      >
+                        <Pencil size={9} />
+                      </button>
+                      <button
+                        onClick={() => void removeModel(m)}
+                        className="flex h-4 w-4 items-center justify-center rounded-full text-(--on-surface-muted) opacity-0 transition-opacity hover:bg-(--outline-soft) hover:text-(--danger) group-hover/model:opacity-100"
+                        title="删除该自定义模型"
+                      >
+                        <X size={10} />
+                      </button>
+                    </>
                   )}
                   {m.source === 'builtin' && (
                     <>
                       <button
                         onClick={() => setEditingModel(m)}
                         className="flex h-4 w-4 items-center justify-center rounded-full text-(--on-surface-muted) opacity-0 transition-opacity hover:bg-(--outline-soft) hover:text-(--on-surface) group-hover/model:opacity-100"
-                        title="编辑（改名 / 上下文 / 最大输出 / 推理）"
+                        title="编辑（改名 / 上下文 / 最大输出 / 推理与思考档位）"
                         data-testid={`model-edit-${m.id}`}
                       >
                         <Pencil size={9} />
@@ -597,7 +667,7 @@ function ProviderDetail({ providerId }: { providerId: string }) {
           )}
           <span className="px-1.5 text-[11px] text-(--on-surface-muted)">
             {models.some((m) => m.source === 'custom')
-              ? '自定义模型悬停可删除；内置模型悬停可编辑或隐藏（隐藏后可在下面恢复）'
+              ? '模型悬停可编辑（名称 / 上下文 / 推理与思考档位）；自定义模型悬停可删除，内置模型可隐藏（隐藏后可在下面恢复）'
               : '点「添加模型」录入自定义模型（ID / 上下文 / 图片支持等）；内置模型悬停可编辑或隐藏'}
           </span>
         </div>
@@ -668,7 +738,6 @@ export function ProvidersTab() {
     setNewBaseUrl('')
     setNewApi('openai-completions')
     setAdding(false)
-    await refreshChat()
     setSelectedId(id)
   }
 
@@ -727,6 +796,8 @@ export function ProvidersTab() {
               <span className="mt-1 block text-[10px] leading-relaxed text-(--on-surface-muted)">
                 选错不会报错，只会连不上：走 OpenAI 兼容端点的网关选第一项，Anthropic/Claude
                 兼容端点（如 open.bigmodel.cn/api/anthropic）选最后一项。建好后改协议要删掉重建。
+                自建供应商按「通用兼容形态」发请求（system 角色 + max_tokens，不带 OpenAI
+                专有参数），不会把兼容网关当成 OpenAI 官方来对待；真 OpenAI 请用内置供应商。
               </span>
             </Field>
             {addError && <div className="text-[12px] text-(--danger)">{addError}</div>}

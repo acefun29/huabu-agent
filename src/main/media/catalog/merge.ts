@@ -63,8 +63,7 @@ export function mergeCatalog(builtin: readonly BuiltinProviderDef[], userConfig:
         requestModel: model.remoteModel ?? defaultRemoteModel(def.id, model.id),
         ...(model.costHint ? { costHint: model.costHint } : {}),
         ...(model.capabilities ? { capabilities: model.capabilities } : {}),
-        ...(model.status ? { status: model.status } : {}),
-        ...resultKeyHint(model)
+        ...(model.status ? { status: model.status } : {})
       })
     }
     effective.set(def.id, {
@@ -106,7 +105,7 @@ export function mergeCatalog(builtin: readonly BuiltinProviderDef[], userConfig:
         label: userLabel,
         source: 'user',
         authKey: userAuthKey,
-        // 环境变量回退名：用户配置 > 适配器声明（如 gateway-fal → FAL_KEY）
+        // 环境变量回退名：用户配置 > 适配器声明（如 gateway-dashscope → DASHSCOPE_KEY）
         ...(sanitized.authEnv ?? adapterDefaultAuthEnv(sanitized.type)
           ? { authEnv: sanitized.authEnv ?? adapterDefaultAuthEnv(sanitized.type) }
           : {}),
@@ -124,13 +123,12 @@ export function mergeCatalog(builtin: readonly BuiltinProviderDef[], userConfig:
 
 function userModelToAdapterConfig(
   modelId: string,
-  modelDef: { kind: MediaKind; label?: string; resultKey?: string; capabilities?: ModelCapabilities; costHint?: string }
+  modelDef: { kind: MediaKind; label?: string; capabilities?: ModelCapabilities; costHint?: string }
 ): AdapterModelConfig {
   return {
     id: modelId,
     kind: modelDef.kind,
     ...(modelDef.label ? { label: modelDef.label } : {}),
-    ...(modelDef.resultKey ? { resultKey: modelDef.resultKey } : {}),
     ...(modelDef.capabilities ? { capabilities: modelDef.capabilities } : {}),
     ...(modelDef.costHint ? { costHint: modelDef.costHint } : {})
   }
@@ -205,11 +203,6 @@ function defaultRemoteModel(providerId: string, modelId: string): string {
   return modelId.startsWith(`${providerId}/`) ? modelId.slice(providerId.length + 1) : modelId
 }
 
-function resultKeyHint(model: { adapterHints?: Record<string, unknown> }): { resultKey?: string } {
-  const hint = model.adapterHints?.resultKey
-  return typeof hint === 'string' && hint.trim() ? { resultKey: hint.trim() } : {}
-}
-
 /**
  * 清洗单个用户供应商条目（workspace.json userProviders 形态）：坏配置报
  * 「哪条模型哪个字段错了」并丢弃该条，绝不让一个坏条目炸掉整个清单链路（§5）。
@@ -230,13 +223,13 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
   if (typeof rawType !== 'string' || rawType === 'mock' || !isRegisteredAdapterType(rawType)) {
     warn(
       where,
-      `type 不合法（${JSON.stringify(rawType)}）：必须是已实现的适配器类型（gateway-fal 等），已丢弃供应商 ${providerId}`
+      `type 不合法（${JSON.stringify(rawType)}）：必须是已实现的适配器类型（gateway-dashscope 等），已丢弃供应商 ${providerId}`
     )
     return null
   }
   const type = rawType as Exclude<MediaProviderType, 'mock'>
   if (!isPlainObject(raw.models)) {
-    warn(where, `供应商 ${providerId} 缺少 models 对象（形如 { "fal-ai/xxx": { "kind": "image" } }），已丢弃`)
+    warn(where, `供应商 ${providerId} 缺少 models 对象（形如 { "wan2.7-image": { "kind": "image" } }），已丢弃`)
     return null
   }
   const models: WorkspaceMediaProviderConfig['models'] = {}
@@ -247,7 +240,7 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
       continue
     }
     if (!isPlainObject(modelDef)) {
-      warn(modelWhere, '不是对象（应为 { kind, label?, resultKey? }），已丢弃该模型')
+      warn(modelWhere, '不是对象（应为 { kind, label? }），已丢弃该模型')
       continue
     }
     if (!MEDIA_KINDS.includes(modelDef.kind as MediaKind)) {
@@ -257,9 +250,6 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
     if (modelDef.label !== undefined && modelDef.label !== '' && !isNonEmptyString(modelDef.label)) {
       warn(modelWhere, `label 不是字符串（${JSON.stringify(modelDef.label)}），已忽略 label`)
     }
-    if (modelDef.resultKey !== undefined && !isNonEmptyString(modelDef.resultKey)) {
-      warn(modelWhere, `resultKey 不是非空字符串（${JSON.stringify(modelDef.resultKey)}），已忽略 resultKey`)
-    }
     if (modelDef.costHint !== undefined && !isNonEmptyString(modelDef.costHint)) {
       warn(modelWhere, `costHint 不是非空字符串（${JSON.stringify(modelDef.costHint)}），已忽略 costHint`)
     }
@@ -267,7 +257,6 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
     models[modelId] = {
       kind: modelDef.kind as MediaKind,
       ...(isNonEmptyString(modelDef.label) ? { label: modelDef.label.trim() } : {}),
-      ...(isNonEmptyString(modelDef.resultKey) ? { resultKey: modelDef.resultKey.trim() } : {}),
       ...(isNonEmptyString(modelDef.costHint) ? { costHint: modelDef.costHint.trim() } : {}),
       ...(capabilities ? { capabilities } : {})
     }

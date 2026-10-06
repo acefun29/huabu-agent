@@ -247,15 +247,28 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     await Promise.all([refreshChat(), refreshMedia(), refreshSkillsAndMcp()])
   }, [refreshChat, refreshMedia, refreshSkillsAndMcp])
 
+  /**
+   * chat 配置变更成功后同步清单：设置页头部的认证徽章与「N 个模型」来自 chatProviders
+   * IPC（statuses），只在 refreshChat 时重算；没有这一步，存 Key / 加模型后详情区是新的、
+   * 头部永远停在面板首次打开时的旧快照。
+   */
+  const refreshChatAfter = useCallback(
+    async (error: string | null) => {
+      if (!error) await refreshChat()
+      return error
+    },
+    [refreshChat]
+  )
+
   const setApiKey = useCallback(async (providerId: string, apiKey: string) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.setApiKey(providerId, apiKey))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.setApiKey(providerId, apiKey)))
+  }, [refreshChatAfter])
 
   const removeApiKey = useCallback(async (providerId: string) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.removeApiKey(providerId))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.removeApiKey(providerId)))
+  }, [refreshChatAfter])
 
   const testProvider = useCallback(async (providerId: string) => {
     if (!hasBridge()) return null
@@ -278,35 +291,35 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   const customAddProvider = useCallback(
     async (providerId: string, name: string, baseUrl: string, api: ChatModelApi = 'openai-completions') => {
       if (!hasBridge()) return '当前环境没有可用的设置服务'
-      return errorText(await window.huabu.settings.customAddProvider({ providerId, name, baseUrl, api }))
+      return refreshChatAfter(errorText(await window.huabu.settings.customAddProvider({ providerId, name, baseUrl, api })))
     },
-    []
+    [refreshChatAfter]
   )
 
   const customRemoveProvider = useCallback(async (providerId: string) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.customRemoveProvider(providerId))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.customRemoveProvider(providerId)))
+  }, [refreshChatAfter])
 
   const customAddModel = useCallback(async (input: CustomModelInput) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.customAddModel(input))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.customAddModel(input)))
+  }, [refreshChatAfter])
 
   const modelRemove = useCallback(async (providerId: string, modelId: string) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.modelRemove(providerId, modelId))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.modelRemove(providerId, modelId)))
+  }, [refreshChatAfter])
 
   const modelEdit = useCallback(async (input: ModelEditInput) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.modelEdit(input))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.modelEdit(input)))
+  }, [refreshChatAfter])
 
   const modelRestore = useCallback(async (providerId: string, modelId: string) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'
-    return errorText(await window.huabu.settings.modelRestore(providerId, modelId))
-  }, [])
+    return refreshChatAfter(errorText(await window.huabu.settings.modelRestore(providerId, modelId)))
+  }, [refreshChatAfter])
 
   const updateMediaConfig = useCallback(async (patch: MediaConfigPatch) => {
     if (!hasBridge()) return '当前环境没有可用的设置服务'

@@ -141,8 +141,8 @@ group('B-边界校验')
     ['workspace:create 非法名字被拒', `window.huabu.workspace.create('..')`, (r) => r.ok === false],
     ['workspace:reveal 越界路径被拒', `window.huabu.workspace.reveal('..\\\\..\\\\win.ini')`, (r) => r.ok === false],
     ['media:generate 未知 provider 被拒', `window.huabu.media.generate({ provider: 'nope', model: 'x', kind: 'image', prompt: 'x' })`, (r) => r.ok === false && /provider/.test(r.error ?? '')],
-    ['media:generate 未知模型被拒', `window.huabu.media.generate({ provider: 'fal', model: 'fal/nope', kind: 'image', prompt: 'x' })`, (r) => r.ok === false && /模型/.test(r.error ?? '')],
-    ['media:generate kind 不匹配被拒', `window.huabu.media.generate({ provider: 'fal', model: 'fal/flux-2-flash', kind: 'video', prompt: 'x' })`, (r) => r.ok === false],
+    ['media:generate 未知模型被拒', `window.huabu.media.generate({ provider: 'dashscope', model: 'dashscope/nope', kind: 'image', prompt: 'x' })`, (r) => r.ok === false && /模型/.test(r.error ?? '')],
+    ['media:generate kind 不匹配被拒', `window.huabu.media.generate({ provider: 'dashscope', model: 'dashscope/wan2.7-image', kind: 'video', prompt: 'x' })`, (r) => r.ok === false],
     ['media:set-config 并发越界被拒', `window.huabu.media.setConfig({ concurrency: 99 })`, (r) => r.ok === false],
     ['media:set-config 绝对路径输出目录被拒', `window.huabu.media.setConfig({ outputDir: 'C:\\\\Windows' })`, (r) => r.ok === false],
     ['media:cancel 未知任务返回失败', `window.huabu.media.cancel('no-such-job')`, (r) => r.ok === false],
@@ -247,8 +247,8 @@ group('C-IPC矩阵')
   )
   const setConfig = await evalp(`window.huabu.media.setConfig({ defaultRatio: '1:1', defaultDuration: 5 })`)
   record('media:set-config 往返', setConfig.ok === true, JSON.stringify(setConfig).slice(0, 80))
-  // 应用默认 provider 现在是 fal（真实网关）；mock 存在时测试环境的 Agent 媒体工具显式钉在
-  // mock（零配额离线可跑）。钉完后必须走 UI 同路径刷新渲染端 settings 缓存，否则卡片生成仍按旧缓存选 fal
+  // 应用默认 provider 是内置真实网关（dashscope）；mock 存在时测试环境的 Agent 媒体工具显式钉在
+  // mock（零配额离线可跑）。钉完后必须走 UI 同路径刷新渲染端 settings 缓存，否则卡片生成仍按旧缓存选默认网关
   if (hasMock) {
     const pinMock = await evalp(
       `window.huabu.media.setConfig({ agentProvider: 'mock', agentModels: { image: 'mock/image-v1', video: 'mock/video-v1', audio: 'mock/audio-v1' } })`

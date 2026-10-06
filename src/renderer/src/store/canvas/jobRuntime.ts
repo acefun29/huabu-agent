@@ -1,5 +1,5 @@
 import type { MediaJobStatus } from '@shared/ipc'
-import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO } from '@shared/media'
+import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO, nearestMediaRatio } from '@shared/media'
 import { shortModelLabel } from '@shared/mediaResolve'
 import { normalizePath } from '../../harness/assetCategories'
 import type { AssetData, AssetGen, CanvasNode, GenerateVersion, MediaKind } from '../../types'
@@ -102,6 +102,18 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
                 error: undefined,
                 // 终态即解绑任务：再次载入画布时对账不会重复入库同一产物
                 jobId: undefined,
+                // 比例标签对齐产物事实：图生图等场景可能不按请求比例出图，成功后按
+                // 实际宽高反推（与工具结果回显同一 nearestMediaRatio），请求值不再冒充结果
+                params: {
+                  ...gen.params,
+                  ...(job.artifact?.width && job.artifact?.height
+                    ? {
+                        ratio:
+                          nearestMediaRatio(job.artifact.width, job.artifact.height) ??
+                          gen.params.ratio
+                      }
+                    : {})
+                },
                 versions: [version, ...gen.versions],
                 activeVersionId: version.id
               }
