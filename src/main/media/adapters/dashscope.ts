@@ -323,5 +323,5 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'DASHSCOPE_KEY' }
+  { defaultAuthEnv: 'DASHSCOPE_KEY', supportedKinds: ['image', 'video'] }
 )

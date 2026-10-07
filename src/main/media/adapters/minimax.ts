@@ -9,8 +9,8 @@ import { firstImageRefDataUri } from './refImage'
  * 国内域名 api.minimaxi.com 经实测与本契约同构，可直接用 baseUrl 覆盖切换国际站）。
  *
  * 协议（官方 API 参考）：
- * - 图片（同步）：POST /v1/image_generation，body {model:'image-01', prompt,
- *   aspect_ratio, response_format:'url'}。aspect_ratio 枚举 1:1/16:9/4:3/3:2/2:3/
+ * - 图片（同步）：POST /v1/image_generation，body {model:<配置的模型标识，目录缺省
+ *   image-01>, prompt, aspect_ratio, response_format:'url'}。aspect_ratio 枚举 1:1/16:9/4:3/3:2/2:3/
  *   3:4/9:16/21:9 —— 本应用的 5 档比例全部直接可用；垫图走 subject_reference
  *   [{type:'character', image_file}]（人像主体参考，支持 data URI，JPG/PNG ≤10MB）。
  *   注意：该 API 失败不走 HTTP 错误码，而是 HTTP 200 + base_resp.status_code
@@ -75,14 +75,16 @@ export class MiniMaxProvider extends BaseGatewayProvider<MiniMaxModelConfig> {
     const requestModel = this.requestModelOf(model)
     if (!requestModel) this.noSuchModel(model)
     const kind = this.kindOf(model)
-    return kind === 'video' ? this.submitVideo(key, requestModel, input) : this.submitImage(key, input)
+    return kind === 'video' ? this.submitVideo(key, requestModel, input) : this.submitImage(key, requestModel, input)
   }
 
   /** 同步生图：结果 URL 直接编进 jobId，poll 原样回传 succeeded */
-  private async submitImage(key: string, input: ProviderSubmitInput): Promise<string> {
+  private async submitImage(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
     const refDataUri = await firstImageRefDataUri(input.refFiles)
     const body: Record<string, unknown> = {
-      model: 'image-01',
+      // 跟随清单里配置的模型标识（内置目录 remoteModel 即 image-01，行为不变；
+      // 自定义供应商在 MiniMax 类型下加别的图片名不再被静默换成 image-01）
+      model: requestModel,
       prompt: input.prompt,
       response_format: 'url',
       ...(input.ratio ? { aspect_ratio: input.ratio } : {}),
@@ -230,5 +232,5 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'MINIMAX_KEY' }
+  { defaultAuthEnv: 'MINIMAX_KEY', supportedKinds: ['image', 'video'] }
 )

@@ -65,6 +65,12 @@ export type AdapterFactory = (deps: AdapterDeps, config: AdapterProviderConfig) 
 export interface AdapterMeta {
   /** 用户配置未声明 authEnv 时的默认环境变量名（如 gateway-dashscope → DASHSCOPE_KEY） */
   defaultAuthEnv?: string
+  /**
+   * 该适配器路由得通的媒体大类（如 gateway-openai-compat → image|audio，
+   * 端点族里没有视频端点）。缺省 = 全部大类。用户配置的模型 kind 越界会被
+   * 清洗层丢弃、IPC 层显式报错——堵住「配了 video 实际静默走图片端点」。
+   */
+  supportedKinds?: MediaKind[]
 }
 
 const registry = new Map<MediaProviderType, AdapterFactory>()
@@ -82,6 +88,21 @@ export function registerAdapter(type: MediaProviderType, factory: AdapterFactory
 /** 某适配器类型声明过的默认环境变量名；未声明返回 undefined（不做环境变量回退） */
 export function adapterDefaultAuthEnv(type: string): string | undefined {
   return metaByType.get(type as MediaProviderType)?.defaultAuthEnv
+}
+
+/**
+ * 某适配器路由得通的媒体大类（注册时自述；未声明 = 全部）。
+ * 清洗层、IPC 校验、渲染端选项过滤共用的唯一事实来源。
+ */
+export function adapterSupportedKinds(type: string): MediaKind[] {
+  return metaByType.get(type as MediaProviderType)?.supportedKinds ?? ['image', 'video', 'audio']
+}
+
+/** 全矩阵（类型 → 支持大类）：渲染端选项过滤经 media:adapter-kinds 通道取用 */
+export function getAdapterKindMatrix(): Record<string, MediaKind[]> {
+  const out: Record<string, MediaKind[]> = {}
+  for (const type of registry.keys()) out[type] = adapterSupportedKinds(type)
+  return out
 }
 
 /** 已有实现的适配器类型（运行时事实来源；CI 与配置清洗共用） */

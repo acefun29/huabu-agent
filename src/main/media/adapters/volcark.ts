@@ -257,5 +257,5 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'ARK_KEY' }
+  { defaultAuthEnv: 'ARK_KEY', supportedKinds: ['image', 'video'] }
 )

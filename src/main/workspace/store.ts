@@ -117,8 +117,14 @@ export interface WorkspaceMediaProviderConfig {
   authEnv?: string
   /** 网关基址（协议家族适配器用，如 gateway-openai-compat）；缺省 = 适配器官方默认 */
   baseUrl?: string
-  /** 认证头风格（通用协议用）：bearer | x-api-key；缺省 = 适配器默认 */
+  /** 认证头风格（gateway-openai-compat 消费的通用协议字段）：bearer | x-api-key；缺省 = bearer */
   authStyle?: 'bearer' | 'x-api-key'
+  /**
+   * 模型表：键 = 发给网关的模型标识。裸 slug（'wan2.7-image'）或带供应商前缀的
+   * 全 id（'dashscope/wan2.7-image'，覆盖/恢复内置模型时用）都合法——合并层按
+   * 内置目录同一条规则剥前缀得出实际请求标识（catalog/merge.ts）。
+   * kind 必须落在该适配器类型支持的端点族内（越界的模型条目会被清洗层丢弃）。
+   */
   models: Record<
     string,
     {

@@ -11,5 +11,11 @@ import './openaiCompat'
 import './minimax'
 import './tencent'
 
-export { createAdapters, getAdapterTypes, isRegisteredAdapterType } from './registry'
+export {
+  adapterSupportedKinds,
+  createAdapters,
+  getAdapterKindMatrix,
+  getAdapterTypes,
+  isRegisteredAdapterType
+} from './registry'
 export type { AdapterDeps, AdapterProviderConfig } from './registry'

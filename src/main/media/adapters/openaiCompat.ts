@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto'
-import { mkdirSync, writeFileSync } from 'fs'
-import { resolve } from 'path'
+import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { basename, resolve } from 'path'
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
 import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
 import { registerAdapter, type AdapterDeps } from './registry'
@@ -13,8 +13,14 @@ import { BaseGatewayProvider, buildModelRecord } from './base'
  * - 图片：POST {base}/images/generations（同步），body {model, prompt, size, n}。
  *   响应 data[0].url（dall-e 系）或 data[0].b64_json（gpt-image 系只回 b64）——
  *   b64 就地落成临时文件，走 resultFile 通道交编排层收编。
+ * - 图生图（有参考图时自动切换）：POST {base}/images/edits，multipart
+ *   （model/prompt/size + image 或 image[] 文件）。响应与 generations 同构
+ *   （url / b64_json 双通道）。只实现官方契约：不吃 image_url 之类的网关私有
+ *   字段，不支持 edits 端点的网关会得到明确的 404/405 错误而不是静默丢参考图。
  * - 音频：POST {base}/audio/speech（同步二进制流），body {model, input, voice,
  *   response_format:'mp3'}。时长由文本长度决定，durationSeconds 不参与请求。
+ * - 认证头：默认 `Authorization: Bearer`；供应商配置 authStyle='x-api-key' 时
+ *   改发 `x-api-key` 头（硅基流动之外的部分聚合网关用这种风格）。
  *
  * 兼容 OpenAI 原生、以及一切实现了同款 images/speech 端点的网关（硅基流动、
  * 302.AI、Novita 等）：用户在设置页「新增供应商」选本类型 + 填 baseUrl 即可，
@@ -40,6 +46,15 @@ function sizeFor(width?: number, height?: number): string {
   return width > height ? '1536x1024' : '1024x1536'
 }
 
+/** edits multipart 里参考图文件的 MIME（按扩展名，认不出的一律按 png） */
+function mimeForImage(file: string): string {
+  const ext = file.slice(file.lastIndexOf('.')).toLowerCase()
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg'
+  if (ext === '.webp') return 'image/webp'
+  if (ext === '.gif') return 'image/gif'
+  return 'image/png'
+}
+
 export interface OpenAICompatModelConfig {
   kind: MediaKind
   label?: string
@@ -61,11 +76,14 @@ export interface OpenAICompatProviderConfig {
   authKey?: string
   /** 环境变量名（默认 OPENAI_API_KEY） */
   authEnv?: string
+  /** 认证头风格：bearer（缺省）= `Authorization: Bearer <key>`；x-api-key = `x-api-key: <key>` */
+  authStyle?: 'bearer' | 'x-api-key'
 }
 
 export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelConfig> {
   readonly type: MediaProviderType = 'gateway-openai-compat'
   private readonly baseUrl: string
+  private readonly authStyle: 'bearer' | 'x-api-key'
 
   constructor(
     config: OpenAICompatProviderConfig,
@@ -75,6 +93,13 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
   ) {
     super(config, getKey, 'OPENAI_API_KEY', { id: 'openai-compat', label: 'OpenAI 兼容网关' })
     this.baseUrl = (config.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
+    this.authStyle = config.authStyle ?? 'bearer'
+  }
+
+  /** 认证头（只含凭据部分）：x-api-key 风格供部分聚合网关用。
+   *  Content-Type 由调用点按 body 形态自行附加——multipart 绝不能手动声明 */
+  private authHeaders(key: string): Record<string, string> {
+    return this.authStyle === 'x-api-key' ? { 'x-api-key': key } : { Authorization: `Bearer ${key}` }
   }
 
   async submit(model: string, input: ProviderSubmitInput): Promise<string> {
@@ -85,8 +110,9 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
     return kind === 'audio' ? this.submitSpeech(key, requestModel, input) : this.submitImage(key, requestModel, input)
   }
 
-  /** 同步出图：url 形态编码进 jobId；b64 形态落临时文件 */
+  /** 同步出图（文生图）：url 形态编码进 jobId；b64 形态落临时文件 */
   private async submitImage(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
+    if (input.refFiles?.length) return this.submitEditImage(key, requestModel, input)
     const body: Record<string, unknown> = {
       model: requestModel,
       prompt: input.prompt,
@@ -95,7 +121,7 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
     }
     const response = await fetch(`${this.baseUrl}/images/generations`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers: { ...this.authHeaders(key), 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       // 同步生成端点：请求即生成，gpt-image 高质量档可超 30s，放宽到 5 分钟防误杀
       signal: AbortSignal.timeout(300_000)
@@ -104,10 +130,47 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
       const text = await response.text().catch(() => '')
       throw this.httpErrorMessage(response, text, '网关认证失败', '图片生成失败')
     }
-    const data = (await response.json()) as {
-      data?: { url?: string; b64_json?: string }[]
-      error?: { message?: string }
+    return this.ingestImageResult(
+      (await response.json()) as { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } }
+    )
+  }
+
+  /**
+   * 图生图：官方 images/edits 的 multipart 契约（单图字段 image、多图 image[]）。
+   * 不实现网关私有扩展字段（image_url 等）：不支持 edits 的网关会在 404/405
+   * 拿到带提示的错误，而不是被静默降级成文生图。
+   */
+  private async submitEditImage(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
+    const form = new FormData()
+    form.append('model', requestModel)
+    form.append('prompt', input.prompt)
+    form.append('size', sizeFor(input.width, input.height))
+    const refs = input.refFiles ?? []
+    const field = refs.length === 1 ? 'image' : 'image[]'
+    for (const file of refs) {
+      form.append(field, new Blob([readFileSync(file)], { type: mimeForImage(file) }), basename(file))
     }
+    const response = await fetch(`${this.baseUrl}/images/edits`, {
+      method: 'POST',
+      headers: this.authHeaders(key),
+      body: form,
+      signal: AbortSignal.timeout(300_000)
+    })
+    if (!response.ok) {
+      const text = await response.text().catch(() => '')
+      const base = this.httpErrorMessage(response, text, '网关认证失败', '图片编辑失败')
+      if (response.status === 404 || response.status === 405) {
+        throw new Error(`${base.message}（该网关可能不支持图生图端点 /images/edits，文生图不受影响）`)
+      }
+      throw base
+    }
+    return this.ingestImageResult(
+      (await response.json()) as { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } }
+    )
+  }
+
+  /** generations / edits 共用的结果解析：url 与 b64_json 双通道 */
+  private ingestImageResult(data: { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } }): string {
     const first = data.data?.[0]
     if (first?.url) return `${URL_PREFIX}${first.url}`
     if (first?.b64_json) {
@@ -121,7 +184,7 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
   private async submitSpeech(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
     const response = await fetch(`${this.baseUrl}/audio/speech`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+      headers: { ...this.authHeaders(key), 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: requestModel,
         input: input.prompt,
@@ -183,10 +246,11 @@ registerAdapter(
         models: buildModelRecord<OpenAICompatModelConfig>(config.models),
         baseUrl: config.baseUrl,
         authKey: config.authKey,
-        authEnv: config.authEnv
+        authEnv: config.authEnv,
+        authStyle: config.authStyle
       },
       () => deps.resolveKey(config),
       () => deps.mediaDir()
     ),
-  { defaultAuthEnv: 'OPENAI_API_KEY' }
+  { defaultAuthEnv: 'OPENAI_API_KEY', supportedKinds: ['image', 'audio'] }
 )

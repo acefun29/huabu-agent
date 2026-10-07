@@ -1,6 +1,6 @@
 import type { MediaKind, MediaProviderType, MediaRatio, ModelCapabilities } from '../../../shared/media'
 import { MEDIA_RATIOS } from '../../../shared/media'
-import { adapterDefaultAuthEnv, isRegisteredAdapterType } from '../adapters/registry'
+import { adapterDefaultAuthEnv, adapterSupportedKinds, isRegisteredAdapterType } from '../adapters/registry'
 import type { AdapterModelConfig, AdapterProviderConfig } from '../adapters/registry'
 import type { BuiltinProviderDef } from './types'
 import type { MediaModelOverride, WorkspaceMediaProviderConfig } from '../../workspace/store'
@@ -95,7 +95,7 @@ export function mergeCatalog(builtin: readonly BuiltinProviderDef[], userConfig:
       if (sanitized.authStyle) existing.authStyle = sanitized.authStyle
       const byId = new Map(existing.models.map((m) => [m.id, m]))
       for (const [modelId, modelDef] of Object.entries(sanitized.models)) {
-        byId.set(modelId, userModelToAdapterConfig(modelId, modelDef))
+        byId.set(modelId, userModelToAdapterConfig(sanitized.id, modelId, modelDef))
       }
       existing.models = [...byId.values()]
     } else {
@@ -112,7 +112,7 @@ export function mergeCatalog(builtin: readonly BuiltinProviderDef[], userConfig:
         ...(sanitized.baseUrl ? { baseUrl: sanitized.baseUrl } : {}),
         ...(sanitized.authStyle ? { authStyle: sanitized.authStyle } : {}),
         models: Object.entries(sanitized.models).map(([modelId, modelDef]) =>
-          userModelToAdapterConfig(modelId, modelDef)
+          userModelToAdapterConfig(sanitized.id, modelId, modelDef)
         )
       })
     }
@@ -121,13 +121,22 @@ export function mergeCatalog(builtin: readonly BuiltinProviderDef[], userConfig:
   return [...effective.values()]
 }
 
+/**
+ * 用户模型条目 → 适配器模型配置。
+ *
+ * requestModel 与内置目录同一条派生规则（defaultRemoteModel：带 `供应商id/`
+ * 前缀的 id 剥前缀、裸 slug 原样）——用户在内置供应商下手输带前缀的全 id
+ * 覆盖/恢复模型时，发给网关的标识才不会被带上前缀。
+ */
 function userModelToAdapterConfig(
+  providerId: string,
   modelId: string,
   modelDef: { kind: MediaKind; label?: string; capabilities?: ModelCapabilities; costHint?: string }
 ): AdapterModelConfig {
   return {
     id: modelId,
     kind: modelDef.kind,
+    requestModel: defaultRemoteModel(providerId, modelId),
     ...(modelDef.label ? { label: modelDef.label } : {}),
     ...(modelDef.capabilities ? { capabilities: modelDef.capabilities } : {}),
     ...(modelDef.costHint ? { costHint: modelDef.costHint } : {})
@@ -228,6 +237,7 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
     return null
   }
   const type = rawType as Exclude<MediaProviderType, 'mock'>
+  const supportedKinds = adapterSupportedKinds(type)
   if (!isPlainObject(raw.models)) {
     warn(where, `供应商 ${providerId} 缺少 models 对象（形如 { "wan2.7-image": { "kind": "image" } }），已丢弃`)
     return null
@@ -245,6 +255,11 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
     }
     if (!MEDIA_KINDS.includes(modelDef.kind as MediaKind)) {
       warn(modelWhere, `kind 不合法（${JSON.stringify(modelDef.kind)}）：需要 image|video|audio，已丢弃该模型`)
+      continue
+    }
+    // kind 越界 = 该适配器没有对应端点族（如 openai-compat 配 video 会静默走图片端点）
+    if (!supportedKinds.includes(modelDef.kind as MediaKind)) {
+      warn(modelWhere, `kind ${modelDef.kind} 超出适配器 ${type} 支持的端点族（仅支持 ${supportedKinds.join('/')}），已丢弃该模型`)
       continue
     }
     if (modelDef.label !== undefined && modelDef.label !== '' && !isNonEmptyString(modelDef.label)) {

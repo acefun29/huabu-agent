@@ -306,5 +306,5 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'TENCENT_KEY' }
+  { defaultAuthEnv: 'TENCENT_KEY', supportedKinds: ['image', 'video'] }
 )
