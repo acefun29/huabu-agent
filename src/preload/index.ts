@@ -238,6 +238,8 @@ const api: HuabuApi = {
 
     browseCatalog: (providerId) => ipcRenderer.invoke(IpcChannel.MediaBrowseCatalog, { providerId }),
 
+    adapterKinds: () => ipcRenderer.invoke(IpcChannel.MediaAdapterKinds),
+
     onJobEvent: (listener) =>
       subscribeRaw(IpcChannel.MediaJobEvent, (payload) => listener(payload as MediaJobStatus)),
 

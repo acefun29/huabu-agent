@@ -214,7 +214,7 @@ async function main() {
     const effective = mergeCatalog([], {
       userProviders: [
         { id: 'my-oai', type: 'gateway-openai-compat', models: { 'gpt-image-1': { kind: 'image', label: 'GPT Image' } } },
-        { id: 'my-oai-noenv', type: 'gateway-openai-compat', authEnv: 'MY_KEY', models: { 'gpt-image-x': { kind: 'video' } } }
+        { id: 'my-oai-noenv', type: 'gateway-openai-compat', authEnv: 'MY_KEY', models: { 'gpt-audio-x': { kind: 'audio' } } }
       ]
     })
     assert(effective.length === 2, `应追加 2 个用户供应商，实际 ${effective.length}`)
@@ -496,7 +496,8 @@ async function main() {
       userProviders: [
         {
           id: 'caps',
-          type: 'gateway-openai-compat',
+          // 时长档位是视频语义，须挂在支持视频端点的适配器类型下（openai-compat 无视频端点）
+          type: 'gateway-dashscope',
           models: {
             'veo-4-text-to-video': {
               kind: 'video',
@@ -513,6 +514,134 @@ async function main() {
     assert(JSON.stringify(model.capabilities.durations) === '[4,8]', `durations 应去重升序且丢非正数：${JSON.stringify(model.capabilities.durations)}`)
     assert(model.capabilities.maxRefImages === 1, 'maxRefImages 未透传')
     assert(model.costHint === '约 $0.4/秒', 'costHint 未透传')
+  })
+
+  check('合并层回归：模型 kind 超出适配器端点族时逐条丢弃（kind 支持矩阵）', () => {
+    const warnings = []
+    const originalWarn = console.warn
+    console.warn = (...args) => warnings.push(args.join(' '))
+    try {
+      const effective = mergeCatalog([], {
+        userProviders: [
+          // openai-compat 只有 image/audio 端点：整条只有 video 模型 → 供应商一起丢弃
+          { id: 'oai-video-only', type: 'gateway-openai-compat', models: { vid: { kind: 'video' } } },
+          // 合法与越界混合：丢 video，保留 image/audio
+          {
+            id: 'oai-mixed',
+            type: 'gateway-openai-compat',
+            models: { img: { kind: 'image' }, tts: { kind: 'audio' }, vid: { kind: 'video' } }
+          },
+          // dashscope 只有 image/video 端点：audio 模型整条丢弃
+          { id: 'dash-audio-only', type: 'gateway-dashscope', models: { a: { kind: 'audio' } } },
+          // 未声明 supportedKinds 的类型（缺省 = 全部）不受限——这里用 dashscope 的合法组合验证不受影响
+          { id: 'dash-ok', type: 'gateway-dashscope', models: { v: { kind: 'video' } } }
+        ]
+      })
+      const ids = effective.map((e) => e.id)
+      assert(!ids.includes('oai-video-only'), `openai-compat 下纯 video 模型的供应商应被丢弃：${JSON.stringify(ids)}`)
+      assert(!ids.includes('dash-audio-only'), `dashscope 下 audio 模型的供应商应被丢弃：${JSON.stringify(ids)}`)
+      const mixed = effective.find((e) => e.id === 'oai-mixed')
+      assert(mixed && mixed.models.length === 2, `混合条目应保留 2 个合法模型，实际 ${mixed?.models.length}`)
+      assert(mixed.models.every((m) => m.kind !== 'video'), '混合条目的 video 模型应被丢弃')
+      assert(
+        warnings.some((w) => w.includes('vid') && w.includes('端点族')),
+        `越界 kind 应给出可定位警告（含模型 id 与端点族提示）：${JSON.stringify(warnings)}`
+      )
+    } finally {
+      console.warn = originalWarn
+    }
+  })
+
+  check('合并层回归：用户模型带前缀 id 剥前缀派生 requestModel（与内置同规则）', () => {
+    const builtin = [
+      {
+        id: 'acme',
+        label: 'ACME',
+        adapter: 'gateway-dashscope',
+        auth: { env: 'ACME_KEY', label: 'K', helpUrl: 'https://example.com/keys' },
+        models: [{ id: 'acme/keep', kind: 'image', label: 'Keep' }]
+      }
+    ]
+    // 隐藏内置模型后由用户条目带全 id 重新加回（覆盖/恢复的典型形态）
+    const effective = mergeCatalog(builtin, {
+      hiddenBuiltin: ['acme/keep'],
+      userProviders: [
+        {
+          id: 'acme',
+          type: 'gateway-dashscope',
+          models: { 'acme/keep': { kind: 'image' }, bare: { kind: 'video' } }
+        }
+      ]
+    })
+    const models = effective[0].models
+    const prefixed = models.find((m) => m.id === 'acme/keep')
+    assert(prefixed && prefixed.requestModel === 'keep', `带前缀 id 应剥前缀发给网关，实际 ${prefixed?.requestModel}`)
+    const bare = models.find((m) => m.id === 'bare')
+    assert(bare && bare.requestModel === 'bare', `裸 slug 应原样透传，实际 ${bare?.requestModel}`)
+  })
+
+  check('合并层回归：用户供应商 authStyle 清洗与透传（openai-compat 消费）', () => {
+    const effective = mergeCatalog([], {
+      userProviders: [
+        { id: 'xkey', type: 'gateway-openai-compat', authStyle: 'x-api-key', models: { m: { kind: 'image' } } },
+        { id: 'default-bearer', type: 'gateway-openai-compat', models: { m: { kind: 'image' } } },
+        { id: 'bogus-style', type: 'gateway-openai-compat', authStyle: 'basic', models: { m: { kind: 'image' } } }
+      ]
+    })
+    assert(effective.find((e) => e.id === 'xkey')?.authStyle === 'x-api-key', '合法 authStyle 应透传')
+    assert(effective.find((e) => e.id === 'default-bearer')?.authStyle === undefined, '未声明 = 缺省 bearer（不写字段）')
+    assert(effective.find((e) => e.id === 'bogus-style')?.authStyle === undefined, '枚举外的 authStyle 应被忽略')
+  })
+
+  await checkAsync('openaiCompat 认证头风格与图生图 edits 端点（fetch 挡板断言）', async () => {
+    const effective = mergeCatalog([], {
+      userProviders: [
+        { id: 'oc', type: 'gateway-openai-compat', baseUrl: 'https://gw.example/v1', models: { 'img-1': { kind: 'image' } } },
+        { id: 'oc-xkey', type: 'gateway-openai-compat', authStyle: 'x-api-key', models: { 'img-1': { kind: 'image' } } }
+      ]
+    })
+    const created = adapters.createAdapters(effective, { mediaDir: () => OUT_DIR, resolveKey: async () => 'k-1' })
+    assert(created.length === 2, '应实例化 2 个 openai-compat 适配器')
+
+    const captured = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      captured.push({ url: String(url), init })
+      if (String(url).endsWith('/images/generations')) {
+        return new Response(JSON.stringify({ data: [{ url: 'https://cdn.example/gen.png' }] }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ data: [{ b64_json: Buffer.from('89504e47', 'hex').toString('base64') }] }), { status: 200 })
+    }
+    const refPng = path.join(OUT_DIR, 'ref-fixture.png')
+    fs.mkdirSync(path.dirname(refPng), { recursive: true })
+    fs.writeFileSync(refPng, Buffer.from('89504e47', 'hex'))
+
+    try {
+      // ① 文生图（缺省 bearer）：打 generations 端点、Authorization: Bearer
+      await created[0].submit('img-1', { prompt: 'p' })
+      let c = captured.at(-1)
+      assert(c.url === 'https://gw.example/v1/images/generations', `文生图端点不对：${c.url}`)
+      assert(c.init.headers.Authorization === 'Bearer k-1', `缺省应走 Bearer 头：${JSON.stringify(c.init.headers)}`)
+
+      // ② x-api-key 风格：只发 x-api-key 头，不带 Authorization
+      await created[1].submit('img-1', { prompt: 'p' })
+      c = captured.at(-1)
+      assert(c.init.headers['x-api-key'] === 'k-1', `x-api-key 头未生效：${JSON.stringify(c.init.headers)}`)
+      assert(c.init.headers.Authorization === undefined, 'x-api-key 风格不应再带 Authorization')
+
+      // ③ 图生图：带参考图自动切 edits 端点，multipart 含 model/prompt/size/image
+      const jobId = await created[0].submit('img-1', { prompt: 'p', refFiles: [refPng] })
+      c = captured.at(-1)
+      assert(c.url === 'https://gw.example/v1/images/edits', `有参考图应走 edits 端点：${c.url}`)
+      assert(c.init.body instanceof FormData, 'edits 请求体应为 FormData（multipart）')
+      assert(c.init.body.get('model') === 'img-1' && c.init.body.get('prompt') === 'p', 'edits 表单缺 model/prompt')
+      assert(c.init.body.get('size') === '1024x1024', 'edits 表单缺 size')
+      assert(c.init.body.getAll('image').length === 1, 'edits 表单应含 1 个 image 文件字段')
+      // ④ b64 结果落临时文件：jobId 带 oc-file| 前缀，文件真实存在
+      assert(jobId.startsWith('oc-file|') && fs.existsSync(jobId.slice('oc-file|'.length)), `b64 产物应落临时文件：${jobId.slice(0, 60)}`)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 
   /* ---------------- 汇总 ---------------- */

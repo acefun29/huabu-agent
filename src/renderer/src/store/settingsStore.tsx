@@ -102,6 +102,8 @@ interface SettingsState {
   mediaUserRestoreModel: (providerId: string, modelId: string) => Promise<string | null>
   /** 浏览供应商的全量模型目录（设置页「浏览完整模型库」；无目录的供应商返回空数组） */
   mediaBrowseCatalog: (providerId: string) => Promise<MediaCatalogBrowseItem[]>
+  /** 适配器类型 → 支持的媒体大类矩阵（主进程注册表事实来源；设置页 kind 选项过滤用） */
+  mediaAdapterKinds: Record<string, MediaKind[]>
   /** 模型回退链：卡片指定 → 设置里该类媒体默认 → 默认供应商首个同类模型 */
   resolveMediaModel: (kind: MediaKind, override?: string) => ResolvedMediaModel | null
   /** 某 kind 的全部可选模型（复合 id = `provider:model`） */
@@ -169,6 +171,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   const [mediaStatus, setMediaStatus] = useState<MediaSettingsStatus['config'] | null>(null)
   const [confirmVideo, setConfirmVideo] = useState(true)
   const [mediaLoaded, setMediaLoaded] = useState(false)
+  const [mediaAdapterKinds, setMediaAdapterKinds] = useState<Record<string, MediaKind[]>>({})
 
   const [skills, setSkills] = useState<SkillInfo[]>([])
   const [mcpServers, setMcpServers] = useState<McpServerRuntimeInfo[]>([])
@@ -209,15 +212,17 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
 
   const refreshMedia = useCallback(async () => {
     if (!hasBridge()) return
-    const [providersResult, statusResult] = await Promise.all([
+    const [providersResult, statusResult, kindsResult] = await Promise.all([
       window.huabu.media.providers(),
-      window.huabu.settings.mediaStatus()
+      window.huabu.settings.mediaStatus(),
+      window.huabu.media.adapterKinds()
     ])
     if (providersResult.ok) setMediaProviders(providersResult.value)
     if (statusResult.ok) {
       setMediaStatus(statusResult.value.config)
       setConfirmVideo(statusResult.value.confirmVideo)
     }
+    if (kindsResult.ok) setMediaAdapterKinds(kindsResult.value)
     setMediaLoaded(true)
   }, [])
 
@@ -545,6 +550,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       mediaUserRemoveModel,
       mediaUserRestoreModel,
       mediaBrowseCatalog,
+      mediaAdapterKinds,
       resolveMediaModel,
       mediaModelOptions,
       skills,
@@ -564,7 +570,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       mediaProviders, mediaStatus, confirmVideo,
       mediaLoaded, refreshMedia, refreshAll, updateMediaConfig, setMediaKey, removeMediaKey,
       mediaUserAddProvider, mediaUserRemoveProvider, mediaUserAddModel, mediaUserRemoveModel,
-      mediaUserRestoreModel, mediaBrowseCatalog,
+      mediaUserRestoreModel, mediaBrowseCatalog, mediaAdapterKinds,
       resolveMediaModel, mediaModelOptions,
       skills, toggleSkill, mcpServers, toggleMcp, addMcp, removeMcp, refreshMcp,
       appearance, setAppearance

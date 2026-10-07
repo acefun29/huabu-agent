@@ -126,7 +126,7 @@ export const IpcChannel = {
 
   /** 媒体设置状态：确认闸门 + 各 provider 的 Key 来源 */
   SettingsMediaStatus: 'settings:media-status',
-  /** 录入媒体网关 Key（加密存储，键 media:<providerId>） */
+  /** 录入媒体网关 Key（加密存储，键 media:<生效清单 authKey>，缺省 = providerId） */
   SettingsMediaSetKey: 'settings:media-set-key',
   /** 删除媒体网关 Key */
   SettingsMediaRemoveKey: 'settings:media-remove-key',
@@ -196,6 +196,8 @@ export const IpcChannel = {
   MediaUserRestoreModel: 'media:user-restore-model',
   /** 浏览供应商的全量模型目录（随应用打包的只读数据，返回条目带 enabled 标注） */
   MediaBrowseCatalog: 'media:browse-catalog',
+  /** 适配器类型 → 支持的媒体大类矩阵（注册表运行时事实来源；设置页 kind 选项过滤用） */
+  MediaAdapterKinds: 'media:adapter-kinds',
 
   /* ------------------------------------------------------------------ */
   /* asset 域（新原型同步：素材归档 / 临时 inbox / 素材库映射）               */
@@ -964,6 +966,8 @@ export interface MediaUserProviderInput {
   baseUrl?: string
   /** 凭据回退环境变量名（可选；缺省按适配器约定） */
   authEnv?: string
+  /** 认证头风格（仅 gateway-openai-compat 等通用协议消费）：缺省 = bearer */
+  authStyle?: 'bearer' | 'x-api-key'
   /** 首个模型（供应商至少要有一个模型才有存在意义） */
   firstModel: { id: string; kind: 'image' | 'video' | 'audio'; label?: string }
 }
@@ -1034,6 +1038,7 @@ export interface ModelEditInput {
 export type {
   MediaProviderInfo,
   MediaProviderType,
+  MediaKind,
   MediaGenerateRequest,
   MediaJobStatus,
   MediaImportRequest,

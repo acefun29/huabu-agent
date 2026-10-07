@@ -124,7 +124,7 @@ export interface MediaProviderInfo {
   source?: 'builtin' | 'user'
   /** 是否已可提交（网关 = 凭据已录入或环境变量存在；mock 适配器已于 42db3cf 移除） */
   configured: boolean
-  /** 凭据来源提示（workspace-store / environment / none），不含密钥内容 */
+  /** 凭据来源提示（workspace-store / environment:<环境变量名> / none），不含密钥内容 */
   authHint?: string
   models: MediaModelInfo[]
 }

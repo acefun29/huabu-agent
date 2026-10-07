@@ -190,6 +190,16 @@ function MediaDefaultsView() {
   )
 }
 
+/** 全部媒体大类（矩阵通道异常时的兜底 = 不因数据缺失卡住表单） */
+const ALL_KINDS: MediaKind[] = ['image', 'video', 'audio']
+
+/** 凭据来源徽章：media:providers 的 authHint（workspace-store / environment:<NAME> / none） */
+function authHintLabel(hint?: string): string {
+  if (!hint || hint === 'none') return '未配置凭据'
+  if (hint.startsWith('environment')) return `走环境变量 ${hint.slice('environment:'.length)}`
+  return '加密存储'
+}
+
 /** 新增供应商表单页 */
 function MediaAddProviderView({
   onDone,
@@ -200,15 +210,19 @@ function MediaAddProviderView({
   onCancel: () => void
   onNotice: (message: string | null) => void
 }) {
-  const { mediaUserAddProvider } = useSettings()
+  const { mediaUserAddProvider, mediaAdapterKinds } = useSettings()
   const [npId, setNpId] = useState('')
   const [npLabel, setNpLabel] = useState('')
   const [npType, setNpType] = useState<MediaProviderType>('gateway-openai-compat')
   const [npBaseUrl, setNpBaseUrl] = useState('')
+  const [npAuthStyle, setNpAuthStyle] = useState<'bearer' | 'x-api-key'>('bearer')
   const [npAuthEnv, setNpAuthEnv] = useState('')
   const [npModelId, setNpModelId] = useState('')
   const [npModelKind, setNpModelKind] = useState<MediaKind>('image')
   const adapterTypeOption = ADAPTER_TYPE_OPTIONS.find((t) => t.value === npType)
+  // kind 选项 = 该接入类型路由得通的大类（主进程注册表事实来源）；矩阵没拉到就全放
+  const kindOptions = mediaAdapterKinds[npType] ?? ALL_KINDS
+  const effectiveModelKind = kindOptions.includes(npModelKind) ? npModelKind : kindOptions[0]
 
   const submit = async () => {
     const error = await mediaUserAddProvider({
@@ -216,8 +230,9 @@ function MediaAddProviderView({
       type: npType,
       ...(npLabel.trim() ? { label: npLabel.trim() } : {}),
       ...(npType === 'gateway-openai-compat' && npBaseUrl.trim() ? { baseUrl: npBaseUrl.trim() } : {}),
+      ...(npType === 'gateway-openai-compat' ? { authStyle: npAuthStyle } : {}),
       ...(npAuthEnv.trim() ? { authEnv: npAuthEnv.trim() } : {}),
-      firstModel: { id: npModelId.trim(), kind: npModelKind }
+      firstModel: { id: npModelId.trim(), kind: effectiveModelKind }
     })
     if (error) {
       onNotice(`新增供应商失败：${error}`)
@@ -252,33 +267,40 @@ function MediaAddProviderView({
             options={ADAPTER_TYPE_OPTIONS.map((t) => ({ value: t.value, label: t.label }))}
           />
         </Field>
-        {npType === 'gateway-openai-compat' ? (
-          <Field label="Base URL（网关端点，留空 = 官方默认）">
-            <input
-              value={npBaseUrl}
-              onChange={(e) => setNpBaseUrl(e.target.value)}
-              placeholder={adapterTypeOption?.baseUrlHint ?? 'https://…'}
-              className={inputCls}
-            />
-          </Field>
-        ) : (
-          <Field label="凭据环境变量名（可选，录入 Key 后不需要）">
-            <input value={npAuthEnv} onChange={(e) => setNpAuthEnv(e.target.value)} placeholder="SILICONFLOW_KEY" className={inputCls} />
-          </Field>
+        {npType === 'gateway-openai-compat' && (
+          <>
+            <Field label="Base URL（网关端点，留空 = 官方默认）">
+              <input
+                value={npBaseUrl}
+                onChange={(e) => setNpBaseUrl(e.target.value)}
+                placeholder={adapterTypeOption?.baseUrlHint ?? 'https://…'}
+                className={inputCls}
+              />
+            </Field>
+            <Field label="认证头风格">
+              <Select
+                value={npAuthStyle}
+                onChange={(v) => setNpAuthStyle(v as 'bearer' | 'x-api-key')}
+                options={[
+                  { value: 'bearer', label: 'Authorization: Bearer（默认）' },
+                  { value: 'x-api-key', label: 'x-api-key' },
+                ]}
+              />
+            </Field>
+          </>
         )}
+        <Field label="凭据环境变量名（可选，录入 Key 后不需要）">
+          <input value={npAuthEnv} onChange={(e) => setNpAuthEnv(e.target.value)} placeholder="SILICONFLOW_KEY" className={inputCls} />
+        </Field>
         <Field label="首个模型 id（发给网关的标识）">
           <div className="flex gap-1.5">
             <input value={npModelId} onChange={(e) => setNpModelId(e.target.value)} placeholder="Kwai-Kolors/Kolors" className={inputCls} />
             <Select
               hug
               className="w-24 shrink-0"
-              value={npModelKind}
+              value={effectiveModelKind}
               onChange={(v) => setNpModelKind(v as MediaKind)}
-              options={[
-                { value: 'image', label: '图片' },
-                { value: 'video', label: '视频' },
-                { value: 'audio', label: '音频' },
-              ]}
+              options={kindOptions.map((k) => ({ value: k, label: KIND_LABEL[k] }))}
             />
           </div>
         </Field>
@@ -438,6 +460,7 @@ function MediaProviderDetail({
   const {
     mediaProviders,
     mediaStatus,
+    mediaAdapterKinds,
     updateMediaConfig,
     setMediaKey,
     removeMediaKey,
@@ -462,6 +485,9 @@ function MediaProviderDetail({
   if (!provider) return null
   const keyUrl = MEDIA_API_KEY_URLS[provider.id]
   const agentProviderId = mediaStatus?.agentProvider ?? DEFAULT_MEDIA_PROVIDER
+  /** 该供应商接入类型路由得通的大类（kind 选项过滤；与新增供应商表单同一矩阵） */
+  const kindOptions = mediaAdapterKinds[provider.type] ?? ALL_KINDS
+  const effectiveNmKind = kindOptions.includes(nmKind) ? nmKind : kindOptions[0]
   /** 当前供应商名下被隐藏的内置模型（恢复入口用） */
   const hiddenModels = (mediaStatus?.hiddenBuiltin ?? []).filter((id) => id.startsWith(`${provider.id}/`))
 
@@ -475,7 +501,7 @@ function MediaProviderDetail({
 
   const submitNewModel = async () => {
     if (!nmId.trim()) return
-    const error = await mediaUserAddModel({ providerId: provider.id, id: nmId.trim(), kind: nmKind })
+    const error = await mediaUserAddModel({ providerId: provider.id, id: nmId.trim(), kind: effectiveNmKind })
     if (error) {
       onNotice(`添加模型失败：${error}`)
       return
@@ -490,7 +516,7 @@ function MediaProviderDetail({
         <div className="min-w-0">
           <div className="truncate text-[15px] font-semibold text-(--on-surface)">{provider.label}</div>
           <div className="mt-0.5 text-[11px] text-(--on-surface-muted)">
-            {provider.type} · {provider.models.length} 个模型 · {provider.authHint ?? '无需凭据'}
+            {provider.type} · {provider.models.length} 个模型 · {authHintLabel(provider.authHint)}
           </div>
         </div>
         {provider.id === agentProviderId && (
@@ -500,7 +526,7 @@ function MediaProviderDetail({
         )}
       </div>
 
-      <Field label={`API Key（${provider.authHint === 'environment' ? '当前走环境变量' : '加密存储'}）`}>
+      <Field label={`API Key（${authHintLabel(provider.authHint)}）`}>
         <div className="flex gap-2">
           <input
             type="password"
@@ -586,13 +612,9 @@ function MediaProviderDetail({
             />
             <Select
               variant="ghost"
-              value={nmKind}
+              value={effectiveNmKind}
               onChange={(v) => setNmKind(v as MediaKind)}
-              options={[
-                { value: 'image', label: '图片' },
-                { value: 'video', label: '视频' },
-                { value: 'audio', label: '音频' },
-              ]}
+              options={kindOptions.map((k) => ({ value: k, label: KIND_LABEL[k] }))}
             />
             <button
               onClick={() => void submitNewModel()}

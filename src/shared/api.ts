@@ -37,6 +37,7 @@ import type {
   MediaImportRequest,
   MediaImportResult,
   MediaJobStatus,
+  MediaKind,
   MediaProviderInfo,
   MediaUserModelInput,
   MediaUserProviderInput,
@@ -318,6 +319,9 @@ export interface MediaApi {
 
   /** 浏览该供应商的全量模型目录（设置页「浏览完整模型库」；无目录的供应商返回空数组） */
   browseCatalog(providerId: string): Promise<ChatResult<MediaCatalogBrowseItem[]>>
+
+  /** 适配器类型 → 支持的媒体大类矩阵（注册表事实来源；新增供应商/模型时过滤 kind 选项） */
+  adapterKinds(): Promise<ChatResult<Record<string, MediaKind[]>>>
 
   /** 订阅任务状态事件，返回取消订阅函数 */
   onJobEvent(listener: (job: MediaJobStatus) => void): () => void

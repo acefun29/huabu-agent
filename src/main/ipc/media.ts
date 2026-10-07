@@ -25,7 +25,9 @@ import type { MediaApprovalInfo } from '../agent/mediaTools'
 import { MediaJobManager } from '../media/manager'
 import type { MediaProviderAdapter } from '../media/provider'
 import {
+  adapterSupportedKinds,
   createAdapters,
+  getAdapterKindMatrix,
   isRegisteredAdapterType,
   type AdapterDeps,
   type AdapterProviderConfig
@@ -143,6 +145,11 @@ export type MediaContextReturnType = {
   providers: AdapterProviderConfig[]
   adapters: MediaProviderAdapter[]
   ready: boolean
+  /**
+   * 凭据来源探测：加密存储优先，其次 authEnv 环境变量。
+   * media:providers 的真实 authHint 据此组装（适配器静态值不反映实际录入）。
+   */
+  keySourceOf: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
   notifyAssetsChanged: () => void
 }
 
@@ -212,6 +219,11 @@ export function createMediaRuntime(
       providers,
       adapters: adapterCache.adapters,
       ready: Boolean(workspace),
+      keySourceOf: async (auth) => {
+        if (!workspace) return 'none'
+        if (auth.authKey && (await host.hasMediaKey(workspace, auth.authKey))) return 'workspace-store'
+        return auth.authEnv && process.env[auth.authEnv] ? 'environment' : 'none'
+      },
       // 产物落进素材库目录后由 MediaJobManager 调用，面板才会即时出现新文件（否则要重开工作区）
       notifyAssetsChanged: broadcastAssetChanged
     }
@@ -391,9 +403,14 @@ export function registerMediaIpc(ctx: IpcContext): void {
     }
     const firstKind = asMediaKind(first?.kind)
     if (!firstKind) return invalidPayload('firstModel.kind 需要 image|video|audio')
+    const supported = adapterSupportedKinds(type)
+    if (!supported.includes(firstKind)) {
+      return invalidPayload(`接入类型 ${type} 只有 ${supported.join('/')} 端点，不支持 ${firstKind} 模型`)
+    }
     const label = isNonEmptyString(request?.label) ? request.label : undefined
     const baseUrl = isNonEmptyString(request?.baseUrl) ? request.baseUrl : undefined
     const authEnv = isNonEmptyString(request?.authEnv) ? request.authEnv : undefined
+    const authStyle = request?.authStyle === 'bearer' || request?.authStyle === 'x-api-key' ? request.authStyle : undefined
     const firstLabel = isNonEmptyString(first?.label) ? first.label : undefined
     return guardSync(() => {
       const config = store.mediaConfig()
@@ -407,6 +424,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
         ...(label ? { label } : {}),
         ...(baseUrl ? { baseUrl } : {}),
         ...(authEnv ? { authEnv } : {}),
+        ...(authStyle ? { authStyle } : {}),
         models: {
           [firstModelId.trim()]: {
             kind: firstKind,
@@ -452,8 +470,19 @@ export function registerMediaIpc(ctx: IpcContext): void {
       const effective = mergeCatalog(BUILTIN_PROVIDERS, config)
       const provider = effective.find((p) => p.id === providerId)
       if (!provider) throw new Error(`供应商不存在：${providerId}`)
-      if (provider.models.some((m) => m.id === modelId)) {
-        throw new Error(`模型已存在：${modelId}`)
+      const supported = adapterSupportedKinds(provider.type)
+      if (!supported.includes(kind)) {
+        throw new Error(`${providerId} 的接入类型 ${provider.type} 只有 ${supported.join('/')} 端点，不支持 ${kind} 模型`)
+      }
+      // 查重要同时比对稳定 id 与网关标识：用户在内置供应商下手输裸 slug
+      // （如 'wan2.7-image'）与内置带前缀 id（'dashscope/wan2.7-image'）发给网关的是
+      // 同一个标识，直接放行会在适配器模型表里撞键、静默顶掉内置模型条目
+      const bareId = modelId.startsWith(`${providerId}/`) ? modelId.slice(providerId.length + 1) : modelId
+      const conflict = provider.models.find(
+        (m) => m.id === modelId || m.id === bareId || m.requestModel === modelId || m.requestModel === bareId
+      )
+      if (conflict) {
+        throw new Error(`已有同网关标识的模型：${conflict.id}（发给网关的标识都是 ${conflict.requestModel ?? conflict.id}）`)
       }
       const modelDef = {
         kind,
@@ -549,6 +578,24 @@ export function registerMediaIpc(ctx: IpcContext): void {
     })
   })
 
+  ipcMain.handle(IpcChannel.MediaAdapterKinds, () => {
+    // 注册表运行时事实来源（kind 越界配置在清洗层/上面的 add handler 已被拦截）
+    return { ok: true, value: getAdapterKindMatrix() } satisfies ChatResult<Record<string, MediaKind[]>>
+  })
+
+  /**
+   * 凭据存储键 = 生效清单里该供应商的 authKey（workspace.json 可覆盖；内置目录缺省
+   * 同 id）。按 providerId 直存会和读取路径 media:<authKey> 错位——手改过 authKey 的
+   * 工作区会出现「Key 保存成功但一直报缺凭据」。查不到条目时回落 providerId。
+   */
+  const authKeyOf = (providerId: string): string => {
+    try {
+      return mergeCatalog(BUILTIN_PROVIDERS, store.mediaConfig()).find((p) => p.id === providerId)?.authKey ?? providerId
+    } catch {
+      return providerId
+    }
+  }
+
   ipcMain.handle(IpcChannel.SettingsMediaSetKey, async (_event, payload: unknown) => {
     const request = payload as { providerId?: unknown; apiKey?: unknown } | null
     if (!isNonEmptyString(request?.providerId)) return invalidPayload('需要 providerId')
@@ -556,7 +603,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
     try {
-      await host.setMediaKey(dir, request.providerId, request.apiKey)
+      await host.setMediaKey(dir, authKeyOf(request.providerId), request.apiKey)
       return ok()
     } catch (error) {
       return { ok: false, code: 'unknown', error: describe(error) }
@@ -569,7 +616,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
     try {
-      await host.removeMediaKey(dir, providerId)
+      await host.removeMediaKey(dir, authKeyOf(providerId))
       return ok()
     } catch (error) {
       return { ok: false, code: 'unknown' as const, error: describe(error) }

@@ -70,6 +70,8 @@ export class MediaJobManager {
       adapters: MediaProviderAdapter[]
       /** 提交前校验：工作区是否可用 */
       ready: boolean
+      /** 凭据来源探测（media:providers 的真实 authHint 用）；宿主未提供时回落适配器静态值 */
+      keySourceOf?: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
       /** 素材库内容有变化的广播（产物落进库目录后调用，渲染端据此刷新素材库面板） */
       notifyAssetsChanged: () => void
     }
@@ -89,13 +91,20 @@ export class MediaJobManager {
       // 凭据探测要解密存储/查环境变量，逐个 await（清单最多几家，串行可忽略）
       const ready = adapter.isReady ? await adapter.isReady() : adapter.isConfigured()
       const conf = this.context().providers.find((p) => p.id === adapter.id)
+      // authHint 反映实际凭据来源（存储 Key / 环境变量 / 未配置）：适配器静态值
+      // 只区分「有没有声明 authKey」，merge 层已把 authKey 缺省化为 id，恒真不可用
+      let authHint = adapter.authHint()
+      if (this.context().keySourceOf && conf) {
+        const source = await this.context().keySourceOf!({ authKey: conf.authKey, authEnv: conf.authEnv })
+        authHint = source === 'environment' ? `environment:${conf.authEnv}` : source
+      }
       list.push({
         id: adapter.id,
         label: adapter.label,
         type: adapter.type,
         source: conf?.source,
         configured: ready,
-        authHint: adapter.authHint(),
+        authHint,
         models: [...adapter.models]
       })
     }
