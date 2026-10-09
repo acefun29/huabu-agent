@@ -25,16 +25,28 @@ import { firstImageRefDataUri } from './refImage'
  *   + ratio("16:9" 等) + duration 整数 [2,15]，产物仍是 output.video_url。
  *
  * 图生图 / 图生视频（2026-09-25 对照官方 API 参考核实，data URI 支持=本地垫图可离线）：
- * - 图生图 wan2.6-image / wan2.7-image(-pro)：与文生图共用 image-generation/generation
- *   端点，content 数组追加 {image: <URL 或 data URI>} 即为图生图；官方支持
- *   "data:{MIME};base64,{base64_data}"（wan2.7 单图 ≤20MB，宽高 [240,8000]，wan2.7 可 0-9 张）；
- *   有图输入时输出比例缺省随最后一张输入图；调用方显式给了比例（width/height）时必须传
- *   size 覆盖，否则竖版请求会静默出成参考图的横版（官方允许显式 size，编辑模式像素
- *   窗口 [768²,2048²] 包含本适配器的归一窗口）；未指定比例时不传 size，保持随参考图。
- * - 图生视频 wan2.7-i2v / wan3.0-video(-prime)：input 从 {prompt} 扩为
+ * - 图生图 wan2.6-image / wan2.7-image(-pro) / qwen-image-3.0(-pro)：与文生图共用
+ *   image-generation/generation 端点，content 数组追加 {image: <URL 或 data URI>} 即为
+ *   图生图；官方支持 "data:{MIME};base64,{base64_data}"（wan2.7 单图 ≤20MB，宽高
+ *   [240,8000]，wan2.7 可 0-9 张；有图输入时输出比例缺省随最后一张输入图）；调用方显式
+ *   给了比例（width/height）时必须传 size 覆盖，否则竖版请求会静默出成参考图的横版
+ *   （官方允许显式 size，编辑模式像素窗口 [768²,2048²] 包含本适配器的归一窗口）；
+ *   未指定比例时不传 size，保持随参考图。
+ * - 图生视频 wan2.7-i2v / wan3.0-video(-prime) / happyhorse-i2v：input 从 {prompt} 扩为
  *   {prompt, media:[{type:'first_frame', url}]}，url 同样吃 Base64 data URI（≤20MB）；
  *   wan2.7-i2v 无 ratio 参数、duration [2,15]；wan3.0-video 支持 ratio（默认 adaptive）
- *   且 duration [2,30]。尾帧 last_frame 一期不做（编排层只有单参考图语义）。
+ *   且 duration [2,30]；happyhorse-i2v duration [3,15]。尾帧 last_frame 一期不做
+ *   （编排层只有单参考图语义）。
+ *
+ * 2026-10-09 逐页核实官方文档后的两处补齐（这两族模型名不带 wan 前缀，原版本正则
+ * wanVersion() 匹配不到，会静默走旧协议分支）：
+ * - 千问 qwen-image 全系走**与 wan2.6+ 完全同构**的图片新协议——官方「千问-图像生成与
+ *   编辑 API参考」的异步章节用的是同一端点 image-generation/generation、同一
+ *   messages/content 形态、同一 choices[].message.content[].image 产物结构，故
+ *   isNewImageProtocol 直接认定。其像素窗口 [512², 2048²] 比 wan2.6 的归一窗口更宽，
+ *   归一后的尺寸落在合法区间内。
+ * - happyhorse 走现有 video-synthesis 端点与 parameters（resolution/ratio/duration），
+ *   同因模型名需在 isNewVideoParams 里单独认定；官方时长区间 3~15 秒。
  */
 
 const BASE_URL = 'https://dashscope.aliyuncs.com'
@@ -196,14 +208,27 @@ function wanVersion(requestModel: string): [number, number] | null {
   return m ? [Number(m[1]), Number(m[2])] : null
 }
 
-/** 图片新协议：wan2.6 起（image-generation/generation + messages + choices 产物） */
+/**
+ * 图片新协议：万相 wan2.6 起 + 千问 qwen-image 全系（image-generation/generation
+ * + input.messages + choices 产物）。
+ * 千问系列模型名不带 wan 前缀，wanVersion() 匹配不到，只能单独认定——官方
+ * 「千问-图像生成与编辑 API参考」的异步章节与万相 2.6+ 用**完全相同**的端点、
+ * 请求体与产物结构（同一份 messages/content 形态），故一并走新协议。
+ */
 function isNewImageProtocol(requestModel: string): boolean {
+  if (/^qwen-image-/i.test(requestModel)) return true
   const v = wanVersion(requestModel)
   return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 6))
 }
 
-/** 视频新参数：wan2.7 起（resolution+ratio 替代 size，duration 为整数） */
+/**
+ * 视频新参数：wan2.7 起（resolution+ratio 替代 size，duration 为整数）。
+ * 千问之外的另一族：happyhorse（官方「HappyHorse-文生视频 API参考」）用的是
+ * 同一套 parameters（resolution 480P/720P/1080P + ratio + duration [3,15]），
+ * 但模型名不带 wan 前缀、wanVersion() 匹配不到，单独认定。
+ */
 function isNewVideoParams(requestModel: string): boolean {
+  if (/^happyhorse-/i.test(requestModel)) return true
   const v = wanVersion(requestModel)
   return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 7))
 }
@@ -247,9 +272,11 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
       parameters.resolution = input.height >= 1000 ? '1080P' : '720P'
     }
     if (input.durationSeconds) {
-      parameters.duration = isWan3Video(requestModel)
-        ? clamp(Math.round(input.durationSeconds), 2, 30)
-        : clamp(Math.round(input.durationSeconds), 2, 15)
+      // 时长上限逐族：wan3.0-video 官方 2~30 秒，happyhorse 官方 3~15 秒，
+      // wan2.x-i2v 官方 2~15 秒（官方 API 参考核实）
+      const maxDuration = isWan3Video(requestModel) ? 30 : 15
+      const minDuration = isHappyHorse(requestModel) ? 3 : 2
+      parameters.duration = clamp(Math.round(input.durationSeconds), minDuration, maxDuration)
     }
     return {
       model: requestModel,
@@ -279,9 +306,10 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
 }
 
 /**
- * 「media 数组」形态的视频模型：wan2.x-i2v 系与 wan3.0-video（All-in-One）。
- * 与 t2v 的 {input:{prompt}} 形态不同，它们把首帧图放进 input.media（官方 API 参考：
- * media[].type = first_frame/last_frame/reference_image…，url 支持 Base64 data URI）。
+ * 「media 数组」形态的视频模型：wan2.x-i2v 系、wan3.0-video(-prime)（All-in-One）、
+ * happyhorse-i2v。与 t2v 的 {input:{prompt}} 形态不同，它们把首帧图放进 input.media
+ * （官方 API 参考：media[].type = first_frame/last_frame/reference_image…，
+ * url 支持 Base64 data URI）。
  */
 function isMediaVideoModel(requestModel: string): boolean {
   return /-i2v/i.test(requestModel) || isWan3Video(requestModel)
@@ -291,7 +319,16 @@ function isWan3Video(requestModel: string): boolean {
   return /^wan3\.0-video/i.test(requestModel)
 }
 
-/** wan2.6 图片：保持比例，把总像素归一到 [1280×1280, 1440×1440] 窗口 */
+/** happyhorse 族（文生/图生视频，官方 HappyHorse API 参考） */
+function isHappyHorse(requestModel: string): boolean {
+  return /^happyhorse-/i.test(requestModel)
+}
+
+/**
+ * wan2.6+ 图片：保持比例，把总像素归一到合法窗口。
+ * 万相 2.6/2.7 编辑模式的像素窗口是 [768², 2048²]，千问 qwen-image 全系是
+ * [512², 2048²]（官方 API 参考）——两者都覆盖本函数的下限 1280²，用同一档归一即可。
+ */
 function wan26PixelSize(width: number, height: number): string {
   let w = Math.round(width)
   let h = Math.round(height)

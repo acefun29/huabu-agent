@@ -1,8 +1,8 @@
 import { defineProvider } from '../define'
 
 /**
- * 火山方舟内置目录（2026-09-22 对照 docs.volcengine.com 官方 API 文档核实，
- * 文档页面当日更新：图片生成 API / 创建视频生成任务 / Seedream·Seedance 教程页）。
+ * 火山方舟内置目录（2026-10-09 对照 docs.volcengine.com 官方 API 文档核实：
+ * 图片生成 API / 创建视频生成任务 API / Seedream·Seedance 教程页 / 模型广场）。
  *
  * 模型 id 是稳定承诺（合入后不得改名）；线上模型 ID 带日期后缀，厂商升级时老条目
  * 标 deprecated 保留、新模型加新条目。价格随官方调价漂移，costHint 标「约」。
@@ -11,8 +11,9 @@ import { defineProvider } from '../define'
  *   （doubao-seedream-5-0-pro-260628）、5.0 Flash（doubao-seedream-5-0-flash-260915）、
  *   5.0 Lite（doubao-seedream-5-0-lite-260128）、4.5（doubao-seedream-4-5-251128）；
  * - 视频（POST /api/v3/contents/generations/tasks 异步）：Seedance 2.5
- *   （doubao-seedance-2-5-260628，duration [4,30] 原生有声）、2.0 Fast
- *   （doubao-seedance-2-0-fast-260128）、2.0 Mini（doubao-seedance-2-0-mini-260615）。
+ *   （doubao-seedance-2-5-260628，duration [4,30] 原生有声）、2.0 标准版
+ *   （doubao-seedance-2-0-260128）、2.0 Fast（doubao-seedance-2-0-fast-260128）、
+ *   2.0 Mini（doubao-seedance-2-0-mini-260615）。
  * 老条目 Seedream 4.0 / Seedance 1.0 Lite 标 deprecated 保留。
  * 未入库模型（Seedance i2v 等）经 workspace.json media.userProviders 声明即可，无需改代码。
  */
@@ -78,6 +79,14 @@ export default defineProvider({
       remoteModel: 'doubao-seedance-2-5-260628',
       costHint: '按秒计费（支持 4~30 秒，默认可选 720p/1080p）',
       capabilities: { durations: [5, 10, 15, 30], maxRefImages: 1 }
+    },
+    {
+      id: 'volcark/seedance-2.0',
+      kind: 'video',
+      label: 'Seedance 2.0（标准版，原生有声）',
+      remoteModel: 'doubao-seedance-2-0-260128',
+      costHint: '按秒计费（2.0 标准档，支持 1080P；480P/720P/1080P 三档）',
+      capabilities: { durations: [4, 5, 10, 15], maxRefImages: 1 }
     },
     {
       id: 'volcark/seedance-2.0-fast',

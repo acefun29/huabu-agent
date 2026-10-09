@@ -369,6 +369,69 @@ async function main() {
     }
   })
 
+  await checkAsync('dashscope 千问/happyhorse 新族协议（模型名不带 wan 前缀的识别回归）', async () => {
+    const effective = mergeCatalog(
+      BUILTIN_PROVIDERS.filter((p) => p.id === 'dashscope'),
+      {}
+    )
+    const created = adapters.createAdapters(effective, { mediaDir: () => null, resolveKey: async () => 'sk-dry' })
+    const adapter = created.find((a) => a.id === 'dashscope')
+    assert(adapter, 'dashscope 适配器未实例化')
+
+    const calls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const urlText = String(url)
+      if (urlText.includes('/api/v1/tasks/')) {
+        return new Response(JSON.stringify({ output: { task_status: 'SUCCEEDED', video_url: 'https://cdn/v.mp4' } }), { status: 200 })
+      }
+      calls.push({ url: urlText, body: JSON.parse(init.body) })
+      return new Response(JSON.stringify({ output: { task_id: 'task-dry' } }), { status: 200 })
+    }
+    const refPng = path.join(OUT_DIR, 'ref-fixture.png')
+    fs.mkdirSync(path.dirname(refPng), { recursive: true })
+    fs.writeFileSync(refPng, Buffer.from('89504e47', 'hex'))
+
+    try {
+      // ① qwen-image-3.0-pro 文生图：必须走新端点 + messages 形态（回归点：模型名不含 wan）
+      await adapter.submit('dashscope/qwen-image-3.0-pro', { prompt: 'p', width: 1280, height: 720 })
+      let c = calls.at(-1)
+      assert(c.url.includes('/api/v1/services/aigc/image-generation/generation'), `千问应走新图片端点：${c.url}`)
+      assert(c.body.model === 'qwen-image-3.0-pro', `模型名未透传：${c.body.model}`)
+      assert(c.body.input.messages[0].content[0].text === 'p', '千问应走 messages 形态')
+      assert(typeof c.body.parameters.size === 'string' && c.body.parameters.size.includes('*'), `size 应为「宽*高」：${c.body.parameters.size}`)
+
+      // ② qwen-image-3.0-pro 图生图：同端点 + content 追加 {image}（data URI）
+      await adapter.submit('dashscope/qwen-image-3.0-pro', { prompt: 'p', width: 1024, height: 1024, refFiles: [refPng] })
+      c = calls.at(-1)
+      const content = c.body.input.messages[0].content
+      assert(content.length === 2 && content[1].image?.startsWith('data:image/png;base64,'), `千问图生图 content 不对：${JSON.stringify(content).slice(0, 120)}`)
+
+      // ③ happyhorse-1.1-t2v 文生视频：video-synthesis + resolution/ratio/duration 新参数
+      //   （回归点：模型名不含 wan，不能落到旧 size 分支）
+      await adapter.submit('dashscope/happyhorse-1.1-t2v', { prompt: 'p', width: 1280, height: 720, durationSeconds: 99 })
+      c = calls.at(-1)
+      assert(c.url.includes('/api/v1/services/aigc/video-generation/video-synthesis'), `happyhorse 端点不对：${c.url}`)
+      assert(c.body.parameters.size === undefined, 'happyhorse 不应传旧 size 字段')
+      assert(c.body.parameters.resolution === '720P' && c.body.parameters.ratio === '16:9', `参数形态不对：${JSON.stringify(c.body.parameters)}`)
+      assert(c.body.parameters.duration === 15, `duration 应 clamp 到 15：${c.body.parameters.duration}`)
+
+      // ④ happyhorse-1.1-i2v 图生视频：media 数组 + duration 下限 3（官方 3~15 秒）
+      await adapter.submit('dashscope/happyhorse-1.1-i2v', { prompt: 'p', durationSeconds: 1, refFiles: [refPng] })
+      c = calls.at(-1)
+      assert(c.body.input.media?.[0]?.type === 'first_frame', `happyhorse i2v 应走 media 形态：${JSON.stringify(c.body.input)}`)
+      assert(c.body.parameters.duration === 3, `happyhorse duration 下限应为 3：${c.body.parameters.duration}`)
+
+      // ⑤ wan3.0-video-prime 优速版：复用 wan3.0 的 duration 上限 30
+      await adapter.submit('dashscope/wan3.0-video-prime', { prompt: 'p', durationSeconds: 99, refFiles: [refPng] })
+      c = calls.at(-1)
+      assert(c.body.input.media?.[0]?.type === 'first_frame', 'wan3.0-video-prime 应走 media 形态')
+      assert(c.body.parameters.duration === 30, `wan3.0-video-prime duration 应 clamp 到 30：${c.body.parameters.duration}`)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   await checkAsync('minimax 图生图/视频协议形态（2026-10 官方 API 参考核实的 body 断言）', async () => {
     const effective = mergeCatalog(BUILTIN_PROVIDERS.filter((p) => p.id === 'minimax'), {})
     const created = adapters.createAdapters(effective, { mediaDir: () => null, resolveKey: async () => 'sk-dry' })
