@@ -66,8 +66,8 @@ export interface AdapterMeta {
   /** 用户配置未声明 authEnv 时的默认环境变量名（如 gateway-dashscope → DASHSCOPE_KEY） */
   defaultAuthEnv?: string
   /**
-   * 该适配器路由得通的媒体大类（如 gateway-openai-compat → image|audio，
-   * 端点族里没有视频端点）。缺省 = 全部大类。用户配置的模型 kind 越界会被
+   * 该适配器路由得通的媒体大类（如 gateway-openai-compat → image|video|audio，
+   * 端点族里没有对话补全那类东西）。缺省 = 全部大类。用户配置的模型 kind 越界会被
    * 清洗层丢弃、IPC 层显式报错——堵住「配了 video 实际静默走图片端点」。
    */
   supportedKinds?: MediaKind[]

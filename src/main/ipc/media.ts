@@ -412,6 +412,9 @@ export function registerMediaIpc(ctx: IpcContext): void {
     const authEnv = isNonEmptyString(request?.authEnv) ? request.authEnv : undefined
     const authStyle = request?.authStyle === 'bearer' || request?.authStyle === 'x-api-key' ? request.authStyle : undefined
     const firstLabel = isNonEmptyString(first?.label) ? first.label : undefined
+    // capabilities/costHint 与 MediaUserAddModel 同一清洗口径（sanitizeCapabilities 同源）
+    const firstCapabilities = sanitizeCapabilities(first?.capabilities)
+    const firstCostHint = isNonEmptyString(first?.costHint) ? first.costHint.trim() : undefined
     return guardSync(() => {
       const config = store.mediaConfig()
       if ((config.userProviders ?? []).some((p) => p.id === providerId)) {
@@ -428,7 +431,9 @@ export function registerMediaIpc(ctx: IpcContext): void {
         models: {
           [firstModelId.trim()]: {
             kind: firstKind,
-            ...(firstLabel ? { label: firstLabel } : {})
+            ...(firstLabel ? { label: firstLabel } : {}),
+            ...(firstCostHint ? { costHint: firstCostHint } : {}),
+            ...(firstCapabilities ? { capabilities: firstCapabilities } : {})
           }
         }
       })

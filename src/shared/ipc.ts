@@ -968,8 +968,14 @@ export interface MediaUserProviderInput {
   authEnv?: string
   /** 认证头风格（仅 gateway-openai-compat 等通用协议消费）：缺省 = bearer */
   authStyle?: 'bearer' | 'x-api-key'
-  /** 首个模型（供应商至少要有一个模型才有存在意义） */
-  firstModel: { id: string; kind: 'image' | 'video' | 'audio'; label?: string }
+  /** 首个模型（供应商至少要有一个模型才有存在意义）；capabilities/costHint 与 media:user-add-model 同口径 */
+  firstModel: {
+    id: string
+    kind: 'image' | 'video' | 'audio'
+    label?: string
+    capabilities?: ModelCapabilities
+    costHint?: string
+  }
 }
 
 /** media:user-add-model 的载荷 */

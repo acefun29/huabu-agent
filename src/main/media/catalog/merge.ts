@@ -257,7 +257,7 @@ export function sanitizeUserProvider(raw: unknown, index = 0): WorkspaceMediaPro
       warn(modelWhere, `kind 不合法（${JSON.stringify(modelDef.kind)}）：需要 image|video|audio，已丢弃该模型`)
       continue
     }
-    // kind 越界 = 该适配器没有对应端点族（如 openai-compat 配 video 会静默走图片端点）
+    // kind 越界 = 该适配器没有对应端点族（如 dashscope 配 audio 会静默走图片端点）
     if (!supportedKinds.includes(modelDef.kind as MediaKind)) {
       warn(modelWhere, `kind ${modelDef.kind} 超出适配器 ${type} 支持的端点族（仅支持 ${supportedKinds.join('/')}），已丢弃该模型`)
       continue

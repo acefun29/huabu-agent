@@ -3,16 +3,17 @@ import { defineProvider } from '../define'
 /**
  * OpenAI 官方内置目录（gateway-openai-compat 协议家族）。
  *
- * 模型清单 2026-09-22 对照官方 openai-node SDK 的模型枚举核实
- * （openai/openai-node@master src/resources/images.ts 的 ImageModel 与
- * audio/speech.ts 的 SpeechModel；platform.openai.com 文档页有反爬，SDK 类型
- * 定义是官方 API 契约的同等来源）。核实记录：
- * - 图片在列：gpt-image-2.5-flare（2026-09-08 快照）、gpt-image-2.5-sunburst、
- *   gpt-image-2、gpt-image-1.5（图片编辑默认值）、gpt-image-1 系列、dall-e-2/3；
- * - 语音在列：tts-1、tts-1-hd、gpt-4o-mini-tts（2025-12-15 快照）。
- * 只放官方端点确实支持的模型；视频类本协议族不支持。兼容网关（硅基流动、
- * 302.AI 等）不要往这里加——用户在设置页「新增供应商」选 OpenAI 兼容类型
- * + 填 baseUrl 即可接入，零代码。
+ * 模型清单 2026-10-09 对照 openai-openapi 仓库核实（platform.openai.com 文档页有反爬，
+ * OpenAPI spec 是官方 API 契约的同等来源）：
+ * - 图片在列：images.md 的 ImageModel——gpt-image-2.5-flare（2026-09-08 快照）、
+ *   gpt-image-2.5-sunburst、gpt-image-2、gpt-image-1.5（图片编辑默认值）、
+ *   gpt-image-1 系列、dall-e-2/3；
+ * - 视频在列：videos.md 的 VideoModel——sora-2、sora-3（异步任务制：POST /videos
+ *   创建 → GET /videos/{id} 轮询 → GET /videos/{id}/content 取回 mp4；seconds
+ *   官方枚举 4/8/12，input_reference 单图即首帧图生视频）；
+ * - 语音在列：audio/speech.md 的 SpeechModel——tts-1、tts-1-hd、gpt-4o-mini-tts。
+ * 只放官方端点确实支持的模型；兼容网关（硅基流动、302.AI 等）不要往这里加——
+ * 用户在设置页「新增供应商」选 OpenAI 兼容类型 + 填 baseUrl 即可接入，零代码。
  */
 export default defineProvider({
   id: 'openai',
@@ -21,6 +22,23 @@ export default defineProvider({
   auth: { env: 'OPENAI_KEY', label: 'OpenAI API Key', helpUrl: 'https://platform.openai.com/api-keys' },
   region: 'global',
   models: [
+    {
+      id: 'openai/sora-3',
+      kind: 'video',
+      label: 'Sora 3（文生 / 首帧图生视频，最新）',
+      remoteModel: 'sora-3',
+      costHint: '按秒计费（官方定价页为准）',
+      // seconds 官方枚举 4/8/12；size 官方形如 WxH，按应用比例体系只放横竖两档
+      capabilities: { ratios: ['16:9', '9:16'], durations: [4, 8, 12], maxRefImages: 1 }
+    },
+    {
+      id: 'openai/sora-2',
+      kind: 'video',
+      label: 'Sora 2（文生 / 首帧图生视频）',
+      remoteModel: 'sora-2',
+      costHint: '按秒计费（官方定价页为准）',
+      capabilities: { ratios: ['16:9', '9:16'], durations: [4, 8, 12], maxRefImages: 1 }
+    },
     {
       id: 'openai/gpt-image-2.5-flare',
       kind: 'image',

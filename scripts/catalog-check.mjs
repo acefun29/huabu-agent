@@ -496,7 +496,7 @@ async function main() {
       userProviders: [
         {
           id: 'caps',
-          // 时长档位是视频语义，须挂在支持视频端点的适配器类型下（openai-compat 无视频端点）
+          // 时长档位是视频语义；openai-compat 三类端点都有，dashscope 同样支持视频
           type: 'gateway-dashscope',
           models: {
             'veo-4-text-to-video': {
@@ -523,28 +523,27 @@ async function main() {
     try {
       const effective = mergeCatalog([], {
         userProviders: [
-          // openai-compat 只有 image/audio 端点：整条只有 video 模型 → 供应商一起丢弃
+          // openai-compat 三类端点都有（images/videos/speech）：video 供应商应保留
           { id: 'oai-video-only', type: 'gateway-openai-compat', models: { vid: { kind: 'video' } } },
-          // 合法与越界混合：丢 video，保留 image/audio
+          // 合法混合：image/audio/video 全保留
           {
             id: 'oai-mixed',
             type: 'gateway-openai-compat',
             models: { img: { kind: 'image' }, tts: { kind: 'audio' }, vid: { kind: 'video' } }
           },
-          // dashscope 只有 image/video 端点：audio 模型整条丢弃
-          { id: 'dash-audio-only', type: 'gateway-dashscope', models: { a: { kind: 'audio' } } },
+          // volcark 只有 image/video 端点：audio 越界，纯越界供应商整条丢弃
+          { id: 'volc-audio-only', type: 'gateway-volcark', models: { tts: { kind: 'audio' } } },
           // 未声明 supportedKinds 的类型（缺省 = 全部）不受限——这里用 dashscope 的合法组合验证不受影响
           { id: 'dash-ok', type: 'gateway-dashscope', models: { v: { kind: 'video' } } }
         ]
       })
       const ids = effective.map((e) => e.id)
-      assert(!ids.includes('oai-video-only'), `openai-compat 下纯 video 模型的供应商应被丢弃：${JSON.stringify(ids)}`)
-      assert(!ids.includes('dash-audio-only'), `dashscope 下 audio 模型的供应商应被丢弃：${JSON.stringify(ids)}`)
+      assert(ids.includes('oai-video-only'), `openai-compat 已支持 video，纯 video 供应商应保留：${JSON.stringify(ids)}`)
+      assert(!ids.includes('volc-audio-only'), `volcark 下 audio 供应商应被丢弃：${JSON.stringify(ids)}`)
       const mixed = effective.find((e) => e.id === 'oai-mixed')
-      assert(mixed && mixed.models.length === 2, `混合条目应保留 2 个合法模型，实际 ${mixed?.models.length}`)
-      assert(mixed.models.every((m) => m.kind !== 'video'), '混合条目的 video 模型应被丢弃')
+      assert(mixed && mixed.models.length === 3, `openai-compat 三类端点应全保留，实际 ${mixed?.models.length}`)
       assert(
-        warnings.some((w) => w.includes('vid') && w.includes('端点族')),
+        warnings.some((w) => w.includes('tts') && w.includes('端点族')),
         `越界 kind 应给出可定位警告（含模型 id 与端点族提示）：${JSON.stringify(warnings)}`
       )
     } finally {
@@ -639,6 +638,89 @@ async function main() {
       assert(c.init.body.getAll('image').length === 1, 'edits 表单应含 1 个 image 文件字段')
       // ④ b64 结果落临时文件：jobId 带 oc-file| 前缀，文件真实存在
       assert(jobId.startsWith('oc-file|') && fs.existsSync(jobId.slice('oc-file|'.length)), `b64 产物应落临时文件：${jobId.slice(0, 60)}`)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  await checkAsync('openaiCompat 视频协议形态（2026-10 openai-openapi videos.md 核实的 body/轮询断言）', async () => {
+    const effective = mergeCatalog([], {
+      userProviders: [
+        { id: 'ocv', type: 'gateway-openai-compat', baseUrl: 'https://gw.example/v1', models: { 'sora-2': { kind: 'video' } } }
+      ]
+    })
+    const created = adapters.createAdapters(effective, { mediaDir: () => OUT_DIR, resolveKey: async () => 'k-1' })
+    assert(created.length === 1 && created[0].models[0].kind === 'video', 'openai-compat 应接受 video 模型')
+
+    const calls = []
+    /** 可变任务态：查询端点按它回包，content 端点固定回二进制 */
+    let video = { id: 'vid-1', status: 'queued', progress: 0, seconds: 4 }
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const urlText = String(url)
+      const method = init?.method ?? 'GET'
+      if (urlText.endsWith('/videos') && method === 'POST') {
+        calls.push({ url: urlText, init })
+        return new Response(JSON.stringify({ id: 'vid-1', status: 'queued' }), { status: 200 })
+      }
+      if (urlText.endsWith('/videos/vid-1/content')) {
+        calls.push({ url: urlText, init })
+        return new Response(Buffer.from('89504e47', 'hex'), { status: 200, headers: { 'content-type': 'video/mp4' } })
+      }
+      calls.push({ url: urlText, init })
+      return new Response(JSON.stringify(video), { status: 200 })
+    }
+    const refPng = path.join(OUT_DIR, 'ref-fixture.png')
+    fs.mkdirSync(path.dirname(refPng), { recursive: true })
+    fs.writeFileSync(refPng, Buffer.from('89504e47', 'hex'))
+
+    try {
+      // ① 文生视频：JSON body（model/prompt/size/seconds）、Bearer 头、jobId 编码 oc-video|
+      const jobId = await created[0].submit('sora-2', { prompt: 'p', width: 1280, height: 720, durationSeconds: 5 })
+      let c = calls.at(-1)
+      assert(c.url === 'https://gw.example/v1/videos', `视频提交端点不对：${c.url}`)
+      assert(c.init.headers.Authorization === 'Bearer k-1', '视频提交应带认证头')
+      const body = JSON.parse(c.init.body)
+      assert(body.model === 'sora-2' && body.prompt === 'p', 'JSON body 缺 model/prompt')
+      assert(body.size === '1280x720', `size 应为 WxH 形态：${body.size}`)
+      assert(body.seconds === 4, `seconds=5 应就近归档到官方枚举 4：${body.seconds}`)
+      assert(jobId === 'oc-video|vid-1', `jobId 编码不对：${jobId}`)
+
+      // ② 轮询 in_progress：running 态 + 百分比进度
+      video = { id: 'vid-1', status: 'in_progress', progress: 42 }
+      let polled = await created[0].poll('sora-2', jobId)
+      c = calls.at(-1)
+      assert(c.url === 'https://gw.example/v1/videos/vid-1' && c.init.headers.Authorization === 'Bearer k-1', `轮询请求不对：${c.url}`)
+      assert(polled.status === 'running' && Math.abs((polled.progress ?? 0) - 0.42) < 1e-6, `in_progress 形态不对：${JSON.stringify(polled)}`)
+
+      // ③ 图生视频（首帧）：multipart + input_reference 文件，seconds 在枚举内原样透传
+      await created[0].submit('sora-2', { prompt: 'p', width: 720, height: 1280, durationSeconds: 8, refFiles: [refPng] })
+      c = calls.at(-1)
+      assert(c.init.body instanceof FormData, '带参考图应走 multipart（input_reference）')
+      assert(Boolean(c.init.body.get('input_reference')), 'multipart 缺 input_reference 文件字段')
+      assert(c.init.body.get('seconds') === '8', 'seconds=8 应原样透传')
+      assert(c.init.body.get('size') === '720x1280', `size 未透传：${c.init.body.get('size')}`)
+
+      // ④ completed：content 端点取回二进制并落临时文件（编排层下载 URL 不带认证头，只能在这里落）
+      video = { id: 'vid-1', status: 'completed', progress: 100, seconds: 8 }
+      polled = await created[0].poll('sora-2', jobId)
+      assert(polled.status === 'succeeded' && polled.fileExt === '.mp4' && polled.mime === 'video/mp4', `completed 形态不对：${JSON.stringify(polled)}`)
+      assert(polled.durationSeconds === 8, `durationSeconds 应取网关 seconds：${polled.durationSeconds}`)
+      assert(polled.resultFile && fs.existsSync(polled.resultFile), 'mp4 应落成真实临时文件')
+      assert(calls.at(-1).url === 'https://gw.example/v1/videos/vid-1/content', 'completed 后应打 content 端点')
+
+      // ⑤ failed：携带网关原因
+      video = { id: 'vid-1', status: 'failed', error: { message: 'boom' } }
+      polled = await created[0].poll('sora-2', jobId)
+      assert(polled.status === 'failed' && polled.message?.includes('boom'), `failed 形态不对：${JSON.stringify(polled)}`)
+
+      // ⑥ 取消：DELETE /videos/{id}；同步结果的 jobId 取消是 no-op（不再发请求）
+      const before = calls.length
+      await created[0].cancel(jobId)
+      c = calls.at(-1)
+      assert(c.init.method === 'DELETE' && c.url === 'https://gw.example/v1/videos/vid-1', `取消应 DELETE 同路径：${c.init.method} ${c.url}`)
+      await created[0].cancel('oc-url|https://cdn.example/x.png')
+      assert(calls.length === before + 1, '同步图片结果不应发取消请求')
     } finally {
       globalThis.fetch = originalFetch
     }

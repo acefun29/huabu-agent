@@ -1,7 +1,7 @@
 // 设置面板「媒体生成」tab：生成默认值、新增供应商、全量模型库浏览、供应商详情（内部组件不导出，仅导出 MediaTab）
 
 import { useEffect, useState } from 'react'
-import { ExternalLink, Plus, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { ChevronDown, ExternalLink, Plus, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useSettings } from '../../store/settingsStore'
 import { useCanvasStore } from '../../store/canvasStore'
 import type { MediaCatalogBrowseItem, MediaProviderType } from '@shared/ipc'
@@ -10,7 +10,9 @@ import {
   DEFAULT_MEDIA_DURATION_S,
   DEFAULT_MEDIA_PROVIDER,
   DEFAULT_MEDIA_RATIO,
-  MEDIA_RATIOS
+  MEDIA_RATIOS,
+  type MediaRatio,
+  type ModelCapabilities
 } from '@shared/media'
 import { matchBareModelId, shortModelLabel } from '@shared/mediaResolve'
 import { MEDIA_ROOT_REL } from '../../harness/assetCategories'
@@ -24,7 +26,7 @@ import { Field, Select, Toggle, inputCls } from './ui'
 
 /** 新增供应商可用的适配器类型（与主进程注册表对应；新增类型时两处同步） */
 const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHint?: string }[] = [
-  { value: 'gateway-openai-compat', label: 'OpenAI 兼容（图片 / 语音合成）', baseUrlHint: 'https://api.openai.com/v1' },
+  { value: 'gateway-openai-compat', label: 'OpenAI 兼容（图片 / 视频 / 语音合成）', baseUrlHint: 'https://api.openai.com/v1' },
   { value: 'gateway-dashscope', label: '阿里云百炼（异步任务）' },
   { value: 'gateway-volcark', label: '火山方舟' },
   { value: 'gateway-minimax', label: 'MiniMax（海螺视频 / 图片）' },
@@ -200,6 +202,128 @@ function authHintLabel(hint?: string): string {
   return '加密存储'
 }
 
+/**
+ * 表单态能力参数 → media:user-add-* 载荷：全空则不留字段（不声明，参数面板与
+ * 编排层按兜底走）。去重升序在这里先做一遍，主进程 sanitizeCapabilities 再同源兜底。
+ */
+function capsPayload(caps: ModelCapabilities, costHint: string): { capabilities?: ModelCapabilities; costHint?: string } {
+  const out: ModelCapabilities = {}
+  if (caps.ratios?.length) out.ratios = [...new Set(caps.ratios)]
+  if (caps.durations?.length) out.durations = [...new Set(caps.durations)].sort((a, b) => a - b)
+  if (typeof caps.maxRefImages === 'number' && Number.isFinite(caps.maxRefImages) && caps.maxRefImages > 0) {
+    out.maxRefImages = Math.floor(caps.maxRefImages)
+  }
+  return {
+    ...(Object.keys(out).length > 0 ? { capabilities: out } : {}),
+    ...(costHint.trim() ? { costHint: costHint.trim() } : {})
+  }
+}
+
+/**
+ * 模型能力参数编辑（可选，新增供应商 / 供应商详情两处复用）。
+ * 声明后生成卡片的比例与时长档位、垫图上限按这里走；留空 = 用兜底。
+ */
+function ModelCapsFields({
+  kind,
+  caps,
+  costHint,
+  onChange
+}: {
+  kind: MediaKind
+  caps: ModelCapabilities
+  costHint: string
+  onChange: (next: { capabilities: ModelCapabilities; costHint: string }) => void
+}) {
+  const [durationsText, setDurationsText] = useState(() => (caps.durations ?? []).join(', '))
+  const isAudio = kind === 'audio'
+
+  const toggleRatio = (r: MediaRatio) => {
+    const ratios = caps.ratios?.includes(r) ? caps.ratios.filter((x) => x !== r) : [...(caps.ratios ?? []), r]
+    onChange({ capabilities: { ...caps, ...(ratios.length > 0 ? { ratios } : {}) }, costHint })
+  }
+
+  // 时长档位：逗号/空格分隔的随手输入，边打边解析（主进程 sanitize 再排序去重）
+  const onDurationsText = (text: string) => {
+    setDurationsText(text)
+    const parsed = text
+      .split(/[,，\s]+/)
+      .map((s) => Number(s))
+      .filter((n) => Number.isFinite(n) && n > 0)
+    onChange({ capabilities: { ...caps, ...(parsed.length > 0 ? { durations: parsed } : {}) }, costHint })
+  }
+
+  return (
+    <div className="space-y-2.5 rounded-xl bg-(--surface-input) p-2.5">
+      <div className="text-[10px] leading-relaxed text-(--on-surface-muted)">
+        可选。声明后生成卡片的比例 / 时长档位与垫图上限按这里走；留空则用兜底（全部比例、默认时长档、最多 4 张垫图）。
+      </div>
+      {isAudio ? (
+        <div className="text-[11px] text-(--on-surface-muted)">音频模型按文稿长度合成，无需声明比例 / 时长 / 垫图。</div>
+      ) : (
+        <>
+          <div>
+            <div className="mb-1 text-[11px] font-medium text-(--on-surface-variant)">支持的比例（不声明 = 全部）</div>
+            <div className="flex flex-wrap gap-1.5">
+              {MEDIA_RATIOS.map((r) => {
+                const on = caps.ratios?.includes(r) ?? false
+                return (
+                  <button
+                    key={r}
+                    type="button"
+                    onClick={() => toggleRatio(r)}
+                    className={`rounded-full px-2 py-0.5 text-[11px] ring-1 transition-colors ${
+                      on
+                        ? 'bg-(--surface-chip) font-medium text-(--on-surface) ring-(--outline)'
+                        : 'text-(--on-surface-muted) ring-(--outline-soft) hover:text-(--on-surface)'
+                    }`}
+                  >
+                    {r}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <Field label="时长档位（秒，逗号分隔）">
+              <input
+                value={durationsText}
+                onChange={(e) => onDurationsText(e.target.value)}
+                placeholder="如 5, 10, 15"
+                className={inputCls}
+              />
+            </Field>
+            <Field label="垫图数量上限（不声明 = 4）">
+              <input
+                type="number"
+                min={1}
+                max={30}
+                value={caps.maxRefImages ?? ''}
+                onChange={(e) => {
+                  const n = Number(e.target.value)
+                  onChange({
+                    capabilities: { ...caps, ...(Number.isFinite(n) && n > 0 ? { maxRefImages: Math.floor(n) } : {}) },
+                    costHint
+                  })
+                }}
+                placeholder="4"
+                className={inputCls}
+              />
+            </Field>
+          </div>
+        </>
+      )}
+      <Field label="成本提示（可选，展示在参数面板）">
+        <input
+          value={costHint}
+          onChange={(e) => onChange({ capabilities: caps, costHint: e.target.value })}
+          placeholder="如 约 ¥0.4/秒"
+          className={inputCls}
+        />
+      </Field>
+    </div>
+  )
+}
+
 /** 新增供应商表单页 */
 function MediaAddProviderView({
   onDone,
@@ -219,6 +343,9 @@ function MediaAddProviderView({
   const [npAuthEnv, setNpAuthEnv] = useState('')
   const [npModelId, setNpModelId] = useState('')
   const [npModelKind, setNpModelKind] = useState<MediaKind>('image')
+  const [npCaps, setNpCaps] = useState<ModelCapabilities>({})
+  const [npCostHint, setNpCostHint] = useState('')
+  const [npCapsOpen, setNpCapsOpen] = useState(false)
   const adapterTypeOption = ADAPTER_TYPE_OPTIONS.find((t) => t.value === npType)
   // kind 选项 = 该接入类型路由得通的大类（主进程注册表事实来源）；矩阵没拉到就全放
   const kindOptions = mediaAdapterKinds[npType] ?? ALL_KINDS
@@ -232,7 +359,7 @@ function MediaAddProviderView({
       ...(npType === 'gateway-openai-compat' && npBaseUrl.trim() ? { baseUrl: npBaseUrl.trim() } : {}),
       ...(npType === 'gateway-openai-compat' ? { authStyle: npAuthStyle } : {}),
       ...(npAuthEnv.trim() ? { authEnv: npAuthEnv.trim() } : {}),
-      firstModel: { id: npModelId.trim(), kind: effectiveModelKind }
+      firstModel: { id: npModelId.trim(), kind: effectiveModelKind, ...capsPayload(npCaps, npCostHint) }
     })
     if (error) {
       onNotice(`新增供应商失败：${error}`)
@@ -305,6 +432,26 @@ function MediaAddProviderView({
           </div>
         </Field>
       </div>
+      <button
+        type="button"
+        onClick={() => setNpCapsOpen((v) => !v)}
+        className="flex items-center gap-1.5 text-[11px] font-medium text-(--on-surface-variant) transition-colors hover:text-(--on-surface)"
+      >
+        <SlidersHorizontal size={12} />
+        能力参数（可选）
+        <ChevronDown size={11} className={`transition-transform ${npCapsOpen ? 'rotate-180' : ''}`} />
+      </button>
+      {npCapsOpen && (
+        <ModelCapsFields
+          kind={effectiveModelKind}
+          caps={npCaps}
+          costHint={npCostHint}
+          onChange={(next) => {
+            setNpCaps(next.capabilities)
+            setNpCostHint(next.costHint)
+          }}
+        />
+      )}
       <div className="flex items-center gap-2">
         <button
           onClick={() => void submit()}
@@ -473,6 +620,9 @@ function MediaProviderDetail({
   const [keyInput, setKeyInput] = useState('')
   const [nmId, setNmId] = useState('')
   const [nmKind, setNmKind] = useState<MediaKind>('image')
+  const [nmCaps, setNmCaps] = useState<ModelCapabilities>({})
+  const [nmCostHint, setNmCostHint] = useState('')
+  const [nmCapsOpen, setNmCapsOpen] = useState(false)
   /* 删除供应商的两步确认（第二次点击才真正执行） */
   const [pendingRemove, setPendingRemove] = useState(false)
 
@@ -501,13 +651,22 @@ function MediaProviderDetail({
 
   const submitNewModel = async () => {
     if (!nmId.trim()) return
-    const error = await mediaUserAddModel({ providerId: provider.id, id: nmId.trim(), kind: effectiveNmKind })
+    const error = await mediaUserAddModel({
+      providerId: provider.id,
+      id: nmId.trim(),
+      kind: effectiveNmKind,
+      ...capsPayload(nmCaps, nmCostHint)
+    })
     if (error) {
       onNotice(`添加模型失败：${error}`)
       return
     }
     onNotice(`已添加模型：${nmId.trim()}`)
     setNmId('')
+    setNmCaps({})
+    setNmCostHint('')
+    // 收起面板让 ModelCapsFields 卸载重挂：内部时长文本是本地草稿，不随 caps 重置而清
+    setNmCapsOpen(false)
   }
 
   return (
@@ -617,6 +776,15 @@ function MediaProviderDetail({
               options={kindOptions.map((k) => ({ value: k, label: KIND_LABEL[k] }))}
             />
             <button
+              onClick={() => setNmCapsOpen((v) => !v)}
+              className={`flex h-4 w-4 items-center justify-center rounded-full transition ${
+                nmCapsOpen ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface-muted) hover:text-(--on-surface)'
+              }`}
+              title="能力参数（可选）"
+            >
+              <SlidersHorizontal size={10} />
+            </button>
+            <button
               onClick={() => void submitNewModel()}
               disabled={!nmId.trim()}
               className="flex h-4 w-4 items-center justify-center rounded-full bg-(--fab-bg) text-(--fab-text) transition hover:opacity-90 disabled:opacity-30"
@@ -626,6 +794,19 @@ function MediaProviderDetail({
             </button>
           </span>
         </div>
+        {nmCapsOpen && (
+          <div className="mt-1.5">
+            <ModelCapsFields
+              kind={effectiveNmKind}
+              caps={nmCaps}
+              costHint={nmCostHint}
+              onChange={(next) => {
+                setNmCaps(next.capabilities)
+                setNmCostHint(next.costHint)
+              }}
+            />
+          </div>
+        )}
         {hiddenModels.length > 0 && (
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-(--on-surface-muted)">
             <span>已隐藏：</span>
