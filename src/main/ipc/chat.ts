@@ -10,6 +10,7 @@
  */
 import { ipcMain } from 'electron'
 import { resolveSessionFile } from '../agent/workspace'
+import { assembleBlockoutTool } from '../agent/blockoutTools'
 import { assembleMediaTools } from '../agent/mediaToolAssembly'
 import { inboxRoot } from '../assets/manager'
 import {
@@ -70,10 +71,14 @@ export function registerChatIpc(ctx: IpcContext): void {
     // （状态在设置页徽章可见），不让单个坏服务器拖死会话创建
     const mcpTools = await mcpManager.assembleTools()
 
+    // blockout 粗模/运镜引擎工具：customTools 即进 tools 白名单（host.create 组装），
+    // 默认惰性——创建后被 host 摘除，Agent 读 blockout-shot 技能时再激活（P2）
+    const blockoutTool = assembleBlockoutTool({ currentDir })
+
     return host.create(createRequest, {
       currentDir: current?.path ?? null,
       defaultModel: current?.defaultModel,
-      customTools: [...mediaTools, readMediaTool, ...videoTools, ...mcpTools],
+      customTools: [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool],
       // 工作区技能禁用名单（写 workspace.json skills 段；读取同源，见 listWorkspaceSkills）
       ...(current ? { disabledSkills: store.skillsDisabled() } : {})
     })

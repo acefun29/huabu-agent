@@ -167,6 +167,50 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     showToast(`产物已写入工作目录：${rel}`)
   }
 
+  /**
+   * blockout 成片发布 → 画布视频卡片（P4）。与 pinWrittenFile 的差异：
+   * - 路径不来自工具参数而来自主进程 tool_end 的 details.published——
+   *   importToWorkspace 去重后的最终 relPath 只有主进程知道，渲染端推导必错；
+   * - kind 放开到 video（pinWrittenFile 只钉 doc/code）；
+   * - 同镜头覆盖发布时 relPath 不变，去重只按 path（不限 fromChatId），
+   *   重渲染不堆新卡（缩略图按内容 sha1 缓存，内容变了自动换图）。
+   */
+  const pinPublishedAsset = (
+    sessionId: string,
+    published: { relPath: string; name: string; kind: string; bytes?: number }
+  ) => {
+    const wsRoot = get().workspace?.path
+    if (!wsRoot) return
+    const rel = published.relPath.replace(/\\/g, '/')
+    if (rel.startsWith('/') || rel.includes('..')) return
+    const kind: AssetKind = published.kind === 'video' ? 'video' : guessKind(rel)
+    if (get().nodes.some((n) => n.data.path === rel)) return
+    zCounter.current += 1
+    applyNodes((prev) => [
+      ...prev,
+      {
+        id: newNodeId(),
+        type: 'asset',
+        x: 140 + spawnOffset(prev),
+        y: 120 + spawnOffset(prev) + 40,
+        width: 240,
+        height: 210,
+        zIndex: zCounter.current,
+        data: {
+          name: published.name,
+          kind,
+          storage: 'ws',
+          path: rel,
+          ...(kind === 'video' ? { mime: 'video/mp4' } : {}),
+          ...(typeof published.bytes === 'number' ? { bytes: published.bytes } : {}),
+          meta: 'blockout 成片',
+          fromChatId: sessionId
+        } satisfies AssetData
+      } satisfies CanvasNode
+    ])
+    showToast(`blockout 成片已入库：${rel}`)
+  }
+
   /** 把缓冲里的事件一次 fold 进流状态并同步一次渲染（write 工具副作用保持原时序语义） */
   const flushChatEvents = () => {
     chatFlushTimer = null
@@ -188,6 +232,17 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
           const entry = writeToolPaths.get(event.toolCallId)
           writeToolPaths.delete(event.toolCallId)
           if (entry) pinWrittenFile(sessionId, entry.path)
+        }
+        // blockout 成片发布：tool_end 的 details.published 带主进程落库后的最终路径
+        if (event.type === 'tool_end' && event.toolName === 'blockout' && !event.isError && event.details) {
+          try {
+            const details = JSON.parse(event.details) as {
+              published?: { relPath: string; name: string; kind: string; bytes?: number }
+            }
+            if (details.published) pinPublishedAsset(sessionId, details.published)
+          } catch {
+            /* details 非法（截断/超限丢弃）即不钉卡，素材库面板仍会刷新 */
+          }
         }
         // 本轮收尾：agent_end 前还没被 tool_end 配对销掉的 write 条目必是 abort/中断遗留
         //（事件流里 tool_end 一定先于 agent_end），按会话清扫，防止 Map 单调增长

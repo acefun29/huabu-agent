@@ -350,6 +350,12 @@ export type ChatEvent =
       isError: boolean
       /** 工具结果文本。实测 ls/read/write 的 result 形如 { content: [{ type:'text', text }] }，无 details */
       resultText: string
+      /**
+       * 工具结构化结果的瘦子集（主进程 JSON 序列化 + 体积截断后的字符串，非透传原对象）。
+       * 目前只有 blockout 用：video 发布后带 { published: { relPath, name, kind, bytes } }，
+       * 渲染端据此钉画布卡片——发布产物最终路径（importToWorkspace 去重后）只有主进程知道。
+       */
+      details?: string
     }
   | { nodeId: string; type: 'message'; message: ChatAssistantSnapshot }
   | { nodeId: string; type: 'turn_end'; turnIndex: number }

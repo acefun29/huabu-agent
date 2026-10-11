@@ -1,0 +1,482 @@
+{
+  "version": 2,
+  "units": "m",
+  "up": "Z",
+  "forward": "+X",
+  "_comment": "粗模：一辆轿车停在道路上。所有尺寸走驱动参数，所有坐标由锚点解算——文件里没有任何一行手算的绝对坐标，也没有任何一行相机坐标。",
+
+  "drivers": {
+    "carL": 4.50,
+    "bodyL": "$carL - 0.16",
+    "carW": 1.68,
+    "clearance": 0.18,
+    "bodyH": 0.60,
+    "bodyTopZ": "$clearance + $bodyH",
+
+    "tireD": 0.66,
+    "tireW": 0.24,
+    "tireLowZ": 0.0,
+    "halfTrack": 0.83,
+    "wheelbase": 2.84,
+
+    "hoodL": 1.55,
+    "hoodH": 0.13,
+    "hoodX": 1.40,
+
+    "trunkL": 1.05,
+    "trunkH": 0.10,
+    "trunkX": -1.70,
+
+    "cabinL": 2.15,
+    "cabinW": 1.52,
+    "cabinH": 0.58,
+    "cabinX": -0.45,
+    "wsL": 0.55,
+    "wsH": "$cabinH - $hoodH",
+
+    "noseX": "$carL / 2",
+    "tailX": "-$carL / 2",
+    "lampPitch": 1.10,
+    "lampZ": 0.16,
+
+    "laneY": 3.20,
+    "laneSpan": 6.40,
+    "poleH": 4.20,
+    "trunkH_tree": 3.00,
+    "crownR": 1.50
+  },
+
+  "defs": {
+    "car": {
+      "parts": [
+        {
+          "id": "body",
+          "shape": "box",
+          "size": ["$bodyL", "$carW", "$bodyH"],
+          "color": "#8899aa",
+          "at": { "anchor": "base_center", "to": "ground", "offset": [0, 0, "$clearance"] }
+        },
+        {
+          "id": "hood",
+          "shape": "wedge",
+          "size": ["$hoodL", "$carW*0.99", "$hoodH"],
+          "color": "#93a4b5",
+          "at": {
+            "anchor": "base_center",
+            "to": { "ref": "body", "anchor": "top_center" },
+            "offset": ["$hoodX", 0, 0],
+            "yawDeg": 180
+          }
+        },
+        {
+          "id": "trunk",
+          "shape": "wedge",
+          "size": ["$trunkL", "$carW*0.99", "$trunkH"],
+          "color": "#93a4b5",
+          "at": {
+            "anchor": "base_center",
+            "to": { "ref": "body", "anchor": "top_center" },
+            "offset": ["$trunkX", 0, 0]
+          }
+        },
+        {
+          "id": "cabin",
+          "shape": "box",
+          "size": ["$cabinL", "$cabinW", "$cabinH"],
+          "color": "#5d6b7a",
+          "at": {
+            "anchor": "base_center",
+            "to": { "ref": "body", "anchor": "top_center" },
+            "offset": ["$cabinX", 0, 0]
+          }
+        },
+        {
+          "id": "windshield",
+          "shape": "wedge",
+          "_why": "前风挡：底面高于车身顶面 hoodH（与引擎盖顶面同高）、高 = 座舱高 − 引擎盖高 → 顶边正好接到车顶；从座舱前脸向车头方向铺 wsL，斜边朝车头。注意不要锚到 hood —— hood 带 yawDeg:180，其局部 ±X/±Y 是世界反向的，corner() 会解到另一侧",
+          "size": ["$wsL", "$cabinW", "$wsH"],
+          "color": "#3d4854",
+          "at": {
+            "anchor": "base_center",
+            "to": { "ref": "cabin", "anchor": "face(+X)" },
+            "offset": ["$wsL / 2", 0, "-($cabinH / 2 - $hoodH)"],
+            "yawDeg": 180
+          }
+        },
+        {
+          "id": "mirror",
+          "shape": "box",
+          "size": [0.16, 0.24, 0.09],
+          "color": "#48535f",
+          "at": {
+            "anchor": "center",
+            "to": { "ref": "cabin", "anchor": "face(+X)" },
+            "offset": [0.04, 0, -0.06]
+          },
+          "_axis": "L/R 标签按右手系：+Y 为车左（前进方向 +X 的左侧）",
+          "combine": [{ "op": "array", "along": "Y", "count": 2, "step": "$cabinW + 0.24", "centered": true, "labels": ["R", "L"] }]
+        },
+        {
+          "id": "wheel",
+          "shape": "ellipsoid",
+          "size": ["$tireD", "$tireW", "$tireD"],
+          "color": "#22262b",
+          "at": { "rest": "ground", "offset": [0, 0, "$tireLowZ"] },
+          "combine": [
+            { "op": "array", "along": "X", "count": 2, "step": "$wheelbase", "centered": true, "labels": ["rear", "front"] },
+            { "op": "array", "along": "Y", "count": 2, "step": "$halfTrack * 2", "centered": true, "labels": ["R", "L"] }
+          ]
+        },
+        {
+          "id": "headlight",
+          "shape": "box",
+          "size": [0.10, 0.40, 0.15],
+          "color": "#ffe9a8",
+          "at": {
+            "anchor": "center",
+            "to": { "ref": "body", "anchor": "face(+X)" },
+            "offset": [0.03, 0, "$lampZ"]
+          },
+          "combine": [{ "op": "array", "along": "Y", "count": 2, "step": "$lampPitch", "centered": true, "labels": ["R", "L"] }]
+        },
+        {
+          "id": "grille",
+          "shape": "box",
+          "size": [0.10, 0.86, 0.16],
+          "color": "#2b3037",
+          "at": {
+            "anchor": "center",
+            "to": { "ref": "body", "anchor": "face(+X)" },
+            "offset": [0.01, 0, "-$lampZ"]
+          }
+        },
+        {
+          "id": "taillight",
+          "shape": "box",
+          "size": [0.10, 0.36, 0.13],
+          "color": "#e04a3a",
+          "at": {
+            "anchor": "center",
+            "to": { "ref": "body", "anchor": "face(-X)" },
+            "offset": [-0.03, 0, "$lampZ"]
+          },
+          "combine": [{ "op": "array", "along": "Y", "count": 2, "step": "$lampPitch", "centered": true, "labels": ["R", "L"] }]
+        }
+      ]
+    },
+
+    "lamp": {
+      "parts": [
+        {
+          "id": "pole",
+          "shape": "cylinder",
+          "radius": 0.09,
+          "height": "$poleH",
+          "color": "#5a6068",
+          "at": { "rest": "ground" }
+        },
+        {
+          "id": "arm",
+          "shape": "box",
+          "size": [0.85, 0.12, 0.12],
+          "color": "#5a6068",
+          "at": { "anchor": "base_center", "to": { "ref": "pole", "anchor": "top_center" }, "offset": [0.35, 0, 0] }
+        },
+        {
+          "id": "head",
+          "shape": "box",
+          "size": [0.55, 0.26, 0.12],
+          "color": "#c9d3da",
+          "at": { "anchor": "center", "to": { "ref": "arm", "anchor": "face(+X)" }, "offset": [0, 0, -0.07] }
+        }
+      ]
+    },
+
+    "tree": {
+      "parts": [
+        {
+          "id": "trunk",
+          "shape": "cylinder",
+          "radius": 0.16,
+          "height": "$trunkH_tree",
+          "color": "#6b4f36",
+          "at": { "rest": "ground" }
+        },
+        {
+          "id": "crown",
+          "shape": "sphere",
+          "radius": "$crownR",
+          "color": "#3f6b4a",
+          "at": { "anchor": "base_center", "to": { "ref": "trunk", "anchor": "top_center" }, "offset": [0, 0, "-$crownR * 0.8"] }
+        }
+      ]
+    }
+  },
+
+  "scene": [
+    { "id": "ground", "shape": "plane", "size": [60, 60], "color": "#2a2e35", "at": { "rest": "ground" } },
+    {
+      "id": "lane",
+      "shape": "box",
+      "size": [40, 0.14, 0.012],
+      "color": "#d8d2c0",
+      "at": { "rest": "ground" },
+      "combine": [{ "op": "array", "along": "Y", "count": 2, "step": "$laneSpan", "centered": true, "labels": ["R", "L"] }]
+    },
+    { "id": "car", "use": "car", "at": {} },
+
+    { "id": "lampA", "use": "lamp", "at": { "offset": [-12, "$laneY + 6.4", 0], "yawDeg": -90 } },
+    { "id": "lampB", "use": "lamp", "at": { "offset": [0, "$laneY + 6.4", 0], "yawDeg": -90 } },
+    { "id": "lampC", "use": "lamp", "at": { "offset": [12, "$laneY + 6.4", 0], "yawDeg": -90 } },
+    { "id": "lampD", "use": "lamp", "at": { "offset": [-12, "-($laneY + 6.4)", 0], "yawDeg": 90 } },
+    { "id": "lampE", "use": "lamp", "at": { "offset": [0, "-($laneY + 6.4)", 0], "yawDeg": 90 } },
+    { "id": "lampF", "use": "lamp", "at": { "offset": [12, "-($laneY + 6.4)", 0], "yawDeg": 90 } },
+
+    { "id": "treeA", "use": "tree", "at": { "offset": [22, 9.5, 0] } },
+    { "id": "treeB", "use": "tree", "at": { "offset": [-21, -9.8, 0] } },
+    { "id": "treeC", "use": "tree", "at": { "offset": [-22, 9.2, 0] } }
+  ],
+
+  "relations": [
+    { "a": "car/*", "b": "ground", "mode": "clear", "minGap": 0.0 },
+    { "a": "lamp*/*", "b": "ground", "mode": "clear", "minGap": 0.0 },
+    { "a": "tree*/*", "b": "ground", "mode": "clear", "minGap": 0.0 },
+    { "a": "car/*", "b": "lamp*/*", "mode": "clear", "minGap": 0.5 },
+    { "a": "car/*", "b": "tree*/*", "mode": "clear", "minGap": 1.0 },
+    { "a": "lane/*", "b": "ground", "mode": "attach" },
+    { "a": "lamp*/*", "b": "tree*/*", "mode": "clear", "minGap": 1.0 }
+  ],
+
+  "_views_comment": "只声明意图、不写相机坐标：主体=整车，三视图尺度/中心/3-4 视角距离全部由几何解算",
+  "views": {
+    "subject": "car/*",
+    "fit": "subject",
+    "marginRatio": 0.16,
+    "size": 1024,
+    "ssaa": 2,
+    "_layout_why": "视图名是世界轴命名：车头朝 +X、车左为 +Y → 'right'（机位在 +X）才是车头正视图，'front'（机位在 −Y）是车侧视图。按整车视 reading 顺序重排。",
+    "layout": ["right", "front", "top", "threequarter"],
+    "threeQuarter": { "azimuthDeg": 38, "elevationDeg": 20, "lens": 45 },
+    "gridStep": "auto"
+  },
+
+  "_shots_comment": "运镜同样只声明意图：构图用 fill 表达、位移用动作表达；机位/四元数/逐帧表全部由引擎解算",
+  "shots": {
+    "1_hero_orbit": {
+      "subject": "car/*",
+      "durationS": 6,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.10] },
+        "orbit": { "azimuthDeg": 38, "elevationDeg": 14 },
+        "framing": { "mode": "fill-height", "fill": 0.42, "lock": "per-frame" },
+        "lens": 40,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "aimMode": "look-at",
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 0.8, "type": "hold" },
+        { "t": 4.8, "ease": "easeInOut", "parallel": [{ "type": "orbit_left", "deg": 34 }, { "type": "dolly_in", "framing": { "fill": [0.42, 0.58] } }] },
+        { "t": 6.4, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 16 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.35,
+        "_speed_why": "线速度 ∝ 角速度 × 半径。车长 4.5m，fill 0.42~0.58 反解出的机位半径 9~12m，34° 环绕的线速度天然落在 3m/s 量级——这不是失控，是尺度的必然。真实 Technocrane 拍车也就是这个量级，所以显式放宽而不是把环绕改小。想要 1m/s 只能用长焦把半径压下来。",
+        "maxSpeed": 4.0,
+        "coverage": { "inFrameMin": 95, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "2_low_glide": {
+      "subject": "car/*",
+      "durationS": 6,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.12] },
+        "orbit": { "azimuthDeg": 74, "elevationDeg": 5 },
+        "framing": { "mode": "fill-height", "fill": 0.46, "lock": "per-frame" },
+        "lens": 28,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "moves": [
+        { "t": 0.6, "type": "hold" },
+        { "t": 3.2, "type": "truck_left", "amount": 1.2, "ease": "easeInOut" },
+        { "t": 5.4, "ease": "easeInOut", "parallel": [{ "type": "dolly_in", "framing": { "fill": [0.46, 0.58] } }, { "type": "pedestal_up", "amount": 0.18, "space": "world" }] },
+        { "t": 6.0, "type": "hold" }
+      ],
+      "modifiers": [{ "type": "handheld", "amplitudeM": 0.006, "frequencyHz": 1.2, "seed": 5 }],
+      "constraints": {
+        "keepInFrame": { "marginPx": 12 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.30,
+        "maxJerk": 6,
+        "maxAngularJerk": 400,
+        "coverage": { "inFrameMin": 95, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "3_nose_push": {
+      "subject": "car/*",
+      "durationS": 5,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.06] },
+        "orbit": { "azimuthDeg": 12, "elevationDeg": 8 },
+        "framing": { "mode": "fill-width", "fill": 0.46, "lock": "per-frame" },
+        "lens": 35,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 0.5, "type": "hold" },
+        { "t": 4.0, "ease": "easeInOut", "parallel": [{ "type": "dolly_in", "framing": { "fill": [0.46, 0.66] } }, { "type": "pedestal_up", "amount": 0.35, "space": "world" }] },
+        { "t": 5.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 14 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.30,
+        "maxSpeed": 1.6,
+        "coverage": { "inFrameMin": 95, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "4_turntable": {
+      "subject": "car/*",
+      "durationS": 7,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.08] },
+        "orbit": { "azimuthDeg": 30, "elevationDeg": 12 },
+        "framing": { "mode": "fill-height", "fill": 0.50, "lock": "start-only" },
+        "lens": 40,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "loop": { "mode": "turntable", "revolutions": 1 },
+      "constraints": {
+        "keepInFrame": { "marginPx": 14 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.40,
+        "_speed_why": "转台：7s 转满 360° = 51°/s，角速度是可读的运镜速度；线速度 9m 半径下自然 8m/s 量级，显式写明上限",
+        "maxAngularSpeed": 60,
+        "maxSpeed": 9.5,
+        "coverage": { "inFrameMin": 95, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "5_wheel_detail": {
+      "subject": "car/wheel.front_L",
+      "durationS": 5,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "car/wheel.front_L", "anchor": "center", "offset": [0, 0, 0] },
+        "orbit": { "azimuthDeg": 125, "elevationDeg": 10 },
+        "framing": { "mode": "fill-height", "fill": 0.50, "lock": "per-frame" },
+        "lens": 50,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 0.6, "type": "hold" },
+        { "t": 4.2, "ease": "easeInOut", "parallel": [{ "type": "orbit_left", "deg": 34 }, { "type": "dolly_in", "framing": { "fill": [0.50, 0.62] } }] },
+        { "t": 5.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 12 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.25,
+        "maxSpeed": 1.6,
+        "coverage": { "inFrameMin": 95, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "_whip_comment": "甩镜：本身就该'急'——maxAngularSpeed 显式放宽，且故意不声明 maxAngularJerk（声明了 autofix 会把这一甩磨平）。原则与场景呼应",
+    "6_whip_pan": {
+      "subject": "car/*",
+      "durationS": 3.4,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.14] },
+        "orbit": { "azimuthDeg": 12, "elevationDeg": 10 },
+        "framing": { "mode": "fill-width", "fill": 0.50, "lock": "start-only" },
+        "lens": 50,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "moves": [
+        { "t": 0.30, "type": "hold" },
+        { "t": 0.60, "ease": "smooth", "parallel": [{ "type": "pan_left", "deg": 85 }, { "type": "roll_move", "deg": 14 }] },
+        { "t": 0.90, "type": "hold" },
+        { "t": 1.50, "ease": "smooth", "parallel": [{ "type": "pan_right", "deg": 85 }, { "type": "roll_move", "deg": -14 }] },
+        { "t": 3.40, "type": "hold" }
+      ],
+      "constraints": {
+        "noCollision": true,
+        "minClearance": 0.40,
+        "maxAngularSpeed": 700,
+        "coverage": { "inFrameMin": 90, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "7_spiral_reveal": {
+      "subject": "car/*",
+      "durationS": 8,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.10] },
+        "orbit": { "azimuthDeg": 150, "elevationDeg": 46 },
+        "_lock_why": "START-ONLY 是刻意的：这一镜是'环绕+推近+下降'三件事同时发生，若用 per-frame 反解构图，主体在环绕中投影尺寸一直在变，机位就会每帧前后泵动（实测半径来回 3 次、摆幅 5.5m）。改成位移驱动（dolly_in amount）后半径单调递减，泵动归零。",
+        "framing": { "mode": "fill-height", "fill": 0.45, "lock": "start-only" },
+        "lens": 35,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "moves": [
+        { "t": 0.6, "type": "hold" },
+        {
+          "t": 6.4,
+          "ease": "easeInOut",
+          "parallel": [
+            { "type": "orbit_left", "deg": 86 },
+            { "type": "dolly_in", "amount": 3.0 },
+            { "type": "pedestal_down", "amount": 0.90, "space": "world" }
+          ]
+        },
+        { "t": 8.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 14 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.35,
+        "_speed_why": "复合动作：同时环绕 130° + 上升 + 推近。半径 6~10m，650° 总转动量摊到 5.8s，线速度 5m/s 量级 —— 虚拟摇臂按真实尺度就是这个数",
+        "maxSpeed": 5.5,
+        "coverage": { "inFrameMin": 95, "graceS": 1.5, "requireAtEnd": true }
+      }
+    }
+  }
+}

@@ -1,0 +1,370 @@
+{
+  "version": 2,
+  "units": "m",
+  "up": "Z",
+  "forward": "+X",
+  "_comment": "粗模示例：香水瓶摆在桌子上。全部尺寸来自驱动参数，坐标由引擎解算——没有任何一行是手算的绝对坐标。",
+
+  "drivers": {
+    "H_table": 0.75,
+    "topW": 1.10,
+    "topD": 0.55,
+    "topT": 0.04,
+    "legW": 0.05,
+    "legInsetX": 0.07,
+    "legInsetY": 0.06,
+    "legSpanX": "$topW - $legW - 2*$legInsetX",
+    "legSpanY": "$topD - $legW - 2*$legInsetY",
+    "legH": "$H_table - $topT",
+
+    "bottleW": 0.062,
+    "bottleD": 0.032,
+    "bottleH": 0.085,
+    "shoulderH": 0.016,
+    "shoulderShrink": 0.84,
+    "neckR": 0.008,
+    "neckH": 0.014,
+    "capR": 0.013,
+    "capH": 0.026,
+    "labelH": 0.045,
+    "labelOut": 0.00075,
+    "placeX": 0.20,
+    "placeY": 0.05
+  },
+
+  "defs": {
+    "table": {
+      "parts": [
+        {
+          "id": "top",
+          "shape": "box",
+          "size": ["$topW", "$topD", "$topT"],
+          "color": "#8a6f52",
+          "at": { "anchor": "base_center", "to": "ground", "offset": [0, 0, "$H_table - $topT"] }
+        },
+        {
+          "id": "leg",
+          "shape": "box",
+          "size": ["$legW", "$legW", "$legH"],
+          "color": "#7a6248",
+          "at": { "rest": "ground", "offset": [0, 0, 0] },
+          "combine": [
+            { "op": "array", "along": "X", "count": 2, "step": "$legSpanX", "centered": true, "labels": ["L", "R"] },
+            { "op": "array", "along": "Y", "count": 2, "step": "$legSpanY", "centered": true, "labels": ["front", "back"] }
+          ]
+        }
+      ]
+    },
+
+    "perfume": {
+      "_comment": "装配体在自身局部坐标系里先站稳（局部地面 z=0），再由场景实例放到桌面上",
+      "parts": [
+        {
+          "id": "body",
+          "shape": "box",
+          "size": ["$bottleW", "$bottleD", "$bottleH"],
+          "color": "#e2b45f",
+          "at": { "rest": "ground" }
+        },
+        {
+          "id": "shoulder",
+          "shape": "box",
+          "size": ["$bottleW*$shoulderShrink", "$bottleD*$shoulderShrink", "$shoulderH"],
+          "color": "#e8c072",
+          "at": { "anchor": "base_center", "to": { "ref": "body", "anchor": "top_center" } }
+        },
+        {
+          "id": "neck",
+          "shape": "cylinder",
+          "radius": "$neckR",
+          "height": "$neckH",
+          "color": "#b9b3a6",
+          "at": { "anchor": "base_center", "to": { "ref": "shoulder", "anchor": "top_center" } }
+        },
+        {
+          "id": "cap",
+          "shape": "cylinder",
+          "radius": "$capR",
+          "height": "$capH",
+          "color": "#7d766c",
+          "at": { "anchor": "base_center", "to": { "ref": "neck", "anchor": "top_center" } }
+        },
+        {
+          "id": "label",
+          "shape": "box",
+          "size": ["$bottleW*0.62", "$labelOut*2", "$labelH"],
+          "color": "#f4efe6",
+          "at": {
+            "anchor": "center",
+            "to": { "ref": "body", "anchor": "face(-Y)" },
+            "offset": [0, "-$labelOut", 0]
+          }
+        }
+      ]
+    }
+  },
+
+  "scene": [
+    {
+      "id": "floor",
+      "shape": "plane",
+      "size": [8, 8],
+      "color": "#2b2f36",
+      "at": { "rest": "ground" }
+    },
+    { "use": "table", "id": "table", "at": {} },
+    {
+      "use": "perfume",
+      "id": "perfume",
+      "at": {
+        "to": { "ref": "table/top", "anchor": "face(+Z)" },
+        "offset": ["$placeX", "$placeY", 0]
+      }
+    }
+  ],
+
+  "relations": [
+    { "a": "table/leg.*", "b": "floor", "mode": "touch", "tol": 0.01 },
+    { "a": "table/top", "b": "table/leg.*", "mode": "attach" },
+    { "a": "perfume/body", "b": "table/top", "mode": "touch", "tol": 0.002 },
+    { "a": "perfume/label", "b": "perfume/body", "mode": "touch", "tol": 0.002 },
+    { "a": "perfume/*", "b": "floor", "mode": "clear", "minGap": 0.40 },
+    { "a": "perfume/body", "b": "table/leg.*", "mode": "clear", "minGap": 0.05 }
+  ],
+
+  "_views_comment": "只声明意图，不写任何相机坐标：主体自动判定（被支撑的那个装配体），三视图尺度/中心/3-4 视角距离全部由引擎按几何解算",
+  "views": {
+    "subject": "auto",
+    "fit": "context",
+    "marginRatio": 0.18,
+    "size": 1024,
+    "ssaa": 2,
+    "layout": ["front", "right", "top", "threequarter"],
+    "threeQuarter": { "azimuthDeg": 32, "elevationDeg": 24, "lens": 45 },
+    "gridStep": "auto"
+  },
+
+  "_shots_comment": "运镜同样只声明意图：构图用 fill 表达、位移用动作表达、朝向用策略表达；机位/四元数/逐帧表全部由引擎解算",
+  "shots": {
+    "hero": {
+      "subject": "perfume/*",
+      "durationS": 6,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.012] },
+        "orbit": { "azimuthDeg": 32, "elevationDeg": 18 },
+        "framing": { "mode": "fill-height", "fill": 0.42, "lock": "per-frame", "margin": 0.15 },
+        "lens": 45,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "aimMode": "look-at",
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 0.8, "type": "hold" },
+        { "t": 3.4, "type": "dolly_in", "framing": { "fill": [0.42, 0.66] }, "ease": "easeInOut" },
+        { "t": 5.2, "type": "orbit_left", "deg": 26, "ease": "easeInOut" },
+        { "t": 6.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 16 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.12,
+        "maxSpeed": 0.8,
+        "noOcclusion": true
+      }
+    },
+    "turntable": {
+      "subject": "perfume/*",
+      "durationS": 4,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.005] },
+        "orbit": { "azimuthDeg": 20, "elevationDeg": 12 },
+        "framing": { "mode": "fill-height", "fill": 0.5, "lock": "per-frame" },
+        "lens": 50,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "loop": { "mode": "turntable", "revolutions": 1 },
+      "constraints": { "keepInFrame": { "marginPx": 16 }, "noCollision": true, "minClearance": 0.1 }
+    },
+
+    "_showcase_comment": "高难度镜头：靠 parallel 复合动作（同时环绕+下降+推近）与 space 参考系切换实现，仍无一处手写坐标",
+    "spiral_reveal": {
+      "subject": "perfume/*",
+      "durationS": 8,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.01] },
+        "orbit": { "azimuthDeg": 150, "elevationDeg": 55 },
+        "framing": { "mode": "fill-height", "fill": 0.3, "lock": "per-frame" },
+        "lens": 35,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 0.6, "type": "hold" },
+        {
+          "t": 6.4,
+          "ease": "easeInOut",
+          "parallel": [
+            { "type": "orbit_left", "deg": 200 },
+            { "type": "pedestal_down", "amount": 0.42, "space": "world" },
+            { "type": "dolly_in", "framing": { "fill": [0.3, 0.7] } }
+          ]
+        },
+        { "t": 8.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 14 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.08,
+        "maxSpeed": 1.5
+      }
+    },
+
+    "low_glide": {
+      "subject": "perfume/*",
+      "durationS": 6,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, -0.01] },
+        "orbit": { "azimuthDeg": 60, "elevationDeg": 4 },
+        "framing": { "mode": "fill-height", "fill": 0.45, "lock": "per-frame" },
+        "lens": 28,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "moves": [
+        { "t": 0.6, "type": "hold" },
+        { "t": 3.0, "type": "truck_left", "amount": 0.55, "ease": "easeInOut" },
+        {
+          "t": 5.4,
+          "ease": "easeInOut",
+          "parallel": [{ "type": "dolly_in", "framing": { "fill": [0.45, 0.58] } }]
+        },
+        { "t": 6.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 12 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.03
+      }
+    },
+
+    "dutch_whip": {
+      "subject": "perfume/*",
+      "durationS": 3.2,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0.02] },
+        "orbit": { "azimuthDeg": 40, "elevationDeg": 10 },
+        "framing": { "mode": "fill-height", "fill": 0.5, "lock": "start-only" },
+        "lens": 50,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 0.3, "type": "hold" },
+        { "t": 0.55, "ease": "smooth", "parallel": [{ "type": "pan_left", "deg": 85 }, { "type": "roll_move", "deg": 16 }] },
+        { "t": 0.8, "type": "hold" },
+        { "t": 1.25, "ease": "smooth", "parallel": [{ "type": "pan_right", "deg": 85 }, { "type": "roll_move", "deg": -16 }] },
+        { "t": 3.2, "type": "hold" }
+      ],
+      "constraints": {
+        "noCollision": true,
+        "minClearance": 0.05,
+        "_why": "甩镜本来就该'急'：所以 maxAngularSpeed 显式放宽到 700，且**故意不声明 maxAngularJerk**（否则 autofix 会把这一甩磨平）。主体中途离画由 graceS 容忍，但 requireAtEnd=true：回摆不足、结束时还没回到主体身上，就必须报错",
+        "maxAngularSpeed": 700,
+        "coverage": { "inFrameMin": 90, "visibleMin": 60, "graceS": 1.5, "requireAtEnd": true }
+      }
+    },
+
+    "handheld_follow": {
+      "subject": "perfume/*",
+      "durationS": 6,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "top_center", "offset": [0, 0, -0.03] },
+        "orbit": { "azimuthDeg": 25, "elevationDeg": 12 },
+        "framing": { "mode": "fill-height", "fill": 0.45, "lock": "per-frame" },
+        "lens": 35,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "camera"
+      },
+      "moves": [
+        { "t": 1.0, "type": "hold" },
+        {
+          "t": 5.0,
+          "ease": "easeInOut",
+          "parallel": [
+            { "type": "truck_right", "amount": 0.5 },
+            { "type": "orbit_left", "deg": 22 },
+            { "type": "dolly_in", "framing": { "fill": [0.45, 0.58] } }
+          ]
+        },
+        { "t": 6.0, "type": "hold" }
+      ],
+      "modifiers": [{ "type": "handheld", "amplitudeM": 0.012, "frequencyHz": 1.6, "seed": 3 }],
+      "constraints": {
+        "keepInFrame": { "marginPx": 14 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.12,
+        "_why": "抖动与转动卡顿是执行质量问题 → 交给 autofix 自动修（缩修饰器幅度 / 升级缓动 / 平滑轨迹），Agent 只需读 corrections[]",
+        "maxJerk": 6,
+        "maxAngularJerk": 400,
+        "coverage": { "visibleMin": 80, "inFrameMin": 95 }
+      }
+    },
+
+    "topdown_descend": {
+      "subject": "perfume/*",
+      "durationS": 5,
+      "fps": 24,
+      "camera": {
+        "target": { "at": "subject", "anchor": "center", "offset": [0, 0, 0] },
+        "orbit": { "azimuthDeg": 0, "elevationDeg": 80 },
+        "framing": { "mode": "fill-height", "fill": 0.12, "lock": "per-frame" },
+        "lens": 24,
+        "sensorWidth": 36,
+        "resolution": [960, 540],
+        "roll": "level",
+        "space": "world"
+      },
+      "moves": [
+        { "t": 0.5, "type": "hold" },
+        {
+          "t": 4.0,
+          "ease": "easeInOut",
+          "parallel": [
+            { "type": "pedestal_down", "amount": 0.55, "space": "world" },
+            { "type": "dolly_in", "framing": { "fill": [0.12, 0.55] } }
+          ]
+        },
+        { "t": 5.0, "type": "hold" }
+      ],
+      "constraints": {
+        "keepInFrame": { "marginPx": 12 },
+        "levelHorizon": true,
+        "noCollision": true,
+        "minClearance": 0.05
+      }
+    }
+  }
+}

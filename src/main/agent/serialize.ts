@@ -31,6 +31,41 @@ const RESULT_TEXT_LIMIT = 8000
 /** 单个流式文本块的截断上限，防御异常超长 delta */
 const DELTA_LIMIT = 64_000
 
+/** tool_end 结构化 details 的序列化上限：瘦子集超限直接丢弃（resultText 仍完整） */
+const TOOL_DETAILS_LIMIT = 2_048
+
+/**
+ * tool_end 的结构化瘦子集：pi 的 ToolResult.details 是工具自定义对象（可能带大数组），
+ * 只挑渲染端建卡需要的键做 JSON 透传，超限/无 details 返回 undefined。
+ * 目前只有 blockout 的 published（video 成片发布信息）在用。
+ */
+function toToolDetails(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const source = raw as { published?: unknown }
+  const picked: Record<string, unknown> = {}
+  const published = source.published as { relPath?: unknown; name?: unknown; kind?: unknown; bytes?: unknown } | undefined
+  if (
+    published &&
+    typeof published.relPath === 'string' &&
+    typeof published.name === 'string' &&
+    typeof published.kind === 'string'
+  ) {
+    picked.published = {
+      relPath: published.relPath,
+      name: published.name,
+      kind: published.kind,
+      ...(typeof published.bytes === 'number' ? { bytes: published.bytes } : {})
+    }
+  }
+  if (Object.keys(picked).length === 0) return undefined
+  try {
+    const text = JSON.stringify(picked)
+    return text.length <= TOOL_DETAILS_LIMIT ? text : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function toStopReason(value: unknown): ChatStopReason {
   switch (value) {
     case 'pending':
@@ -252,7 +287,8 @@ export class EventTranslator {
           }
         ]
 
-      case 'tool_execution_end':
+      case 'tool_execution_end': {
+        const details = toToolDetails((raw.result as { details?: unknown } | undefined)?.details)
         return [
           {
             nodeId,
@@ -260,9 +296,11 @@ export class EventTranslator {
             toolCallId: String(raw.toolCallId ?? ''),
             toolName: String(raw.toolName ?? 'unknown'),
             isError: raw.isError === true,
-            resultText: toResultText(raw.result)
+            resultText: toResultText(raw.result),
+            ...(details ? { details } : {})
           }
         ]
+      }
 
       // tool_execution_update：长任务（bash / M13 媒体生成）的中间态。
       // 只透传首个 text 块当进度文本（媒体工具的 onUpdate 文本自带百分比）

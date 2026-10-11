@@ -39,6 +39,7 @@ import { evictAllImages } from './contextEviction'
 import { computeContextBreakdown } from './breakdown'
 import { buildSessionHistory, type BuiltHistory, type HistoryImageSlot } from './history'
 import { makeHistoryThumbnail } from './historyThumbs'
+import { BLOCKOUT_SKILL_NAME, BLOCKOUT_TOOL_NAME, isBlockoutSkillReadPath, resolveBuiltinSkillsRoots } from './blockoutTools'
 import { SafeStorageCredentialStore } from './credentials'
 import {
   getCredentialsFile,
@@ -454,10 +455,14 @@ export class AgentHost {
       // 加载器与设置页 listSkills 同源（loadSkillsFromDir），不存在两套解析。
       // 用户级技能目录 ~/.agents/skills（与 ZCode 共享）也一并注入；pi 原生默认目录
       // （agentDir/skills 与 cwd/.pi/skills）由加载器自行扫描，无需在这里给。
+      // 内置技能（resources/skills/，如 blockout-shot）必须追加在末尾：pi 同名技能
+      // 先加载者胜 → 工作区/用户级同名技能覆盖内置版，保留开发期覆盖能力。
       const disabledSkills = new Set(context?.disabledSkills ?? [])
-      const extraSkillPaths = [join(homedir(), '.agents', 'skills'), join(cwd, '.huabu', 'skills')].filter(
-        (dir) => existsSync(dir)
-      )
+      const extraSkillPaths = [
+        join(homedir(), '.agents', 'skills'),
+        join(cwd, '.huabu', 'skills'),
+        ...resolveBuiltinSkillsRoots()
+      ].filter((dir) => existsSync(dir))
       const resourceLoader = new pi.DefaultResourceLoader({
         cwd,
         agentDir: pi.getAgentDir(),
@@ -506,7 +511,23 @@ export class AgentHost {
       })
 
       const boundFile = sessionManager.getSessionFile() ?? sessionFile
-      this.registerSession(nodeId, session, cwd, picked.id, boundFile)
+
+      // blockout 惰性激活（P2）：customTools 进 tools 白名单即被初始激活；创建后立刻摘除，
+      // Agent 读 blockout-shot 技能正文时再纯增量激活（钩子在 registerSession 里）。
+      // 例外：重绑的历史会话已经调用过该工具（assistant 消息里有它的 toolCall）时保持激活，
+      // 否则模型按历史记忆直接重调会撞「未注册工具」白丢一轮。
+      const historyUsedBlockout = session.agent.state.messages.some((message) => {
+        const calls = (message as { toolCalls?: Array<{ name?: string }> }).toolCalls
+        return Array.isArray(calls) && calls.some((call) => call?.name === BLOCKOUT_TOOL_NAME)
+      })
+      if (!historyUsedBlockout) {
+        const activeAtCreate = session.getActiveToolNames()
+        if (activeAtCreate.includes(BLOCKOUT_TOOL_NAME)) {
+          session.setActiveToolsByName(activeAtCreate.filter((name) => name !== BLOCKOUT_TOOL_NAME))
+        }
+      }
+
+      this.registerSession(nodeId, session, cwd, picked.id, boundFile, disabledSkills)
 
       // 历史图片淘汰（执行点二，image-context-eviction-plan.md）：createAgentSession
       // 已把 JSONL 历史装进 agent.state.messages，base64 图块原样回内存，重启/重绑后
@@ -623,7 +644,8 @@ export class AgentHost {
     session: AgentSession,
     cwd: string,
     modelId: string,
-    sessionFile?: string
+    sessionFile?: string,
+    disabledSkills: ReadonlySet<string> = new Set()
   ): SessionEntry {
     const translator = new EventTranslator(nodeId)
     const unsubscribe = session.subscribe((event) => {
@@ -635,6 +657,15 @@ export class AgentHost {
         return
       }
       for (const payload of events) this.emit(payload)
+      // blockout 惰性激活（P2）：Agent 用 read 打开 blockout-shot 技能目录内任一文件
+      //（渐进披露读的就是 SKILL.md）→ 纯增量激活 blockout 工具，下一次模型请求生效。
+      // 幂等（已激活即返回）；技能被禁用时跳过。
+      if (event.type === 'tool_execution_start' && event.toolName === 'read') {
+        const readPath = (event.args as { path?: unknown } | undefined)?.path
+        if (typeof readPath === 'string' && readPath.length > 0) {
+          this.maybeActivateLazyTool(session, nodeId, cwd, readPath, disabledSkills)
+        }
+      }
       // 水位推送挂钩（计划 T1）：整轮结束 / 压缩结束后现读一次 getContextUsage。
       // 推送为主，渲染端不猜时机；压缩后 tokens=null 如实透传（UI 显示"—"）。
       if (event.type === 'agent_end' || event.type === 'compaction_end') {
@@ -645,6 +676,27 @@ export class AgentHost {
     const entry: SessionEntry = { nodeId, session, cwd, modelId, sessionFile, unsubscribe, translator }
     this.sessions.set(nodeId, entry)
     return entry
+  }
+
+  /**
+   * 惰性工具激活判定（目前只有 blockout）：read 路径命中 blockout-shot 技能目录
+   * （工作区 .huabu/skills/ 或内置 resources/skills/ 下同名目录）时纯增量激活。
+   * 路径判定复用 isBlockoutSkillReadPath（探针覆盖）。只加不减——pi 的 registry
+   * 刷新会把白名单内工具整体推回激活集，纯增量是最不易与之打架的姿势。
+   */
+  private maybeActivateLazyTool(
+    session: AgentSession,
+    nodeId: string,
+    cwd: string,
+    readPath: string,
+    disabledSkills: ReadonlySet<string>
+  ): void {
+    if (disabledSkills.has(BLOCKOUT_SKILL_NAME)) return
+    if (!isBlockoutSkillReadPath(cwd, readPath)) return
+    const active = session.getActiveToolNames()
+    if (active.includes(BLOCKOUT_TOOL_NAME)) return
+    session.setActiveToolsByName([...active, BLOCKOUT_TOOL_NAME])
+    console.log(`[agent-host] 惰性激活 ${BLOCKOUT_TOOL_NAME}（read 命中技能 ${BLOCKOUT_SKILL_NAME}）nodeId=${nodeId}`)
   }
 
   /**
