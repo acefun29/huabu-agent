@@ -1,8 +1,9 @@
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
 import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { extraOf, submitRefs } from '../provider'
 import { registerAdapter, type AdapterDeps } from './registry'
 import { BaseGatewayProvider, buildModelRecord, nearestRatio } from './base'
-import { firstImageRefDataUri } from './refImage'
+import { prepareRefs } from './refImage'
 
 /**
  * 阿里云百炼（DashScope）适配器：异步任务制（与 openaiCompat 的同步制是两种网关形态）。
@@ -97,12 +98,15 @@ export class DashScopeProvider extends BaseGatewayProvider<DashScopeModelConfig>
 
     const endpoint = kind === 'video' ? VIDEO_ENDPOINT : isNewImageProtocol(requestModel) ? IMAGE_GEN_ENDPOINT : IMAGE_ENDPOINT
     const body = kind === 'video' ? await videoBody(requestModel, input) : await imageBody(requestModel, input)
+    // oss:// 临时引用必须由百炼侧解析（官方要求带这个头，否则报无效 URL）
+    const usesOssRef = submitRefs(input).some((ref) => ref.url?.startsWith('oss://'))
     const response = await fetch(`${BASE_URL}${endpoint}`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${key}`,
         // 百炼生成类接口只支持异步调用，漏掉该 header 会报「不支持同步调用」
         'X-DashScope-Async': 'enable',
+        ...(usesOssRef ? { 'X-DashScope-OssResourceResolve': 'enable' } : {}),
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(body),
@@ -233,15 +237,42 @@ function isNewVideoParams(requestModel: string): boolean {
   return v !== null && (v[0] > 2 || (v[0] === 2 && v[1] >= 7))
 }
 
+/**
+ * 参考素材的单文件上限（原始字节）：官方图像 ≤20MB（单边 [240,8000]px、不支持透明 PNG）、
+ * 参考音频 ≤15MB、参考视频 ≤100MB。视频/音频没有 base64 形态，只有上传通道换来的
+ * `oss://` 临时 URL —— 见注册处 refCaps 与 ../upload。
+ */
+const DASH_REF_MAX_BYTES: Partial<Record<MediaKind, number>> = {
+  image: 20 * 1024 * 1024,
+  video: 100 * 1024 * 1024,
+  audio: 15 * 1024 * 1024
+}
+
+/**
+ * 声明式附加参数 → `parameters` 字段。百炼在 parameters 里吃这两个布尔开关
+ * （watermark 默认带"AI 生成"水印、prompt_extend 提示词智能改写）；
+ * 只有编排层白名单校验过的键才会到这里，没被挑走的键不进请求体。
+ */
+function dashExtras(input: ProviderSubmitInput): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  const watermark = extraOf(input, 'watermark')
+  if (typeof watermark === 'boolean') out.watermark = watermark
+  const promptExtend = extraOf(input, 'prompt_extend')
+  if (typeof promptExtend === 'boolean') out.prompt_extend = promptExtend
+  return out
+}
+
 async function imageBody(requestModel: string, input: ProviderSubmitInput): Promise<Record<string, unknown>> {
   if (isNewImageProtocol(requestModel)) {
     // 图生图（官方 API 参考）：content 追加 {image}，data URI 是官方支持的离线形态。
+    // 官方支持多张（wan2.7-image 0–9 张、qwen-image-3.0 系列 1–3 张），按模型声明的数量
+    // 全部装入 —— 此前只发第 1 张，声明了多张的模型会把其余参考素材静默丢掉。
     // 编辑模式缺省输出比例随最后一张输入图 —— 调用方显式给了比例（width/height）时
     // 必须传 size 覆盖，否则 3:4/9:16 的竖版请求会静默出成参考图的横版；
     // 未指定比例时不传 size，保持「随参考图」的图生图缺省语义。
-    const refDataUri = await firstImageRefDataUri(input.refFiles)
+    const refs = await prepareRefs(submitRefs(input), DASH_REF_MAX_BYTES)
     const content: Record<string, unknown>[] = [{ text: input.prompt }]
-    if (refDataUri) content.push({ image: refDataUri })
+    for (const ref of refs.items.filter((r) => r.mediaType === 'image')) content.push({ image: ref.url })
     return {
       model: requestModel,
       input: { messages: [{ role: 'user', content }] },
@@ -249,11 +280,12 @@ async function imageBody(requestModel: string, input: ProviderSubmitInput): Prom
       //（官方编辑模式窗口 [768²,2048²] 更大，包含本窗口，显式 size 对图生图同样合法）
       parameters: {
         n: 1,
-        ...(input.width && input.height ? { size: wan26PixelSize(input.width, input.height) } : {})
+        ...(input.width && input.height ? { size: wan26PixelSize(input.width, input.height) } : {}),
+        ...dashExtras(input)
       }
     }
   }
-  const parameters: Record<string, unknown> = { n: 1 }
+  const parameters: Record<string, unknown> = { n: 1, ...dashExtras(input) }
   if (input.width && input.height) {
     // 百炼旧协议 size 是「宽*高」字符串；wan2.2 及以下两边都限 [512,1440]
     parameters.size = `${clamp(input.width, 512, 1440)}*${clamp(input.height, 512, 1440)}`
@@ -266,8 +298,11 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
   // 首帧图吃 data URI；wan2.7-i2v 无 ratio 参数且 duration [2,15]，wan3.0-video [2,30]
   // 且支持 ratio（默认 adaptive —— 有首帧时自适应输入图，正是图生视频语义，故不传）
   if (isMediaVideoModel(requestModel)) {
-    const refDataUri = await firstImageRefDataUri(input.refFiles)
-    const parameters: Record<string, unknown> = { n: 1 }
+    // media[].type 就是角色名（first_frame/last_frame/reference_image/reference_video/
+    // reference_audio，官方另支持 file/link 两种文档类输入，本应用尚未接入）。
+    // 「首帧/首尾帧」与「reference_*」互斥由编排层按模式声明判过，这里照 role 装配。
+    const refs = await prepareRefs(submitRefs(input), DASH_REF_MAX_BYTES)
+    const parameters: Record<string, unknown> = { ...dashExtras(input) }
     if (input.width && input.height) {
       parameters.resolution = input.height >= 1000 ? '1080P' : '720P'
     }
@@ -282,13 +317,17 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
       model: requestModel,
       input: {
         prompt: input.prompt,
-        ...(refDataUri ? { media: [{ type: 'first_frame', url: refDataUri }] } : {})
+        ...(refs.items.length > 0
+          ? { media: refs.items.map((ref) => ({ type: ref.role, url: ref.url })) }
+          : {})
       },
-      parameters
+      // 官方视频端点没有 n 字段（usage.video_count 恒为 1）：多传一个未知参数只会
+      // 让严格校验的网关整单 400，故不再无条件塞 n:1
+      ...(Object.keys(parameters).length > 0 ? { parameters } : {})
     }
   }
 
-  const parameters: Record<string, unknown> = { n: 1 }
+  const parameters: Record<string, unknown> = { n: 1, ...dashExtras(input) }
   if (isNewVideoParams(requestModel)) {
     // wan2.7 t2v 起：resolution + ratio + duration 整数 [2,15]（官方文档核实，无 size 字段）
     if (input.width && input.height) {
@@ -360,5 +399,18 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'DASHSCOPE_KEY', supportedKinds: ['image', 'video'] }
+  {
+    defaultAuthEnv: 'DASHSCOPE_KEY',
+    supportedKinds: ['image', 'video'],
+    // 官方（2026-10 核实）：图像素材可吃公网 URL / oss:// / data URI；
+    // reference_video、reference_audio、file、link **只收公网 URL 或 oss:// 临时 URL**，
+    // 没有 base64 形态 —— 本地文件要先走 uploads getPolicy 换 oss:// 引用
+    refCaps: {
+      byKind: {
+        image: { delivery: 'data_uri', maxBytes: 20 * 1024 * 1024 },
+        video: { delivery: 'upload', maxBytes: 100 * 1024 * 1024, uploadChannel: 'dashscope-instant' },
+        audio: { delivery: 'upload', maxBytes: 15 * 1024 * 1024, uploadChannel: 'dashscope-instant' }
+      }
+    }
+  }
 )

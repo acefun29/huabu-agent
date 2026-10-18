@@ -58,13 +58,16 @@ import type {
   MediaUserModelInput,
   MediaUserProviderInput
 } from '../../shared/ipc'
-import type { MediaKind, MediaRatio } from '../../shared/media'
+import type { MediaKind, MediaRatio, MediaRefInput, MediaRefRole } from '../../shared/media'
 import {
   DEFAULT_MEDIA_CONCURRENCY,
   DEFAULT_MEDIA_DURATION_S,
   DEFAULT_MEDIA_PROVIDER,
   DEFAULT_MEDIA_RATIO,
-  MEDIA_RATIOS
+  MEDIA_EXT_KIND_MIME,
+  MEDIA_RATIOS,
+  MEDIA_REF_ROLES,
+  mediaKindOfPath
 } from '../../shared/media'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString, ok } from './shared'
@@ -115,7 +118,7 @@ export const requestMediaApproval = (
           ...(info.model ? { model: info.model } : {}),
           ...(info.ratio ? { ratio: info.ratio } : {}),
           ...(info.durationSeconds ? { durationSeconds: info.durationSeconds } : {}),
-          refCount: info.refCount
+          refSummary: info.refSummary
         } satisfies MediaConfirmPayload)
       } catch {
         /* 窗口可能正在销毁 */
@@ -150,6 +153,8 @@ export type MediaContextReturnType = {
    * media:providers 的真实 authHint 据此组装（适配器静态值不反映实际录入）。
    */
   keySourceOf: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
+  /** 凭据明文读取（上传通道换临时引用用）；与适配器 resolveKey 同一闭包 */
+  resolveKey: (auth: { authKey?: string; authEnv?: string }) => Promise<string | undefined>
   notifyAssetsChanged: () => void
 }
 
@@ -219,6 +224,8 @@ export function createMediaRuntime(
       providers,
       adapters: adapterCache.adapters,
       ready: Boolean(workspace),
+      // 上传通道换临时引用时要读凭据明文（与适配器共用同一个解析闭包）
+      resolveKey: resolveMediaKey,
       keySourceOf: async (auth) => {
         if (!workspace) return 'none'
         if (auth.authKey && (await host.hasMediaKey(workspace, auth.authKey))) return 'workspace-store'
@@ -671,12 +678,38 @@ export function registerMediaIpc(ctx: IpcContext): void {
       if (typeof request.durationSeconds === 'number' && request.durationSeconds > 0) {
         generateRequest.durationSeconds = Math.min(120, Math.round(request.durationSeconds))
       }
+      // 音色：只清洗形态，是否在模型清单内由编排层按 capabilities.voices 校验
+      if (isNonEmptyString(request.voice)) generateRequest.voice = request.voice
       if (Array.isArray(request.refPaths)) {
-        const refPaths = request.refPaths.filter((p): p is string => isNonEmptyString(p)).slice(0, 4)
+        // 只做形态清洗；数量上限的权威是模型能力声明，唯一执行点在 MediaJobManager.submit
+        const refPaths = request.refPaths.filter((p): p is string => isNonEmptyString(p))
         if (refPaths.length > 0) generateRequest.refPaths = refPaths
+      }
+      if (Array.isArray(request.refs)) {
+        // 带角色参考素材：只认枚举内的 role、且必须给出 path 或 url 之一；
+        // 角色是否被当前模型接受、组合是否合法，由编排层按能力声明判定
+        const refs: MediaRefInput[] = []
+        for (const raw of request.refs as unknown[]) {
+          if (!raw || typeof raw !== 'object') continue
+          const entry = raw as { role?: unknown; path?: unknown; url?: unknown }
+          if (typeof entry.role !== 'string' || !MEDIA_REF_ROLES.includes(entry.role as MediaRefRole)) continue
+          const path = typeof entry.path === 'string' && entry.path.trim() ? entry.path : undefined
+          const url = typeof entry.url === 'string' && entry.url.trim() ? entry.url : undefined
+          if (!path && !url) continue
+          refs.push({ role: entry.role as MediaRefRole, ...(path ? { path } : {}), ...(url ? { url } : {}) })
+        }
+        if (refs.length > 0) generateRequest.refs = refs
       }
       // 落库目录（相对工作区根）：越界校验在 MediaJobManager.submit 内做
       if (isNonEmptyString(request.outputDir)) generateRequest.outputDir = request.outputDir
+      // 附加参数：IPC 只清洗形态（键名 + 原始值类型），是否被该模型接受由编排层按声明判
+      if (request.extra && typeof request.extra === 'object' && !Array.isArray(request.extra)) {
+        const extra: Record<string, string | number | boolean> = {}
+        for (const [key, raw] of Object.entries(request.extra as Record<string, unknown>)) {
+          if (typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') extra[key] = raw
+        }
+        if (Object.keys(extra).length > 0) generateRequest.extra = extra
+      }
       // 产物命名：净化与重名序号在 MediaJobManager.submit/materialize 内收口
       if (isNonEmptyString(request.name)) generateRequest.name = request.name
       try {
@@ -804,33 +837,15 @@ export function registerMediaIpc(ctx: IpcContext): void {
  * （T12）：它们只服务 Agent 工具路径，此处原先的两份实现随之删除。
  */
 
-/** 从扩展名猜媒体大类（导入时渲染端可不传 kind） */
+/** 从扩展名猜媒体大类（导入时渲染端可不传 kind）；认不出的一律按 image，与历史行为一致 */
 function guessKind(pathOrName: string, mime?: string): MediaKind {
   if (mime?.startsWith('video/')) return 'video'
   if (mime?.startsWith('audio/')) return 'audio'
-  const ext = extname(pathOrName).toLowerCase()
-  if (['.mp4', '.webm', '.mov', '.mkv', '.avi'].includes(ext)) return 'video'
-  if (['.mp3', '.wav', '.ogg', '.m4a', '.flac', '.aac'].includes(ext)) return 'audio'
-  return 'image'
+  return mediaKindOfPath(pathOrName)?.kind ?? 'image'
 }
 
 function mimeFromExt(ext: string): string | undefined {
-  const map: Record<string, string> = {
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.webp': 'image/webp',
-    '.gif': 'image/gif',
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.mov': 'video/quicktime',
-    '.mp3': 'audio/mpeg',
-    '.wav': 'audio/wav',
-    '.ogg': 'audio/ogg',
-    '.m4a': 'audio/mp4',
-    '.flac': 'audio/flac'
-  }
-  return map[ext.toLowerCase()]
+  return MEDIA_EXT_KIND_MIME[ext.toLowerCase()]?.mime
 }
 
 function defaultMime(kind: MediaKind): string {

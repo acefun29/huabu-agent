@@ -61,6 +61,32 @@ export interface AdapterDeps {
 
 export type AdapterFactory = (deps: AdapterDeps, config: AdapterProviderConfig) => MediaProviderAdapter
 
+/**
+ * 某类素材进入某家协议的投递形态（2026-10 各家官方文档核实）：
+ * - `data_uri` 本地文件可直接 base64 内联
+ * - `multipart` 走表单文件字段（openai-compat 的 edits / videos）
+ * - `upload`   必须先经上传通道换成临时引用（百炼 oss://、MiniMax mm_file://）
+ * - `url_only` 只收公网 URL —— 本地文件在这家没有合法投递方式
+ * - `none`     该大类根本不能作为参考素材
+ */
+export type MediaRefDelivery = 'data_uri' | 'multipart' | 'upload' | 'url_only' | 'none'
+
+/** 上传通道名（实现住在 ../upload；未实现时编排层按 url_only 处理并给出可操作错误） */
+export type MediaUploadChannel = 'dashscope-instant' | 'minimax-files'
+
+export interface MediaKindDelivery {
+  delivery: MediaRefDelivery
+  /** data_uri / multipart 的单文件原始字节上限（编码后的膨胀由编排层预算） */
+  maxBytes?: number
+  uploadChannel?: MediaUploadChannel
+}
+
+export interface AdapterRefCaps {
+  byKind: Partial<Record<MediaKind, MediaKindDelivery>>
+  /** 请求体总闸（编码后字节）：方舟与 MiniMax 都是 64MB */
+  maxBodyBytes?: number
+}
+
 /** 适配器自描述元数据（注册时声明，宿主与合并层按此取默认值，不写死厂商约定） */
 export interface AdapterMeta {
   /** 用户配置未声明 authEnv 时的默认环境变量名（如 gateway-dashscope → DASHSCOPE_KEY） */
@@ -71,6 +97,11 @@ export interface AdapterMeta {
    * 清洗层丢弃、IPC 层显式报错——堵住「配了 video 实际静默走图片端点」。
    */
   supportedKinds?: MediaKind[]
+  /**
+   * 参考素材的投递形态。这属于**协议家族**的属性、不属于模型能力：
+   * 同一家网关的所有模型都受同一个"能不能吃 base64"约束，而每张模型各有各的配额。
+   */
+  refCaps?: AdapterRefCaps
 }
 
 const registry = new Map<MediaProviderType, AdapterFactory>()
@@ -102,6 +133,24 @@ export function adapterSupportedKinds(type: string): MediaKind[] {
 export function getAdapterKindMatrix(): Record<string, MediaKind[]> {
   const out: Record<string, MediaKind[]> = {}
   for (const type of registry.keys()) out[type] = adapterSupportedKinds(type)
+  return out
+}
+
+/**
+ * 某适配器自述的参考素材投递形态。未声明时给**保守兜底**：只有图片可按老的
+ * data URI 通道走（12MB，即旧实现的硬编码值），视频/音频按"不能作为参考"处理 ——
+ * 宁可少给能力，也不要把本地文件送去只收 URL 的网关然后吃一个看不懂的 400。
+ */
+export function adapterRefCaps(type: string): AdapterRefCaps {
+  const declared = metaByType.get(type as MediaProviderType)?.refCaps
+  if (declared) return declared
+  return { byKind: { image: { delivery: 'data_uri', maxBytes: 12 * 1024 * 1024 } } }
+}
+
+/** 全投递形态矩阵（渲染端提示用，与 getAdapterKindMatrix 同一条通道思路） */
+export function getAdapterRefMatrix(): Record<string, AdapterRefCaps> {
+  const out: Record<string, AdapterRefCaps> = {}
+  for (const type of registry.keys()) out[type] = adapterRefCaps(type)
   return out
 }
 

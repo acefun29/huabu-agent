@@ -266,7 +266,7 @@ export const Composer = memo(function Composer() {
                 )}
                 {p.ratio && <span>比例 {p.ratio}</span>}
                 {p.durationSeconds && <span>时长 {p.durationSeconds}s</span>}
-                {p.refCount ? <span>参考图 {p.refCount} 张</span> : null}
+                {p.refSummary ? <span>参考 {p.refSummary}</span> : null}
               </div>
               <div className="mt-2 flex items-center justify-end gap-1.5">
                 <button

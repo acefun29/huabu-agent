@@ -37,9 +37,18 @@ export default defineProvider({
       remoteModel: 'MiniMax-H3',
       costHint: '按秒计费（768P/2K，4~15 秒；图生视频比例随首帧）',
       capabilities: {
-        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
+        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'],
         durations: [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        maxRefImages: 1
+        // 官方 V2 全模态参考：首/尾帧、9 参考图、3 参考视频、3 参考音频
+        // （三类素材都支持 data URI，是五家里唯一能免上传通道用本地视频的一家）
+        refModes: ['t2v', 'i2v_first', 'i2v_fl', 'r2v'],
+        refQuota: [
+          { role: 'first_frame', max: 1 },
+          { role: 'last_frame', max: 1 },
+          { role: 'reference_image', max: 9 },
+          { role: 'reference_video', max: 3 },
+          { role: 'reference_audio', max: 3 }
+        ]
       }
     },
     {
@@ -49,9 +58,17 @@ export default defineProvider({
       remoteModel: 'MiniMax-H3-Max',
       costHint: '按秒计费（480P/768P 快速档，5~15 秒，不支持 2K）',
       capabilities: {
-        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
+        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'],
         durations: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        maxRefImages: 1
+        // 与 H3 同一套 content 角色（官方 V2），上限同为 1/1/9/3/3
+        refModes: ['t2v', 'i2v_first', 'i2v_fl', 'r2v'],
+        refQuota: [
+          { role: 'first_frame', max: 1 },
+          { role: 'last_frame', max: 1 },
+          { role: 'reference_image', max: 9 },
+          { role: 'reference_video', max: 3 },
+          { role: 'reference_audio', max: 3 }
+        ]
       }
     }
   ]

@@ -12,10 +12,12 @@ import './minimax'
 import './tencent'
 
 export {
+  adapterRefCaps,
   adapterSupportedKinds,
   createAdapters,
   getAdapterKindMatrix,
+  getAdapterRefMatrix,
   getAdapterTypes,
   isRegisteredAdapterType
 } from './registry'
-export type { AdapterDeps, AdapterProviderConfig } from './registry'
+export type { AdapterDeps, AdapterProviderConfig, AdapterRefCaps, MediaKindDelivery, MediaRefDelivery } from './registry'

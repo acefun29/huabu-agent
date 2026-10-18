@@ -1,8 +1,10 @@
 import { randomUUID } from 'crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { mkdirSync, writeFileSync } from 'fs'
 import { basename, resolve } from 'path'
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
-import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import type { ProviderMediaRef, ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { extraOf, submitRefs } from '../provider'
+import { readRefBytes } from './refImage'
 import { registerAdapter, type AdapterDeps } from './registry'
 import { BaseGatewayProvider, buildModelRecord } from './base'
 
@@ -43,6 +45,9 @@ const URL_PREFIX = 'oc-url|'
 const FILE_PREFIX = 'oc-file|'
 const VIDEO_JOB_PREFIX = 'oc-video|'
 
+/** 官方 images 族的 output_format 枚举（b64 通道的临时文件扩展名只认这三个值） */
+const IMAGE_OUTPUT_FORMATS = ['png', 'jpeg', 'webp']
+
 /** 官方 seconds 枚举（VideoSeconds：4 / 8 / 12）；集合外的值就近归档，规避网关 400 */
 const VIDEO_SECONDS = [4, 8, 12] as const
 
@@ -56,13 +61,10 @@ function sizeFor(width?: number, height?: number): string {
   return width > height ? '1536x1024' : '1024x1536'
 }
 
-/** edits multipart 里参考图文件的 MIME（按扩展名，认不出的一律按 png） */
-function mimeForImage(file: string): string {
-  const ext = file.slice(file.lastIndexOf('.')).toLowerCase()
-  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg'
-  if (ext === '.webp') return 'image/webp'
-  if (ext === '.gif') return 'image/gif'
-  return 'image/png'
+/** multipart 文件字段的文件名：本地文件取 basename，URL 素材用角色名兜底 */
+function refNameForSubmit(ref: ProviderMediaRef): string {
+  if (ref.absPath) return basename(ref.absPath)
+  return ref.role === 'first_frame' ? 'input_reference' : `reference.${ref.mime.split('/')[1] ?? 'bin'}`
 }
 
 /** 视频尺寸：官方 size 形如 '1280x720'；请求未给像素时不下发（用网关缺省） */
@@ -137,39 +139,49 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
   /**
    * 视频任务创建（异步）：无参考图走 JSON；带首帧参考图走 multipart
    * （input_reference 文件字段——本地文件没法塞进 JSON 的 image_url）。
-   * 拿第二个及以后的参考图无官方语义，只用 refFiles[0]。
+   * 官方语义只有单张首帧，第二个及以后的参考图没有对应字段，只用第一条图片参考。
    */
   private async submitVideo(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
     const seconds = snapVideoSeconds(input.durationSeconds)
     const size = videoSizeFor(input.width, input.height)
-    const refFile = input.refFiles?.[0]
-    const response = refFile
-      ? await fetch(`${this.baseUrl}/videos`, {
-          method: 'POST',
-          headers: this.authHeaders(key),
-          body: (() => {
-            const form = new FormData()
-            form.append('model', requestModel)
-            form.append('prompt', input.prompt)
-            if (seconds !== undefined) form.append('seconds', String(seconds))
-            if (size) form.append('size', size)
-            form.append('input_reference', new Blob([readFileSync(refFile)], { type: mimeForImage(refFile) }), basename(refFile))
-            return form
-          })(),
-          // 只创建任务不生成：排队/鉴权都要不了几分钟，2 分钟足够
-          signal: AbortSignal.timeout(120_000)
-        })
-      : await fetch(`${this.baseUrl}/videos`, {
-          method: 'POST',
-          headers: { ...this.authHeaders(key), 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            model: requestModel,
-            prompt: input.prompt,
-            ...(seconds !== undefined ? { seconds } : {}),
-            ...(size ? { size } : {})
-          }),
-          signal: AbortSignal.timeout(120_000)
-        })
+    // 有首帧参考图走 multipart（input_reference 是文件字段，本地文件塞不进 JSON 的
+    // image_url）。官方语义只有单张首帧、没有多参考/role 概念，多余的由编排层按上限拦下
+    // 素材来源两种：本地文件（refs[].absPath）与公网/临时 URL（refs[].url，先取回字节）
+    const imageRefs = submitRefs(input).filter((r) => r.mediaType === 'image')
+    const refImage = imageRefs[0]
+    const refBytes = refImage ? await readRefBytes(refImage) : undefined
+    let body: FormData | string
+    let headers: Record<string, string>
+    if (refImage && refBytes) {
+      const form = new FormData()
+      form.append('model', requestModel)
+      form.append('prompt', input.prompt)
+      if (seconds !== undefined) form.append('seconds', String(seconds))
+      if (size) form.append('size', size)
+      form.append(
+        'input_reference',
+        new Blob([refBytes], { type: refImage.mime }),
+        refNameForSubmit(refImage)
+      )
+      body = form
+      // multipart 不能自己写 Content-Type（boundary 由 fetch 生成），只带认证头
+      headers = this.authHeaders(key)
+    } else {
+      body = JSON.stringify({
+        model: requestModel,
+        prompt: input.prompt,
+        ...(seconds !== undefined ? { seconds } : {}),
+        ...(size ? { size } : {})
+      })
+      headers = { ...this.authHeaders(key), 'Content-Type': 'application/json' }
+    }
+    const response = await fetch(`${this.baseUrl}/videos`, {
+      method: 'POST',
+      headers,
+      body,
+      // 只创建任务不生成：排队/鉴权都要不了几分钟，2 分钟足够
+      signal: AbortSignal.timeout(120_000)
+    })
     if (!response.ok) {
       const text = await response.text().catch(() => '')
       throw this.httpErrorMessage(response, text, '网关认证失败', '视频任务创建失败')
@@ -184,12 +196,14 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
 
   /** 同步出图（文生图）：url 形态编码进 jobId；b64 形态落临时文件 */
   private async submitImage(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
-    if (input.refFiles?.length) return this.submitEditImage(key, requestModel, input)
+    if (submitRefs(input).some((r) => r.mediaType === 'image')) return this.submitEditImage(key, requestModel, input)
+    const extras = this.imageExtras(input)
     const body: Record<string, unknown> = {
       model: requestModel,
       prompt: input.prompt,
       n: 1,
-      size: sizeFor(input.width, input.height)
+      size: sizeFor(input.width, input.height),
+      ...extras.body
     }
     const response = await fetch(`${this.baseUrl}/images/generations`, {
       method: 'POST',
@@ -203,7 +217,8 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
       throw this.httpErrorMessage(response, text, '网关认证失败', '图片生成失败')
     }
     return this.ingestImageResult(
-      (await response.json()) as { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } }
+      (await response.json()) as { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } },
+      extras.outputFormat
     )
   }
 
@@ -217,10 +232,18 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
     form.append('model', requestModel)
     form.append('prompt', input.prompt)
     form.append('size', sizeFor(input.width, input.height))
-    const refs = input.refFiles ?? []
-    const field = refs.length === 1 ? 'image' : 'image[]'
-    for (const file of refs) {
-      form.append(field, new Blob([readFileSync(file)], { type: mimeForImage(file) }), basename(file))
+    const extras = this.imageExtras(input)
+    for (const [field, value] of Object.entries(extras.body)) form.append(field, String(value))
+    // 官方 edits：image 单文件字段名 'image'、多文件 'image[]'，上限 16 张 × 每张 <50MB。
+    // 先把字节取齐再定字段名 —— 按"准备发几张"决定单/多数组，而不是按"请求里挂了几张"
+    const images: { bytes: Buffer; ref: ProviderMediaRef }[] = []
+    for (const ref of submitRefs(input).filter((r) => r.mediaType === 'image')) {
+      const bytes = await readRefBytes(ref)
+      if (bytes) images.push({ bytes, ref })
+    }
+    const field = images.length === 1 ? 'image' : 'image[]'
+    for (const { bytes, ref } of images) {
+      form.append(field, new Blob([bytes], { type: ref.mime }), refNameForSubmit(ref))
     }
     const response = await fetch(`${this.baseUrl}/images/edits`, {
       method: 'POST',
@@ -237,19 +260,40 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
       throw base
     }
     return this.ingestImageResult(
-      (await response.json()) as { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } }
+      (await response.json()) as { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } },
+      extras.outputFormat
     )
   }
 
   /** generations / edits 共用的结果解析：url 与 b64_json 双通道 */
-  private ingestImageResult(data: { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } }): string {
+  private ingestImageResult(
+    data: { data?: { url?: string; b64_json?: string }[]; error?: { message?: string } },
+    outputFormat?: string
+  ): string {
     const first = data.data?.[0]
     if (first?.url) return `${URL_PREFIX}${first.url}`
     if (first?.b64_json) {
-      const file = this.writeTemp(Buffer.from(first.b64_json, 'base64'), '.png')
+      // 请求里声明过 output_format 时临时文件跟着换扩展名（只认官方三档，别的值不进文件名）
+      const ext = IMAGE_OUTPUT_FORMATS.includes(String(outputFormat)) ? `.${outputFormat}` : '.png'
+      const file = this.writeTemp(Buffer.from(first.b64_json, 'base64'), ext)
       return `${FILE_PREFIX}${file}`
     }
     throw new Error(`结果里既没有 url 也没有 b64_json：${data.error?.message ?? JSON.stringify(data).slice(0, 200)}`)
+  }
+
+  /** 声明式附加参数 → 图片请求体字段（官方 images 族支持的四个可选参数） */
+  private imageExtras(input: ProviderSubmitInput): { body: Record<string, unknown>; outputFormat?: string } {
+    const body: Record<string, unknown> = {}
+    for (const key of ['quality', 'background', 'input_fidelity'] as const) {
+      const value = extraOf(input, key)
+      if (typeof value === 'string' || typeof value === 'number') body[key] = value
+    }
+    const format = extraOf(input, 'output_format')
+    if (typeof format === 'string' && IMAGE_OUTPUT_FORMATS.includes(format)) {
+      body.output_format = format
+      return { body, outputFormat: format }
+    }
+    return { body }
   }
 
   /** 同步语音：响应是二进制音频流，直接落临时文件 */
@@ -260,7 +304,7 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
       body: JSON.stringify({
         model: requestModel,
         input: input.prompt,
-        voice: this.config.models[requestModel]?.capabilities?.voices?.[0]?.id ?? 'alloy',
+        voice: input.voice ?? this.config.models[requestModel]?.capabilities?.voices?.[0]?.id ?? 'alloy',
         response_format: 'mp3'
       }),
       // 同步生成端点：长文本 TTS 生成耗时随篇幅增长，放宽到 5 分钟防误杀
@@ -325,6 +369,8 @@ export class OpenAICompatProvider extends BaseGatewayProvider<OpenAICompatModelC
       error?: { message?: string } | string
     }
     if (data.status === 'completed') return this.downloadVideo(key, videoId, data.seconds)
+    // 官方 videos.md 的终态枚举只有 completed/failed；cancelled 与 expired 是兼容网关的私有状态
+    // （不少网关自己加了取消与超时清理），一并当失败处理，不给它们编造官方语义
     if (data.status === 'failed' || data.status === 'cancelled' || data.status === 'expired') {
       const message = typeof data.error === 'string' ? data.error : data.error?.message
       return { status: 'failed', message: message ? `视频生成失败：${message}` : '视频生成失败（网关未给原因）' }
@@ -400,5 +446,18 @@ registerAdapter(
       () => deps.resolveKey(config),
       () => deps.mediaDir()
     ),
-  { defaultAuthEnv: 'OPENAI_API_KEY', supportedKinds: ['image', 'video', 'audio'] }
+  {
+    defaultAuthEnv: 'OPENAI_API_KEY',
+    supportedKinds: ['image', 'video', 'audio'],
+    // 官方（2026-10 openai-openapi 核实）：素材一律走 multipart 文件字段
+    // （/images/edits 的 image[] 最多 16 张、单张 <50MB；/videos 的 input_reference 单图）。
+    // 视频/音频**不是**这条通道的参考素材形态 —— sora 只接受一张首帧图
+    refCaps: {
+      byKind: {
+        image: { delivery: 'multipart', maxBytes: 50 * 1024 * 1024 },
+        video: { delivery: 'none' },
+        audio: { delivery: 'none' }
+      }
+    }
+  }
 )

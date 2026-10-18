@@ -1,8 +1,19 @@
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
 import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { submitRefs } from '../provider'
 import { registerAdapter, type AdapterDeps } from './registry'
 import { BaseGatewayProvider, buildModelRecord } from './base'
-import { firstImageRefDataUri } from './refImage'
+import { prepareRefs } from './refImage'
+
+/**
+ * MiniMax 参考素材的单文件上限（原始字节，2026-10 官方 V2 文档核实）：图 ≤30MB、
+ * 视频 ≤50MB、音频 ≤15MB，三类都支持 data URI；整个请求体 ≤64MB 的总闸在编排层预算。
+ */
+const MM_REF_MAX_BYTES: Partial<Record<MediaKind, number>> = {
+  image: 30 * 1024 * 1024,
+  video: 50 * 1024 * 1024,
+  audio: 15 * 1024 * 1024
+}
 
 /**
  * MiniMax 开放平台适配器（2026-10 对照 platform.minimax.io 官方文档逐页核实；
@@ -80,7 +91,9 @@ export class MiniMaxProvider extends BaseGatewayProvider<MiniMaxModelConfig> {
 
   /** 同步生图：结果 URL 直接编进 jobId，poll 原样回传 succeeded */
   private async submitImage(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
-    const refDataUri = await firstImageRefDataUri(input.refFiles)
+    // 官方 subject_reference 每次请求只收 1 张人像主体参考（不是缺口，是协议上限）
+    const refs = await prepareRefs(submitRefs(input), MM_REF_MAX_BYTES)
+    const refImage = refs.items.find((r) => r.mediaType === 'image')
     const body: Record<string, unknown> = {
       // 跟随清单里配置的模型标识（内置目录 remoteModel 即 image-01，行为不变；
       // 自定义供应商在 MiniMax 类型下加别的图片名不再被静默换成 image-01）
@@ -88,7 +101,7 @@ export class MiniMaxProvider extends BaseGatewayProvider<MiniMaxModelConfig> {
       prompt: input.prompt,
       response_format: 'url',
       ...(input.ratio ? { aspect_ratio: input.ratio } : {}),
-      ...(refDataUri ? { subject_reference: [{ type: 'character', image_file: refDataUri }] } : {})
+      ...(refImage ? { subject_reference: [{ type: 'character', image_file: refImage.url }] } : {})
     }
     const response = await fetch(`${this.baseUrl}${IMAGE_ENDPOINT}`, {
       method: 'POST',
@@ -116,9 +129,22 @@ export class MiniMaxProvider extends BaseGatewayProvider<MiniMaxModelConfig> {
 
   /** 异步视频：提交拿 task_id，轮询 /v2/query/video_generation/{task_id} */
   private async submitVideo(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
-    const refDataUri = await firstImageRefDataUri(input.refFiles)
+    // V2 的 content 三类素材都带 role：image_url（first_frame/last_frame/reference_image）、
+    // video_url（reference_video）、audio_url（reference_audio）。i2v（首/尾帧）与
+    // r2v（reference_*）互斥由编排层按模式声明判过，这里照 role 装配
+    const refs = await prepareRefs(submitRefs(input), MM_REF_MAX_BYTES)
     const content: Record<string, unknown>[] = [{ type: 'text', text: input.prompt }]
-    if (refDataUri) content.push({ type: 'image_url', image_url: { url: refDataUri }, role: 'first_frame' })
+    let frameRef = false
+    for (const ref of refs.items) {
+      if (ref.mediaType === 'image') {
+        if (ref.role === 'first_frame' || ref.role === 'last_frame') frameRef = true
+        content.push({ type: 'image_url', image_url: { url: ref.url }, role: ref.role })
+      } else if (ref.mediaType === 'video') {
+        content.push({ type: 'video_url', video_url: { url: ref.url }, role: 'reference_video' })
+      } else if (ref.mediaType === 'audio') {
+        content.push({ type: 'audio_url', audio_url: { url: ref.url }, role: 'reference_audio' })
+      }
+    }
     const body: Record<string, unknown> = {
       model: requestModel,
       content,
@@ -126,8 +152,8 @@ export class MiniMaxProvider extends BaseGatewayProvider<MiniMaxModelConfig> {
       resolution: this.resolutionFor(requestModel, input.height),
       // duration 必填整数；官方 H3 [4,15]、H3-Max [5,15]，缺省 5s 两档都合法
       duration: clamp(Math.round(input.durationSeconds ?? 5), requestModel === 'MiniMax-H3-Max' ? 5 : 4, 15),
-      // 文生视频 ratio 必填且不能 adaptive；图生视频比例固定随首帧，传了也被忽略，不传
-      ...(!refDataUri ? { ratio: input.ratio ?? '16:9' } : {})
+      // 文生视频 ratio 必填且不能 adaptive；首/尾帧模式比例固定随首帧，传了也被忽略，不传
+      ...(!frameRef ? { ratio: input.ratio ?? '16:9' } : {})
     }
     const response = await fetch(`${this.baseUrl}${VIDEO_ENDPOINT}`, {
       method: 'POST',
@@ -232,5 +258,19 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'MINIMAX_KEY', supportedKinds: ['image', 'video'] }
+  {
+    defaultAuthEnv: 'MINIMAX_KEY',
+    supportedKinds: ['image', 'video'],
+    // 官方（2026-10 核实）：V2 的 content[].url **三类素材都支持 data URI**，
+    // 也支持公网 URL 与 mm_file://{file_id}（文件上传通道）。这是五家里唯一能把参考视频
+    // 直接 base64 送进去的一家 —— 代价是请求体总闸 64MB 会先卡住大文件
+    refCaps: {
+      byKind: {
+        image: { delivery: 'data_uri', maxBytes: 30 * 1024 * 1024 },
+        video: { delivery: 'data_uri', maxBytes: 50 * 1024 * 1024, uploadChannel: 'minimax-files' },
+        audio: { delivery: 'data_uri', maxBytes: 15 * 1024 * 1024, uploadChannel: 'minimax-files' }
+      },
+      maxBodyBytes: 64 * 1024 * 1024
+    }
+  }
 )

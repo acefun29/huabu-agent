@@ -28,7 +28,13 @@ export default defineProvider({
       label: '混元生图',
       remoteModel: 'hunyuan-image',
       costHint: '按张计费（参考图场景仅支持 1:1/3:4/4:3 档；默认加"AI 生成"水印，置 0 需控制台申请）',
-      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 1 }
+      // 官方只有一张参考图的位置（ContentImage / Base64，二选一，≤8MB）：
+      // 逐角色声明出来，第二张素材会得到明确报错而不是被静默丢掉
+      capabilities: {
+        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
+        refModes: ['t2i', 'i2i'],
+        refQuota: [{ role: 'reference_image', max: 1 }]
+      }
     },
 
     /* ---------------- 视频 ---------------- */
@@ -38,7 +44,10 @@ export default defineProvider({
       label: '混元生视频',
       remoteModel: 'hunyuan-video',
       costHint: '按条计费（720p 固定分辨率；时长与比例由模型按提示词/首帧自定）',
-      capabilities: { maxRefImages: 1 }
+      capabilities: {
+        refModes: ['t2v', 'i2v_first'],
+        refQuota: [{ role: 'first_frame', max: 1 }]
+      }
     }
   ]
 })

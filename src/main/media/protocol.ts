@@ -1,7 +1,8 @@
 import { protocol } from 'electron'
 import { createReadStream } from 'fs'
 import { stat } from 'fs/promises'
-import { basename, resolve, sep } from 'path'
+import { resolve, sep } from 'path'
+import { extOfPath, mediaKindOfPath } from '../../shared/media'
 import { ensureThumbnail } from './thumbs'
 
 /**
@@ -186,29 +187,17 @@ function parseRange(header: string | null, size: number): { start: number; end: 
   return { start, end }
 }
 
-const MIME_BY_EXT: Record<string, string> = {
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.webp': 'image/webp',
-  '.gif': 'image/gif',
-  '.bmp': 'image/bmp',
-  '.svg': 'image/svg+xml',
-  '.mp4': 'video/mp4',
-  '.webm': 'video/webm',
-  '.mov': 'video/quicktime',
-  '.mkv': 'video/x-matroska',
-  '.mp3': 'audio/mpeg',
-  '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg',
-  '.m4a': 'audio/mp4',
-  '.flac': 'audio/flac'
+/**
+ * 协议服务侧的额外 MIME：不是网关可消费的媒体素材，但本地预览要能出对的 Content-Type。
+ * 媒体大类的 MIME 一律走 shared/media 的 MEDIA_EXT_KIND_MIME（全仓唯一一张表）。
+ */
+const EXTRA_MIME_BY_EXT: Record<string, string> = {
+  '.svg': 'image/svg+xml'
 }
 
 function mimeFor(target: string): string {
-  const dot = basename(target).lastIndexOf('.')
-  const ext = dot >= 0 ? target.slice(dot).toLowerCase() : ''
-  return MIME_BY_EXT[ext] ?? 'application/octet-stream'
+  const ext = extOfPath(target)
+  return EXTRA_MIME_BY_EXT[ext] ?? mediaKindOfPath(target)?.mime ?? 'application/octet-stream'
 }
 
 /** 构建媒体 URL（渲染端与主进程共用同一形态） */

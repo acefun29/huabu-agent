@@ -35,10 +35,13 @@ Thumbs.db
 
 # workspace runtime data (开发期测试工作区)
 .workspaces/
+# 工作区本地状态（.huabu：素材产物 / 技能 / 帧缓存 —— 属用户数据，不入库）
+.huabu/
 
 # 本地设计文档（不提交）
 docs/
 image-context-eviction-plan.md
+blockout-integration-plan.md
 
 # 本地启动脚本（不入库）
 start.bat

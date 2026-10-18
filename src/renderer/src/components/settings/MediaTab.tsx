@@ -10,8 +10,15 @@ import {
   DEFAULT_MEDIA_DURATION_S,
   DEFAULT_MEDIA_PROVIDER,
   DEFAULT_MEDIA_RATIO,
+  MEDIA_GEN_MODES,
+  MEDIA_MODE_LABEL,
   MEDIA_RATIOS,
+  MEDIA_REF_ROLES,
+  REF_ROLE_LABEL,
+  type MediaGenMode,
   type MediaRatio,
+  type MediaRefQuota,
+  type MediaRefRole,
   type ModelCapabilities
 } from '@shared/media'
 import { matchBareModelId, shortModelLabel } from '@shared/mediaResolve'
@@ -205,18 +212,56 @@ function authHintLabel(hint?: string): string {
 /**
  * 表单态能力参数 → media:user-add-* 载荷：全空则不留字段（不声明，参数面板与
  * 编排层按兜底走）。去重升序在这里先做一遍，主进程 sanitizeCapabilities 再同源兜底。
+ *
+ * `maxRefImages` 是已废弃的老字段：新声明一律走 refQuota/refModes/refTotal，
+ * 这里**不再写它**（存量配置仍由 normalizeMediaCaps 派生读取，零迁移）。
  */
-function capsPayload(caps: ModelCapabilities, costHint: string): { capabilities?: ModelCapabilities; costHint?: string } {
+function capsPayload(kind: MediaKind, caps: ModelCapabilities, costHint: string): { capabilities?: ModelCapabilities; costHint?: string } {
   const out: ModelCapabilities = {}
   if (caps.ratios?.length) out.ratios = [...new Set(caps.ratios)]
   if (caps.durations?.length) out.durations = [...new Set(caps.durations)].sort((a, b) => a - b)
-  if (typeof caps.maxRefImages === 'number' && Number.isFinite(caps.maxRefImages) && caps.maxRefImages > 0) {
-    out.maxRefImages = Math.floor(caps.maxRefImages)
-  }
+  const refQuota = (caps.refQuota ?? [])
+    .filter((q) => MEDIA_REF_ROLES.includes(q.role) && Number.isFinite(q.max) && q.max > 0)
+    .map((q) => ({ role: q.role, max: Math.floor(q.max) }))
+  // 存量只有 maxRefImages 的模型：编辑时按老语义搬成逐角色配额，不让它悄悄退回兜底 4 张
+  if (refQuota.length === 0) refQuota.push(...legacyQuota(kind, caps.maxRefImages))
+  if (refQuota.length > 0) out.refQuota = refQuota
+  if (caps.refModes?.length) out.refModes = [...new Set(caps.refModes)]
+  if (Number.isFinite(caps.refTotal) && (caps.refTotal ?? 0) > 0) out.refTotal = Math.floor(caps.refTotal!)
+  const voices = (caps.voices ?? []).filter((v) => v.id.trim()).map((v) => ({ id: v.id.trim(), label: (v.label ?? v.id).trim() || v.id.trim() }))
+  if (voices.length > 0) out.voices = voices
   return {
     ...(Object.keys(out).length > 0 ? { capabilities: out } : {}),
     ...(costHint.trim() ? { costHint: costHint.trim() } : {})
   }
+}
+
+/** 该模型大类下可声明的参考角色（音频通道今天没有任何参考输入） */
+function rolesForKind(kind: MediaKind): MediaRefRole[] {
+  if (kind === 'image') return ['reference_image']
+  if (kind === 'video') {
+    return ['first_frame', 'last_frame', 'reference_image', 'reference_video', 'reference_audio']
+  }
+  return []
+}
+
+/**
+ * 老字段 `maxRefImages` 折算成逐角色配额（与主进程 normalizeMediaCaps 同一映射）：
+ * 图片模型 = 参考图 N 张，视频模型 = 首帧 1 张。设置页据此显示与保存，不再写回老字段。
+ */
+function legacyQuota(kind: MediaKind, maxRefImages: number | undefined): MediaRefQuota[] {
+  const n = Math.floor(Number(maxRefImages))
+  if (!Number.isFinite(n) || n <= 0) return []
+  return [{ role: kind === 'video' ? 'first_frame' : 'reference_image', max: n }]
+}
+
+/** 配额编辑器里每个角色的一句话说明（各家官方语义，避免把首帧当参考图填） */
+const REF_ROLE_NOTE: Record<MediaRefRole, string> = {
+  first_frame: '视频从这张图开始（图生视频的首帧）',
+  last_frame: '视频在这张图结束，需与首帧同时给',
+  reference_image: '垫图 / 风格参考，不决定构图边界',
+  reference_video: '参考视频：方舟只收公网 URL，百炼需先上传换临时引用',
+  reference_audio: '参考音频：百炼需先上传换临时引用'
 }
 
 /**
@@ -252,13 +297,68 @@ function ModelCapsFields({
     onChange({ capabilities: { ...caps, ...(parsed.length > 0 ? { durations: parsed } : {}) }, costHint })
   }
 
+  /** 逐角色配额：留空 = 该角色不接受（与"接受但没声明上限"是两件事，后者走兜底 4 张） */
+  const setRoleMax = (role: MediaRefRole, value: number | string) => {
+    const list = (caps.refQuota ?? []).filter((q) => q.role !== role)
+    const n = Number(value)
+    if (Number.isFinite(n) && n > 0) list.push({ role, max: Math.floor(n) })
+    onChange({ capabilities: { ...caps, ...(list.length > 0 ? { refQuota: list } : {}) }, costHint })
+  }
+
+  const toggleMode = (mode: MediaGenMode) => {
+    const list = caps.refModes ?? []
+    const next = list.includes(mode) ? list.filter((m) => m !== mode) : [...list, mode]
+    onChange({ capabilities: { ...caps, ...(next.length > 0 ? { refModes: next } : {}) }, costHint })
+  }
+
+  const patchVoices = (voices: { id: string; label: string }[]) =>
+    onChange({ capabilities: { ...caps, ...(voices.length > 0 ? { voices } : {}) }, costHint })
+
   return (
     <div className="space-y-2.5 rounded-xl bg-(--surface-input) p-2.5">
       <div className="text-[10px] leading-relaxed text-(--on-surface-muted)">
-        可选。声明后生成卡片的比例 / 时长档位与垫图上限按这里走；留空则用兜底（全部比例、默认时长档、最多 4 张垫图）。
+        可选。声明后生成卡片的比例 / 时长档位与参考素材配额按这里走；留空则用兜底（全部比例、默认时长档、最多 4 张参考图）。
       </div>
       {isAudio ? (
-        <div className="text-[11px] text-(--on-surface-muted)">音频模型按文稿长度合成，无需声明比例 / 时长 / 垫图。</div>
+        <div>
+          <div className="mb-1 text-[11px] font-medium text-(--on-surface-variant)">
+            可用音色（TTS 的 voice 字段；不填 = 用网关默认音色）
+          </div>
+          {(caps.voices ?? []).map((v, i) => (
+            <div key={i} className="mb-1.5 flex items-center gap-1.5">
+              <input
+                value={v.id}
+                onChange={(e) =>
+                  patchVoices((caps.voices ?? []).map((x, j) => (j === i ? { ...x, id: e.target.value } : x)))
+                }
+                placeholder="音色 id，如 alloy"
+                className={inputCls}
+              />
+              <input
+                value={v.label}
+                onChange={(e) =>
+                  patchVoices((caps.voices ?? []).map((x, j) => (j === i ? { ...x, label: e.target.value } : x)))
+                }
+                placeholder="展示名"
+                className={inputCls}
+              />
+              <button
+                type="button"
+                onClick={() => patchVoices((caps.voices ?? []).filter((_, j) => j !== i))}
+                className="shrink-0 cursor-pointer rounded px-1.5 py-0.5 text-[11px] text-(--on-surface-muted) ring-1 ring-(--outline-soft) hover:text-(--danger)"
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => patchVoices([...(caps.voices ?? []), { id: '', label: '' }])}
+            className="cursor-pointer rounded-full px-2 py-0.5 text-[11px] text-(--accent) ring-1 ring-(--outline-soft) hover:bg-(--surface-chip)"
+          >
+            + 添加音色
+          </button>
+        </div>
       ) : (
         <>
           <div>
@@ -292,23 +392,79 @@ function ModelCapsFields({
                 className={inputCls}
               />
             </Field>
-            <Field label="垫图数量上限（不声明 = 4）">
+            <Field label="参考素材总条数上限（不声明 = 各角色之和）">
               <input
                 type="number"
                 min={1}
-                max={30}
-                value={caps.maxRefImages ?? ''}
+                max={64}
+                value={caps.refTotal ?? ''}
                 onChange={(e) => {
                   const n = Number(e.target.value)
                   onChange({
-                    capabilities: { ...caps, ...(Number.isFinite(n) && n > 0 ? { maxRefImages: Math.floor(n) } : {}) },
+                    capabilities: { ...caps, ...(Number.isFinite(n) && n > 0 ? { refTotal: Math.floor(n) } : {}) },
                     costHint
                   })
                 }}
-                placeholder="4"
+                placeholder="如 20"
                 className={inputCls}
               />
             </Field>
+          </div>
+          <div>
+            <div className="mb-1 text-[11px] font-medium text-(--on-surface-variant)">
+              参考素材配额（留空 = 该角色不接受；超出条数会截断并在卡片上留痕）
+            </div>
+            <div className="flex flex-col gap-1.5">
+              {rolesForKind(kind).map((role) => {
+                // 只显示存量老字段折算出来的配额（不改写 caps；用户一动配额键就落成新形状）
+                const legacy = legacyQuota(kind, caps.maxRefImages)
+                const source = caps.refQuota?.length ? caps.refQuota : legacy
+                const entry = source.find((q) => q.role === role)
+                return (
+                  <div key={role} className="flex items-center gap-2">
+                    <span className="w-16 shrink-0 text-[11px] text-(--on-surface-variant)">{REF_ROLE_LABEL[role]}</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={64}
+                      value={entry?.max ?? ''}
+                      onChange={(e) => setRoleMax(role, e.target.value)}
+                      placeholder="不接受"
+                      className={`${inputCls} w-24`}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-[10px] text-(--on-surface-muted)" title={REF_ROLE_NOTE[role]}>
+                      {REF_ROLE_NOTE[role]}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+          <div>
+            <div className="mb-1 text-[11px] font-medium text-(--on-surface-variant)">
+              支持的用法（一个都不选 = 按上面的配额自动推导）
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {MEDIA_GEN_MODES.filter((m) =>
+                kind === 'image' ? m === 't2i' || m === 'i2i' : m === 't2v' || m === 'i2v_first' || m === 'i2v_fl' || m === 'r2v'
+              ).map((mode) => {
+                const on = caps.refModes?.includes(mode) ?? false
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => toggleMode(mode)}
+                    className={`rounded-full px-2 py-0.5 text-[11px] ring-1 transition-colors ${
+                      on
+                        ? 'bg-(--surface-chip) font-medium text-(--on-surface) ring-(--outline)'
+                        : 'text-(--on-surface-muted) ring-(--outline-soft) hover:text-(--on-surface)'
+                    }`}
+                  >
+                    {MEDIA_MODE_LABEL[mode]}
+                  </button>
+                )
+              })}
+            </div>
           </div>
         </>
       )}
@@ -359,7 +515,7 @@ function MediaAddProviderView({
       ...(npType === 'gateway-openai-compat' && npBaseUrl.trim() ? { baseUrl: npBaseUrl.trim() } : {}),
       ...(npType === 'gateway-openai-compat' ? { authStyle: npAuthStyle } : {}),
       ...(npAuthEnv.trim() ? { authEnv: npAuthEnv.trim() } : {}),
-      firstModel: { id: npModelId.trim(), kind: effectiveModelKind, ...capsPayload(npCaps, npCostHint) }
+      firstModel: { id: npModelId.trim(), kind: effectiveModelKind, ...capsPayload(effectiveModelKind, npCaps, npCostHint) }
     })
     if (error) {
       onNotice(`新增供应商失败：${error}`)
@@ -655,7 +811,7 @@ function MediaProviderDetail({
       providerId: provider.id,
       id: nmId.trim(),
       kind: effectiveNmKind,
-      ...capsPayload(nmCaps, nmCostHint)
+      ...capsPayload(effectiveNmKind, nmCaps, nmCostHint)
     })
     if (error) {
       onNotice(`添加模型失败：${error}`)

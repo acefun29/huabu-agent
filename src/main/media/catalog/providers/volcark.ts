@@ -1,6 +1,16 @@
 import { defineProvider } from '../define'
 
 /**
+ * 方舟的声明式附加参数（2026-10 官方 API 核实）：图片与视频都有 watermark；
+ * generate_audio 是 Seedance 2.x 的有声开关（1.x legacy 走 --flag 文本，不在这里）。
+ */
+const ARK_IMAGE_EXTRAS = [{ key: 'watermark', label: '水印', type: 'boolean' as const }]
+const ARK_VIDEO_EXTRAS = [
+  { key: 'watermark', label: '水印', type: 'boolean' as const },
+  { key: 'generate_audio', label: '生成音轨', type: 'boolean' as const }
+]
+
+/**
  * 火山方舟内置目录（2026-10-09 对照 docs.volcengine.com 官方 API 文档核实：
  * 图片生成 API / 创建视频生成任务 API / Seedream·Seedance 教程页 / 模型广场）。
  *
@@ -35,7 +45,8 @@ export default defineProvider({
       label: 'Seedream 5.0 Pro',
       remoteModel: 'doubao-seedream-5-0-pro-260628',
       costHint: '按张计费（旗舰档，支持图层拆分与交互编辑）',
-      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 1 }
+      // 官方 image 上限：5.0 pro/flash 10 张，5.0 lite / 4.5 / 4.0 14 张
+      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 10, extraParams: ARK_IMAGE_EXTRAS }
     },
     {
       id: 'volcark/seedream-5.0-flash',
@@ -43,7 +54,7 @@ export default defineProvider({
       label: 'Seedream 5.0 Flash',
       remoteModel: 'doubao-seedream-5-0-flash-260915',
       costHint: '按张计费（5.0 快速档，支持坐标/框选交互编辑）',
-      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 1 }
+      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 10, extraParams: ARK_IMAGE_EXTRAS }
     },
     {
       id: 'volcark/seedream-5.0-lite',
@@ -51,7 +62,7 @@ export default defineProvider({
       label: 'Seedream 5.0 Lite',
       remoteModel: 'doubao-seedream-5-0-lite-260128',
       costHint: '按张计费（5.0 最低价档）',
-      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 1 }
+      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 14, extraParams: ARK_IMAGE_EXTRAS }
     },
     {
       id: 'volcark/seedream-4.5',
@@ -59,7 +70,7 @@ export default defineProvider({
       label: 'Seedream 4.5',
       remoteModel: 'doubao-seedream-4-5-251128',
       costHint: '约 0.2 元/张',
-      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 1 }
+      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 14, extraParams: ARK_IMAGE_EXTRAS }
     },
     {
       id: 'volcark/seedream-4.0',
@@ -68,7 +79,7 @@ export default defineProvider({
       remoteModel: 'doubao-seedream-4-0-250828',
       costHint: '约 0.2 元/张',
       status: 'deprecated',
-      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 1 }
+      capabilities: { ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'], maxRefImages: 14, extraParams: ARK_IMAGE_EXTRAS }
     },
 
     /* ---------------- 视频 ---------------- */
@@ -78,7 +89,21 @@ export default defineProvider({
       label: 'Seedance 2.5（原生有声）',
       remoteModel: 'doubao-seedance-2-5-260628',
       costHint: '按秒计费（支持 4~30 秒，默认可选 720p/1080p）',
-      capabilities: { durations: [5, 10, 15, 30], maxRefImages: 1 }
+      // 官方全模态参考上限：30 图 / 10 视频 / 10 音频（合计 50）；首帧、首尾帧、
+      // 全模态参考三种用法互斥。参考视频只收公网 URL（见适配器 refCaps）
+      capabilities: {
+        durations: [5, 10, 15, 30],
+        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'],
+        refModes: ['t2v', 'i2v_first', 'i2v_fl', 'r2v'],
+        refQuota: [
+          { role: 'first_frame', max: 1 },
+          { role: 'last_frame', max: 1 },
+          { role: 'reference_image', max: 30 },
+          { role: 'reference_video', max: 10 },
+          { role: 'reference_audio', max: 10 }
+        ],
+        extraParams: ARK_VIDEO_EXTRAS
+      }
     },
     {
       id: 'volcark/seedance-2.0',
@@ -86,7 +111,20 @@ export default defineProvider({
       label: 'Seedance 2.0（标准版，原生有声）',
       remoteModel: 'doubao-seedance-2-0-260128',
       costHint: '按秒计费（2.0 标准档，支持 1080P；480P/720P/1080P 三档）',
-      capabilities: { durations: [4, 5, 10, 15], maxRefImages: 1 }
+      // 官方 2.0 系上限：9 图 / 3 视频 / 3 音频（合计 15），音频不可单独传
+      capabilities: {
+        durations: [4, 5, 10, 15],
+        ratios: ['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'],
+        refModes: ['t2v', 'i2v_first', 'i2v_fl', 'r2v'],
+        refQuota: [
+          { role: 'first_frame', max: 1 },
+          { role: 'last_frame', max: 1 },
+          { role: 'reference_image', max: 9 },
+          { role: 'reference_video', max: 3 },
+          { role: 'reference_audio', max: 3 }
+        ],
+        extraParams: ARK_VIDEO_EXTRAS
+      }
     },
     {
       id: 'volcark/seedance-2.0-fast',

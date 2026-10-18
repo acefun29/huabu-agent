@@ -1,4 +1,5 @@
-import type { MediaKind, MediaModelInfo, MediaProviderType, MediaRatio } from '../../shared/media'
+import type { MediaKind, MediaModelInfo, MediaProviderType, MediaRatio, MediaRefRole } from '../../shared/media'
+import { MEDIA_EXT_KIND_MIME, extOfPath } from '../../shared/media'
 
 /**
  * MediaProvider 契约层（M11）。
@@ -11,6 +12,25 @@ import type { MediaKind, MediaModelInfo, MediaProviderType, MediaRatio } from '.
  * 目录与 workspace.json 用户覆盖层合并（mergeCatalog），「加模型」是纯数据改动。
  */
 
+/**
+ * 已解析、可直接装进各家协议 body 的参考素材。
+ *
+ * **只带路径/URL 与字节数，绝不带 base64**：这条结构会随 JobRecord 长期驻留在内存里
+ * （账本保留最近 50 条终态任务），编码必须在 adapter.submit 内部即时做、即时释放。
+ */
+export interface ProviderMediaRef {
+  role: MediaRefRole
+  /** 素材大类（由扩展名判定，已校验与 role 匹配） */
+  mediaType: MediaKind
+  mime: string
+  /** 原始字节数（编排层 stat 得到，适配器据此自决 data URI 还是 multipart） */
+  bytes: number
+  /** 本地文件绝对路径（已校验存在/越界/类型/配额）；与 url 互斥 */
+  absPath?: string
+  /** 公网 URL，或上传通道换来的临时引用（oss://… / mm_file://…），原样透传 */
+  url?: string
+}
+
 /** 提交时传给 provider 的规范化输入 */
 export interface ProviderSubmitInput {
   prompt: string
@@ -18,9 +38,35 @@ export interface ProviderSubmitInput {
   ratio?: MediaRatio
   width?: number
   height?: number
+  /** 视频/音频时长（秒） */
   durationSeconds?: number
-  /** 参考文件（垫图/首帧）绝对路径。mock 忽略；真实网关把首个图片参考转 data URI 附到请求 */
-  refFiles?: string[]
+  /** 音色 id（音频通道；编排层已按 capabilities.voices 校验过，缺省 = 适配器默认） */
+  voice?: string
+  /**
+   * 带角色的参考素材（编排层已完成类型校验、配额截断与投递形态判定）。
+   * 适配器读参考素材的唯一入口，见 {@link submitRefs}。
+   */
+  refs?: ProviderMediaRef[]
+  /** 经 capabilities.extraParams 白名单校验过的供应商特有参数（未声明的键不会到这里） */
+  extra?: Record<string, string | number | boolean>
+}
+
+/**
+ * 适配器读取参考素材的唯一入口：原样透传编排层校验过的素材。
+ * 角色、大类、体积、投递形态都在闸门定过，适配器只做协议映射 ——
+ * 需要按大类挑字段（图/视频/音频）的自己 `filter((r) => r.mediaType === …)`。
+ */
+export function submitRefs(input: ProviderSubmitInput): ProviderMediaRef[] {
+  return input.refs ?? []
+}
+
+/**
+ * 附加参数取值：适配器只挑自家协议真认识的键（调用点显式写 key），
+ * 没被任何调用点挑走的键永远不会进请求体。编排层已按 capabilities.extraParams
+ * 白名单校验过，这里不再判合法性，只按类型取用。
+ */
+export function extraOf(input: ProviderSubmitInput, key: string): string | number | boolean | undefined {
+  return input.extra?.[key]
 }
 
 /** 一次轮询的结果。gateway 返回 URL（由编排层下载），mock 直接给本地文件 */
@@ -54,36 +100,12 @@ export interface MediaProviderAdapter {
   cancel?(jobId: string): Promise<void>
 }
 
-/** 常见 mime 推断 */
+/** 常见 mime 推断（扩展名表在 shared/media 的 MEDIA_EXT_KIND_MIME，全仓唯一一份） */
 export function mimeForKind(kind: MediaKind, ext?: string): string {
-  const byExt: Record<string, string> = {
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.webp': 'image/webp',
-    '.gif': 'image/gif',
-    '.mp4': 'video/mp4',
-    '.webm': 'video/webm',
-    '.mov': 'video/quicktime',
-    '.mp3': 'audio/mpeg',
-    '.wav': 'audio/wav',
-    '.ogg': 'audio/ogg',
-    '.m4a': 'audio/mp4',
-    '.flac': 'audio/flac'
-  }
-  if (ext && byExt[ext.toLowerCase()]) return byExt[ext.toLowerCase()]
-  switch (kind) {
-    case 'image':
-      return 'image/png'
-    case 'video':
-      return 'video/mp4'
-    case 'audio':
-      return 'audio/wav'
-  }
+  const byExt = ext ? MEDIA_EXT_KIND_MIME[ext.toLowerCase()]?.mime : undefined
+  return byExt ?? (kind === 'image' ? 'image/png' : kind === 'video' ? 'video/mp4' : 'audio/wav')
 }
 
 export function extForUrl(url: string, kind: MediaKind): string {
-  const match = /\.([a-z0-9]{2,5})(?:\?|$)/i.exec(url)
-  if (match) return `.${match[1].toLowerCase()}`
-  return kind === 'image' ? '.png' : kind === 'video' ? '.mp4' : '.wav'
+  return extOfPath(url) || (kind === 'image' ? '.png' : kind === 'video' ? '.mp4' : '.wav')
 }

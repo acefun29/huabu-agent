@@ -1,5 +1,6 @@
 import { join } from 'path'
 import type { MediaJobStatus } from '@shared/ipc'
+import type { MediaRefInput } from '../../shared/media'
 import type { AdapterProviderConfig } from '../media/adapters'
 import { resolveMediaTarget } from '../../shared/mediaResolve'
 import { MEDIA_ROOT_REL, assetDirForKind } from '../../shared/assets'
@@ -18,7 +19,7 @@ import { createVideoTools } from './videoTools'
  * 里用 mock 依赖逐条断言（probe:media-assembly）：
  *
  * - submit 拼装：落库链（resolveOutputLibrary）→ outputDir 条件透传；
- *   refPaths 空数组不传字段；sourceChatId = nodeId；
+ *   refs 空数组不传字段；sourceChatId = nodeId；
  * - 失败分类：resolveAgentMedia 抛「没有可用的 X 生成模型」→ mediaTools 的
  *   failureGuidance 保留关键词原样进工具结果（Agent 一轮拿到指引）；
  * - capabilities/confirmVideo 均为现读闭包（T2 语义：改设置即时生效）。
@@ -51,7 +52,8 @@ export interface MediaAssemblyDeps {
       name?: string
       ratio?: string
       durationSeconds?: number
-      refPaths?: string[]
+      voice?: string
+      refs?: MediaRefInput[]
       outputDir?: string
       sourceChatId?: string
     }): Promise<{ jobId: string }>
@@ -145,7 +147,8 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
         ...(input.name ? { name: input.name } : {}),
         ...(input.ratio ? { ratio: input.ratio } : {}),
         ...(input.durationSeconds ? { durationSeconds: input.durationSeconds } : {}),
-        ...(input.refPaths && input.refPaths.length > 0 ? { refPaths: input.refPaths } : {}),
+        ...(input.voice ? { voice: input.voice } : {}),
+        ...(input.refs && input.refs.length > 0 ? { refs: input.refs } : {}),
         ...(outputLibrary ? { outputDir: outputLibrary } : {}),
         sourceChatId: nodeId
       })

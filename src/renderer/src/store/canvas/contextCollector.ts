@@ -136,7 +136,7 @@ const GEN_STATUS_LABEL: Record<AssetGen['status'], string> = {
 
 function genSummaryFor(d: AssetData): string {
   const gen = d.gen!
-  const params: string[] = [`比例 ${gen.params.ratio}`]
+  const params: string[] = [gen.params.ratio ? `比例 ${gen.params.ratio}` : '比例 自动']
   if (gen.params.durationSeconds) params.push(`${gen.params.durationSeconds}s`)
   if (gen.params.model) params.push(`模型 ${gen.params.model}`)
   return [

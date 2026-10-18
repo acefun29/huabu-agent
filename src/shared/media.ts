@@ -22,7 +22,15 @@ export type MediaAccessMode = 'full' | 'confirm'
  * 此前 '16:9' / 5s / 并发 3 散在 ipc.ts、canvasStore、SettingsPanel 五处，
  * 改一处忘其余；主进程与渲染端一律从这里取。
  */
-export const MEDIA_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9'] as const
+/**
+ * 比例枚举。`21:9` 是 2026-10 官方文档核实的三家共有档（方舟 Seedance、百炼 Wan、
+ * MiniMax H3 都收）。
+ *
+ * 官方还有个 `adaptive`，但它**不是比例**、语义是"跟着首帧/输入素材走"，
+ * 所以不进这个 union：调用方不给 ratio，由各适配器在有首帧时按自家协议发 adaptive
+ *（见 volcark / openaiCompat / dashscope 的 ratio 处理）。
+ */
+export const MEDIA_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'] as const
 export type MediaRatio = (typeof MEDIA_RATIOS)[number]
 export const DEFAULT_MEDIA_PROVIDER = 'dashscope'
 export const DEFAULT_MEDIA_RATIO: MediaRatio = '16:9'
@@ -47,6 +55,8 @@ export function ratioToPixels(ratio: MediaRatio): { width: number; height: numbe
       return { width: 720, height: 1280 }
     case '16:9':
       return { width: 1280, height: 720 }
+    case '21:9':
+      return { width: 1536, height: 640 }
   }
 }
 
@@ -72,6 +82,54 @@ export function nearestMediaRatio(width: number, height: number): MediaRatio | u
 }
 
 /**
+ * 扩展名 → 媒体大类与 MIME 的**唯一事实源**（原先散在 provider.mimeForKind、
+ * ipc/media.guessKind/mimeFromExt、adapters/refImage.EXT_MIME、
+ * adapters/openaiCompat.mimeForImage 五份，改一处漏其余）。
+ *
+ * 判定只看扩展名、**不做魔数嗅探**：参考素材要能喂给网关就必须先读盘，而类型判定的
+ * 调用点在读盘之前（体积预算要能在不开盘的前提下先算总闸），且 catalog:check 的夹具是
+ * 假字节文件 —— 嗅探会把回归夹具全打挂。后来人请勿"顺手加嗅探"。
+ *
+ * 取值范围按各家官方声明的并集（火山/百炼/MiniMax 的参考图接受 bmp/tiff/heic），
+ * 具体某个网关收哪些格式属于投递形态约束，在各适配器与 refCaps 里判，不在这张表里判。
+ */
+export const MEDIA_EXT_KIND_MIME: Record<string, { kind: MediaKind; mime: string }> = {
+  '.png': { kind: 'image', mime: 'image/png' },
+  '.jpg': { kind: 'image', mime: 'image/jpeg' },
+  '.jpeg': { kind: 'image', mime: 'image/jpeg' },
+  '.webp': { kind: 'image', mime: 'image/webp' },
+  '.gif': { kind: 'image', mime: 'image/gif' },
+  '.bmp': { kind: 'image', mime: 'image/bmp' },
+  '.tif': { kind: 'image', mime: 'image/tiff' },
+  '.tiff': { kind: 'image', mime: 'image/tiff' },
+  '.heic': { kind: 'image', mime: 'image/heic' },
+  '.heif': { kind: 'image', mime: 'image/heif' },
+  '.mp4': { kind: 'video', mime: 'video/mp4' },
+  '.mov': { kind: 'video', mime: 'video/quicktime' },
+  '.webm': { kind: 'video', mime: 'video/webm' },
+  '.mkv': { kind: 'video', mime: 'video/x-matroska' },
+  '.avi': { kind: 'video', mime: 'video/x-msvideo' },
+  '.mp3': { kind: 'audio', mime: 'audio/mpeg' },
+  '.wav': { kind: 'audio', mime: 'audio/wav' },
+  '.m4a': { kind: 'audio', mime: 'audio/mp4' },
+  '.ogg': { kind: 'audio', mime: 'audio/ogg' },
+  '.flac': { kind: 'audio', mime: 'audio/flac' },
+  '.aac': { kind: 'audio', mime: 'audio/aac' }
+}
+
+/** 取路径/文件名的扩展名（小写含点；无扩展名或点开头文件返回 ''） */
+export function extOfPath(pathOrName: string): string {
+  const base = (pathOrName.split(/[\\/]/).pop() ?? '').split(/[?#]/)[0]
+  const dot = base.lastIndexOf('.')
+  return dot <= 0 ? '' : base.slice(dot).toLowerCase()
+}
+
+/** 按扩展名识别媒体大类与 MIME；认不出返回 undefined（调用方决定丢弃还是报错） */
+export function mediaKindOfPath(pathOrName: string): { kind: MediaKind; mime: string } | undefined {
+  return MEDIA_EXT_KIND_MIME[extOfPath(pathOrName)]
+}
+
+/**
  * 适配器类型 union 的**唯一声明处**（built-in catalog 架构）。
  *
  * workspace/store.ts 与 shared/ipc.ts 一律从这里引用，不再各自手写 union；
@@ -80,23 +138,399 @@ export function nearestMediaRatio(width: number, height: number): MediaRatio | u
  */
 export type MediaProviderType = 'gateway-dashscope' | 'gateway-volcark' | 'gateway-openai-compat' | 'gateway-minimax' | 'gateway-tencent'
 
-/** 模型能力元数据：驱动渲染端参数面板（能力驱动化渐进迁移，见 catalog 设计 §3.2） */
+/**
+ * 参考素材的角色（2026-10 官方文档核实：方舟 Seedance 与 MiniMax V2 的 role 枚举逐字相同，
+ * 百炼 Wan3.0 是同一套并集再加 file/link）。角色是各家协议的共同语言，不是某家的私有能力。
+ */
+export type MediaRefRole = 'first_frame' | 'last_frame' | 'reference_image' | 'reference_video' | 'reference_audio'
+
+export const MEDIA_REF_ROLES: readonly MediaRefRole[] = [
+  'first_frame',
+  'last_frame',
+  'reference_image',
+  'reference_video',
+  'reference_audio'
+]
+
+/** 每个角色吃哪种媒体大类（缺这个就没法校验"给 reference_video 挂了张 png"） */
+export const MEDIA_ROLE_KIND: Record<MediaRefRole, MediaKind> = {
+  first_frame: 'image',
+  last_frame: 'image',
+  reference_image: 'image',
+  reference_video: 'video',
+  reference_audio: 'audio'
+}
+
+/**
+ * 生成场景模式。三家官方都把"首帧 / 首尾帧 / 全模态参考"写成**互斥的三种用法**，
+ * 与其让上层自由拼角色再指望网关给个好错误，不如把模式显式建模。
+ */
+export type MediaGenMode = 't2i' | 'i2i' | 't2v' | 'i2v_first' | 'i2v_fl' | 'r2v'
+
+export const MEDIA_GEN_MODES: readonly MediaGenMode[] = ['t2i', 'i2i', 't2v', 'i2v_first', 'i2v_fl', 'r2v']
+
+/** 模式 → 该模式允许的角色的唯一事实源（互斥关系就在这里，不在任何适配器里） */
+export const MEDIA_MODE_ROLES: Record<MediaGenMode, readonly MediaRefRole[]> = {
+  t2i: [],
+  i2i: ['reference_image'],
+  t2v: [],
+  i2v_first: ['first_frame'],
+  i2v_fl: ['first_frame', 'last_frame'],
+  r2v: ['reference_image', 'reference_video', 'reference_audio']
+}
+
+/** 模式的中文说法（错误文案与设置页展示共用） */
+export const MEDIA_MODE_LABEL: Record<MediaGenMode, string> = {
+  t2i: '文生图',
+  i2i: '图生图',
+  t2v: '文生视频',
+  i2v_first: '首帧图生视频',
+  i2v_fl: '首尾帧图生视频',
+  r2v: '全模态参考生成'
+}
+
+/**
+ * 角色依赖：尾帧必须与首帧同批提交（方舟、百炼、MiniMax 三家一致——尾帧没有独立语义）。
+ * 全模态参考的三类角色之间没有依赖，只挂一条参考视频是合法用法。
+ */
+export const MEDIA_ROLE_REQUIRES: Partial<Record<MediaRefRole, readonly MediaRefRole[]>> = {
+  last_frame: ['first_frame']
+}
+
+/** 单个角色的配额（未声明的角色 = 该模型不接受） */
+export interface MediaRefQuota {
+  role: MediaRefRole
+  max: number
+}
+
+/**
+ * 未显式指定角色时，按素材大类 + 序数 + 模型配额派生角色（画布与工具共用同一条规则）。
+ *
+ * 派生刻意保守：视频通道的第一张图是首帧（就是老语义），其余优先按参考图；
+ * 优先项没被声明时退回该大类里被声明的角色 —— 让"多挂的素材"走截断留痕，
+ * 而不是冒出一条"角色不支持"把整单拦死。一个都找不到才认定这条素材用不到。
+ */
+export function deriveRefRole(
+  assetKind: MediaKind,
+  modelKind: MediaKind,
+  index: number,
+  quota: Partial<Record<MediaRefRole, number>>
+): MediaRefRole | null {
+  const has = (role: MediaRefRole) => (quota[role] ?? 0) > 0
+  const candidates: MediaRefRole[] =
+    assetKind === 'image'
+      ? modelKind === 'video' && index === 0
+        ? ['first_frame', 'reference_image']
+        : ['reference_image', 'first_frame']
+      : assetKind === 'video'
+        ? ['reference_video']
+        : ['reference_audio']
+  return candidates.find(has) ?? null
+}
+
+/** 跨 IPC 的参考素材形状：path（工作区内相对路径）与 url（公网/临时引用）二选一 */
+export interface MediaRefInput {
+  role: MediaRefRole
+  path?: string
+  url?: string
+}
+
+/** 派生完成、可直接判定的能力（只在内存里存在，不落盘、不跨 IPC） */
+export interface ResolvedRefCaps {
+  modes: MediaGenMode[]
+  quota: Partial<Record<MediaRefRole, number>>
+  /** 素材总件数闸（百炼单次 ≤20 这类）；缺省 = 各角色配额之和 */
+  total: number
+  /** true = 由 maxRefImages/兜底值派生（文案与设置页据此说明"这是老声明，未逐角色建模"） */
+  legacy: boolean
+}
+
+/** 素材上限的兜底值（模型什么都没声明时沿用历史行为：最多 4 张图片参考） */
+export const DEFAULT_MAX_REF_IMAGES = 4
+
+/**
+ * 把能力声明归一成可判定的参考配额。这是**唯一**的降级入口：
+ * 存量 workspace.json 里只有 `maxRefImages` 的老配置、以及什么都没写的模型，
+ * 都从这里派生出与逐角色声明同形的结果，因此不需要任何数据迁移。
+ *
+ * 老语义映射（保守，不外推）：图片模型 `maxRefImages:N` → `reference_image:N`；
+ * 视频模型 `maxRefImages:N` → `first_frame:1` —— 老字段的语义本来就是"垫图/首帧数量"，
+ * 绝不因为用户填了 3 就替他打开 30 张全模态参考。
+ */
+export function normalizeMediaCaps(caps: ModelCapabilities | undefined, kind: MediaKind): ResolvedRefCaps {
+  const hasNew = Boolean(caps?.refQuota?.length || caps?.refModes?.length)
+  if (hasNew) {
+    const quota: Partial<Record<MediaRefRole, number>> = {}
+    for (const entry of caps?.refQuota ?? []) {
+      const prev = quota[entry.role]
+      // 同角色重复声明取更保守的那个（小值）
+      quota[entry.role] = prev === undefined ? entry.max : Math.min(prev, entry.max)
+    }
+    const sum = Object.values(quota).reduce((acc, n) => acc + (n ?? 0), 0)
+    const modes = (caps?.refModes?.length ? caps.refModes : deriveModes(quota, kind)) as MediaGenMode[]
+    return {
+      modes,
+      quota,
+      total: caps?.refTotal && caps.refTotal > 0 ? caps.refTotal : sum,
+      legacy: false
+    }
+  }
+  if (kind === 'image') {
+    const max = caps?.maxRefImages ?? DEFAULT_MAX_REF_IMAGES
+    return { modes: ['t2i', 'i2i'], quota: { reference_image: max }, total: max, legacy: true }
+  }
+  if (kind === 'video') {
+    // 视频通道按老声明只能确定"有首帧、一张"；尾帧/多参考/视音频参考必须逐角色声明才开启
+    return { modes: ['t2v', 'i2v_first'], quota: { first_frame: 1 }, total: 1, legacy: true }
+  }
+  // 音频通道今天没有任何参考素材入口
+  return { modes: [], quota: {}, total: 0, legacy: true }
+}
+
+/** 由配额反推可用模式（模型条目只写了 refQuota 时的缺省，与官方"三场景互斥"一致） */
+function deriveModes(quota: Partial<Record<MediaRefRole, number>>, kind: MediaKind): MediaGenMode[] {
+  const has = (role: MediaRefRole) => (quota[role] ?? 0) > 0
+  if (kind === 'image') {
+    return has('reference_image') ? ['t2i', 'i2i'] : ['t2i']
+  }
+  // 音频通道没有任何参考素材模式可推导
+  if (kind !== 'video') return []
+  const modes: MediaGenMode[] = ['t2v']
+  if (has('first_frame')) {
+    modes.push('i2v_first')
+    if (has('last_frame')) modes.push('i2v_fl')
+  }
+  if (has('reference_image') || has('reference_video') || has('reference_audio')) modes.push('r2v')
+  return modes
+}
+
+/**
+ * 这组角色组合是否落在某个模式的语义内：**子集**关系，不是相等关系。
+ * 全模态参考只挂一条参考视频是合法用法；反过来首帧与 reference_* 谁也不属于对方的模式，
+ * 混用因此仍然不可达。尾帧另有依赖（见 MEDIA_ROLE_REQUIRES）。
+ */
+function modeCovers(mode: MediaGenMode, roles: ReadonlySet<MediaRefRole>): boolean {
+  const modeRoles = MEDIA_MODE_ROLES[mode]
+  if (roles.size === 0) return modeRoles.length === 0
+  if (modeRoles.length === 0) return false
+  for (const role of roles) {
+    if (!modeRoles.includes(role)) return false
+    const deps = MEDIA_ROLE_REQUIRES[role]
+    if (deps && !deps.every((dep) => roles.has(dep))) return false
+  }
+  return true
+}
+
+export type MediaRefIssueCode = 'role_unsupported' | 'mode_unreachable' | 'kind_mismatch'
+
+export interface MediaRefIssue {
+  code: MediaRefIssueCode
+  /** 面向用户/模型的可操作文案（含模型能接受什么，不含密钥与绝对路径） */
+  message: string
+}
+
+export interface RefCheckResult<T extends MediaRefInput> {
+  /** 通过校验、实际进请求的素材（原对象透传，调用方附带的字段都在） */
+  accepted: T[]
+  /** 因数量超限被截断掉的素材（不是错误，但必须留痕告知） */
+  truncated: T[]
+  /** 截断的中文说明（按角色与总闸分别成句），编排层原样写进任务状态的 notes */
+  notes: string[]
+  /** 硬错误：角色未声明、素材类型与角色不符、组合落不到任何允许的模式 */
+  issues: MediaRefIssue[]
+}
+
+/**
+ * 带角色参考素材的合法性判定（纯函数、无 fs/网络/electron，因此能被 catalog:check 直接断言）。
+ *
+ * 判定顺序刻意是"先角色、再类型、后模式、最后数量"：前三种是"这条素材模型压根用不到"，
+ * 一律报错；只有数量超限才截断 —— 今天挂 5 张图到只吃 1 张的模型是能正常出图的，
+ * 把数量也做成硬失败是纯负向回归。
+ *
+ * 投递形态（本地文件 vs 只收公网 URL）不在此判 —— 那是协议家族的属性、不是模型能力，
+ * 由编排层按适配器自述的 refCaps 处理。
+ */
+export function checkMediaRefs<T extends MediaRefInput>(
+  refs: readonly (T & { mediaType?: MediaKind })[],
+  caps: ResolvedRefCaps,
+  /** 素材大类的中文说法前缀（"图片"/"视频"），用于把文案写成"该图片模型…" */
+  kindLabel?: string
+): RefCheckResult<T> {
+  const issues: MediaRefIssue[] = []
+  const notes: string[] = []
+  const accepted: T[] = []
+  const truncated: T[] = []
+  const perRoleCount: Partial<Record<MediaRefRole, number>> = {}
+  const perRoleDropped: Partial<Record<MediaRefRole, number>> = {}
+
+  for (const ref of refs) {
+    const max = caps.quota[ref.role]
+    if (!max || max <= 0) {
+      issues.push({
+        code: 'role_unsupported',
+        message: `该${kindLabel ?? '模型'}不接受${REF_ROLE_LABEL[ref.role]}参考（支持的参考角色：${supportedRoleText(caps)}）`
+      })
+      continue
+    }
+    if (ref.mediaType && ref.mediaType !== MEDIA_ROLE_KIND[ref.role]) {
+      issues.push({
+        code: 'kind_mismatch',
+        message: `按${REF_ROLE_LABEL[ref.role]}提交的素材是${KIND_TEXT[ref.mediaType]}，该角色只能收${KIND_TEXT[MEDIA_ROLE_KIND[ref.role]]}`
+      })
+      continue
+    }
+    const used = perRoleCount[ref.role] ?? 0
+    if (used >= max) {
+      perRoleDropped[ref.role] = (perRoleDropped[ref.role] ?? 0) + 1
+      truncated.push(ref)
+      continue
+    }
+    perRoleCount[ref.role] = used + 1
+    accepted.push(ref)
+  }
+
+  // 模式可达性按**截断后**的组合判：截断让组合合法时不该报错
+  if (accepted.length > 0) {
+    const roles = new Set(accepted.map((r) => r.role))
+    if (!caps.modes.some((mode) => modeCovers(mode, roles))) {
+      const hint =
+        roles.has('last_frame') && !roles.has('first_frame')
+          ? '尾帧需要与首帧一起提交'
+          : '首帧/首尾帧与 reference_* 类参考不能混用'
+      issues.push({
+        code: 'mode_unreachable',
+        message: `这些参考素材的组合不属于该${kindLabel ?? '模型'}支持的任何一种用法（支持：${caps.modes.map((m) => MEDIA_MODE_LABEL[m]).join(' / ')}；${hint}）`
+      })
+    }
+  }
+
+  for (const [role, dropped] of Object.entries(perRoleDropped)) {
+    notes.push(`${REF_ROLE_LABEL[role as MediaRefRole]}参考超出该模型上限 ${caps.quota[role as MediaRefRole]} 个，${dropped} 条未进请求`)
+  }
+  if (issues.length === 0 && caps.total > 0 && accepted.length > caps.total) {
+    truncated.push(...accepted.splice(caps.total))
+    notes.push(`参考素材合计超出该模型上限 ${caps.total} 条，多出的未进请求`)
+  }
+  return { accepted, truncated, notes, issues }
+}
+
+export const REF_ROLE_LABEL: Record<MediaRefRole, string> = {
+  first_frame: '首帧',
+  last_frame: '尾帧',
+  reference_image: '参考图',
+  reference_video: '参考视频',
+  reference_audio: '参考音频'
+}
+
+const KIND_TEXT: Record<MediaKind, string> = { image: '图片', video: '视频', audio: '音频' }
+
+function supportedRoleText(caps: ResolvedRefCaps): string {
+  const roles = Object.entries(caps.quota)
+    .filter(([, max]) => (max ?? 0) > 0)
+    .map(([role]) => REF_ROLE_LABEL[role as MediaRefRole])
+  return roles.length ? roles.join(' / ') : '无（该模型只接受纯文字提示词）'
+}
+
+/**
+ * 从素材组合反推用法模式（渲染端与适配器据此决定协议形态，不用用户手选）。
+ * 落不到任何允许模式时返回 null —— 调用方按"该组合不被支持"处理。
+ */
+export function inferMediaMode(
+  roles: readonly MediaRefRole[],
+  kind: MediaKind,
+  allowed: readonly MediaGenMode[]
+): MediaGenMode | null {
+  if (roles.length === 0) return kind === 'image' ? 't2i' : kind === 'video' ? 't2v' : null
+  const set = new Set(roles)
+  for (const mode of allowed) {
+    if (modeCovers(mode, set)) return mode
+  }
+  return null
+}
+
+/** 单个供应商特有参数的声明（`capabilities.extraParams` 的元素） */
+export interface ModelExtraParam {
+  key: string
+  label: string
+  type: 'select' | 'number' | 'text' | 'boolean'
+  options?: string[]
+  default?: unknown
+}
+
+/**
+ * 附加参数按声明清洗（唯一实现，编排层与回归脚本共用）：
+ * 没声明的键、类型对不上、select 值不在 options 里 —— 一律成条报出来，
+ * 绝不"猜一个意思"塞进请求体。空声明（模型没写 extraParams）时任何附加参数都是越界。
+ */
+export function sanitizeMediaExtra(
+  declared: ModelExtraParam[] | undefined,
+  given: Record<string, unknown> | undefined
+): { value: Record<string, string | number | boolean>; issues: string[] } {
+  const value: Record<string, string | number | boolean> = {}
+  const issues: string[] = []
+  for (const [key, raw] of Object.entries(given ?? {})) {
+    const spec = (declared ?? []).find((p) => p.key === key)
+    if (!spec) {
+      const known = (declared ?? []).map((p) => p.key)
+      issues.push(`模型不支持附加参数 ${key}（可传：${known.length ? known.join(' / ') : '无'}）`)
+      continue
+    }
+    if (spec.type === 'number') {
+      const n = Number(raw)
+      if (!Number.isFinite(n)) {
+        issues.push(`附加参数 ${spec.label} 需要数字，收到 ${JSON.stringify(raw)}`)
+        continue
+      }
+      value[key] = n
+      continue
+    }
+    if (spec.type === 'boolean') {
+      // 渲染端的开关与文本输入都可能递来 "true"/"false" 串，收成布尔再交给适配器
+      if (typeof raw === 'boolean') value[key] = raw
+      else if (raw === 'true') value[key] = true
+      else if (raw === 'false') value[key] = false
+      else issues.push(`附加参数 ${spec.label} 需要 true/false，收到 ${JSON.stringify(raw)}`)
+      continue
+    }
+    if (spec.type === 'select') {
+      const text = typeof raw === 'string' ? raw : String(raw)
+      if (!spec.options?.includes(text)) {
+        issues.push(`附加参数 ${spec.label} 只接受：${(spec.options ?? []).join(' / ') || '（该参数未声明可选值）'}`)
+        continue
+      }
+      value[key] = text
+      continue
+    }
+    if (typeof raw !== 'string' && typeof raw !== 'number' && typeof raw !== 'boolean') {
+      issues.push(`附加参数 ${spec.label} 需要文本，收到 ${JSON.stringify(raw)}`)
+      continue
+    }
+    value[key] = raw
+  }
+  return { value, issues }
+}
+
+/** 声明式能力（`capabilities.extraParams`）之外的参考素材声明见上方 MediaRefQuota/MediaGenMode */
 export interface ModelCapabilities {
   ratios?: MediaRatio[]
-  /** 可选时长档位（秒） */
+  /** 可选时长档位（秒）；`-1` 表示"由模型自选"（方舟/百炼的官方语义，适配器自己决定怎么发） */
   durations?: number[]
-  /** 垫图/首帧数量上限 */
+  /**
+   * 垫图/首帧数量上限。
+   * @deprecated 老字段＝"首帧/垫图一张"的粗粒度声明；新声明一律用 refQuota/refModes。
+   * 仍可读（normalizeMediaCaps 派生），新代码不再写、设置页不再存。
+   */
   maxRefImages?: number
+  /** 逐角色参考配额（未声明的角色＝该模型不接受这种参考） */
+  refQuota?: MediaRefQuota[]
+  /** 该模型支持的用法模式（互斥关系的声明位；缺省时由 refQuota 反推） */
+  refModes?: MediaGenMode[]
+  /** 参考素材总件数上限（百炼单次 ≤20 这类）；缺省 = 各角色配额之和 */
+  refTotal?: number
   /** TTS 音色清单 */
   voices?: { id: string; label: string }[]
   /** 供应商特有参数的声明式描述，渲染端按此动态生成表单 */
-  extraParams?: {
-    key: string
-    label: string
-    type: 'select' | 'number' | 'text'
-    options?: string[]
-    default?: unknown
-  }[]
+  extraParams?: ModelExtraParam[]
 }
 
 /** 单个可生成的媒体模型（来自 provider 配置/内置目录，数据驱动：新增模型=加一行数据） */
@@ -147,6 +581,13 @@ export interface MediaGenerateRequest {
   height?: number
   /** 视频/音频时长（秒，可选）；模型声明了时长档位时就近归档到合法档 */
   durationSeconds?: number
+  /** 音色 id（音频通道）；模型声明了 voices 清单时按 id 校验，缺省 = 适配器自家默认 */
+  voice?: string
+  /**
+   * 供应商特有参数（watermark / prompt_extend / output_format 这类）。
+   * 只有出现在该模型 `capabilities.extraParams` 声明里的键才允许传，越界的键直接报错。
+   */
+  extra?: Record<string, string | number | boolean>
   /** 来源会话节点 id（M13：Agent 工具发起时标记产物归属） */
   sourceChatId?: string
   /**
@@ -155,6 +596,11 @@ export interface MediaGenerateRequest {
    * 网关 provider 会把首个图片参考转为 data URI 附到请求里。
    */
   refPaths?: string[]
+  /**
+   * 带角色的参考素材（多图/首尾帧/参考视频/参考音频）。给了 refs 时以它为准，
+   * `refPaths` 是不带角色的老入口（等价于按模型语义推断角色），两者可以并存但不该混用。
+   */
+  refs?: MediaRefInput[]
   /**
    * 产物落库目录（相对工作区根的 POSIX 路径，如 素材库/海报产出）。
    * 缺省 = 媒体产物目录（.huabu/media 或 media.outputDir 配置）；
@@ -210,6 +656,11 @@ export interface MediaJobStatus {
    * 是可以随时改的设置，事后按"当前配置"去拼老产物就会拼错。
    */
   artifactDirRel?: string
+  /**
+   * 参考素材的处置留痕（哪条没进请求、为什么）。编排层解析参考时逐条判定：
+   * 类型不匹配 / 超出模型上限 → 丢弃但必须在这里说一声，不再让素材凭空消失。
+   */
+  notes?: string[]
   /**
    * 协商后的实际生成参数（clamp/归档之后的值）。Agent 工具结果与画布卡片以这里为准，
    * 避免"Agent 声明 1:1、卡片按默认 16:9"的错位

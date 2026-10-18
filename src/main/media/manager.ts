@@ -3,12 +3,20 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmS
 import { basename, relative, resolve, sep } from 'path'
 import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
-import type { MediaArtifact, MediaGenerateRequest, MediaJobState, MediaJobStatus, MediaProviderInfo } from '../../shared/media'
-import { DEFAULT_MEDIA_CONCURRENCY, ratioToPixels } from '../../shared/media'
+import type {
+  MediaArtifact,
+  MediaGenerateRequest,
+  MediaJobState,
+  MediaJobStatus,
+  MediaProviderInfo
+} from '../../shared/media'
+import { DEFAULT_MEDIA_CONCURRENCY, ratioToPixels, sanitizeMediaExtra } from '../../shared/media'
 import type { WorkspaceMediaConfig } from '../workspace/store'
 import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
 import type { AdapterProviderConfig } from './adapters/registry'
+import { adapterRefCaps } from './adapters/registry'
 import { imageSizeOf } from './imageSize'
+import { resolveMediaRefs } from './mediaRefs'
 import type { ProviderSubmitInput } from './provider'
 import { extForUrl, mimeForKind, type MediaProviderAdapter } from './provider'
 
@@ -72,6 +80,8 @@ export class MediaJobManager {
       ready: boolean
       /** 凭据来源探测（media:providers 的真实 authHint 用）；宿主未提供时回落适配器静态值 */
       keySourceOf?: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
+      /** 读某供应商凭据明文（上传通道换临时引用用；适配器另有同一依赖） */
+      resolveKey?: (auth: { authKey?: string; authEnv?: string }) => Promise<string | undefined>
       /** 素材库内容有变化的广播（产物落进库目录后调用，渲染端据此刷新素材库面板） */
       notifyAssetsChanged: () => void
     }
@@ -162,6 +172,18 @@ export class MediaJobManager {
     const pixels = !request.width && !request.height && request.ratio ? ratioToPixels(request.ratio) : undefined
     const width = request.width ?? pixels?.width
     const height = request.height ?? pixels?.height
+    // 附加参数：只有该模型 extraParams 声明过的键才允许进请求体。越界的键当场报错 ——
+    // 猜个意思发出去是幻觉，悄悄丢掉是等于把用户的开关当成不存在
+    const extra = sanitizeMediaExtra(capabilities?.extraParams, request.extra)
+    if (extra.issues.length > 0) {
+      throw new Error(`模型 ${model.id} 拒绝了这些附加参数：${extra.issues.join('；')}`)
+    }
+    // 音色：模型声明了清单就按 id 校验，不声明的（今天只有 openai-compat 的 TTS 吃 voice）不管
+    if (request.voice && capabilities?.voices?.length && !capabilities.voices.some((v) => v.id === request.voice)) {
+      throw new Error(
+        `模型 ${model.id} 没有音色 ${request.voice}（支持：${capabilities.voices.map((v) => v.id).join(' / ')}）`
+      )
+    }
 
     const jobId = randomUUID()
     const now = new Date().toISOString()
@@ -177,26 +199,40 @@ export class MediaJobManager {
       }
       outputDirAbs = resolved
     }
-    // 参考文件（垫图/首帧）：先按媒体产物目录解析（画布卡片语义），找不到再按工作区根
-    // 解析（Agent 工具递来的工作区相对路径）；越界与不存在的路径丢弃，数量按模型能力截断
+    // 参考素材：角色/类型/配额/投递形态的判定与截断留痕全在 resolveMediaRefs
+    //（画布与 Agent 两个入口在这里合流，适配器侧不再重复判）
     const mediaRoot = resolve(mediaDir)
     const wsRoot = ctx.workspaceDir ? resolve(ctx.workspaceDir) : null
     // 实际落盘目录（相对工作区根）：随任务状态持久化，卡片据此还原引用（见 MediaJobStatus.artifactDirRel）
     const artifactDirRel = wsRoot
       ? relative(wsRoot, outputDirAbs ?? mediaRoot).split(sep).join('/')
       : undefined
-    const maxRefs = Math.min(4, capabilities?.maxRefImages ?? 4)
-    const refFiles = (request.refPaths ?? [])
-      .map((rel) => resolveRefFile(rel, mediaRoot, wsRoot))
-      .filter((abs): abs is string => Boolean(abs))
-      .slice(0, maxRefs)
+    const conf = ctx.providers.find((p) => p.id === adapter.id)
+    const { refs: mediaRefs, notes: refNotes } = await resolveMediaRefs(
+      request,
+      request.kind,
+      capabilities,
+      adapterRefCaps(adapter.type),
+      { mediaRoot, wsRoot },
+      model.id,
+      {
+        indexFile: resolve(mediaRoot, 'upload-index.json'),
+        // 上传换临时引用时网关认的是线上模型标识（百炼的 getPolicy 按模型授权）
+        model: conf?.models.find((m) => m.id === model.id)?.requestModel ?? model.id,
+        resolveKey: async () =>
+          (await ctx.resolveKey?.({ authKey: conf?.authKey, authEnv: conf?.authEnv })) ?? null,
+        ...(conf?.baseUrl ? { baseUrl: conf.baseUrl } : {})
+      }
+    )
     const input: ProviderSubmitInput = {
       prompt,
       ...(request.ratio ? { ratio: request.ratio } : {}),
       ...(width ? { width } : {}),
       ...(height ? { height } : {}),
       ...(durationSeconds ? { durationSeconds } : {}),
-      ...(refFiles.length > 0 ? { refFiles } : {})
+      ...(request.voice ? { voice: request.voice } : {}),
+      ...(Object.keys(extra.value).length > 0 ? { extra: extra.value } : {}),
+      ...(mediaRefs.length > 0 ? { refs: mediaRefs } : {})
     }
     const artifactName = sanitizeArtifactName(request.name)
     const record: JobRecord = {
@@ -215,6 +251,8 @@ export class MediaJobManager {
         ...(request.sourceChatId ? { sourceChatId : request.sourceChatId } : {}),
         ...(outputDirAbs ? { outputDir: request.outputDir!.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '') } : {}),
         ...(artifactDirRel ? { artifactDirRel } : {}),
+        // 参考素材的处置留痕（哪条没进请求、为什么），卡片与工具结果透出
+        ...(refNotes.length > 0 ? { notes: refNotes } : {}),
         // 协商后的实际参数（比例校验/时长归档/像素换算都已完成），工具结果与画布卡片以此为准
         ...((request.ratio || width || height || durationSeconds)
           ? {
@@ -605,17 +643,6 @@ export class MediaJobManager {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms))
-}
-
-/** 参考文件解析：媒体产物目录优先，工作区根兜底；两个根都不收留 null（越界/不存在） */
-function resolveRefFile(rel: string, mediaRoot: string, wsRoot: string | null): string | null {
-  const inMedia = resolve(mediaRoot, rel)
-  if (inMedia.startsWith(mediaRoot + sep) && existsSync(inMedia)) return inMedia
-  if (wsRoot) {
-    const inWs = resolve(wsRoot, rel)
-    if (inWs !== wsRoot && inWs.startsWith(wsRoot + sep) && existsSync(inWs)) return inWs
-  }
-  return null
 }
 
 /** Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9），命中则追加下划线使文件名合法 */

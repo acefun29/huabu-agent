@@ -1,5 +1,12 @@
-import type { MediaKind, MediaProviderType, MediaRatio, ModelCapabilities } from '../../../shared/media'
-import { MEDIA_RATIOS } from '../../../shared/media'
+import type {
+  MediaGenMode,
+  MediaKind,
+  MediaProviderType,
+  MediaRatio,
+  MediaRefRole,
+  ModelCapabilities
+} from '../../../shared/media'
+import { MEDIA_GEN_MODES, MEDIA_RATIOS, MEDIA_REF_ROLES } from '../../../shared/media'
 import { adapterDefaultAuthEnv, adapterSupportedKinds, isRegisteredAdapterType } from '../adapters/registry'
 import type { AdapterModelConfig, AdapterProviderConfig } from '../adapters/registry'
 import type { BuiltinProviderDef } from './types'
@@ -159,7 +166,7 @@ export function sanitizeCapabilities(raw: unknown, where = 'capabilities'): Mode
     if (Array.isArray(raw.ratios)) {
       const ratios = [...new Set(raw.ratios.filter((r): r is MediaRatio => MEDIA_RATIOS.includes(r as MediaRatio)))]
       if (ratios.length > 0) out.ratios = ratios
-      else warn(where, 'ratios 没有合法比例（1:1/3:4/4:3/9:16/16:9），已忽略')
+      else warn(where, 'ratios 没有合法比例（1:1/3:4/4:3/9:16/16:9/21:9），已忽略')
     } else warn(where, 'ratios 不是数组，已忽略')
   }
   if (raw.durations !== undefined) {
@@ -175,6 +182,38 @@ export function sanitizeCapabilities(raw: unknown, where = 'capabilities'): Mode
     if (typeof raw.maxRefImages === 'number' && Number.isInteger(raw.maxRefImages) && raw.maxRefImages > 0) {
       out.maxRefImages = raw.maxRefImages
     } else warn(where, `maxRefImages 不是正整数（${JSON.stringify(raw.maxRefImages)}），已忽略`)
+  }
+  // 逐角色参考配额与用法模式（2026-10 各家官方文档核实的参考素材维度）
+  if (raw.refModes !== undefined) {
+    if (Array.isArray(raw.refModes)) {
+      const modes = [...new Set(raw.refModes.filter((m): m is MediaGenMode => MEDIA_GEN_MODES.includes(m as MediaGenMode)))]
+      if (modes.length > 0) out.refModes = modes
+      else warn(where, 'refModes 没有合法用法模式（t2i/i2i/t2v/i2v_first/i2v_fl/r2v），已忽略')
+    } else warn(where, 'refModes 不是数组，已忽略')
+  }
+  if (raw.refQuota !== undefined) {
+    if (Array.isArray(raw.refQuota)) {
+      type Quota = NonNullable<ModelCapabilities['refQuota']>[number]
+      const byRole = new Map<MediaRefRole, number>()
+      for (const entry of raw.refQuota as unknown[]) {
+        if (!isPlainObject(entry) || !MEDIA_REF_ROLES.includes(entry.role as MediaRefRole)) {
+          warn(where, `refQuota 有条目角色不合法（${JSON.stringify(entry)}），已丢弃该条`)
+          continue
+        }
+        const role = entry.role as MediaRefRole
+        if (typeof entry.max !== 'number' || !Number.isInteger(entry.max) || entry.max <= 0) continue
+        // 同一角色重复声明取更保守的小值；上限 clamp 到 64（官方最高 30 张，防手滑 9999）
+        const max = Math.min(64, entry.max)
+        byRole.set(role, byRole.has(role) ? Math.min(byRole.get(role)!, max) : max)
+      }
+      const quota: Quota[] = [...byRole].map(([role, max]) => ({ role, max }))
+      if (quota.length > 0) out.refQuota = quota
+    } else warn(where, 'refQuota 不是数组，已忽略')
+  }
+  if (raw.refTotal !== undefined) {
+    if (typeof raw.refTotal === 'number' && Number.isInteger(raw.refTotal) && raw.refTotal > 0) {
+      out.refTotal = Math.min(64, raw.refTotal)
+    } else warn(where, `refTotal 不是正整数（${JSON.stringify(raw.refTotal)}），已忽略`)
   }
   if (raw.voices !== undefined) {
     if (Array.isArray(raw.voices)) {
@@ -193,7 +232,7 @@ export function sanitizeCapabilities(raw: unknown, where = 'capabilities'): Mode
             isPlainObject(p) &&
             isNonEmptyString(p.key) &&
             isNonEmptyString(p.label) &&
-            (p.type === 'select' || p.type === 'number' || p.type === 'text')
+            (p.type === 'select' || p.type === 'number' || p.type === 'text' || p.type === 'boolean')
         )
         .map((p) => ({
           key: p.key,

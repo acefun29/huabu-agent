@@ -11,7 +11,7 @@
  */
 import type { ChatMessageBlock, ChatStopReason } from './chatBlocks'
 import type { ChatCompactionDivider, ChatContextUsage, ChatHistoryImage } from '@shared/ipc'
-import type { MediaRatio } from '@shared/media'
+import type { MediaRatio, MediaRefRole } from '@shared/media'
 
 export type { ChatMessageBlock, ChatToolCallView } from './chatBlocks'
 
@@ -167,7 +167,11 @@ export type GenerateStatus = 'idle' | 'queued' | 'running' | 'succeeded' | 'fail
 
 /** 生成参数：参数在节点面板调（chip 下拉），提示词写在卡片上 */
 export interface GenerateParams {
-  ratio: MediaRatio
+  /**
+   * 画面比例。可选：挂了首帧图的视频模型常常"比例随首帧"（官方 adaptive），
+   * 留空 = 不向模型声明比例。老的 canvas.json 里没有这个字段的照读不误。
+   */
+  ratio?: MediaRatio
   /** 视频/音频时长（秒） */
   durationSeconds?: number
   /** 媒体模型（`provider:model` 复合串），空 = 按回退链解析 */
@@ -199,6 +203,11 @@ export interface AssetGen {
   prompt: string
   /** 参考资产节点 id（垫图/首帧/风格参考；连线用） */
   refs: string[]
+  /**
+   * 每条参考素材在该模型里的角色（`refId → role`）。缺席 = 按素材大类与序数派生
+   * （首图当首帧、其余当参考图），也就是历史语义；卡片上的角色胶囊改的就是这个字段。
+   */
+  refRoles?: Record<string, MediaRefRole>
   params: GenerateParams
   status: GenerateStatus
   /** 0..1 */
@@ -207,6 +216,8 @@ export interface AssetGen {
   jobId?: string
   /** status=failed 时的可操作错误文本 */
   error?: string
+  /** 参考素材的处置留痕（哪条没进请求、为什么），来自任务状态 */
+  notes?: string[]
   versions: GenerateVersion[]
   activeVersionId?: string
 }

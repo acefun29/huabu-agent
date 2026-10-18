@@ -1,6 +1,15 @@
 import { defineProvider } from '../define'
 
 /**
+ * 百炼 parameters 里的两个布尔开关（官方：watermark 默认加"AI 生成"水印、
+ * prompt_extend 默认对提示词做智能改写）。声明出来的模型才允许调用方传这两个键。
+ */
+const DASH_EXTRAS = [
+  { key: 'watermark', label: '水印', type: 'boolean' as const },
+  { key: 'prompt_extend', label: '提示词智能改写', type: 'boolean' as const }
+]
+
+/**
  * 阿里云百炼内置目录（2026-10-09 逐页对照 help.aliyun.com/zh/model-studio 官方文档核实：
  * model-list-image-generation、model-list-video-generation、wan-image-generation-and-
  * editing-api-reference、qwen-image-generation-and-editing-api-reference、
@@ -62,7 +71,9 @@ export default defineProvider({
       costHint: '按张计费（文生图/图生图统一；图生图指定比例时按比例出图，未指定则随参考图）',
       capabilities: {
         ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
-        maxRefImages: 1
+        // 官方 2026-10 图像生成与编辑 API：content 支持 0–9 张参考图
+        maxRefImages: 9,
+        extraParams: DASH_EXTRAS
       }
     },
     {
@@ -73,7 +84,9 @@ export default defineProvider({
       costHint: '按张计费（专业版：文生图 4K / 编辑 2K；图生图指定比例时按比例出图，未指定则随参考图）',
       capabilities: {
         ratios: ['1:1', '3:4', '4:3', '9:16', '16:9'],
-        maxRefImages: 1
+        // 官方 2026-10 图像生成与编辑 API：content 支持 0–9 张参考图
+        maxRefImages: 9,
+        extraParams: DASH_EXTRAS
       }
     },
     {
@@ -131,7 +144,17 @@ export default defineProvider({
       costHint: '按秒计费（与 wan3.0-video 同能力，生成更快；2~30 秒 1080P 30fps，含音轨）',
       capabilities: {
         durations: [5, 10, 15, 20, 30],
-        maxRefImages: 1
+        // 与 wan3.0-video 同能力（官方全能参考：首帧/首尾帧 与 reference_* 互斥，≤20 素材）
+        refModes: ['t2v', 'i2v_first', 'i2v_fl', 'r2v'],
+        refQuota: [
+          { role: 'first_frame', max: 1 },
+          { role: 'last_frame', max: 1 },
+          { role: 'reference_image', max: 10 },
+          { role: 'reference_video', max: 5 },
+          { role: 'reference_audio', max: 5 }
+        ],
+        refTotal: 20,
+        extraParams: DASH_EXTRAS
       }
     },
     {
@@ -164,7 +187,18 @@ export default defineProvider({
       costHint: '按秒计费（2~30 秒 1080P 30fps，含音轨；挂参考图即首帧图生视频）',
       capabilities: {
         durations: [5, 10, 15, 20, 30],
-        maxRefImages: 1
+        // 官方「全能参考」：首帧/首尾帧 与 reference_* 互斥，单次合计 ≤20 个素材；
+        // 参考视频/音频只收公网 URL 或 oss:// 临时引用（没有 base64 形态）
+        refModes: ['t2v', 'i2v_first', 'i2v_fl', 'r2v'],
+        refQuota: [
+          { role: 'first_frame', max: 1 },
+          { role: 'last_frame', max: 1 },
+          { role: 'reference_image', max: 10 },
+          { role: 'reference_video', max: 5 },
+          { role: 'reference_audio', max: 5 }
+        ],
+        refTotal: 20,
+        extraParams: DASH_EXTRAS
       }
     },
     {

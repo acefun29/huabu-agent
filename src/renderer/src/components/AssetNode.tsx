@@ -32,7 +32,15 @@ import { parseLegacyAssetPayload } from '../lib/dragPayload'
 import { bumpRender } from '../lib/perfProbe'
 import { CARD_THUMB_SIZE, assetSrc, formatBytes } from '../lib/media'
 import { KIND_LABEL, type AssetData, type AssetKind, type CanvasNode, type GenerateVersion, type MediaKind } from '../types'
-import { DEFAULT_MEDIA_DURATION_S, MEDIA_RATIOS } from '@shared/media'
+import {
+  DEFAULT_MEDIA_DURATION_S,
+  MEDIA_RATIOS,
+  MEDIA_ROLE_KIND,
+  REF_ROLE_LABEL,
+  deriveRefRole,
+  normalizeMediaCaps
+} from '@shared/media'
+import type { MediaRefRole } from '@shared/media'
 import { shortModelLabel } from '@shared/mediaResolve'
 import { ChipSelect, MenuGroup, MenuItem, MenuNote } from './Dropdown'
 import { Collapse } from './Collapse'
@@ -601,13 +609,14 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
     gen.refs.map((id) => {
       // 查 id 索引而非 nodes.find：selector 在每次 set 都会执行，find 是 O(k×n)
       const n = s.nodesById.get(id)
-      return n ? `${id}${(n.data as AssetData).name}` : ''
+      return n ? `${id}${(n.data as AssetData).kind ?? ''}${(n.data as AssetData).name}` : ''
     }).join('')
   )
   const {
     setActiveGenerate,
     updateNode,
     updateGenerate,
+    addGenerateRef,
     removeGenerateRef,
     submitGeneration,
     resolveOutputLibrary,
@@ -680,10 +689,32 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
         .split('')
         .filter(Boolean)
         .map((pair) => {
-          const [id, name] = pair.split('')
-          return { id, name }
+          const [id, assetKind, name] = pair.split('')
+          return { id, name, assetKind: (assetKind || 'image') as MediaKind }
         })
     : []
+
+  /**
+   * 参考配额与角色：判据与主进程闸门同源（normalizeMediaCaps 从同一份能力声明派生），
+   * 卡片只做"这条素材在这个模型里当什么"的即时可见性，权威判定仍在提交时。
+   */
+  const refCaps = normalizeMediaCaps(resolvedCapabilities, kind)
+  /** 某大类素材在该模型里可担当的角色（点角色胶囊就在这些之间循环） */
+  const rolesForAssetKind = (assetKind: MediaKind): MediaRefRole[] =>
+    (Object.keys(refCaps.quota) as MediaRefRole[]).filter(
+      (role) => MEDIA_ROLE_KIND[role] === assetKind && (refCaps.quota[role] ?? 0) > 0
+    )
+  const roleOfRef = (refId: string, assetKind: MediaKind, index: number): MediaRefRole | null =>
+    gen.refRoles?.[refId] ?? deriveRefRole(assetKind, kind, index, refCaps.quota)
+
+  /** 点角色胶囊：在该素材大类支持的角色里切到下一个（模型只支持一种角色时不动） */
+  const cycleRefRole = (refId: string, assetKind: MediaKind, index: number) => {
+    const roles = rolesForAssetKind(assetKind)
+    if (roles.length < 2) return
+    const current = roleOfRef(refId, assetKind, index)
+    const next = roles[(roles.indexOf(current as MediaRefRole) + 1) % roles.length]
+    updateGenerate(node.id, { refRoles: { ...(gen.refRoles ?? {}), [refId]: next } })
+  }
 
   const patchParams = (patch: Partial<typeof gen.params>) =>
     updateGenerate(node.id, { params: { ...gen.params, ...patch } })
@@ -710,8 +741,8 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
       showToast('该卡片已在参考列表中')
       return
     }
-    updateGenerate(node.id, { refs: [...gen.refs, refId] })
-    showToast('已加入参考（垫图 / 首帧）')
+    // 走 store 的添加入口：角色支持与配额上限只有一份判据（这里不再自己 updateGenerate）
+    addGenerateRef(node.id, refId)
   }
 
   return (
@@ -873,25 +904,66 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
           }`}
         >
           {refNames.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap gap-1">
-              {refNames.map((r) => (
-                <span
-                  key={r.id}
-                  className="flex max-w-[130px] items-center gap-1 rounded-full bg-(--active-tint) py-0.5 pl-2 pr-1 text-[10.5px] text-(--accent)"
-                  title="生成参考（垫图 / 首帧）"
-                >
-                  <span className="truncate">{r.name}</span>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      removeGenerateRef(node.id, r.id)
-                    }}
-                    className="shrink-0 cursor-pointer rounded-full p-0.5 transition-colors hover:bg-(--accent) hover:text-white"
-                    title="移除参考"
+            <div className="mb-1.5 flex flex-wrap items-center gap-1">
+              {refNames.map((r, index) => {
+                const role = roleOfRef(r.id, r.assetKind, index)
+                const switchable = rolesForAssetKind(r.assetKind).length > 1
+                return (
+                  <span
+                    key={r.id}
+                    className={`flex max-w-[170px] items-center gap-1 rounded-full py-0.5 pl-2 pr-1 text-[10.5px] ${
+                      role ? 'bg-(--active-tint) text-(--accent)' : 'bg-(--surface-input) text-(--danger)'
+                    }`}
+                    title={
+                      role
+                        ? `这条参考在本次生成里的角色：${REF_ROLE_LABEL[role]}${switchable ? '（点击角色可切换）' : '（当前模型只支持这一种角色）'}`
+                        : '当前模型用不到这条参考素材（该模型没有这种媒体的参考输入），不会进请求'
+                    }
                   >
-                    <X size={10} />
-                  </button>
+                    <span className="truncate">{r.name}</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        cycleRefRole(r.id, r.assetKind, index)
+                      }}
+                      disabled={!switchable}
+                      className={`shrink-0 rounded px-1 text-[9.5px] ring-1 transition-colors ${
+                        role ? 'ring-(--accent)/30 hover:bg-(--accent)/10' : 'ring-(--danger)/30'
+                      } ${switchable ? 'cursor-pointer' : 'cursor-default'}`}
+                    >
+                      {role ? REF_ROLE_LABEL[role] : '用不到'}
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        removeGenerateRef(node.id, r.id)
+                      }}
+                      className="shrink-0 cursor-pointer rounded-full p-0.5 transition-colors hover:bg-(--accent) hover:text-white"
+                      title="移除参考"
+                    >
+                      <X size={10} />
+                    </button>
+                  </span>
+                )
+              })}
+              {refCaps.total > 0 && (
+                <span
+                  className="shrink-0 text-[10px] text-(--on-surface-muted)"
+                  title={`当前模型最多使用 ${refCaps.total} 条参考素材`}
+                >
+                  {refNames.length}/{refCaps.total}
                 </span>
+              )}
+            </div>
+          )}
+
+          {/* 参考素材的处置留痕：哪条没进请求、为什么（主进程编排层逐条判定后随任务状态带回来） */}
+          {gen.notes && gen.notes.length > 0 && (
+            <div className="mb-1.5 flex flex-col gap-0.5">
+              {gen.notes.map((n) => (
+                <div key={n} className="line-clamp-2 text-[10.5px] leading-snug text-(--danger)" title={n}>
+                  · {n}
+                </div>
               ))}
             </div>
           )}
@@ -932,9 +1004,9 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
           <div className="mt-1.5 flex flex-wrap items-center gap-1 border-t border-(--outline-soft) pt-1.5">
             {kind === 'image' ? (
               <ChipSelect
-                icon={<RatioGlyph ratio={gen.params.ratio} size={13} />}
-                label={gen.params.ratio}
-                title="图片比例"
+                icon={<RatioGlyph ratio={gen.params.ratio ?? '1:1'} size={13} />}
+                label={gen.params.ratio ?? '自动'}
+                title={gen.params.ratio ? '图片比例' : '比例：自动（跟随参考图/模型默认）'}
                 open={openMenu === 'ratio'}
                 onOpenChange={(v) => setOpenMenu(v ? 'ratio' : null)}
               >
@@ -955,6 +1027,16 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
                         />
                       ))}
                     </div>
+                    {/* 不声明比例：图生图/首帧视频里让出图比例跟随素材（官方 adaptive 语义） */}
+                    <MenuItem
+                      label="自动（随参考图）"
+                      hint="不向模型声明比例"
+                      selected={!gen.params.ratio}
+                      onClick={() => {
+                        patchParams({ ratio: undefined })
+                        close()
+                      }}
+                    />
                   </>
                 )}
               </ChipSelect>

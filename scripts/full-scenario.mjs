@@ -276,10 +276,21 @@ group('C-IPC矩阵')
     record('media:job 事件往返（queued→running→succeeded）', !events.timedOut, `trace=${events.value}`)
     const jobs = await evalp('window.huabu.media.jobs()')
     record('media:jobs 账本', jobs.ok === true && jobs.value.some((j) => j.jobId === gen.value?.jobId && j.state === 'succeeded'), `jobs=${jobs.value?.length}`)
+    // 带角色参考素材的拒绝路径（零配额：提交前就被编排层闸门拦下，不产生任务）：
+    // 图片通道收到 first_frame 角色 = 该模型没声明这个角色，必须明确报错而不是静默丢掉
+    const rejected = await evalp(
+      `window.huabu.media.generate({ provider: 'mock', model: 'mock/image-v1', kind: 'image', prompt: 'reject path', refs: [{ role: 'first_frame', url: 'https://example.com/a.png' }] })`
+    )
+    record(
+      'media:generate 参考角色越界 ⇒ 提交前拒绝（不烧配额、不建任务）',
+      rejected.ok === false && /参考/.test(rejected.error ?? ''),
+      JSON.stringify(rejected).slice(0, 160)
+    )
   } else {
     record('media:generate 提交（含参考路径过滤）', 'SKIP', MEDIA_SKIP_REASON)
     record('media:job 事件往返（queued→running→succeeded）', 'SKIP', MEDIA_SKIP_REASON)
     record('media:jobs 账本', 'SKIP', MEDIA_SKIP_REASON)
+    record('media:generate 参考角色越界 ⇒ 提交前拒绝（不烧配额、不建任务）', 'SKIP', MEDIA_SKIP_REASON)
   }
 
   // 用户供应商/模型管理（workspace.json 覆盖层）：创建 → 清单可见 → 加模型 →

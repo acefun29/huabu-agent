@@ -1,5 +1,6 @@
 import type { MediaJobStatus } from '@shared/ipc'
-import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO, nearestMediaRatio } from '@shared/media'
+import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO, deriveRefRole, nearestMediaRatio, normalizeMediaCaps } from '@shared/media'
+import type { MediaRefInput, MediaRefRole, ResolvedRefCaps } from '@shared/media'
 import { shortModelLabel } from '@shared/mediaResolve'
 import { normalizePath } from '../../harness/assetCategories'
 import type { AssetData, AssetGen, CanvasNode, GenerateVersion, MediaKind } from '../../types'
@@ -74,7 +75,10 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
                 ...gen,
                 status: job.state as AssetGen['status'],
                 progress: job.progress,
-                error: undefined
+                error: undefined,
+                // 参考素材的处置留痕（哪条没进请求、为什么）；每次事件都按最新任务覆盖，
+                // 新一轮提交没有 notes 时自然清空
+                notes: job.notes
               }
             }
           }
@@ -100,6 +104,7 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
                 status: 'succeeded',
                 progress: 1,
                 error: undefined,
+                notes: job.notes,
                 // 终态即解绑任务：再次载入画布时对账不会重复入库同一产物
                 jobId: undefined,
                 // 比例标签对齐产物事实：图生图等场景可能不按请求比例出图，成功后按
@@ -129,6 +134,7 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
               ...gen,
               status: 'failed',
               error: job.error ?? (job.state === 'cancelled' ? '已取消' : '生成失败'),
+              notes: job.notes,
               jobId: undefined
             }
           }
@@ -231,6 +237,32 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
 
   /* ---------------- 生成：提交（并发上限/排队在主进程编排，卡片只认任务事件） ---------------- */
 
+  /**
+   * 卡片当前生效模型的参考配额（角色 + 总量）。判据与主进程闸门同源
+   * （normalizeMediaCaps 从同一份能力声明派生），渲染端只做即时反馈，权威判定在提交时。
+   */
+  const refCapsFor = (data: AssetData): ResolvedRefCaps => {
+    const kind = (data.kind as MediaKind) ?? 'image'
+    const resolved = settingsBridgeRef.current?.resolveMediaModel(kind, data.gen?.params.model)
+    const caps = resolved
+      ? settingsBridgeRef.current?.mediaProviders
+          ?.find((p) => p.id === resolved.provider)
+          ?.models.find((m) => m.id === resolved.model)?.capabilities
+      : undefined
+    return normalizeMediaCaps(caps, kind)
+  }
+
+  /** 一条参考素材在本次提交里的角色：卡片上显式指定优先，否则按大类 + 序数派生 */
+  const roleOfRef = (
+    gen: AssetGen,
+    refData: AssetData,
+    refId: string,
+    index: number,
+    caps: ResolvedRefCaps,
+    modelKind: MediaKind
+  ): MediaRefRole | null =>
+    gen.refRoles?.[refId] ?? deriveRefRole((refData.kind as MediaKind) ?? 'image', modelKind, index, caps.quota)
+
   const submitGeneration = async (nodeId: string, prompt: string) => {
     const text = prompt.trim()
     if (!text) return
@@ -251,18 +283,35 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
       )
       return
     }
+    // 当前生效模型的参考配额（判据与主进程闸门同源）
+    const caps = refCapsFor(data)
     // 落库优先级链：卡片指定 > 类型默认 > 全局默认 > 公共库；命中素材库 → outputDir 落库
     const library = get().resolveOutputLibrary(kind, data.gen.params.libraryId)
-    // 参考文件：只有落在产物目录（storage=media）的文件能直接喂给网关。
-    // 有 pathRoot 时送"相对工作区根"的完整路径 —— 主进程 resolveRefFile 是产物根优先、
-    // 工作区根兜底的存在性两段试，完整相对路径正好落在第二段，产物目录被改过也不会指偏；
+    // 参考文件：产物目录（storage=media）与工作区素材库（storage=ws）两种落点都能直接喂给
+    // 网关 —— 主进程闸门是"产物根优先、工作区根兜底"的两段试，ws 卡的相对路径正好落第二段。
+    // 有 pathRoot 时送"相对工作区根"的完整路径（产物目录被改过也不会指偏）；
     // 没有 pathRoot 的历史卡片仍送裸文件名（等价于按当前产物根解析，语义不变）。
-    const refPaths = data.gen.refs
-      .map((refId) => get().nodes.find((n) => n.id === refId))
-      .filter((n): n is CanvasNode => Boolean(n))
-      .map((n) => n.data)
-      .filter((d) => d.storage === 'media' && Boolean(d.path))
-      .map((d) => (d.pathRoot ? `${d.pathRoot.replace(/\/+$/, '')}/${d.path}` : (d.path as string)))
+    const refEntries = data.gen.refs
+      .map((refId) => ({ id: refId, node: get().nodes.find((n) => n.id === refId) }))
+      .filter((entry): entry is { id: string; node: CanvasNode } => Boolean(entry.node))
+      .filter((entry) => (entry.node.data.storage === 'media' || entry.node.data.storage === 'ws') && Boolean(entry.node.data.path))
+    const refs: MediaRefInput[] = []
+    const unusable: string[] = []
+    for (const [index, entry] of refEntries.entries()) {
+      const role = roleOfRef(data.gen, entry.node.data, entry.id, index, caps, kind)
+      const path = entry.node.data.pathRoot
+        ? `${entry.node.data.pathRoot.replace(/\/+$/, '')}/${entry.node.data.path}`
+        : (entry.node.data.path as string)
+      // 角色派生不出来 = 该模型对这种素材根本没有参考输入（例如只有首帧的老声明模型挂了视频）
+      if (!role) unusable.push(path)
+      else refs.push({ role, path })
+    }
+    if (unusable.length > 0) {
+      showToast(`${unusable.length} 条参考素材当前模型用不到（该模型没有这种媒体的参考输入），不会进请求`)
+    }
+    if (caps.total > 0 && refs.length > caps.total) {
+      showToast(`该模型最多用 ${caps.total} 条参考素材，多出的 ${refs.length - caps.total} 条不会进请求`)
+    }
     mutateNodeData(nodeId, (d) => {
       if (!d.gen) return d
       return { ...d, gen: { ...d.gen, prompt: text, status: 'queued', progress: 0, error: undefined, jobId: undefined } }
@@ -273,11 +322,11 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
       model: resolved.model,
       kind,
       prompt: text,
-      ratio: data.gen.params.ratio,
+      ...(data.gen.params.ratio ? { ratio: data.gen.params.ratio } : {}),
       ...(data.gen.params.durationSeconds ? { durationSeconds: data.gen.params.durationSeconds } : {}),
       nodeId,
       ...(library ? { outputDir: library.path } : {}),
-      ...(refPaths.length > 0 ? { refPaths } : {})
+      ...(refs.length > 0 ? { refs } : {})
     })
     if (!result.ok) {
       mutateNodeData(nodeId, (d) => {
@@ -302,10 +351,25 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
   }
 
   const addGenerateRef = (nodeId: string, refId: string) => {
+    const node = get().nodes.find((n) => n.id === nodeId)
+    const gen = node?.data.gen
+    if (!gen || gen.refs.includes(refId) || refId === nodeId) return
+    const caps = refCapsFor(node.data)
+    // 挂不上来的两种情况：这种素材在该模型里根本没有角色；或已经挂到总量上限
+    const refData = get().nodes.find((n) => n.id === refId)?.data
+    if (refData && !deriveRefRole((refData.kind as MediaKind) ?? 'image', node.data.kind as MediaKind, gen.refs.length, caps.quota)) {
+      showToast('当前模型用不到这条参考素材（该模型没有这种媒体的参考输入）')
+      return
+    }
+    if (caps.total > 0 && gen.refs.length >= caps.total) {
+      showToast(`当前模型最多使用 ${caps.total} 条参考素材，先移除一条再添加`)
+      return
+    }
     mutateNodeData(nodeId, (d) => {
-      if (!d.gen || d.gen.refs.includes(refId) || refId === nodeId) return d
+      if (!d.gen || d.gen.refs.includes(refId)) return d
       return { ...d, gen: { ...d.gen, refs: [...d.gen.refs, refId] } }
     })
+    showToast('已加入参考（角色按当前模型派生，点卡片上的角色胶囊可改）')
   }
 
   const removeGenerateRef = (nodeId: string, refId: string) => {

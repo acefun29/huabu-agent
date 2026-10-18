@@ -128,6 +128,17 @@ export abstract class BaseGatewayProvider<TModelConfig extends GatewayModelConfi
     )
   }
 
+  /**
+   * 按稳定 id 或线上标识查能力声明。适配器据此决定自家协议里装几条参考素材
+   * （编排层 manager 已按同一声明截断过，这里是第二道：适配器只按自己协议能表达的数量取）。
+   */
+  protected capabilitiesOf(model: string): ModelCapabilities | undefined {
+    for (const [requestModel, entry] of Object.entries(this.config.models)) {
+      if (requestModel === model || entry.userId === model) return entry.capabilities
+    }
+    return undefined
+  }
+
   /** 「provider X 下没有模型」可操作错误（清单入口提示 media:providers） */
   protected noSuchModel(model: string): never {
     throw new Error(`provider ${this.id} 下没有模型 ${model}（清单见 media:providers）`)

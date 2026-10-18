@@ -1,8 +1,9 @@
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
 import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { extraOf, submitRefs } from '../provider'
 import { registerAdapter, type AdapterDeps } from './registry'
 import { BaseGatewayProvider, buildModelRecord, nearestRatio } from './base'
-import { firstImageRefDataUri } from './refImage'
+import { prepareRefs } from './refImage'
 
 /**
  * 火山方舟（Volcengine Ark）适配器：图片同步 API + 视频异步任务制。
@@ -15,7 +16,10 @@ import { firstImageRefDataUri } from './refImage'
  * - 视频创建：POST /api/v3/contents/generations/tasks → {id, status:'queued'}。
  *   Seedance 2.x（2.0/2.5，2026-09 对照 docs.volcengine.com/docs/ark/
  *   create-video-generation-task-api 核实）：content 为 [{type:'text', text}]，
- *   分辨率/比例/时长走顶层结构化字段（resolution/ratio/duration，duration [4,30]）；
+ *   图生视频追加 {type:'image_url', image_url:{url}, role:'first_frame'}（官方还有
+ *   last_frame 与 reference_image/video/audio，与首帧互斥、按模式二选一）；
+ *   分辨率/比例/时长走顶层结构化字段（resolution/ratio/duration，2.5 [4,30]、
+ *   2.0 [4,15]；2.5 有首帧时 ratio 只能 adaptive）；
  *   1.x 老模型（deprecated 保留）沿用 --resolution/--ratio/--duration 文本后缀旗标。
  * - 视频查询：GET 同路径 /{id}，status ∈ queued/running/succeeded/failed/
  *   cancelled/expired，成功取 content.video_url；取消 DELETE 同路径 /{id}。
@@ -31,6 +35,26 @@ const VIDEO_TASKS_ENDPOINT = '/contents/generations/tasks'
 
 /** 视频异步任务的 jobId 前缀；不带该前缀的 jobId 是同步图片的结果 URL 本身 */
 const VIDEO_JOB_PREFIX = 'ark-video|'
+
+/**
+ * 方舟参考素材的单文件上限（原始字节，官方单图 <30MB、单音频 ≤15MB；整个请求体 ≤64MB
+ * 的总闸在编排层预算）。视频素材只收公网 URL，没有本地文件的投递方式 —— 见注册处 refCaps。
+ */
+const ARK_REF_MAX_BYTES: Partial<Record<MediaKind, number>> = {
+  image: 30 * 1024 * 1024,
+  audio: 15 * 1024 * 1024
+}
+
+/** 附加参数里的布尔取值（编排层已按声明校验过类型；没传 = undefined，由调用点定默认） */
+function boolExtra(input: ProviderSubmitInput, key: string): boolean | undefined {
+  const value = extraOf(input, key)
+  return typeof value === 'boolean' ? value : undefined
+}
+
+/** Seedance 2.5 家族（官方 duration [4,30]、首帧/首尾帧/编辑/延长只收 ratio=adaptive） */
+function isSeedance25(requestModel: string): boolean {
+  return /^doubao-seedance-2-5/i.test(requestModel)
+}
 
 export interface VolcArkModelConfig {
   kind: MediaKind
@@ -78,12 +102,16 @@ export class VolcArkProvider extends BaseGatewayProvider<VolcArkModelConfig> {
       model: requestModel,
       prompt: input.prompt,
       response_format: 'url',
-      // 产物走干净版（控制台预览水印与 API 水印默认值不同，显式关掉）
-      watermark: false
+      // 产物默认走干净版（控制台预览水印与 API 水印默认值不同）；模型声明了 watermark
+      // 这个附加参数时按用户给的值走
+      watermark: boolExtra(input, 'watermark') ?? false
     }
     if (input.width && input.height) body.size = seedreamSize(input.width, input.height)
-    const refDataUri = await firstImageRefDataUri(input.refFiles)
-    if (refDataUri) body.image = [refDataUri]
+    // 官方 image 字段是 string|string[]（Seedream 5.0 pro/flash 上限 10 张、
+    // 4.x 与 5.0 lite 14 张），按编排层校验过的数量全部装入
+    const refs = await prepareRefs(submitRefs(input), ARK_REF_MAX_BYTES)
+    const imageUrls = refs.items.filter((r) => r.mediaType === 'image').map((r) => r.url)
+    if (imageUrls.length > 0) body.image = imageUrls
 
     const response = await fetch(`${BASE_URL}${IMAGES_ENDPOINT}`, {
       method: 'POST',
@@ -116,7 +144,7 @@ export class VolcArkProvider extends BaseGatewayProvider<VolcArkModelConfig> {
     const legacy = /^doubao-seedance-1-/.test(requestModel)
     let body: Record<string, unknown>
     if (legacy) {
-      const flags: string[] = ['--watermark false']
+      const flags: string[] = [`--watermark ${boolExtra(input, 'watermark') ?? false}`]
       if (input.durationSeconds) flags.push(`--duration ${Math.max(1, Math.round(input.durationSeconds))}`)
       if (input.width && input.height) {
         flags.push(`--resolution ${resolutionFor(input.height)}`)
@@ -124,16 +152,37 @@ export class VolcArkProvider extends BaseGatewayProvider<VolcArkModelConfig> {
       }
       body = { model: requestModel, content: [{ type: 'text', text: [input.prompt, ...flags].join(' ') }] }
     } else {
-      body = {
-        model: requestModel,
-        content: [{ type: 'text', text: input.prompt }],
-        watermark: false
+      // 官方 content 的参考素材三种类型都带 role：image_url（first_frame/last_frame/
+      // reference_image）、video_url（reference_video）、audio_url（reference_audio）。
+      // 角色合法性与"首帧/首尾帧/全模态参考三场景互斥"已在编排层按模式声明判过，
+      // 这里只按 role 装配 —— 装配前先想清楚 1.x legacy 分支不能被这条改动波及
+      const refs = await prepareRefs(submitRefs(input), ARK_REF_MAX_BYTES)
+      const content: Record<string, unknown>[] = [{ type: 'text', text: input.prompt }]
+      let hasImageRef = false
+      for (const ref of refs.items) {
+        if (ref.mediaType === 'image') {
+          hasImageRef = true
+          content.push({ type: 'image_url', image_url: { url: ref.url }, role: ref.role })
+        } else if (ref.mediaType === 'video') {
+          content.push({ type: 'video_url', video_url: { url: ref.url }, role: 'reference_video' })
+        } else if (ref.mediaType === 'audio') {
+          content.push({ type: 'audio_url', audio_url: { url: ref.url }, role: 'reference_audio' })
+        }
       }
-      // Seedance 2.5：duration [4,30] 秒（-1 = 模型自选，缺省不传即自动）；2.0 系列 [5,10]
-      if (input.durationSeconds) body.duration = Math.max(4, Math.round(input.durationSeconds))
+      body = { model: requestModel, content, watermark: boolExtra(input, 'watermark') ?? false }
+      // 2.x 的有声视频开关（generate_audio）：模型声明了这个附加参数才发，缺省不动官方默认
+      const generateAudio = boolExtra(input, 'generate_audio')
+      if (generateAudio !== undefined) body.generate_audio = generateAudio
+      // Seedance 2.5：duration [4,30] 秒（-1 = 模型自选，缺省不传即自动）；2.0 系列 [4,15]
+      if (input.durationSeconds) {
+        const maxDuration = isSeedance25(requestModel) ? 30 : 15
+        body.duration = Math.min(maxDuration, Math.max(4, Math.round(input.durationSeconds)))
+      }
       if (input.width && input.height) {
         body.resolution = resolutionFor(input.height)
-        body.ratio = nearestRatio(input.width, input.height)
+        // 2.5 的首帧/首尾帧/编辑/延长模式官方只收 ratio=adaptive（按输入图自适应），
+        // 下发算出来的固定比例会被整单拒掉
+        body.ratio = hasImageRef && isSeedance25(requestModel) ? 'adaptive' : nearestRatio(input.width, input.height)
       }
     }
     const response = await fetch(`${BASE_URL}${VIDEO_TASKS_ENDPOINT}`, {
@@ -257,5 +306,18 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'ARK_KEY', supportedKinds: ['image', 'video'] }
+  {
+    defaultAuthEnv: 'ARK_KEY',
+    supportedKinds: ['image', 'video'],
+    // 官方（2026-10 核实）：image_url 与 audio_url 支持 data URI，video_url **只收公网 URL**
+    // （"大文件请勿使用 Base64"；管控面 CreateAsset 又只收 URL，本地文件在这家没有合法通道）
+    refCaps: {
+      byKind: {
+        image: { delivery: 'data_uri', maxBytes: 30 * 1024 * 1024 },
+        video: { delivery: 'url_only' },
+        audio: { delivery: 'data_uri', maxBytes: 15 * 1024 * 1024 }
+      },
+      maxBodyBytes: 64 * 1024 * 1024
+    }
+  }
 )

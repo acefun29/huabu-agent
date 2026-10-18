@@ -1075,8 +1075,8 @@ export interface MediaConfirmPayload {
   model?: string
   ratio?: MediaRatio
   durationSeconds?: number
-  /** 参考图（垫图/首帧）数量 */
-  refCount?: number
+  /** 参考素材摘要（"首帧 1 · 参考视频 2"）；空串 = 无参考素材 */
+  refSummary?: string
 }
 
 /* -------------------------------------------------------------------------- */

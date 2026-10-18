@@ -1,6 +1,22 @@
 import { Type } from 'typebox'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
-import { DEFAULT_MEDIA_DURATION_S, DEFAULT_MEDIA_RATIO, MEDIA_RATIOS, nearestMediaRatio, type MediaAccessMode, type MediaJobStatus, type MediaKind, type MediaRatio, type ModelCapabilities } from '../../shared/media'
+import {
+  DEFAULT_MEDIA_DURATION_S,
+  DEFAULT_MEDIA_RATIO,
+  MEDIA_RATIOS,
+  REF_ROLE_LABEL,
+  checkMediaRefs,
+  mediaKindOfPath,
+  nearestMediaRatio,
+  normalizeMediaCaps,
+  type MediaAccessMode,
+  type MediaJobStatus,
+  type MediaKind,
+  type MediaRatio,
+  type MediaRefInput,
+  type MediaRefRole,
+  type ModelCapabilities
+} from '../../shared/media'
 import { MEDIA_SRC_MARKER } from './contextEviction'
 
 /** 宿主持有的工具定义（pi 的 ToolDefinition，类型擦除后无运行时依赖） */
@@ -32,8 +48,10 @@ export interface MediaToolSubmitInput {
   prompt: string
   ratio?: MediaRatio
   durationSeconds?: number
-  /** 参考图（垫图/首帧）的工作区相对路径（媒体产物目录优先解析） */
-  refPaths?: string[]
+  /** 音色 id（音频通道；由当前模型的 voices 清单校验） */
+  voice?: string
+  /** 带角色的参考素材（工作区相对路径），角色由工具参数名给定、编排层按模型能力判定 */
+  refs?: MediaRefInput[]
   confirmed?: boolean
   /** 产物文件主名（不含扩展名）：Agent 给素材命名的口子，宿主净化 + 重名自动加序号 */
   name?: string
@@ -53,7 +71,8 @@ export interface MediaApprovalInfo {
   model?: string
   ratio?: MediaRatio
   durationSeconds?: number
-  refCount: number
+  /** 参考素材摘要（"首帧 1 · 参考视频 2"）；空串 = 没有参考素材 */
+  refSummary: string
 }
 
 export interface MediaToolContext {
@@ -102,17 +121,65 @@ const KIND_LABEL: Record<MediaKind, string> = {
 }
 
 /**
- * 参考图参数描述：静态通用上限（真实上限由宿主按模型能力截断）。
+ * 参考素材参数：按角色分槽的扁平顶层参数 —— 角色写在参数名里，模型不必猜
+ * "这张图当首帧还是参考图"。描述里的上限是静态说法，真实上限与角色支持由 execute
+ * 现读模型能力判定（超限截断留痕、角色不被支持则报错，绝不静默丢素材）。
  */
-function referenceImagesParam(kind: MediaKind) {
-  const role = kind === 'video' ? '首帧' : '垫图'
+function refSlotParam(role: MediaRefRole, opts?: { single?: boolean }) {
+  const label = REF_ROLE_LABEL[role]
+  const what = opts?.single ? '工作区内单个文件的相对路径' : '工作区内文件相对路径的数组'
+  return Type.Optional(
+    Type.String({
+      description: `${label}参考：${what}。${REF_SLOT_HINT[role]}上限由当前模型决定，超出部分不进请求并在结果里逐条说明；不需要时省略`
+    })
+  )
+}
+
+/** 每个角色的官方语义一句话（模型据此决定挂哪条素材，不靠猜） */
+const REF_SLOT_HINT: Record<MediaRefRole, string> = {
+  first_frame: '视频从这张图开始生成（首帧图生视频）；',
+  last_frame: '视频在这张图结束，必须与 first_frame 同时给；',
+  reference_image: '以参考图为素材生成，不决定构图边界；',
+  reference_video: '参考视频（画面风格/运镜的参照）；',
+  reference_audio: '参考音频（音色/节奏的参照）；'
+}
+
+/** 同类槽位 = 路径数组的参数（typebox 的 array<string>，与单值槽位区分开） */
+function refListParam(role: MediaRefRole) {
+  const label = REF_ROLE_LABEL[role]
   return Type.Optional(
     Type.Array(Type.String(), {
       description:
-        `${role}参考：工作区内图片文件的相对路径数组（媒体产物如 "xxxx.png"，素材库文件如 "assets/xxx.png"），` +
-        `最多 4 张；不需要时省略`
+        `${label}参考：工作区内文件相对路径的数组。${REF_SLOT_HINT[role]}` +
+        `上限由当前模型决定，超出部分不进请求并在结果里逐条说明；不需要时省略`
     })
   )
+}
+
+/** 工具参数（按角色分槽）→ 跨 IPC 的 MediaRefInput[] */
+function collectToolRefs(input: ToolParams, kind: MediaKind): MediaRefInput[] {
+  const slots: [MediaRefRole, string | string[] | undefined][] = [
+    ['first_frame', input.first_frame],
+    ['last_frame', input.last_frame],
+    ['reference_image', input.reference_images],
+    ['reference_video', input.reference_videos],
+    ['reference_audio', input.reference_audios]
+  ]
+  const refs: MediaRefInput[] = []
+  for (const [role, value] of slots) {
+    if (typeof value === 'string') refs.push({ role, path: value })
+    else if (Array.isArray(value)) refs.push(...value.map((path) => ({ role, path })))
+  }
+  // 音频通道今天没有任何参考素材形态（各家 TTS 只吃文稿），给了也不如立刻说清
+  if (kind === 'audio') return []
+  return refs
+}
+
+/** 确认卡摘要：把角色数出来（"首帧 1 · 参考视频 2"），空组合 = 空串 */
+function refSummaryOf(refs: readonly MediaRefInput[]): string {
+  const counts = new Map<MediaRefRole, number>()
+  for (const ref of refs) counts.set(ref.role, (counts.get(ref.role) ?? 0) + 1)
+  return [...counts].map(([role, n]) => `${REF_ROLE_LABEL[role]} ${n}`).join(' · ')
 }
 
 /** 画面比例：静态全集枚举；当前模型不支持时 execute 报错会给出该模型的支持清单 */
@@ -150,6 +217,30 @@ function nameParam() {
   )
 }
 
+/** 音频音色：静态文案（可用音色是模型声明，execute 现读校验后报错列出支持清单） */
+function voiceParam() {
+  return Type.Optional(
+    Type.String({
+      description: '音色 id（TTS）。当前模型可用音色见「设置 → 媒体生成」该模型的能力声明；不在清单内时错误信息会列出支持项。缺省用模型默认音色'
+    })
+  )
+}
+
+/** 工具参数（三条 generate_* 的并集，按 kind 各取所需） */
+interface ToolParams {
+  prompt: string
+  name?: string
+  ratio?: MediaRatio
+  duration_seconds?: number
+  voice?: string
+  first_frame?: string
+  last_frame?: string
+  reference_images?: string[]
+  reference_videos?: string[]
+  reference_audios?: string[]
+  confirmed?: boolean
+}
+
 /**
  * 失败分类 → 可操作文案。错误串来自编排层（manager/resolveAgentMedia），按稳定短语匹配；
  * 兜底原样透出。所有文案都要求 Agent 转告用户并给出下一步。
@@ -165,10 +256,17 @@ function failureGuidance(kind: MediaKind, error: string | undefined, provider?: 
       `或把默认生成模型切换到已配置凭据的供应商。在用户配置好之前不要再次尝试生成。`
     )
   }
-  if (text.includes('不支持比例') || text.includes('不支持时长') || text.includes('没有模型')) {
+  if (text.includes('不支持比例') || text.includes('不支持时长') || text.includes('没有模型') || text.includes('没有音色')) {
     return (
       `生成参数不被当前模型接受：${text}${where}。` +
       `请按错误信息里的支持列表调整参数后重试，或改用其他模型，并向用户说明原因。`
+    )
+  }
+  if (text.includes('参考素材') || text.includes('参考（') || text.includes('只接受公网') || text.includes('上传通道')) {
+    return (
+      `参考素材不被当前模型接受：${text}${where}。` +
+      `请按错误信息里的支持范围调整：换用声明了这种参考的模型、减少素材条数、或把素材换成更小/更少的图片。` +
+      `提示「只接受公网 URL」时，可以让用户提供公网可访问的地址（放进对应槽位的 URL），不要反复用同一组素材重试。`
     )
   }
   if (text.includes('超时')) {
@@ -219,7 +317,7 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
           prompt: Type.String({ description: '画面描述（越具体越好：主体、风格、构图、光线）' }),
           name: nameParam(),
           ratio: ratioParam(),
-          reference_images: referenceImagesParam(kind)
+          reference_images: refListParam('reference_image')
         })
       : kind === 'video'
         ? Type.Object({
@@ -227,7 +325,11 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
             name: nameParam(),
             ratio: ratioParam(),
             duration_seconds: durationParam(),
-            reference_images: referenceImagesParam(kind),
+            first_frame: refSlotParam('first_frame', { single: true }),
+            last_frame: refSlotParam('last_frame', { single: true }),
+            reference_images: refListParam('reference_image'),
+            reference_videos: refListParam('reference_video'),
+            reference_audios: refListParam('reference_audio'),
             confirmed: Type.Optional(
               Type.Boolean({ description: '视频生成成本高：先向用户确认，用户同意后置 true' })
             )
@@ -235,7 +337,8 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         : Type.Object({
             prompt: Type.String({ description: '音频内容描述（乐器/风格/情绪/节奏）' }),
             name: nameParam(),
-            duration_seconds: durationParam()
+            duration_seconds: durationParam(),
+            voice: voiceParam()
           })
 
   return {
@@ -243,20 +346,14 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
     label,
     description:
       kind === 'image'
-        ? '根据文字描述生成一张图片，可用 reference_images 垫图（以参考图为底生成）。调用会阻塞到生成完成，结果里包含实际参数与产物路径；产物同时作为媒体节点出现在画布上。'
+        ? '根据文字描述生成一张图片，可用 reference_images 垫图（以参考图为底生成，条数上限由模型决定）。调用会阻塞到生成完成，结果里包含实际参数与产物路径；产物同时作为媒体节点出现在画布上。'
         : kind === 'video'
-          ? '根据文字描述生成一段短视频，可用 reference_images 指定首帧。成本较高：调用前需先向用户确认，得到同意后传 confirmed=true。调用会阻塞到生成完成（可能数分钟），结果里包含实际参数与产物路径。'
-          : '根据文字描述生成一段音频（音效/配乐）。调用会阻塞到生成完成，结果里包含实际参数与产物路径。',
+          ? '根据文字描述生成一段短视频。参考素材按角色分槽：first_frame/last_frame 是首帧/首尾帧图生视频，reference_images/reference_videos/reference_audios 是全模态参考（哪种角色可用由当前模型决定，混用首帧与 reference_* 会报错）。成本较高：调用前需先向用户确认，得到同意后传 confirmed=true。调用会阻塞到生成完成（可能数分钟），结果里包含实际参数与产物路径。'
+          : '根据文字描述生成一段音频（音效/配乐），可选 voice 指定音色。调用会阻塞到生成完成，结果里包含实际参数与产物路径。',
     parameters,
     execute: async (_toolCallId, params, signal, onUpdate) => {
-      const input = params as {
-        prompt: string
-        name?: string
-        ratio?: MediaRatio
-        duration_seconds?: number
-        reference_images?: string[]
-        confirmed?: boolean
-      }
+      const input = params as ToolParams
+      const refs = collectToolRefs(input, kind)
       // 变更前确认模式：所有生成提交前先弹确认卡（取代视频对话闸门 —— 反正都要用户点头）。
       // 拒绝走「返回文本」而非抛错：这是用户的决定不是故障，Agent 应转告并等待新指示。
       if ((ctx.accessMode?.() ?? 'full') === 'confirm') {
@@ -270,7 +367,7 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
             prompt: input.prompt,
             ...(input.ratio ? { ratio: input.ratio } : {}),
             ...(input.duration_seconds ? { durationSeconds: input.duration_seconds } : {}),
-            refCount: input.reference_images?.length ?? 0
+            refSummary: refSummaryOf(refs)
           },
           signal
         )
@@ -314,6 +411,25 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
           )
         )
       }
+      if (caps?.voices?.length && input.voice && !caps.voices.some((v) => v.id === input.voice)) {
+        throw new Error(
+          failureGuidance(kind, `没有音色 ${input.voice}（当前模型支持：${caps.voices.map((v) => v.id).join(' / ')}）`)
+        )
+      }
+      // 参考素材前置检查用编排层同一份纯函数（角色、类型、模式互斥）：这里拦下省一次任务记录，
+      // 且工具文本能直接给模型可操作的指引；配额截断与投递形态仍在闸门里做
+      if (refs.length > 0 && caps) {
+        const checked = checkMediaRefs(
+          refs.map((ref) => ({ ...ref, mediaType: mediaKindOfPath(ref.path ?? ref.url ?? '')?.kind })),
+          normalizeMediaCaps(caps, kind),
+          KIND_LABEL[kind]
+        )
+        if (checked.issues.length > 0) {
+          throw new Error(
+            failureGuidance(kind, `参考素材不被当前模型接受：${checked.issues.map((i) => i.message).join('；')}`)
+          )
+        }
+      }
 
       /** 进度透传：编排层的 patch 事件 → pi 的 tool_execution_update */
       const onProgress = (progress: MediaToolProgress) => {
@@ -335,9 +451,8 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
             ...(input.name && input.name.trim() ? { name: input.name } : {}),
             ...(input.ratio ? { ratio: input.ratio } : {}),
             ...(input.duration_seconds ? { durationSeconds: input.duration_seconds } : {}),
-            ...(input.reference_images && input.reference_images.length > 0
-              ? { refPaths: input.reference_images }
-              : {}),
+            ...(input.voice ? { voice: input.voice } : {}),
+            ...(refs.length > 0 ? { refs } : {}),
             confirmed: input.confirmed
           },
           signal,
@@ -368,6 +483,11 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         `${final.artifact.width ? `，${final.artifact.width}×${final.artifact.height}px` : ''}` +
         `${final.artifact.durationSeconds ? `，${final.artifact.durationSeconds}s` : ''}），` +
         `已作为媒体节点出现在画布上（来源标记为当前会话）。`
+      // 参考素材的处置留痕必须转告：用户挂了 5 张而模型只吃 1 张时，"生成成功"不等于
+      // "按全部参考生成"——不说清就是Agent 在替网关撒谎
+      if (final.notes?.length) {
+        text += `注意：${final.notes.join('；')}。请把这条说明如实转告用户。`
+      }
       const images: Array<{ type: 'image'; data: string; mimeType: string }> = []
       if (
         kind === 'image' &&

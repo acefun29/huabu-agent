@@ -8,7 +8,7 @@
  * assembleMediaTools，断言的是装配语义本身：
  *
  *   工具面：3 个生成工具 + read_media + 视频两工具（skim_video / read_video_frames）
- *   submit 拼装：落库链 → outputDir 条件透传 / refPaths 空不传字段 / sourceChatId=nodeId /
+ *   submit 拼装：落库链 → outputDir 条件透传 / refs 空不传字段 / sourceChatId=nodeId /
  *               ratio·时长条件透传 / waitForCompletion 与进度转发
  *   失败分类：无可用模型 → 工具结果含可操作指引（不静默、不裸抛）
  *   现读语义（T2）：capabilities 与 confirmVideo 每次调用现读，改 mock 即时生效
@@ -122,8 +122,16 @@ void app
       path.join('src', 'main', 'media', 'artifactImage.ts'),
       path.join('src', 'main', 'media', 'videoFrames.ts'),
       path.join('src', 'main', 'media', 'manager.ts'),
+      path.join('src', 'main', 'media', 'mediaRefs.ts'),
       path.join('src', 'main', 'media', 'provider.ts'),
       path.join('src', 'main', 'media', 'imageSize.ts'),
+      // manager 的投递形态表（adapterRefCaps）住在 registry，转译清单必须带上
+      path.join('src', 'main', 'media', 'adapters', 'registry.ts'),
+      // mediaRefs 的上传通道（换临时引用）与索引原子写
+      path.join('src', 'main', 'media', 'upload', 'types.ts'),
+      path.join('src', 'main', 'media', 'upload', 'dashscope.ts'),
+      path.join('src', 'main', 'media', 'upload', 'minimax.ts'),
+      path.join('src', 'main', 'media', 'upload', 'index.ts'),
       // manager.ts 依赖的原子写（1d60212 收口到 fsutil；漏登会让产物主名净化直测挂掉）
       path.join('src', 'main', 'fsutil', 'atomic.ts'),
       path.join('src', 'shared', 'assets.ts'),
@@ -209,20 +217,44 @@ void app
       assert(arg.outputDir === 'assets/images', `outputDir=${JSON.stringify(arg.outputDir)}`)
       assert(arg.sourceChatId === NODE, `sourceChatId=${JSON.stringify(arg.sourceChatId)}`)
       assert(arg.provider === 'prov' && arg.model === 'prov/img', `解析=${arg.provider}:${arg.model}`)
-      assert(arg.refPaths === undefined, 'refPaths 空时不应传字段')
+      assert(arg.refs === undefined, 'refs 空时不应传字段')
       return 'outputDir + 身份 + 模型解析'
     })
 
-    await check('submit 拼装：ratio/时长/refPaths 条件透传，空 refPaths 不传字段', async () => {
+    await check('submit 拼装：ratio/时长/refs 条件透传，空 refs 不传字段', async () => {
       await imageTool.execute('c2', { prompt: 'p', ratio: '16:9', reference_images: ['/x.png'] })
       const arg = submitted.at(-1)
       assert(arg.ratio === '16:9', `ratio=${JSON.stringify(arg.ratio)}`)
-      assert(Array.isArray(arg.refPaths) && arg.refPaths[0] === '/x.png', `refPaths=${JSON.stringify(arg.refPaths)}`)
+      assert(
+        Array.isArray(arg.refs) && arg.refs.length === 1 && arg.refs[0].role === 'reference_image' && arg.refs[0].path === '/x.png',
+        `refs=${JSON.stringify(arg.refs)}`
+      )
       const audioTool = byName.get('generate_audio')
       await audioTool.execute('c3', { prompt: 'p', duration_seconds: 4 })
       const a = submitted.at(-1)
       assert(a.durationSeconds === 4, `durationSeconds=${JSON.stringify(a.durationSeconds)}`)
       return '三种条件字段'
+    })
+
+    // 视频通道的角色分槽：首帧按 first_frame 走，未声明的 reference_image 必须在提交前被拦下
+    await check('参考素材按角色分槽：first_frame 透传，未声明角色提交前报错', async () => {
+      const videoTool = byName.get('generate_video')
+      await videoTool.execute('c4', { prompt: 'p', first_frame: 'a/first.png', confirmed: true })
+      const arg = submitted.at(-1)
+      assert(
+        Array.isArray(arg.refs) && arg.refs.length === 1 && arg.refs[0].role === 'first_frame',
+        `first_frame 应归成首帧参考：${JSON.stringify(arg.refs)}`
+      )
+      let thrown
+      try {
+        await videoTool.execute('c5', { prompt: 'p', reference_images: ['a/x.png'], confirmed: true })
+      } catch (error) {
+        thrown = error
+      }
+      assert(thrown, '该视频模型未声明 reference_image，挂参考图必须报错')
+      assert(/参考素材/.test(thrown.message), `报错文案要归到参考素材分支：${thrown.message.slice(0, 120)}`)
+      assert(submitted.at(-1) === arg, '被拦下时不该提交新任务')
+      return '首帧透传 + 角色不支持前置拦截'
     })
 
     await check('产物命名透传：工具 name → submit.name；省略不传字段', async () => {

@@ -1,9 +1,13 @@
 import { createHash, createHmac } from 'crypto'
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
 import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { submitRefs } from '../provider'
 import { registerAdapter, type AdapterDeps } from './registry'
 import { BaseGatewayProvider, buildModelRecord } from './base'
-import { firstImageRefDataUri } from './refImage'
+import { prepareRefs } from './refImage'
+
+/** 混元参考图上限：官方 Base64 ≤8MB、Url ≤10MB（生图与生视频同一档） */
+const TC_REF_MAX_BYTES: Partial<Record<MediaKind, number>> = { image: 8 * 1024 * 1024 }
 
 /**
  * 腾讯云混元适配器（TC3-HMAC-SHA256 签名协议，2026-10 对照 cloud.tencent.com
@@ -77,8 +81,15 @@ export class TencentHunyuanProvider extends BaseGatewayProvider<TencentModelConf
     const requestModel = this.requestModelOf(model)
     if (!requestModel) this.noSuchModel(model)
     const kind = this.kindOf(model)
-    const refDataUri = await firstImageRefDataUri(input.refFiles)
-    const refBase64 = refDataUri ? base64Of(refDataUri) : undefined
+    // 官方只收**单张**首帧（ContentImage / Image 都是单个 {Url|Base64} 结构，没有多图、
+    // 没有尾帧、没有参考视频/音频）：取第一条图片素材，URL 型直传、本地文件转裸 base64
+    const refs = await prepareRefs(submitRefs(input), TC_REF_MAX_BYTES)
+    const refImage = refs.items.find((r) => r.mediaType === 'image')
+    const refField = refImage
+      ? refImage.url.startsWith('http')
+        ? { Url: refImage.url }
+        : { Base64: base64Of(refImage.url) }
+      : undefined
     if (kind === 'video') {
       const { Response } = await tc3Request<{ JobId?: string }>({
         host: VIDEO_HOST,
@@ -90,7 +101,7 @@ export class TencentHunyuanProvider extends BaseGatewayProvider<TencentModelConf
         payload: {
           // 官方硬上限 200 字：防御性截断，别让超长提示词把整单打成 400
           Prompt: truncateChars(input.prompt, 200),
-          ...(refBase64 ? { Image: { Base64: refBase64 } } : {}),
+          ...(refField ? { Image: refField } : {}),
           Resolution: '720p',
           LogoAdd: 0
         }
@@ -108,8 +119,8 @@ export class TencentHunyuanProvider extends BaseGatewayProvider<TencentModelConf
       secretKey,
       payload: {
         Prompt: truncateChars(input.prompt, 1024),
-        ...(refBase64 ? { ContentImage: { Base64: refBase64 } } : {}),
-        ...(input.ratio ? { Resolution: imageResolution(input.ratio, Boolean(refBase64)) } : {}),
+        ...(refField ? { ContentImage: refField } : {}),
+        ...(input.ratio ? { Resolution: imageResolution(input.ratio, Boolean(refField)) } : {}),
         LogoAdd: 0
       }
     })
@@ -306,5 +317,17 @@ registerAdapter(
       },
       () => deps.resolveKey(config)
     ),
-  { defaultAuthEnv: 'TENCENT_KEY', supportedKinds: ['image', 'video'] }
+  {
+    defaultAuthEnv: 'TENCENT_KEY',
+    supportedKinds: ['image', 'video'],
+    // 官方（2026-10 核实）：生图 ContentImage 与生视频 Image 都只收**单张**图
+    // （Url 或裸 Base64，Base64 ≤8MB）；没有首尾帧、没有多图、没有参考视频/音频输入
+    refCaps: {
+      byKind: {
+        image: { delivery: 'data_uri', maxBytes: 8 * 1024 * 1024 },
+        video: { delivery: 'none' },
+        audio: { delivery: 'none' }
+      }
+    }
+  }
 )
