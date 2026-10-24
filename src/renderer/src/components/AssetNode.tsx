@@ -6,6 +6,7 @@ import {
   FileCode,
   FileText,
   FolderOpen,
+  History,
   Image as ImageIcon,
   Library as LibraryIcon,
   Loader2,
@@ -27,8 +28,6 @@ import ReactMarkdown from 'react-markdown'
 import { useCanvasStore } from '../store/canvasStore'
 import { useSettings } from '../store/settingsStore'
 import { ASSET_IDS_MIME, MEDIA_LABEL } from '../store/canvasStore'
-import { LEGACY_ASSET_MIME } from '../store/canvas/shared'
-import { parseLegacyAssetPayload } from '../lib/dragPayload'
 import { bumpRender } from '../lib/perfProbe'
 import { CARD_THUMB_SIZE, assetSrc, formatBytes } from '../lib/media'
 import { KIND_LABEL, type AssetData, type AssetKind, type CanvasNode, type GenerateVersion, type MediaKind } from '../types'
@@ -36,14 +35,20 @@ import {
   DEFAULT_MEDIA_DURATION_S,
   MEDIA_RATIOS,
   MEDIA_ROLE_KIND,
-  REF_ROLE_LABEL,
-  deriveRefRole,
   normalizeMediaCaps
 } from '@shared/media'
 import type { MediaRefRole } from '@shared/media'
 import { shortModelLabel } from '@shared/mediaResolve'
 import { ChipSelect, MenuGroup, MenuItem, MenuNote } from './Dropdown'
 import { Collapse } from './Collapse'
+import { MediaConnectionHandle } from './canvas/MediaConnectionHandle'
+import {
+  ChainControls,
+  MediaReferenceInputs,
+  VersionDetailPanel,
+  hasReferenceDrag,
+  parseReferencePayload
+} from './canvas/MediaReferenceInputs'
 
 /** 模型未声明能力时的兜底选项（目录里的模型都带 capabilities，这份只为用户自建模型兜底） */
 const FALLBACK_DURATIONS = [3, 5, 10, 15]
@@ -435,6 +440,17 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
         />
       </div>
 
+      {/* 参考连接把手：媒体卡（图/视/音）才能被其他生成卡引用，框内左缘垂直居中，悬停/选中浮现 */}
+      {viewable && (
+        <MediaConnectionHandle
+          nodeId={node.id}
+          title="拖到生成卡片的参考槽位加为参考素材；拖到空白画布可搭生成链"
+          className={`absolute left-2 top-1/2 z-10 -translate-y-1/2 transition-opacity duration-150 ${
+            selected ? 'opacity-100' : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100'
+          }`}
+        />
+      )}
+
       <div className="relative min-h-0 flex-1 bg-(--surface-input)">
         {data.kind === 'image' && src && !previewBroken && (
           <img
@@ -601,23 +617,20 @@ const PlainAssetCard = memo(function PlainAssetCard({ node, data }: { node: Canv
  * 交互控制元素带 .gen-no-drag，避免和画布节点拖拽冲突。
  */
 const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { node: CanvasNode; data: AssetData }) {
-  // 高频字段走精确订阅：激活布尔 + 参考名（字符串 key，引用没变不重渲染）
+  // 高频字段走精确订阅：激活布尔 + 链内占用（都返回原始布尔，未波及本卡不重渲染）
   const active = useCanvasStore((s) => s.activeGenerateId === node.id)
   const gen = data.gen!
   const kind = data.kind as MediaKind
-  const refNamesKey = useCanvasStore((s) =>
-    gen.refs.map((id) => {
-      // 查 id 索引而非 nodes.find：selector 在每次 set 都会执行，find 是 O(k×n)
-      const n = s.nodesById.get(id)
-      return n ? `${id}${(n.data as AssetData).kind ?? ''}${(n.data as AssetData).name}` : ''
-    }).join('')
-  )
+  /** 链运行中且本卡尚未完成：禁用单独重跑入口，避免链任务和手动任务叠在同一卡上 */
+  const chainHoldsMe = useCanvasStore((s) => {
+    const c = s.chainRun
+    return Boolean(c && c.status === 'running' && c.nodeIds.includes(node.id) && !c.completedNodeIds.includes(node.id))
+  })
   const {
     setActiveGenerate,
     updateNode,
     updateGenerate,
     addGenerateRef,
-    removeGenerateRef,
     submitGeneration,
     resolveOutputLibrary,
     showToast,
@@ -625,6 +638,10 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
   } = useCanvasStore.getState()
   const { mediaProviders, resolveMediaModel } = useSettings()
   const [dropOver, setDropOver] = useState(false)
+  /** 整卡 drop 命中多个合法角色时挂起的来源 id，由 MediaReferenceInputs 渲染明确角色菜单 */
+  const [pendingDropSource, setPendingDropSource] = useState<string | null>(null)
+  /** 版本详情折叠区（回放该版本真实输入，不把当前配置当历史事实） */
+  const [detailOpen, setDetailOpen] = useState(false)
   const [previewBroken, setPreviewBroken] = useState(false)
   /** 卡片内联提示词：回显上次提示词，可直接编辑后提交新一行版本 */
   const [prompt, setPrompt] = useState(gen.prompt)
@@ -660,7 +677,8 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
 
   const submitPrompt = () => {
     const t = prompt.trim()
-    if (!t || busy) return
+    // 链占用本卡（等待/运行中）时不再接受手动提交，避免与链任务叠加
+    if (!t || busy || chainHoldsMe) return
     setOpenMenu(null)
     void submitGeneration(node.id, t)
   }
@@ -684,37 +702,17 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
     [mediaProviders, kind]
   )
 
-  const refNames = refNamesKey
-    ? refNamesKey
-        .split('')
-        .filter(Boolean)
-        .map((pair) => {
-          const [id, assetKind, name] = pair.split('')
-          return { id, name, assetKind: (assetKind || 'image') as MediaKind }
-        })
-    : []
-
   /**
    * 参考配额与角色：判据与主进程闸门同源（normalizeMediaCaps 从同一份能力声明派生），
    * 卡片只做"这条素材在这个模型里当什么"的即时可见性，权威判定仍在提交时。
+   * 槽位渲染与引用管理在 MediaReferenceInputs；这里只保留整卡 drop 的合法角色判定。
    */
   const refCaps = normalizeMediaCaps(resolvedCapabilities, kind)
-  /** 某大类素材在该模型里可担当的角色（点角色胶囊就在这些之间循环） */
+  /** 某大类素材在该模型里可担当的角色（整卡 drop 据此决定直接加还是弹角色菜单） */
   const rolesForAssetKind = (assetKind: MediaKind): MediaRefRole[] =>
     (Object.keys(refCaps.quota) as MediaRefRole[]).filter(
       (role) => MEDIA_ROLE_KIND[role] === assetKind && (refCaps.quota[role] ?? 0) > 0
     )
-  const roleOfRef = (refId: string, assetKind: MediaKind, index: number): MediaRefRole | null =>
-    gen.refRoles?.[refId] ?? deriveRefRole(assetKind, kind, index, refCaps.quota)
-
-  /** 点角色胶囊：在该素材大类支持的角色里切到下一个（模型只支持一种角色时不动） */
-  const cycleRefRole = (refId: string, assetKind: MediaKind, index: number) => {
-    const roles = rolesForAssetKind(assetKind)
-    if (roles.length < 2) return
-    const current = roleOfRef(refId, assetKind, index)
-    const next = roles[(roles.indexOf(current as MediaRefRole) + 1) % roles.length]
-    updateGenerate(node.id, { refRoles: { ...(gen.refRoles ?? {}), [refId]: next } })
-  }
 
   const patchParams = (patch: Partial<typeof gen.params>) =>
     updateGenerate(node.id, { params: { ...gen.params, ...patch } })
@@ -735,34 +733,46 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
     setPreviewBroken(false)
   }
 
-  const onDropRef = (refId: string) => {
-    if (refId === node.id) return
-    if (gen.refs.includes(refId)) {
-      showToast('该卡片已在参考列表中')
+  /** 整卡 drop：一种合法角色直接加；多种交给 MediaReferenceInputs 的角色菜单；零种说明原因 */
+  const onCardDrop = (sourceId: string) => {
+    const sourceNode = useCanvasStore.getState().nodesById.get(sourceId)
+    const sourceKind = sourceNode?.data.kind
+    if (sourceKind !== 'image' && sourceKind !== 'video' && sourceKind !== 'audio') {
+      showToast('文档/代码等文件不能作为媒体生成的参考素材')
       return
     }
-    // 走 store 的添加入口：角色支持与配额上限只有一份判据（这里不再自己 updateGenerate）
-    addGenerateRef(node.id, refId)
+    const legal = rolesForAssetKind(sourceKind)
+    if (legal.length === 1) {
+      addGenerateRef(node.id, sourceId, legal[0])
+    } else if (legal.length === 0) {
+      showToast(`当前模型不接受${KIND_LABEL[sourceKind]}参考（可在模型菜单换支持参考的模型）`)
+    } else {
+      setPendingDropSource(sourceId)
+    }
   }
 
   return (
     <div
       data-testid="gen-node"
       data-status={gen.status}
+      data-gen-drop-target={node.id}
       onClick={() => setActiveGenerate(node.id)}
       onDragOver={(e) => {
-        if (e.dataTransfer.types.includes(LEGACY_ASSET_MIME)) {
+        // dragover 只读 types 判通道（HTML5 此刻 getData 为空），drop 才读载荷
+        if (hasReferenceDrag(e.dataTransfer.types)) {
           e.preventDefault()
           setDropOver(true)
         }
       }}
       onDragLeave={() => setDropOver(false)}
       onDrop={(e) => {
+        if (!hasReferenceDrag(e.dataTransfer.types)) return
         e.preventDefault()
+        // 本卡已处理（槽位 drop 会先 stopPropagation 走不到这里），不让画布根重复接手
+        e.stopPropagation()
         setDropOver(false)
-        // 遗留单卡通道：解析收口在 dragPayload（未命中/空串 = null）
-        const refId = parseLegacyAssetPayload(e.dataTransfer)
-        if (refId) onDropRef(refId)
+        const sourceId = parseReferencePayload(e.dataTransfer)
+        if (sourceId && sourceId !== node.id) onCardDrop(sourceId)
       }}
       className={`relative flex h-full w-full cursor-pointer flex-col overflow-hidden rounded-2xl bg-(--surface-card) transition-shadow ${
         dropOver || active ? 'shadow-md' : 'shadow-sm hover:shadow-md'
@@ -779,6 +789,11 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
         <span className={`ml-auto shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium ${status.cls}`}>
           {gen.status === 'running' ? `${status.label} ${Math.round(gen.progress * 100)}%` : status.label}
         </span>
+        {/* 无产物/生成中也能当参考源（搭链时上游往往还没结果），把手常驻头部 */}
+        <MediaConnectionHandle
+          nodeId={node.id}
+          title="把本卡拖到其他生成卡上当参考（尚无结果也可先搭生成链）；拖到空白画布 = 接到链上"
+        />
         <ContextDragHandle nodeId={node.id} title="拖到对话框递给助手；拖到左侧素材库 = 移动归档（回喂对话）" />
       </div>
 
@@ -862,21 +877,45 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
               <span className="truncate font-mono text-[10px] text-(--on-surface-muted)" title={activeVersion.path}>
                 {activeVersion.path}
               </span>
-              {gen.versions.length > 1 && (
+              <span className="ml-auto flex shrink-0 items-center gap-1">
+                {gen.versions.length > 1 && (
+                  <button
+                    data-testid="switch-version"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      const i = gen.versions.findIndex((v) => v.id === activeVersion.id)
+                      switchVersion(gen.versions[(i + 1) % gen.versions.length])
+                    }}
+                    disabled={busy}
+                    className="gen-no-drag shrink-0 rounded-full bg-(--surface-chip) px-2 py-0.5 text-[10px] text-(--on-surface-variant) transition-colors hover:bg-(--surface-hover) disabled:cursor-not-allowed disabled:opacity-40"
+                    title={busy ? '生成中不可切换版本' : '切换版本对比'}
+                  >
+                    v{gen.versions.findIndex((v) => v.id === activeVersion.id) + 1}/{gen.versions.length}
+                  </button>
+                )}
                 <button
-                  data-testid="switch-version"
+                  data-testid="version-detail-toggle"
                   onClick={(e) => {
                     e.stopPropagation()
-                    const i = gen.versions.findIndex((v) => v.id === activeVersion.id)
-                    switchVersion(gen.versions[(i + 1) % gen.versions.length])
+                    setDetailOpen((v) => !v)
                   }}
-                  className="gen-no-drag ml-auto shrink-0 rounded-full bg-(--surface-chip) px-2 py-0.5 text-[10px] text-(--on-surface-variant) transition-colors hover:bg-(--surface-hover)"
-                  title="切换版本对比"
+                  className={`gen-no-drag flex shrink-0 items-center gap-0.5 rounded-full px-2 py-0.5 text-[10px] transition-colors ${
+                    detailOpen
+                      ? 'bg-(--active-tint) text-(--accent)'
+                      : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--surface-hover)'
+                  }`}
+                  title="回放该版本生成时实际使用的提示词、模型、参数与参考（未记录的旧版本会如实说明）"
                 >
-                  v{gen.versions.findIndex((v) => v.id === activeVersion.id) + 1}/{gen.versions.length}
+                  <History size={10} />
+                  详情
                 </button>
-              )}
+              </span>
             </div>
+            <Collapse open={detailOpen}>
+              <div className="border-t border-(--outline-soft) bg-(--surface-input)/40" onClick={(e) => e.stopPropagation()}>
+                <VersionDetailPanel version={activeVersion} />
+              </div>
+            </Collapse>
           </div>
         ) : (
           <div className="flex h-full w-full flex-col items-center justify-center gap-2 px-6 text-center">
@@ -903,70 +942,14 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
             dropOver ? 'ring-2 ring-(--accent)' : 'ring-1 ring-(--outline-soft) focus-within:ring-2 focus-within:ring-(--accent)/50'
           }`}
         >
-          {refNames.length > 0 && (
-            <div className="mb-1.5 flex flex-wrap items-center gap-1">
-              {refNames.map((r, index) => {
-                const role = roleOfRef(r.id, r.assetKind, index)
-                const switchable = rolesForAssetKind(r.assetKind).length > 1
-                return (
-                  <span
-                    key={r.id}
-                    className={`flex max-w-[170px] items-center gap-1 rounded-full py-0.5 pl-2 pr-1 text-[10.5px] ${
-                      role ? 'bg-(--active-tint) text-(--accent)' : 'bg-(--surface-input) text-(--danger)'
-                    }`}
-                    title={
-                      role
-                        ? `这条参考在本次生成里的角色：${REF_ROLE_LABEL[role]}${switchable ? '（点击角色可切换）' : '（当前模型只支持这一种角色）'}`
-                        : '当前模型用不到这条参考素材（该模型没有这种媒体的参考输入），不会进请求'
-                    }
-                  >
-                    <span className="truncate">{r.name}</span>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        cycleRefRole(r.id, r.assetKind, index)
-                      }}
-                      disabled={!switchable}
-                      className={`shrink-0 rounded px-1 text-[9.5px] ring-1 transition-colors ${
-                        role ? 'ring-(--accent)/30 hover:bg-(--accent)/10' : 'ring-(--danger)/30'
-                      } ${switchable ? 'cursor-pointer' : 'cursor-default'}`}
-                    >
-                      {role ? REF_ROLE_LABEL[role] : '用不到'}
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        removeGenerateRef(node.id, r.id)
-                      }}
-                      className="shrink-0 cursor-pointer rounded-full p-0.5 transition-colors hover:bg-(--accent) hover:text-white"
-                      title="移除参考"
-                    >
-                      <X size={10} />
-                    </button>
-                  </span>
-                )
-              })}
-              {refCaps.total > 0 && (
-                <span
-                  className="shrink-0 text-[10px] text-(--on-surface-muted)"
-                  title={`当前模型最多使用 ${refCaps.total} 条参考素材`}
-                >
-                  {refNames.length}/{refCaps.total}
-                </span>
-              )}
-            </div>
-          )}
-
-          {/* 参考素材的处置留痕：哪条没进请求、为什么（主进程编排层逐条判定后随任务状态带回来） */}
-          {gen.notes && gen.notes.length > 0 && (
-            <div className="mb-1.5 flex flex-col gap-0.5">
-              {gen.notes.map((n) => (
-                <div key={n} className="line-clamp-2 text-[10.5px] leading-snug text-(--danger)" title={n}>
-                  · {n}
-                </div>
-              ))}
-            </div>
-          )}
+          {/* 参考输入区：角色槽位/配额、引用条目、新鲜度提示与多角色菜单（数据订阅在组件内部） */}
+          <MediaReferenceInputs
+            node={node}
+            gen={gen}
+            refCaps={refCaps}
+            pendingSourceId={pendingDropSource}
+            onClearPending={() => setPendingDropSource(null)}
+          />
 
           <div className="flex items-end gap-2">
             <textarea
@@ -992,9 +975,9 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
                 e.stopPropagation()
                 submitPrompt()
               }}
-              disabled={busy || !prompt.trim()}
-              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full bg-(--fab-bg) text-(--fab-text) shadow-sm transition hover:opacity-90 disabled:opacity-30"
-              title={`生成${KIND_LABEL[kind]}（Enter）`}
+              disabled={busy || chainHoldsMe || !prompt.trim()}
+              className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-full bg-(--fab-bg) text-(--fab-text) shadow-sm transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
+              title={chainHoldsMe ? '生成链正在运行本卡，结束后可单独重跑' : `生成${KIND_LABEL[kind]}（Enter）`}
             >
               <Sparkles size={14} />
             </button>
@@ -1152,17 +1135,10 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
               )}
             </ChipSelect>
 
-            <button
-              onClick={(e) => {
-                e.stopPropagation()
-                showToast(`把画布上的文件卡片拖到本卡片上，即可作为${KIND_LABEL[kind]}生成的参考（垫图 / 首帧）`)
-              }}
-              className="ml-auto flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md border border-dashed border-(--outline) px-1.5 text-[10.5px] text-(--on-surface-muted) transition-colors hover:border-(--accent) hover:text-(--accent)"
-              title="参考：把画布上的文件卡片拖到本卡片上"
-            >
-              <Plus size={11} />
-              参考
-            </button>
+            {/* 生成链：运行到此 / 本卡链状态 / 取消（链运行期间入口停用防误触重跑） */}
+            <span className="ml-auto flex items-center gap-1">
+              <ChainControls nodeId={node.id} prompt={prompt} busy={busy} />
+            </span>
           </div>
         </div>
       </div>
