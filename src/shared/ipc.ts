@@ -880,7 +880,8 @@ export interface MediaSettingsStatus {
   providers: MediaProviderStatus[]
   /** 生成默认值（workspace.json media 段），设置页据此回显 */
   config: {
-    agentProvider: string
+    /** Agent 使用的媒体供应商；未设置 = undefined（强制配置：UI 显示"请选择"，不兜底内置默认） */
+    agentProvider?: string
     agentModels: Partial<Record<'image' | 'video' | 'audio', string>>
     /** 产物输出目录（相对工作区根），缺省 .huabu/media */
     outputDir: string

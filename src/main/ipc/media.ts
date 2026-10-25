@@ -62,13 +62,13 @@ import type { MediaKind, MediaRatio, MediaRefInput, MediaRefRole } from '../../s
 import {
   DEFAULT_MEDIA_CONCURRENCY,
   DEFAULT_MEDIA_DURATION_S,
-  DEFAULT_MEDIA_PROVIDER,
   DEFAULT_MEDIA_RATIO,
   MEDIA_EXT_KIND_MIME,
   MEDIA_RATIOS,
   MEDIA_REF_ROLES,
   mediaKindOfPath
 } from '../../shared/media'
+import { resolveMediaTarget } from '../../shared/mediaResolve'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString, ok } from './shared'
 import { consumeSourcePath } from './workspace'
@@ -278,7 +278,9 @@ export function registerMediaIpc(ctx: IpcContext): void {
           accessMode: config.accessMode ?? 'full',
           providers,
           config: {
-            agentProvider: config.agentProvider ?? DEFAULT_MEDIA_PROVIDER,
+            // 不再兜底 DEFAULT_MEDIA_PROVIDER：未设置就如实缺省，UI 显示"请选择供应商"
+            //（媒体配置强制化后，"看起来已配置"的假象比缺配置更误事）
+            ...(config.agentProvider ? { agentProvider: config.agentProvider } : {}),
             agentModels: config.agentModels ?? {},
             outputDir: config.outputDir ?? MEDIA_ROOT_REL,
             concurrency: normalizeConcurrency(config.concurrency),
@@ -303,12 +305,26 @@ export function registerMediaIpc(ctx: IpcContext): void {
     const patch = (payload ?? {}) as MediaConfigPatch
     if (typeof patch !== 'object' || patch === null) return invalidPayload('media:set-config 需要配置对象')
     const clean: Record<string, unknown> = {}
-    if (isNonEmptyString(patch.agentProvider)) clean.agentProvider = patch.agentProvider
+    // agentProvider / agentModels 做存在性校验（强制配置的写入口）：指向不存在的
+    // 供应商/模型的配置宁可不落盘，也不能让"配置好了"的假象流进解析链
+    if (isNonEmptyString(patch.agentProvider)) {
+      if (!mergeCatalog(BUILTIN_PROVIDERS, store.mediaConfig()).some((p) => p.id === patch.agentProvider)) {
+        return invalidPayload(`media:set-config 的 agentProvider 不在供应商清单里：${patch.agentProvider}`)
+      }
+      clean.agentProvider = patch.agentProvider
+    }
     if (patch.agentModels && typeof patch.agentModels === 'object') {
+      const catalog = mergeCatalog(BUILTIN_PROVIDERS, store.mediaConfig())
       const models: Record<string, string> = {}
       for (const kind of ['image', 'video', 'audio'] as const) {
         const value = patch.agentModels[kind]
-        if (isNonEmptyString(value)) models[kind] = value
+        if (!isNonEmptyString(value)) continue
+        // 复用解析链校验（复合串/旧裸 id 都能命中，kind 匹配一并检查），落盘统一规范化为复合串
+        const hit = resolveMediaTarget(catalog, { kind, agentModels: { [kind]: value } })
+        if (!hit) {
+          return invalidPayload(`media:set-config 的 agentModels.${kind} 不指向任何可用模型：${value}`)
+        }
+        models[kind] = hit.ref
       }
       clean.agentModels = models
     }

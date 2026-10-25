@@ -8,6 +8,7 @@ import { ChatDock } from './components/ChatDock'
 import { Toast } from './components/Toast'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { WorkspaceGate } from './components/WorkspaceGate'
+import { MediaConfigGate } from './components/MediaConfigGate'
 
 // 重组件按需加载：均为命名导出且只在自身 store 状态开启时显示，
 // lazy 化后首屏不必解析这些模块（内部 perfProbe 计数不受影响）
@@ -57,6 +58,7 @@ export default function App() {
         <div className="h-full w-full overflow-hidden bg-(--surface) text-(--on-surface)">
           <TitleBar />
           <WorkspaceBody />
+          <MediaConfigGate />
           <Suspense fallback={null}>
             <GuideTour />
           </Suspense>

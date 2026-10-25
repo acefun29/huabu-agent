@@ -200,7 +200,7 @@ export function SessionSidebar() {
           data-tour="rail-settings"
           whileTap={{ scale: 0.9 }}
           transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-          onClick={openSettings}
+          onClick={() => openSettings()}
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft)"
           title="设置"
         >

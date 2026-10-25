@@ -1054,8 +1054,8 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
 
             <ChipSelect
               icon={<Cpu size={11} />}
-              label={gen.params.model ?? `默认 · ${resolvedModel ? `${resolvedModel.provider} · ${shortModelLabel(resolvedModel.provider, resolvedModel.model)}` : '未配置'}`}
-              title={`${gen.params.model ? `已指定模型：${gen.params.model}` : '跟随设置里的默认模型回退链'}${resolvedCostHint ? `\n成本：${resolvedCostHint}` : ''}`}
+              label={gen.params.model ?? `默认 · ${resolvedModel ? `${resolvedModel.provider} · ${shortModelLabel(resolvedModel.provider, resolvedModel.model)}` : '默认模型未选择'}`}
+              title={`${gen.params.model ? `已指定模型：${gen.params.model}` : '使用设置里的默认模型（未选择时该卡片无法生成，去「设置 → 媒体生成」配置）'}${resolvedCostHint ? `\n成本：${resolvedCostHint}` : ''}`}
               overridden={Boolean(gen.params.model)}
               open={openMenu === 'model'}
               onOpenChange={(v) => setOpenMenu(v ? 'model' : null)}
@@ -1067,7 +1067,7 @@ const GeneratingAssetCard = memo(function GeneratingAssetCard({ node, data }: { 
                   <MenuItem
                     icon={<Sparkles size={12} />}
                     label="跟随默认"
-                    hint={resolvedModel ? `${resolvedModel.provider} · ${shortModelLabel(resolvedModel.provider, resolvedModel.model)}` : '未配置'}
+                    hint={resolvedModel ? `${resolvedModel.provider} · ${shortModelLabel(resolvedModel.provider, resolvedModel.model)}` : '默认模型未选择'}
                     selected={!gen.params.model}
                     onClick={() => {
                       patchParams({ model: undefined })

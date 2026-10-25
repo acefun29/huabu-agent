@@ -1,6 +1,6 @@
 // 设置面板「媒体生成」tab：生成默认值、新增供应商、全量模型库浏览、供应商详情（内部组件不导出，仅导出 MediaTab）
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ExternalLink, Plus, RotateCcw, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { useSettings } from '../../store/settingsStore'
 import { useCanvasStore } from '../../store/canvasStore'
@@ -8,7 +8,6 @@ import type { MediaCatalogBrowseItem, MediaProviderType } from '@shared/ipc'
 import {
   DEFAULT_MEDIA_CONCURRENCY,
   DEFAULT_MEDIA_DURATION_S,
-  DEFAULT_MEDIA_PROVIDER,
   DEFAULT_MEDIA_RATIO,
   MEDIA_GEN_MODES,
   MEDIA_MODE_LABEL,
@@ -21,11 +20,17 @@ import {
   type MediaRefRole,
   type ModelCapabilities
 } from '@shared/media'
-import { matchBareModelId, shortModelLabel } from '@shared/mediaResolve'
+import {
+  assessMediaReadiness,
+  matchBareModelId,
+  parseModelRef,
+  shortModelLabel
+} from '@shared/mediaResolve'
 import { MEDIA_ROOT_REL } from '../../harness/assetCategories'
 import type { MediaKind } from '../../types'
 import { KIND_LABEL } from '../../types'
 import { Field, Select, Toggle, inputCls } from './ui'
+import { ModelPickerDialog } from './ModelPickerDialog'
 
 /* -------------------------------------------------------------------------- */
 /* 媒体生成（真实 IPC：workspace.json media 段 + 网关凭据）                     */
@@ -58,26 +63,140 @@ const MEDIA_API_KEY_URLS: Record<string, { url: string; label: string }> = {
 
 type MediaView = 'defaults' | 'add' | 'provider'
 
+/** 存储值 → 规范化复合串：统一 `provider:模型id` 记法（旧裸 id 兼容映射，映射不到返回空） */
+function normalizeStoredRef(
+  kind: MediaKind,
+  stored: string,
+  providers: Parameters<typeof matchBareModelId>[0],
+  agentProviderId: string
+): string {
+  if (!stored) return ''
+  if (stored.includes(':')) return stored
+  return matchBareModelId(providers, stored, kind, agentProviderId || undefined)?.ref ?? ''
+}
+
+/** 复合串 → 完整显示名（供应商 · 模型名）；供应商/模型已不在清单返回 null（已失效） */
+function displayNameOfRef(ref: string, providers: Array<{ id: string; label: string; models: Array<{ id: string; label?: string }> }>): string | null {
+  const parsed = parseModelRef(ref)
+  if (!parsed) return null
+  const provider = providers.find((p) => p.id === parsed.provider)
+  const model = provider?.models.find((m) => m.id === parsed.model)
+  if (!provider || !model) return null
+  return `${provider.label} · ${model.label ?? model.id}`
+}
+
+/** 完成度清单的单格：label 固定，状态文案随评估结果（绿=就绪 / 红=拦截 / 灰=豁免） */
+function ReadinessChip({ label, ok, muted, text }: { label: string; ok: boolean; muted?: boolean; text: string }) {
+  return (
+    <div
+      className={`flex min-w-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-[11px] ${
+        muted ? 'bg-(--surface-chip) text-(--on-surface-muted)' : ok ? 'bg-(--success-bg) text-(--success-text)' : 'bg-(--danger)/10 text-(--danger)'
+      }`}
+    >
+      <span className="shrink-0 font-medium">{label}</span>
+      <span className="min-w-0 truncate" title={text}>
+        {text}
+      </span>
+    </div>
+  )
+}
+
 /** 生成默认值编辑页：Agent 工具与画布生成卡片共用，写入当前工作区 workspace.json */
 function MediaDefaultsView() {
-  const { mediaProviders, mediaStatus, confirmVideo, updateMediaConfig, resolveMediaModel, mediaModelOptions } = useSettings()
+  const { mediaProviders, mediaStatus, confirmVideo, updateMediaConfig, resolveMediaModel } = useSettings()
   const libraries = useCanvasStore((s) => s.libraries)
   const [outputDirDraft, setOutputDirDraft] = useState<string | null>(null)
   const [saveHint, setSaveHint] = useState<string | null>(null)
-  const agentProviderId = mediaStatus?.agentProvider ?? DEFAULT_MEDIA_PROVIDER
+  /** 当前打开的模型选择弹窗（大面积完整展示模型名；null = 关闭） */
+  const [pickerKind, setPickerKind] = useState<MediaKind | null>(null)
   const outputDir = mediaStatus?.outputDir ?? MEDIA_ROOT_REL
   const imageFallback = resolveMediaModel('image')
   /** 落库默认值：未配置 = 画布素材（按类型归类）；特殊值 builtin-assets / none 与主进程校验对齐 */
   const defaultLibraryId = mediaStatus?.defaultLibraryId ?? 'builtin-assets'
+
+  const agentProviderId = mediaStatus?.agentProvider ?? ''
+  // 完成度评估：供应商选择 + 三类默认模型（选择与 Key 分开呈现；unavailable 豁免不算未完成）
+  const readiness = useMemo(
+    () =>
+      assessMediaReadiness(mediaProviders, {
+        agentProvider: mediaStatus?.agentProvider,
+        agentModels: mediaStatus?.agentModels
+      }),
+    [mediaProviders, mediaStatus]
+  )
+  const refOf = (kind: MediaKind) => normalizeStoredRef(kind, mediaStatus?.agentModels?.[kind] ?? '', mediaProviders, agentProviderId)
+  const nameOf = (ref: string) => displayNameOfRef(ref, mediaProviders)
+
+  /** 弹窗选中：写入后立即关闭（agentModels 整对象替换，带上其他类的现有值） */
+  const handlePick = (ref: string) => {
+    if (!pickerKind) return
+    void updateMediaConfig({ agentModels: { ...mediaStatus?.agentModels, [pickerKind]: ref } })
+    setPickerKind(null)
+  }
 
   return (
     <div className="space-y-4">
       <div>
         <div className="text-[15px] font-semibold text-(--on-surface)">生成默认值</div>
         <div className="mt-0.5 text-[11px] leading-relaxed text-(--on-surface-muted)">
-          Agent 工具与画布上的生成卡片共用这套默认值与回退链（卡片指定 → 各类默认模型 →
-          供应商首个同类模型）；全部改动即时写入当前工作区
+          Agent 工具与画布上的生成卡片共用这套默认值（卡片指定 → 各类默认模型，均需显式选择；
+          未选择默认模型的类型，其生成会被拦截）；全部改动即时写入当前工作区
         </div>
+      </div>
+
+      {/* 配置完成度清单：强制填写的四项（选择是闸门，Key 缺失由提交层拦截并指引） */}
+      <div className="rounded-2xl bg-(--surface-card) p-4 ring-1 ring-(--outline-soft)" data-testid="media-readiness">
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-[12px] font-semibold text-(--on-surface)">配置完成度</span>
+          <span className={`text-[11px] font-medium ${readiness.complete ? 'text-(--success-text)' : 'text-(--danger)'}`}>
+            {readiness.complete ? '已就绪，可以生成' : '未完成'}
+          </span>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-1.5">
+          <ReadinessChip
+            label="Agent 供应商"
+            ok={readiness.provider.state === 'ok'}
+            text={
+              readiness.provider.state === 'ok'
+                ? (mediaProviders.find((p) => p.id === readiness.provider.ref)?.label ?? '已选择')
+                : readiness.provider.state === 'stale'
+                  ? '已失效，请重新选择'
+                  : '待选择'
+            }
+          />
+          {(['image', 'video', 'audio'] as MediaKind[]).map((kind) => {
+            const state = readiness.kinds[kind].state
+            const ref = readiness.kinds[kind].ref ?? ''
+            return (
+              <ReadinessChip
+                key={kind}
+                label={`${KIND_LABEL[kind]}默认模型`}
+                ok={state === 'ok' || state === 'unavailable'}
+                muted={state === 'unavailable'}
+                text={
+                  state === 'ok'
+                    ? (nameOf(ref) ?? '已选择')
+                    : state === 'no-key'
+                      ? `${nameOf(ref) ?? '已选择'}（供应商未配 Key）`
+                      : state === 'unselected'
+                        ? '待选择'
+                        : state === 'stale'
+                          ? '已失效，请重新选择'
+                          : '无可用模型（不拦截其他类型）'
+                }
+              />
+            )
+          })}
+        </div>
+        {!readiness.complete && (
+          <div className="mt-2 text-[11px] leading-relaxed text-(--danger)">
+            配置未完成：
+            {readiness.blockingKinds.length > 0
+              ? `${readiness.blockingKinds.map((k) => KIND_LABEL[k]).join('、')}生成将被拦截`
+              : 'Agent 供应商待选择'}
+            （Agent 工具与画布卡片同样受限）。
+          </div>
+        )}
       </div>
 
       <div className="rounded-2xl bg-(--surface-card) p-4 ring-1 ring-(--outline-soft)">
@@ -86,30 +205,42 @@ function MediaDefaultsView() {
             <Select
               value={agentProviderId}
               onChange={(v) => void updateMediaConfig({ agentProvider: v })}
-              options={mediaProviders.map((p) => ({ value: p.id, label: p.label }))}
+              options={[
+                // 未选择时给占位项（强制填写）；存量配置指向已删供应商时如实展示失效态
+                ...(agentProviderId
+                  ? mediaProviders.some((p) => p.id === agentProviderId)
+                    ? []
+                    : [{ value: agentProviderId, label: `${agentProviderId}（已失效，请重新选择）` }]
+                  : [{ value: '', label: '请选择供应商' }]),
+                ...mediaProviders.map((p) => ({ value: p.id, label: p.label }))
+              ]}
             />
           </Field>
           {(['image', 'video', 'audio'] as MediaKind[]).map((kind) => {
-            // 存储记法统一为 `provider:模型id` 复合串；旧工作区存的裸模型 id 在显示时兼容映射
             const stored = mediaStatus?.agentModels?.[kind] ?? ''
-            const selectValue =
-              !stored || stored.includes(':')
-                ? stored
-                : (matchBareModelId(mediaProviders, stored, kind, agentProviderId)?.ref ?? '')
+            const ref = refOf(kind)
+            const state = readiness.kinds[kind].state
+            // 显示名解析不出但存储值还在 = 该模型已失效（供应商被删/模型隐藏），如实展示
+            const buttonLabel =
+              state === 'unavailable'
+                ? '无可用模型'
+                : (nameOf(ref) ?? (stored ? '已失效，请重新选择' : '未选择'))
             return (
               <Field key={kind} label={`${KIND_LABEL[kind]}默认模型`}>
-                <Select
-                  value={selectValue}
-                  onChange={(v) =>
-                    void updateMediaConfig({
-                      agentModels: { ...mediaStatus?.agentModels, [kind]: v },
-                    })
-                  }
-                  options={[
-                    { value: '', label: '未指定（用供应商首个同类模型）' },
-                    ...mediaModelOptions(kind).map((m) => ({ value: m.id, label: m.label })),
-                  ]}
-                />
+                <button
+                  type="button"
+                  onClick={() => setPickerKind(kind)}
+                  disabled={state === 'unavailable'}
+                  data-testid={`media-default-model-${kind}`}
+                  className={`${inputCls} flex items-center justify-between gap-2 text-left ${
+                    state === 'unavailable' ? 'cursor-not-allowed opacity-50' : ''
+                  }`}
+                >
+                  <span className={`min-w-0 text-[13px] leading-snug ${nameOf(ref) ? 'text-(--on-surface)' : 'text-(--danger)'}`}>
+                    {buttonLabel}
+                  </span>
+                  <ChevronDown size={14} className="shrink-0 text-(--on-surface-muted)" />
+                </button>
               </Field>
             )
           })}
@@ -191,11 +322,21 @@ function MediaDefaultsView() {
         )}
       </div>
 
+      {pickerKind && (
+        <ModelPickerDialog
+          kind={pickerKind}
+          providers={mediaProviders}
+          selectedRef={refOf(pickerKind)}
+          onPick={handlePick}
+          onClose={() => setPickerKind(null)}
+        />
+      )}
+
       <div className="rounded-2xl bg-(--surface-card) px-4 py-3 text-[12px] leading-relaxed text-(--on-surface-muted) ring-1 ring-(--outline-soft)">
-        <span className="text-(--on-surface)">当前图片回退</span> →{' '}
+        <span className="text-(--on-surface)">当前图片模型</span> →{' '}
         {imageFallback
           ? `${imageFallback.provider} · ${shortModelLabel(imageFallback.provider, imageFallback.model)}`
-          : '未配置（先在左侧选供应商录入 Key）'}
+          : '未选择（图片生成将被拦截）'}
       </div>
     </div>
   )
@@ -792,7 +933,7 @@ function MediaProviderDetail({
 
   if (!provider) return null
   const keyUrl = MEDIA_API_KEY_URLS[provider.id]
-  const agentProviderId = mediaStatus?.agentProvider ?? DEFAULT_MEDIA_PROVIDER
+  const agentProviderId = mediaStatus?.agentProvider ?? ''
   /** 该供应商接入类型路由得通的大类（kind 选项过滤；与新增供应商表单同一矩阵） */
   const kindOptions = mediaAdapterKinds[provider.type] ?? ALL_KINDS
   const effectiveNmKind = kindOptions.includes(nmKind) ? nmKind : kindOptions[0]
@@ -1047,7 +1188,7 @@ export function MediaTab() {
     if (!mediaLoaded) void refreshMedia()
   }, [mediaLoaded, refreshMedia])
 
-  const agentProviderId = mediaStatus?.agentProvider ?? DEFAULT_MEDIA_PROVIDER
+  const agentProviderId = mediaStatus?.agentProvider ?? ''
   const selected = mediaProviders.find((p) => p.id === selectedId)
   // 供应商被删除后详情页失去目标，回落到默认值页
   const effectiveView: MediaView = view === 'provider' && !selected ? 'defaults' : view

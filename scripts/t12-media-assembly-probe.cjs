@@ -143,7 +143,14 @@ void app
     /* ---------------- mock 依赖 ---------------- */
 
     const NODE = 'probe-node'
-    let mediaConfigValue = { confirmVideo: true, defaultLibraryId: 'lib-default' }
+    // 媒体配置强制化（feat/media-config-gate）：解析链没有"供应商首个同类"兜底，
+    // 夹具必须显式选择每类默认模型（复合串 `provider:模型id`）才解析得到
+    let mediaConfigValue = {
+      confirmVideo: true,
+      defaultLibraryId: 'lib-default',
+      agentProvider: 'prov',
+      agentModels: { image: 'prov:prov/img', video: 'prov:prov/vid', audio: 'prov:prov/aud' }
+    }
     /** 变更前确认：approval 结果可控（undefined = 不拦截/未调用） */
     let approvalDecision = undefined
     let approvalCalls = []
@@ -411,13 +418,21 @@ void app
       return '两分支'
     })
 
-    await check('resolveAgentMedia 直测：解析命中 / 无模型抛可操作错误', () => {
+    await check('resolveAgentMedia 直测：显式默认命中 / 未显式选择不兜底 / 无模型抛可操作错误', () => {
       const hit = assembly.resolveAgentMedia(
         [{ id: 'prov', models: [{ id: 'prov/img', kind: 'image' }] }],
-        { agentProvider: 'prov' },
+        { agentProvider: 'prov', agentModels: { image: 'prov/img' } },
         'image'
       )
       assert(hit.provider === 'prov' && hit.model === 'prov/img', JSON.stringify(hit))
+      // 强制配置语义：只设供应商不选默认模型 ⇒ null ⇒ 抛指引（不再回落"供应商首个同类"）
+      let unsetThrew = null
+      try {
+        assembly.resolveAgentMedia([{ id: 'prov', models: [{ id: 'prov/img', kind: 'image' }] }], { agentProvider: 'prov' }, 'image')
+      } catch (e) {
+        unsetThrew = e
+      }
+      assert(unsetThrew && /没有可用的图片生成模型/.test(unsetThrew.message), `未显式选择应抛指引，实际：${unsetThrew}`)
       let threw = null
       try {
         assembly.resolveAgentMedia([], {}, 'video')
@@ -425,7 +440,7 @@ void app
         threw = e
       }
       assert(threw && /没有可用的视频生成模型/.test(threw.message), `抛错形态不对：${threw}`)
-      return '正反两路'
+      return '显式命中 + 不兜底 + 空清单三路'
     })
 
     /* ---------------- 视频两工具（视频理解 M2/M3）---------------- */

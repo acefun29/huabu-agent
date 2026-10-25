@@ -109,7 +109,8 @@ export function resolveOutputLibrary(
  * Agent 媒体工具的 provider/model 解析。
  *
  * 回退链的唯一实现在 shared/mediaResolve.ts（与渲染端卡片共用同一纯函数，语义一致）。
- * 默认供应商不存在、没有同类模型、没配 Key 时，都给可操作错误，绝不静默生成假图。
+ * 媒体配置强制化后没有"供应商首个同类模型"兜底：未显式选择默认模型即报可操作错误，
+ * 绝不静默替用户挑模型——选哪个模型是用户的配置任务，Agent 只负责引导。
  */
 export function resolveAgentMedia(
   providers: readonly AdapterProviderConfig[],
@@ -123,7 +124,9 @@ export function resolveAgentMedia(
   })
   if (!resolved) {
     const label = kind === 'image' ? '图片' : kind === 'video' ? '视频' : '音频'
-    throw new Error(`没有可用的${label}生成模型：请在「设置 → 媒体生成」里选择供应商并录入 API Key`)
+    throw new Error(
+      `没有可用的${label}生成模型：${label}默认模型未选择或已失效，请在「设置 → 媒体生成」为${label}选择默认模型并录入 API Key`
+    )
   }
   return { provider: resolved.provider, model: resolved.model }
 }

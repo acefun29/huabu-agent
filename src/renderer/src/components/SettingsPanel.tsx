@@ -1,16 +1,14 @@
 // 设置面板壳：Tab 定义 + 面板骨架与 tab 分派（各 tab 实现见 ./settings/）
 
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Bot, Boxes, CirclePlay, Palette, PlugZap, Sparkles, Wand2, X } from 'lucide-react'
-import { useSettingsUi } from '../store/settingsStore'
+import { useSettingsUi, type SettingsTabKey } from '../store/settingsStore'
 import { useEsc } from '../lib/hooks'
 import { GuideTab, SkillsTab, McpTab, AgentTab, AppearanceTab } from './settings/tabs'
 import { ProvidersTab } from './settings/ProvidersTab'
 import { MediaTab } from './settings/MediaTab'
 
-type TabKey = 'guide' | 'providers' | 'media' | 'skills' | 'mcp' | 'agent' | 'appearance'
-
-const TABS: { key: TabKey; label: string; icon: ReactNode }[] = [
+const TABS: { key: SettingsTabKey; label: string; icon: ReactNode }[] = [
   { key: 'guide', label: '使用引导', icon: <CirclePlay size={15} /> },
   { key: 'providers', label: '模型供应商', icon: <Boxes size={15} /> },
   { key: 'media', label: '媒体生成', icon: <Wand2 size={15} /> },
@@ -23,10 +21,15 @@ const TABS: { key: TabKey; label: string; icon: ReactNode }[] = [
 /* -------------------------------------------------------------------------- */
 
 export function SettingsPanel() {
-  const { isOpen, closeSettings } = useSettingsUi()
-  const [tab, setTab] = useState<TabKey>('providers')
+  const { isOpen, closeSettings, requestedTab } = useSettingsUi()
+  const [tab, setTab] = useState<SettingsTabKey>('providers')
 
   useEsc(isOpen, closeSettings)
+
+  // openSettings(tab) 直达：媒体配置引导等场景带着目标页打开，打开期间同步一次
+  useEffect(() => {
+    if (isOpen && requestedTab) setTab(requestedTab)
+  }, [isOpen, requestedTab])
 
   return (
     <>

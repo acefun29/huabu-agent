@@ -252,8 +252,8 @@ function failureGuidance(kind: MediaKind, error: string | undefined, provider?: 
   if (text.includes('没有可用的') || text.includes('未配置凭据')) {
     return (
       `${label}生成不可用：${text}${where}。` +
-      `请告诉用户：需要打开「设置 → 媒体生成」，选择一个媒体供应商并在那里录入 API Key（对话供应商的 Key 与媒体生成是两套独立配置），` +
-      `或把默认生成模型切换到已配置凭据的供应商。在用户配置好之前不要再次尝试生成。`
+      `选择供应商、录入 API Key 和挑选默认模型都是用户自己的配置任务（对话供应商的 Key 与媒体生成是两套独立配置）。` +
+      `请转告用户打开「设置 → 媒体生成」完成这三步，并如实说明当前缺的是哪一步；配置完成前不要再次尝试生成，也不要替用户挑选模型。`
     )
   }
   if (text.includes('不支持比例') || text.includes('不支持时长') || text.includes('没有模型') || text.includes('没有音色')) {

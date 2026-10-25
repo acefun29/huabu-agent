@@ -33,6 +33,9 @@ import type { MediaKind } from '../types'
 
 export type { SkillInfo, McpServerConfig, McpServerRuntimeInfo }
 
+/** 设置面板的 tab 键（SettingsPanel 的导航分派；openSettings(tab) 直达用） */
+export type SettingsTabKey = 'guide' | 'providers' | 'media' | 'skills' | 'mcp' | 'agent' | 'appearance'
+
 export interface AppearanceSettings {
   theme: 'light' | 'dark'
   showGrid: boolean
@@ -53,7 +56,13 @@ export interface ResolvedMediaModel {
  */
 export interface SettingsUiState {
   isOpen: boolean
-  openSettings: () => void
+  /**
+   * 打开设置面板；带 tab 时直达该页（如媒体配置引导 openSettings('media')）。
+   * requestedTab 在面板打开期间保持，SettingsPanel 据此同步内部 tab state。
+   */
+  openSettings: (tab?: SettingsTabKey) => void
+  /** 最近一次 openSettings(tab) 指定的 tab；不带 tab 的打开为 null（保持用户上次所在页） */
+  requestedTab: SettingsTabKey | null
   closeSettings: () => void
 }
 
@@ -104,7 +113,7 @@ interface SettingsState {
   mediaBrowseCatalog: (providerId: string) => Promise<MediaCatalogBrowseItem[]>
   /** 适配器类型 → 支持的媒体大类矩阵（主进程注册表事实来源；设置页 kind 选项过滤用） */
   mediaAdapterKinds: Record<string, MediaKind[]>
-  /** 模型回退链：卡片指定 → 设置里该类媒体默认 → 默认供应商首个同类模型 */
+  /** 模型解析：卡片指定 → 设置里该类媒体的显式默认（未选择/失效即 null，无兜底） */
   resolveMediaModel: (kind: MediaKind, override?: string) => ResolvedMediaModel | null
   /** 某 kind 的全部可选模型（复合 id = `provider:model`） */
   mediaModelOptions: (kind: MediaKind) => Array<{ id: string; label: string }>
@@ -512,8 +521,13 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     setAppearanceState((prev) => ({ ...prev, ...patch }))
   }, [])
 
-  // 面板开合的稳定回调：只进 UI 层 value，开/关面板不会牵动数据域 value 的重建
-  const openSettings = useCallback(() => setIsOpen(true), [])
+  // 面板开合的稳定回调：只进 UI 层 value，开/关面板不会牵动数据域 value 的重建。
+  // openSettings(tab) 记录目标页：媒体配置强制引导等场景直达「媒体生成」tab
+  const [requestedTab, setRequestedTab] = useState<SettingsTabKey | null>(null)
+  const openSettings = useCallback((tab?: SettingsTabKey) => {
+    setRequestedTab(tab ?? null)
+    setIsOpen(true)
+  }, [])
   const closeSettings = useCallback(() => setIsOpen(false), [])
 
   const value = useMemo<SettingsState>(
@@ -577,10 +591,10 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     ]
   )
 
-  // UI 层只依赖 isOpen（openSettings/closeSettings 恒定），面板开合不再重建数据域 value
+  // UI 层只依赖 isOpen/requestedTab（openSettings/closeSettings 恒定），面板开合不再重建数据域 value
   const uiValue = useMemo<SettingsUiState>(
-    () => ({ isOpen, openSettings, closeSettings }),
-    [isOpen, openSettings, closeSettings]
+    () => ({ isOpen, requestedTab, openSettings, closeSettings }),
+    [isOpen, requestedTab, openSettings, closeSettings]
   )
 
   return (
