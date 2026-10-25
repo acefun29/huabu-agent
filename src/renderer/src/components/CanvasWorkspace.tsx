@@ -16,15 +16,39 @@ import { LIBRARY_ASSET_MIME, MEDIA_LABEL, useCanvasStore } from '../store/canvas
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
-import { type AssetData, type CanvasNode, type MediaKind, type ViewState } from '../types'
+import { useDismiss } from '../lib/hooks'
+import { KIND_LABEL, type AssetData, type CanvasNode, type MediaKind, type ViewState } from '../types'
+import { MEDIA_REF_ROLES, MEDIA_ROLE_KIND, REF_ROLE_LABEL, normalizeMediaCaps } from '@shared/media'
+import type { MediaRefRole, ResolvedRefCaps } from '@shared/media'
 import type { NodeGestureApi } from './NodeFrame'
 import { NodeLayer } from './canvas/NodeLayer'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
+import { MEDIA_REFERENCE_MIME } from './canvas/MediaConnectionHandle'
+import { parseReferencePayload } from './canvas/MediaReferenceInputs'
+import { ReferenceEdgeLayer, type ReferenceEdgeSync } from './canvas/ReferenceEdgeLayer'
 
 interface MenuState {
   x: number
   y: number
   items: ContextMenuItem[]
+}
+
+/** 空白落点「用来生成」候选项：目标 kind + 首个合法角色 + 兼容模型（null = 默认链已兼容，不覆盖） */
+interface RefCreateOption {
+  kind: MediaKind
+  role: MediaRefRole
+  model: string | null
+  modelLabel: string
+}
+
+/** 参考连线拖到空白画布后弹出的建卡菜单状态 */
+interface RefDropMenuState {
+  screen: { x: number; y: number }
+  /** 落点的画布坐标（新生成卡的位置） */
+  at: { x: number; y: number }
+  sourceId: string
+  sourceName: string
+  options: RefCreateOption[]
 }
 
 /**
@@ -68,6 +92,67 @@ function TagFilterBar({ active, onChange }: { active: string | null; onChange: (
           <X size={11} />
         </button>
       )}
+    </div>
+  )
+}
+
+/**
+ * 由一个「用来生成」候选创建下游生成卡：建卡 → 需要时显式指定兼容模型 → 按合法角色挂参考 → 激活。
+ * 建卡后的每次读取都必须重新 getState：nodesById 随每次 set 整表重建，旧快照里取不到新卡 id。
+ * 能力/成环/配额校验仍在 store（addGenerateRef）。
+ */
+function createGenerateFromReference(opt: RefCreateOption, sourceId: string, at: { x: number; y: number }) {
+  const genId = useCanvasStore.getState().createGenerateNode(opt.kind, at)
+  const fresh = useCanvasStore.getState()
+  if (opt.model) {
+    const gen = fresh.nodesById.get(genId)?.data.gen
+    if (gen) fresh.updateGenerate(genId, { params: { ...gen.params, model: opt.model } })
+  }
+  fresh.addGenerateRef(genId, sourceId, opt.role)
+  fresh.setActiveGenerate(genId)
+}
+
+/**
+ * 参考连线拖到空白画布的建卡菜单（reference-create-menu）：
+ * 只列「已启用媒体模型里能吃这种素材」的目标 kind；点击 = 在落点建空 refs 生成卡 →
+ * 默认链模型不兼容时显式指定可用模型 → addGenerateRef 按合法角色挂参考
+ * （能力/成环/配额校验仍在 runtime）→ 选中新卡。Esc / 点击外部关闭。
+ */
+function ReferenceCreateMenu({ menu, onClose }: { menu: RefDropMenuState; onClose: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useDismiss(ref, true, onClose)
+  const create = (opt: RefCreateOption) => {
+    createGenerateFromReference(opt, menu.sourceId, menu.at)
+    onClose()
+  }
+  return (
+    <div
+      ref={ref}
+      data-testid="reference-create-menu"
+      className="ctx-menu fixed z-50 rounded-2xl bg-(--surface-card) p-1.5 shadow-xl ring-1 ring-(--outline)"
+      style={{
+        left: Math.max(8, Math.min(menu.screen.x, window.innerWidth - 224)),
+        top: Math.max(8, Math.min(menu.screen.y, window.innerHeight - 170)),
+        width: 212,
+      }}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <div className="px-2.5 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">
+        「{menu.sourceName}」用来生成
+      </div>
+      {menu.options.map((opt) => (
+        <button
+          key={opt.kind}
+          data-testid={`reference-create-${opt.kind}`}
+          onClick={() => create(opt)}
+          title={`模型 ${opt.modelLabel} · 角色 ${REF_ROLE_LABEL[opt.role]}（卡片上可再改）`}
+          className="flex w-full cursor-pointer items-center gap-2 rounded-xl px-2.5 py-2 text-left text-[12.5px] text-(--on-surface) transition-colors hover:bg-(--outline-soft)"
+        >
+          {opt.kind === 'image' ? <ImageIcon size={13} /> : opt.kind === 'video' ? <Video size={13} /> : <AudioLines size={13} />}
+          <span className="min-w-0 flex-1 truncate">生成{MEDIA_LABEL[opt.kind]}</span>
+          <span className="shrink-0 text-[10px] text-(--on-surface-muted)">{REF_ROLE_LABEL[opt.role]}</span>
+        </button>
+      ))}
     </div>
   )
 }
@@ -124,7 +209,8 @@ function scheduleWrite(ref: { raf: number }, apply: () => void) {
  * 渲染层拆分：nodes 数组的订阅下沉到 NodeLayer（canvas/NodeLayer.tsx）——单节点
  * 变化（生成进度事件 / 拖拽提交 / 打标签）只重渲节点层，不再重跑本组件函数体；
  * 主组件只保留「画布是否为空」的布尔派生，事件路径（右键菜单 / 框选命中）经
- * getState 现取最新 nodes。
+ * getState 现取最新 nodes。参考连线层（ReferenceEdgeLayer）是有意的第二个 nodes
+ * 订阅者：引用线是 nodes 的纯派生投影，几何手势经 edgeSyncRef 直写其 path。
  */
 export function CanvasWorkspace() {
   bumpRender('workspace')
@@ -135,8 +221,10 @@ export function CanvasWorkspace() {
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
   const activeGenerateId = useCanvasStore((s) => s.activeGenerateId)
   const workspace = useCanvasStore((s) => s.workspace)
-  const { appearance } = useSettings()
+  const { appearance, mediaProviders, resolveMediaModel } = useSettings()
   const [menu, setMenu] = useState<MenuState | null>(null)
+  /** 参考连线拖到空白画布后的「用来生成」菜单（reference-create-menu） */
+  const [refMenu, setRefMenu] = useState<RefDropMenuState | null>(null)
   /** 标签筛选：非 null 时只亮带该标签的卡片（其余降透明度） */
   const [activeTag, setActiveTag] = useState<string | null>(null)
   const [osDragOver, setOsDragOver] = useState(false)
@@ -151,6 +239,8 @@ export function CanvasWorkspace() {
   const gridRef = useRef<HTMLDivElement>(null)
   /** 框选矩形：常驻 DOM，几何由手势直写，不进 React state */
   const marqueeRef = useRef<HTMLDivElement>(null)
+  /** 参考连线层的手势同步口：拖动/resize 期间直写受影响边的 path/label（不触发渲染） */
+  const edgeSyncRef = useRef<ReferenceEdgeSync | null>(null)
   /** 已提交的 view。手势进行中它保持旧值（手势用闭包内的 live），提交后由渲染同步 */
   const viewRef = useRef(view)
   viewRef.current = view
@@ -393,29 +483,33 @@ export function CanvasWorkspace() {
         let latest = { x: node.x, y: node.y }
         /** 最新指针位置（client 坐标）：松手补算参考投放命中用 */
         let latestPointer = { x: e.clientX, y: e.clientY }
-        // 参考投放（「+ 参考」）：拖动途中悬停到某张生成卡片上即高亮，松手把它加为
-        // 参考（垫图 / 首帧）并弹回原位——本手势语义是「引用」不是「摆放」，与
-        // HTML5 把手拖到生成卡片的 drop 同效（onDropRef 的自引用/去重规则一致）。
-        let refTarget: HTMLElement | null = null
-        const setRefHover = (next: HTMLElement | null) => {
-          if (next === refTarget) return
-          refTarget?.querySelector('[data-testid="gen-node"]')?.classList.remove('gen-ref-hover')
-          next?.querySelector('[data-testid="gen-node"]')?.classList.add('gen-ref-hover')
-          refTarget = next
+        // 参考投放（引用语义）：只在明确的参考接收区命中才算 —— 角色槽位
+        // [data-reference-role]（或整卡接区 [data-reference-drop-zone]）。命中即挂参考
+        // 并弹回原位；卡面普通重叠仍可自由摆放，「以此生成」入口在右键菜单保留。
+        let refHover: { zone: HTMLElement; frame: HTMLElement; id: string } | null = null
+        const setRefHover = (next: typeof refHover) => {
+          if (refHover?.zone === next?.zone) return
+          refHover?.frame.querySelector('[data-testid="gen-node"]')?.classList.remove('gen-ref-hover')
+          next?.frame.querySelector('[data-testid="gen-node"]')?.classList.add('gen-ref-hover')
+          refHover = next
         }
-        const hitRefTarget = (cx: number, cy: number) => {
-          // 被拖卡片跟手挡在最上层，elementsFromPoint 取整叠：跳过自己，找底下带
-          // 生成状态的卡片
+        const hitRefZone = (cx: number, cy: number) => {
+          // 被拖卡片跟手挡在最上层：elementsFromPoint 取整叠，跳过自己子树，只认接收区
           for (const hit of document.elementsFromPoint(cx, cy)) {
             const frame = (hit as HTMLElement).closest?.('.canvas-node')
             if (!frame || frame === el) continue
+            const zone = (hit as HTMLElement).closest?.('[data-reference-role], [data-reference-drop-zone]')
+            if (!zone || !frame.contains(zone)) continue
             const id = frame.getAttribute('data-node-id')
             if (!id || id === node.id) continue
-            if (useCanvasStore.getState().nodes.find((n) => n.id === id)?.data.gen) return frame as HTMLElement
+            if (useCanvasStore.getState().nodesById.get(id)?.data.gen) {
+              return { zone: zone as HTMLElement, frame: frame as HTMLElement, id }
+            }
           }
           return null
         }
         const onMove = (ev: MouseEvent) => {
+          latestPointer = { x: ev.clientX, y: ev.clientY }
           if (!dragging) {
             if (Math.abs(ev.clientX - start.cx) + Math.abs(ev.clientY - start.cy) <= GESTURE_THRESHOLD_PX) return
             dragging = true
@@ -428,12 +522,17 @@ export function CanvasWorkspace() {
             y: start.y + (ev.clientY - start.cy) / scale,
           }
           const current = latest
-          const pt = { x: ev.clientX, y: ev.clientY }
+          const pt = latestPointer
           scheduleWrite(write, () => {
             el.style.transform = `translate3d(${current.x}px, ${current.y}px, 0)`
-            // 参考投放命中检测合并进同一帧：elementsFromPoint 是强制命中测试，
-            // 且每个命中元素还要 O(n) 查 nodes —— 一帧内多个 mousemove 只算一次
-            setRefHover(hitRefTarget(pt.x, pt.y))
+            // 参考连线跟手 + 投放命中检测合并进同一帧（elementsFromPoint 是强制命中测试）
+            edgeSyncRef.current?.refreshReferenceEdges(node.id, {
+              x: current.x,
+              y: current.y,
+              width: node.width,
+              height: node.height,
+            })
+            setRefHover(hitRefZone(pt.x, pt.y))
           })
         }
         const finish = () => {
@@ -441,28 +540,23 @@ export function CanvasWorkspace() {
           window.removeEventListener('mouseup', finish)
           if (write.raf) cancelAnimationFrame(write.raf)
           // 松手补算最后一次命中：快速甩动松手时它还压在未执行的 rAF 里，直接取消
-          // 会漏判，把「悬停生成卡片松手 = 加参考」退化成普通摆放（setRefHover
-          // 内部有等值短路，命中已生效时这里是空转）
-          if (dragging) setRefHover(hitRefTarget(latestPointer.x, latestPointer.y))
-          const droppedOn = refTarget
+          // 会漏判（setRefHover 内部有等值短路，命中已生效时这里是空转）
+          if (dragging) setRefHover(hitRefZone(latestPointer.x, latestPointer.y))
+          const dropped = refHover
           setRefHover(null)
+          // 连线几何覆盖必须清除：摆放与引用两条路径随后回归已提交坐标
+          edgeSyncRef.current?.refreshReferenceEdges(node.id, null)
           if (dragging) {
             el.classList.remove('canvas-node-dragging')
             setInteracting(false)
             suppressClickRef.current = true
-            if (droppedOn) {
-              // 落在生成卡片上 = 加参考并弹回原位（引用手势不改摆放）
+            if (dropped) {
+              // 命中接收区 = 挂参考并弹回原位（引用手势不改摆放）。角色取槽位显式值，
+              // 未带则由 addGenerateRef 按模型能力自动推荐；能力/成环/配额校验都在 runtime
               el.style.transform = `translate3d(${start.x}px, ${start.y}px, 0)`
-              const genId = droppedOn.getAttribute('data-node-id')
-              const gen = genId ? useCanvasStore.getState().nodes.find((n) => n.id === genId)?.data.gen : undefined
-              if (genId && gen) {
-                if (gen.refs.includes(node.id)) {
-                  useCanvasStore.getState().showToast('该卡片已在参考列表中')
-                } else {
-                  useCanvasStore.getState().updateGenerate(genId, { refs: [...gen.refs, node.id] })
-                  useCanvasStore.getState().showToast('已加入参考（垫图 / 首帧）')
-                }
-              }
+              const roleAttr = dropped.zone.getAttribute('data-reference-role')
+              const role = MEDIA_REF_ROLES.includes(roleAttr as MediaRefRole) ? (roleAttr as MediaRefRole) : undefined
+              useCanvasStore.getState().addGenerateRef(dropped.id, node.id, role)
             } else {
               useCanvasStore.getState().updateNode(node.id, { x: latest.x, y: latest.y })
             }
@@ -495,6 +589,13 @@ export function CanvasWorkspace() {
           scheduleWrite(write, () => {
             el.style.width = `${current.width}px`
             el.style.height = `${current.height}px`
+            // 参考连线锚点跟手（源/目标几何变化都要即时反映）
+            edgeSyncRef.current?.refreshReferenceEdges(node.id, {
+              x: node.x,
+              y: node.y,
+              width: current.width,
+              height: current.height,
+            })
           })
         }
         const finish = () => {
@@ -505,6 +606,7 @@ export function CanvasWorkspace() {
             el.classList.remove('canvas-node-dragging')
             setInteracting(false)
             suppressClickRef.current = true
+            edgeSyncRef.current?.refreshReferenceEdges(node.id, null)
             useCanvasStore.getState().updateNode(node.id, { width: latest.width, height: latest.height })
           }
         }
@@ -604,20 +706,38 @@ export function CanvasWorkspace() {
     }
 
     const deriveAt = { x: node.x + 48, y: node.y + 48 }
+    // 「以此生成」与空白落点建卡走同一套能力判定：只列当前已配置模型能吃这种素材的
+    // 目标 kind，角色标签取真实判定结果（不再写死垫图/首帧，也不再绕过校验直挂 refs）
+    const refSource = d.kind === 'image' || d.kind === 'video' || d.kind === 'audio'
+    const refOptions = refSource ? buildReferenceCreateOptions(d.kind as MediaKind) : []
+    const deriveItems: ContextMenuItem[] = refSource
+      ? [
+          { header: `以此生成 · ${d.name}` },
+          ...(refOptions.length === 0
+            ? [
+                {
+                  label: '当前已启用的媒体模型都不接受此素材作参考',
+                  disabled: true,
+                } satisfies ContextMenuItem,
+              ]
+            : refOptions.map(
+                (opt): ContextMenuItem => ({
+                  label: `生成${MEDIA_LABEL[opt.kind]}（${REF_ROLE_LABEL[opt.role]}）`,
+                  icon:
+                    opt.kind === 'image' ? (
+                      <ImageIcon size={13} />
+                    ) : opt.kind === 'video' ? (
+                      <Video size={13} />
+                    ) : (
+                      <AudioLines size={13} />
+                    ),
+                  onClick: () => createGenerateFromReference(opt, node.id, deriveAt),
+                })
+              )),
+        ]
+      : []
     return [
-      { header: `以此生成 · ${d.name}` },
-      {
-        label: '生成图片（作为垫图）',
-        icon: <ImageIcon size={13} />,
-        disabled: d.kind !== 'image',
-        onClick: () => useCanvasStore.getState().createGenerateNode('image', deriveAt, [node.id]),
-      },
-      {
-        label: '生成视频（作为首帧）',
-        icon: <Video size={13} />,
-        disabled: d.kind !== 'image' && d.kind !== 'video',
-        onClick: () => useCanvasStore.getState().createGenerateNode('video', deriveAt, [node.id]),
-      },
+      ...deriveItems,
       {
         label: '引用进会话（作为对话上下文）',
         icon: <MessageSquare size={13} />,
@@ -654,6 +774,77 @@ export function CanvasWorkspace() {
     setMenu({ x: e.clientX, y: e.clientY, items: node ? nodeItems(node) : canvasItems(at) })
   }
 
+  /** 某来源素材大类在某模型 caps 里可担当的首个角色（官方枚举顺序；无则 null） */
+  const firstAcceptingRole = (sourceKind: MediaKind, caps: ResolvedRefCaps): MediaRefRole | null =>
+    MEDIA_REF_ROLES.find((role) => MEDIA_ROLE_KIND[role] === sourceKind && (caps.quota[role] ?? 0) > 0) ?? null
+
+  /**
+   * 空白落点「用来生成」候选：目标 kind 三类逐一判 —— 先看默认链模型是否已兼容
+   * （兼容就不覆盖 params.model），不兼容再找第一个能吃这种素材的已配置模型显式指定。
+   * 只列实际可提交的候选：供应商必须 configured（凭据已就绪），模型不取 deprecated
+   * （生命周期约定：deprecated 不出现在新建入口）。全都不兼容的 kind 不进菜单。
+   */
+  const buildReferenceCreateOptions = (sourceKind: MediaKind): RefCreateOption[] => {
+    const options: RefCreateOption[] = []
+    for (const kind of ['image', 'video', 'audio'] as MediaKind[]) {
+      const resolved = resolveMediaModel(kind)
+      const providerInfo = resolved ? mediaProviders.find((p) => p.id === resolved.provider) : undefined
+      const info = providerInfo?.models.find((m) => m.id === resolved?.model)
+      // 默认链命中的供应商也必须已配置凭据，否则该候选提交必失败，落往下方的已配置兜底
+      if (info && providerInfo?.configured) {
+        const role = firstAcceptingRole(sourceKind, normalizeMediaCaps(info.capabilities, kind))
+        if (role) {
+          options.push({ kind, role, model: null, modelLabel: info.label ?? info.id })
+          continue
+        }
+      }
+      for (const p of mediaProviders) {
+        if (!p.configured) continue
+        const model = p.models.find((m) => {
+          if (m.kind !== kind || m.status === 'deprecated') return false
+          return firstAcceptingRole(sourceKind, normalizeMediaCaps(m.capabilities, kind)) !== null
+        })
+        if (model) {
+          options.push({
+            kind,
+            role: firstAcceptingRole(sourceKind, normalizeMediaCaps(model.capabilities, kind))!,
+            model: `${p.id}:${model.id}`,
+            modelLabel: model.label ?? model.id,
+          })
+          break
+        }
+      }
+    }
+    return options
+  }
+
+  /** 参考连线拖到空白画布：弹「用来生成」菜单搭生成链。卡片上的 drop 已由卡片自身消费（不落到这里） */
+  const handleReferenceDrop = (e: React.DragEvent) => {
+    // 普通素材卡等未消费的卡片落点不接管（只有空白位置才建卡）
+    if ((e.target as HTMLElement).closest?.('[data-node-id]')) return
+    const sourceId = parseReferencePayload(e.dataTransfer)
+    if (!sourceId) return
+    const source = useCanvasStore.getState().nodesById.get(sourceId)
+    if (!source) return
+    const kind = source.data.kind
+    if (kind !== 'image' && kind !== 'video' && kind !== 'audio') {
+      useCanvasStore.getState().showToast('文档/代码等文件不能作为媒体生成的参考素材')
+      return
+    }
+    const options = buildReferenceCreateOptions(kind)
+    if (options.length === 0) {
+      useCanvasStore.getState().showToast(`当前已启用的媒体模型都不接受${KIND_LABEL[kind]}参考，可在设置 → 媒体供应商中启用支持参考输入的模型`)
+      return
+    }
+    setRefMenu({
+      screen: { x: e.clientX, y: e.clientY },
+      at: toCanvas(e.clientX, e.clientY),
+      sourceId,
+      sourceName: source.data.name,
+      options,
+    })
+  }
+
   const selectedCount = selectedAssetIds.length
 
   return (
@@ -672,16 +863,29 @@ export function CanvasWorkspace() {
       onContextMenu={onContextMenu}
       onDragStart={(e) => e.preventDefault()}
       onDragOver={(e) => {
-        // OS 文件拖入（归档进素材库）与素材库文件拖入（钉引用）都接受落点
-        if (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes(LIBRARY_ASSET_MIME)) {
+        const types = e.dataTransfer.types
+        // 参考连线通道优先放行：拖到空白画布 = 搭生成链（drop 里弹菜单）；
+        // 生成卡片上的 drop 由卡片自身消费（stopPropagation），不经过这里
+        if (types.includes(MEDIA_REFERENCE_MIME)) {
           e.preventDefault()
-          if (e.dataTransfer.types.includes('Files')) setOsDragOver(true)
+          return
+        }
+        // OS 文件拖入（归档进素材库）与素材库文件拖入（钉引用）都接受落点
+        if (types.includes('Files') || types.includes(LIBRARY_ASSET_MIME)) {
+          e.preventDefault()
+          if (types.includes('Files')) setOsDragOver(true)
         }
       }}
       onDragLeave={(e) => {
         if (e.dataTransfer.types.includes('Files')) setOsDragOver(false)
       }}
       onDrop={(e) => {
+        // 通道〇：参考连线拖到空白画布 = 弹「用来生成」菜单搭生成链
+        if (e.dataTransfer.types.includes(MEDIA_REFERENCE_MIME)) {
+          e.preventDefault()
+          handleReferenceDrop(e)
+          return
+        }
         // 通道一：OS 文件拖上画布 = 归档进素材库分类目录（asset:import-canvas）
         if (e.dataTransfer.files.length > 0) {
           e.preventDefault()
@@ -706,6 +910,9 @@ export function CanvasWorkspace() {
       {appearance.showGrid && <div ref={gridRef} aria-hidden="true" className="dot-grid-layer" />}
       {/* 变换层：transform 非受控（applyView / 手势 rAF 直写），React 不渲染 style.transform */}
       <div ref={transformRef} data-canvas-bg="true" className="canvas-transform absolute inset-0">
+        {/* 参考连线层：nodes 的派生投影（不持久化），几何与 NodeLayer 同坐标系；
+            SVG 根不拦截事件，只有边线命中描边可点选。置于卡片之下，边不遮卡面 */}
+        <ReferenceEdgeLayer syncRef={edgeSyncRef} />
         {/* 节点层：唯一的 nodes 订阅者（单节点变化只重渲这一层，不再波及主组件） */}
         <NodeLayer api={nodeGestureApi} activeTag={activeTag} />
 
@@ -787,9 +994,11 @@ export function CanvasWorkspace() {
 
       <div className="pointer-events-none absolute bottom-2 left-3 right-3 truncate text-[11px] text-(--on-surface-muted)">
         工作目录 {workspace?.path ?? '未打开'}（Agent 可读写全部文件）· 缩放 {Math.round(view.scale * 100)}% ·
-        左键拖动框选 · 中键 / 空格+左键平移 · 滚轮缩放 · 清空画布在右上角
+        左键拖动框选 · 中键 / 空格+左键平移 · 滚轮缩放 · 拖卡片到生成卡参考槽位 = 挂参考 · 拖把手到空白 =
+        搭生成链 · 清空画布在右上角
       </div>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
+      {refMenu && <ReferenceCreateMenu menu={refMenu} onClose={() => setRefMenu(null)} />}
     </div>
   )
 }

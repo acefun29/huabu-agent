@@ -37,6 +37,7 @@
     "context-digest:check": "node scripts/context-digest-check.mjs",
     "chat-events:check": "node scripts/chat-events-check.mjs",
     "context-breakdown:check": "node scripts/context-breakdown-check.mjs",
+    "media-reference:check": "node scripts/media-reference-check.mjs",
     "session-history:check": "node scripts/session-history-check.mjs",
     "session-fork:check": "node scripts/session-fork-check.mjs",
     "probe:media-assembly": "electron scripts/t12-media-assembly-probe.cjs",

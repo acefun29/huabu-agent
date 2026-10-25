@@ -5,8 +5,9 @@ import type { StoreSet } from './chatRuntime'
 import { MEDIA_LABEL, jobCardIndex, newNodeId, settingsBridgeRef, spawnOffset, zCounter } from './shared'
 
 /**
- * 画布节点域（T8 拆分）：卡片 = 图钉（引用而非副本），删除不动文件；
- * 生成卡片清理任务绑定与悬空引用；删除一律可撤销（undoEntry 单步）。
+ * 画布节点域（T8 拆分）：卡片 = 图钉（引用而非副本），删除不动文件、也不清理
+ * 其他卡片对它的参考引用（保留失效占位，撤销恢复后自动复活）；删除一律可撤销
+ * （undoEntry 单步）。
  * 选中/注入集合（selectedAssetIds / injectedAssetIds / tempAttachments）的
  * 增删也在这里 —— 它们是 contextCollector 的输入，语义是"这一轮递给助手的料"。
  */
@@ -71,6 +72,15 @@ export function createNodeOps(deps: NodeOpsDeps) {
     const id = newNodeId()
     zCounter.current += 1
     const offset = spawnOffset(get().nodes)
+    // refs 入口规范化：去重 / 去自引 / 去指向不存在卡片的项。刻意不做模型能力判定
+    // （配额与角色派生归 runtime 的 addGenerateRef 与 validateGenerateReferences）；
+    // 先落 legacy refs 保证 getGenerateReferences 后续统一懒读（含真实 caps）。
+    const known = new Set(get().nodes.map((n) => n.id))
+    const normalizedRefs: string[] = []
+    for (const ref of refs ?? []) {
+      if (ref === id || !known.has(ref) || normalizedRefs.includes(ref)) continue
+      normalizedRefs.push(ref)
+    }
     applyNodes((prev) => [
       ...prev,
       {
@@ -86,7 +96,7 @@ export function createNodeOps(deps: NodeOpsDeps) {
           kind,
           gen: {
             prompt: '',
-            refs: refs ?? [],
+            refs: normalizedRefs,
             params: {
               ratio: settingsBridgeRef.current?.mediaStatus?.defaultRatio ?? DEFAULT_MEDIA_RATIO,
               durationSeconds: kind === 'image' ? undefined : settingsBridgeRef.current?.mediaStatus?.defaultDuration ?? DEFAULT_MEDIA_DURATION_S
@@ -102,7 +112,11 @@ export function createNodeOps(deps: NodeOpsDeps) {
     return id
   }
 
-  /** 执行删除：卡片只是图钉，删除不动文件；生成卡片清理任务绑定与悬空引用 */
+  /**
+   * 执行删除：卡片只是图钉，删除不动文件；也不清理其他卡片对被删卡片的参考 ——
+   * 引用保留为失效占位（getGenerateReferences 照常读出，校验报缺失），撤销恢复
+   * 后引用自动复活（getReferenceUpdateState 由 missing 回到 current）。
+   */
   const performRemove = (ids: string[]) => {
     const removed = get().nodes.filter((n) => ids.includes(n.id))
     if (removed.length === 0) return
@@ -110,16 +124,7 @@ export function createNodeOps(deps: NodeOpsDeps) {
     for (const [jobId, nodeId] of jobCardIndex) {
       if (ids.includes(nodeId)) jobCardIndex.delete(jobId)
     }
-    applyNodes((prev) =>
-      prev
-        .filter((n) => !ids.includes(n.id))
-        .map((n) => {
-          // 清理生成卡片对已删参考的悬空引用
-          const data = n.data
-          if (!data.gen || data.gen.refs.every((r) => !ids.includes(r))) return n
-          return { ...n, data: { ...data, gen: { ...data.gen, refs: data.gen.refs.filter((r) => !ids.includes(r)) } } }
-        })
-    )
+    applyNodes((prev) => prev.filter((n) => !ids.includes(n.id)))
     const activeGenerateId = get().activeGenerateId
     set((s) => ({
       activeGenerateId: activeGenerateId && ids.includes(activeGenerateId) ? null : activeGenerateId,

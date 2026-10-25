@@ -37,12 +37,9 @@ import { MEDIA_REFERENCE_MIME } from './MediaConnectionHandle'
 /**
  * 参考素材输入区（生成卡控制台内）：能力驱动的命名角色槽位 + 引用条目管理 +
  * 引用新鲜度提示 + 生成链控件 + 版本详情回放。
- *
- * 数据契约（types / store / lib/mediaReferenceGraph 由其他代理落地，此处按契约消费）：
- * - getGenerateReferences(node, nodes, caps) → GenerateReference[]（references 权威，旧 refs/refRoles 兼容）；
- * - addGenerateRef(nodeId, sourceId, role?) / setGenerateRefRole / moveGenerateRef /
- *   removeGenerateRef / runGenerationChain / cancelGeneration / chainRun 均由 store 提供；
- * - 单值槽占用后新拖入 = store 替换 + Toast 撤销，UI 只负责投递，不做自己的替换逻辑。
+ * 读写走 store 的 addGenerateRef / setGenerateRefRole / moveGenerateRef /
+ * removeGenerateRef / runGenerationChain / cancelGeneration；
+ * 单值槽占用后新拖入 = store 替换 + Toast 撤销，UI 只负责投递，不做自己的替换逻辑。
  */
 
 /** 参考连接通道 drop 载荷解析（新 MIME 优先，旧 LEGACY 通道兜底）；未命中返回 null */
@@ -246,34 +243,37 @@ function ReferenceChip({
 /**
  * 生成链控件：「运行到此」+ 本卡在链中的状态 + 取消。
  * runGenerationChain 内部自带范围确认，这里不再弹二次确认；链活跃时禁用入口防误触重跑。
+ * 链终态（succeeded/failed/cancelled）后不再显示「等待/运行」——等待下游与被中断的
+ * 当前卡回归安静，只有真正完成的卡保留「链已完成」（失败/取消的详情由 Toast 与卡片自身状态呈现）。
  */
 export function ChainControls({ nodeId, prompt, busy }: { nodeId: string; prompt: string; busy: boolean }) {
   const chainState = useCanvasStore((s) => {
     const c = s.chainRun
     if (!c || !c.nodeIds.includes(nodeId)) return 'idle' as const
+    if (c.status !== 'running') {
+      return c.completedNodeIds.includes(nodeId) ? ('done' as const) : ('idle' as const)
+    }
     if (c.completedNodeIds.includes(nodeId)) return 'done' as const
-    if (c.currentNodeId === nodeId) return c.status === 'failed' ? ('failed' as const) : ('running' as const)
+    if (c.currentNodeId === nodeId) return 'running' as const
     return 'waiting' as const
   })
   const chainActive = useCanvasStore((s) => s.chainRun?.status === 'running')
   const { runGenerationChain, cancelGeneration } = useCanvasStore.getState()
+  /** 本卡在活跃链上（正在跑或等待轮到）：取消按钮取消的是整条链 */
+  const chainHoldsMe = chainState === 'running' || chainState === 'waiting'
 
   const stateLabel =
     chainState === 'waiting'
       ? '链等待中'
       : chainState === 'running'
         ? '链运行中'
-        : chainState === 'done'
-          ? '链已完成'
-          : '链失败'
+        : '链已完成'
   const stateCls =
     chainState === 'running'
       ? 'bg-(--active-tint) text-(--accent)'
       : chainState === 'done'
         ? 'bg-(--success-bg) text-(--success-text)'
-        : chainState === 'failed'
-          ? 'bg-(--surface-chip) text-(--danger)'
-          : 'bg-(--surface-chip) text-(--on-surface-variant)'
+        : 'bg-(--surface-chip) text-(--on-surface-variant)'
 
   return (
     <span className="flex items-center gap-1">
@@ -296,14 +296,14 @@ export function ChainControls({ nodeId, prompt, busy }: { nodeId: string; prompt
         <ChevronDown size={11} />
         运行到此
       </button>
-      {(busy || chainState === 'running') && (
+      {(busy || chainHoldsMe) && (
         <button
           data-testid="cancel-generation"
           onClick={(e) => {
             e.stopPropagation()
             void cancelGeneration(nodeId)
           }}
-          title="取消本卡的生成任务"
+          title={chainHoldsMe ? '取消本卡所在的生成链（已完成的产物保留，后续卡不再执行）' : '取消本卡的生成任务'}
           className="flex h-6 shrink-0 cursor-pointer items-center gap-1 rounded-md bg-(--surface-chip) px-1.5 text-[10.5px] text-(--danger) transition-colors hover:bg-(--surface-hover)"
         >
           <X size={11} />
@@ -314,13 +314,27 @@ export function ChainControls({ nodeId, prompt, busy }: { nodeId: string; prompt
   )
 }
 
-/** 版本详情：回放该版本生成时的真实输入（prompt/model/params/引用来源），旧版本未记录时如实说明 */
+/** 版本详情：回放该版本生成时的真实输入（prompt/model/params/引用来源）；老版本如实说明缺什么 */
 export function VersionDetailPanel({ version }: { version: GenerateVersion }) {
   const inputs = version.inputs
   if (!inputs) {
+    // 老版本：版本自身仍存了当时的 prompt/model，如实展示；参数与参考快照确实没记录
     return (
-      <div data-testid="version-detail-panel" className="px-3 py-1.5 text-[10.5px] leading-relaxed text-(--on-surface-muted)">
-        该版本生成于输入记录功能之前，未保存当时的提示词、参数与参考快照；下方仅为当前卡片配置，不代表该版本的真实输入。
+      <div
+        data-testid="version-detail-panel"
+        className="flex flex-col gap-1 px-3 py-1.5 text-[10.5px] leading-relaxed"
+        onClick={(e) => e.stopPropagation()}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="text-(--on-surface-muted)">提示词（该版本实际使用）</div>
+        <div className="line-clamp-3 whitespace-pre-wrap break-all text-(--on-surface)">{version.prompt || '（空）'}</div>
+        <div className="text-(--on-surface-variant)">
+          模型：
+          <span className="font-mono">{version.model ?? '默认回退链'}</span>
+        </div>
+        <div className="text-(--on-surface-muted)">
+          该版本生成于输入快照功能之前：当时已保存提示词与模型（见上），但参数与参考素材快照未记录，无法回放完整输入，也无法比对引用是否变化。
+        </div>
       </div>
     )
   }
@@ -387,6 +401,10 @@ export function MediaReferenceInputs({
   const refs = useMemo(() => getGenerateReferences(node, nodes, refCaps), [node, nodes, refCaps])
   /** 引用新鲜度：与最近一次已记录输入对比（unknown = 旧历史未记录） */
   const updateState = useMemo(() => getReferenceUpdateState(node, nodes), [node, nodes])
+  /** 「上次生成未记录」只在确有生成历史（存在版本）但缺输入快照时提示；新空卡不打扰 */
+  const hasGenHistory = (node.data.gen?.versions.length ?? 0) > 0
+  const showUpdateHint =
+    updateState === 'missing' || updateState === 'changed' || (updateState === 'unknown' && hasGenHistory)
   const sourceById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes])
 
   const validRefs = refs.filter((r) => (refCaps.quota[r.role] ?? 0) > 0)
@@ -447,7 +465,7 @@ export function MediaReferenceInputs({
         </div>
       )}
 
-      {updateState !== 'current' && (
+      {showUpdateHint && (
         <div
           data-testid="reference-update-hint"
           data-state={updateState}

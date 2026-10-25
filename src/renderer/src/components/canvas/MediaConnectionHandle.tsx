@@ -2,7 +2,7 @@ import { Spline } from 'lucide-react'
 import { LEGACY_ASSET_MIME } from '../../store/canvas/shared'
 
 /**
- * 参考连接通道的唯一 MIME（契约与其他代理共用）：载荷 = 源节点 id 纯文本。
+ * 参考连接通道的唯一 MIME：载荷 = 源节点 id 纯文本。
  * HTML5 dragover 阶段读不到 getData，通道判定一律走 e.dataTransfer.types；
  * 只有 drop 命中后才允许读载荷。
  */

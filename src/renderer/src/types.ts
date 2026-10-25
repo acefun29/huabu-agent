@@ -194,20 +194,93 @@ export interface GenerateVersion {
   /** 当时的提示词 */
   prompt: string
   model?: string
+  /** 产出该版本的真实任务 id（media job；运行时按它去重/回溯） */
+  jobId?: string
+  /** 提交时的输入定格（参考快照/参数/模型，见 GenerateInputSnapshot）。老版本无此字段 = 无从比对，引用新鲜度读作 unknown */
+  inputs?: GenerateInputSnapshot
   createdAt: string
+}
+
+/**
+ * 一条生成参考的显式记录（引用链事实源）。AssetGen.references 存在时它是唯一权威，
+ * legacy refs/refRoles 退化为兼容视图：读一律走 lib/mediaReferenceGraph 的
+ * getGenerateReferences（references 缺席时按 refs/refRoles + 当前 caps 懒派生），
+ * 写一律经 withGenerateReferences 回填双份，不要绕开它直接改 refs/refRoles。
+ */
+export interface GenerateReference {
+  id: string
+  sourceNodeId: string
+  role: MediaRefRole
+  /** 在该卡参考序列中的位次（0 起；写入时由 withGenerateReferences 统一重排） */
+  order: number
+}
+
+/** 提交生成时一条参考素材的定格快照（GenerateInputSnapshot.refs 的元素） */
+export interface GenerateRefSnapshot {
+  referenceId: string
+  sourceNodeId: string
+  role: MediaRefRole
+  sourceName: string
+  /** 来源是生成卡时被引用的版本 id：上游再生成（activeVersionId 变化）即可判 changed；只改提示词不算 */
+  sourceVersionId?: string
+  storage: AssetStorage
+  path: string
+  pathRoot?: string
+  mime?: string
+  bytes?: number
+}
+
+/** 一次提交的输入定格（版本级事实源）：引用新鲜度比对与历史回放都以它为准 */
+export interface GenerateInputSnapshot {
+  prompt: string
+  params: GenerateParams
+  provider: string
+  model: string
+  refs: GenerateRefSnapshot[]
+  createdAt: number
+}
+
+/**
+ * 生成链运行态（引用链批量生成）。由生成任务域（jobRuntime）创建与推进；
+ * 画布载入/切换工作区时重置为 null，在途链的取消由 runtime 自行处理。
+ */
+export interface GenerationChainRun {
+  id: string
+  targetNodeId: string
+  /** 按上游拓扑排序的待执行生成卡（含目标卡自身，target 排最后；planGenerationChain 产出） */
+  nodeIds: string[]
+  completedNodeIds: string[]
+  currentNodeId?: string
+  status: 'running' | 'cancelled' | 'failed' | 'succeeded'
+  error?: string
 }
 
 /** 文件卡片上的生成状态 */
 export interface AssetGen {
   /** 最近一次提交的提示词（回显进卡片输入框，可改一字再生成） */
   prompt: string
-  /** 参考资产节点 id（垫图/首帧/风格参考；连线用） */
+  /**
+   * 参考资产节点 id 序列（legacy 兼容视图）。references 存在时由
+   * withGenerateReferences 从 references 反向同步（去重、按首现身排序），
+   * 只读不写；新写入一律走 references（连线绘制仍读它取来源节点）。
+   */
   refs: string[]
   /**
-   * 每条参考素材在该模型里的角色（`refId → role`）。缺席 = 按素材大类与序数派生
-   * （首图当首帧、其余当参考图），也就是历史语义；卡片上的角色胶囊改的就是这个字段。
+   * legacy 兼容视图：`sourceNodeId → 显式角色`。references 存在时由
+   * withGenerateReferences 同步（同源多角色时取首现身角色的映射，legacy 表达力如此）；
+   * references 缺席的旧数据里它仍有效（缺席项 = 按素材大类与序数派生的历史语义）。
    */
   refRoles?: Record<string, MediaRefRole>
+  /**
+   * 显式参考记录（引用链唯一事实源）。缺席 = 尚未归一化的旧数据，读路径按
+   * refs/refRoles + 当前模型 caps 懒派生（getGenerateReferences），
+   * 刻意不在载入期用默认 caps 固化，避免"reference_image 专用视频模型被存成 first_frame"。
+   */
+  references?: GenerateReference[]
+  /** 提交成功后、任务终态前的输入定格暂存（runtime 绑定 job；succeeded 时落进版本.inputs） */
+  pendingInputs?: GenerateInputSnapshot
+  /** 关联的生成链运行 id（GenerationChainRun.id；链式生成的成员卡标记） */
+  chainRunId?: string
   params: GenerateParams
   status: GenerateStatus
   /** 0..1 */

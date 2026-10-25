@@ -200,6 +200,106 @@ textarea,
   z-index: 99999;
 }
 
+/* ---- 参考连线层（引用链可视化，ReferenceEdgeLayer）---- */
+
+/* SVG 覆盖整个变换层、与 NodeLayer 同坐标系；根不拦截事件（平移/框选/滚轮照常），
+   内容可越出视口（画布坐标可能为负） */
+.reference-edge-layer {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+/* 普通连线：低对比；端点选中/激活的直接关系才提亮（ref-edge-active） */
+.reference-edge-line {
+  fill: none;
+  stroke: var(--outline);
+  stroke-width: 1.5;
+  pointer-events: none;
+  transition: stroke 0.15s ease;
+}
+.reference-edge.ref-edge-active .reference-edge-line {
+  stroke: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.reference-edge.ref-edge-selected .reference-edge-line {
+  stroke: var(--accent);
+  stroke-width: 2.5;
+}
+
+/* 箭头 marker（方向感：源出目标入）；CSS 变量只能走类，不能写进 presentation 属性 */
+.ref-arrow-normal {
+  fill: none;
+  stroke: var(--outline);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ref-arrow-active {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* 命中描边：透明宽 stroke 可点选（pointer-events: stroke，fill 不吃事件） */
+.reference-edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 16px;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+/* 角色 label：悬停/端点选中才出现（文字 = 源-目标-角色），白边描字保证可读 */
+.reference-edge-label {
+  font-size: 10px;
+  font-weight: 500;
+  fill: var(--on-surface-variant);
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.reference-edge:hover .reference-edge-label,
+.reference-edge.ref-edge-active .reference-edge-label,
+.reference-edge.ref-edge-selected .reference-edge-label {
+  opacity: 1;
+}
+
+/* 移除按钮：随 label 一起浮现；只在可见时可点（隐形不吃事件） */
+.reference-edge-remove {
+  opacity: 0;
+  pointer-events: none;
+  cursor: pointer;
+  transition: opacity 0.12s ease;
+}
+.reference-edge-remove circle {
+  fill: var(--surface-card);
+  stroke: var(--outline);
+}
+.reference-edge-remove path {
+  fill: none;
+  stroke: var(--danger);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.reference-edge:hover .reference-edge-remove,
+.reference-edge.ref-edge-selected .reference-edge-remove {
+  opacity: 1;
+  pointer-events: auto;
+}
+.reference-edge-remove:hover circle {
+  fill: var(--danger);
+  stroke: var(--danger);
+}
+.reference-edge-remove:hover path {
+  stroke: #fff;
+}
+
 /* 右键菜单 / 弹层 / 确认框 / Toast 的入场动效（替代原型里的 motion 库） */
 .ctx-menu {
   animation: huabu-pop 0.13s ease-out;

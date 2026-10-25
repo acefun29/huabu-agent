@@ -9,6 +9,7 @@ import type {
   WorkspaceDeleteResult,
   WorkspaceInfo
 } from '@shared/ipc'
+import type { MediaRefRole } from '@shared/media'
 import { useSettings } from './settingsStore'
 import type {
   AssetData,
@@ -17,6 +18,7 @@ import type {
   ChatData,
   ChatMessage,
   DirEntry,
+  GenerationChainRun,
   MaterialLibrary,
   MediaKind,
   MessageAttachment,
@@ -25,6 +27,7 @@ import type {
   ViewState,
   Workspace
 } from '../types'
+import { withGenerateReferences } from '../lib/mediaReferenceGraph'
 import { createChatRuntime } from './canvas/chatRuntime'
 import { createJobRuntime } from './canvas/jobRuntime'
 import { createNodeOps } from './canvas/nodeOps'
@@ -147,10 +150,22 @@ export interface CanvasState {
   /** @internal 供自动保存订阅与探针使用 */
   undoEntry: UndoEntry | null
 
-  /* 生成卡片 */
+  /* 生成卡片（引用链契约：实现一律由生成任务域 jobRuntime 提供，装配层只声明签名） */
   updateGenerate: (nodeId: string, patch: Partial<AssetGen>) => void
-  addGenerateRef: (nodeId: string, refId: string) => void
+  /** 加入一条生成参考（引用链显式记录）：role 缺省按素材大类与序数派生；实现含配额校验/单值槽替换/撤销 */
+  addGenerateRef: (nodeId: string, refId: string, role?: MediaRefRole) => void
+  /** 移除一条生成参考：referenceId 优先，兼容老 sourceNodeId 入参 */
   removeGenerateRef: (nodeId: string, refId: string) => void
+  /** 设置一条参考的角色（referenceId 优先，兼容老 sourceNodeId） */
+  setGenerateRefRole: (nodeId: string, referenceId: string, role: MediaRefRole) => void
+  /** 参考在序列里前移/后移一位（referenceId 优先） */
+  moveGenerateRef: (nodeId: string, referenceId: string, direction: -1 | 1) => void
+  /** 以该卡为终点执行生成链（上游拓扑先跑；范围确认由实现内部处理，调用方不二次弹窗） */
+  runGenerationChain: (nodeId: string, prompt?: string) => Promise<void>
+  /** 取消该卡所在的生成链（chainRun → cancelled 由生成任务域写） */
+  cancelGeneration: (nodeId: string) => Promise<void>
+  /** 生成链运行态（由生成任务域写；画布载入/切换工作区时重置 null，在途链取消由 runtime 处理） */
+  chainRun: GenerationChainRun | null
   clearGenerateVersions: (nodeId: string) => void
   requestClearGenerateVersions: (nodeId: string) => void
   submitGeneration: (nodeId: string, prompt: string) => Promise<void>
@@ -423,11 +438,19 @@ export const useCanvasStore = create<CanvasState>()(
       } else if (!result.ok) {
         console.warn('[canvas] 载入画布失败：', result.error)
       }
-      const maxZ = restored.reduce((max, node) => Math.max(max, node.zIndex), 10)
+      // 引用记录轻规范：仅对已带 references 的卡去重/重排序号并同步 legacy 视图；
+      // 旧数据（refs/refRoles）不在此固化角色 —— 由 getGenerateReferences 按当前
+      // 模型 caps 懒读迁移，避免 settings 未就绪时把默认角色错存（见 mediaReferenceGraph）。
+      const normalized = restored.map((node) => {
+        const gen = node.data.gen
+        if (!gen || !Array.isArray(gen.references) || gen.references.length === 0) return node
+        return { ...node, data: { ...node.data, gen: withGenerateReferences(gen, gen.references) } }
+      })
+      const maxZ = normalized.reduce((max, node) => Math.max(max, node.zIndex), 10)
       zCounter.current = maxZ + 1
       // 重建任务绑定索引：重载后同一任务的后续事件依然只由既有卡片承接
       jobCardIndex.clear()
-      for (const [k, v] of buildJobCardIndex(restored)) jobCardIndex.set(k, v)
+      for (const [k, v] of buildJobCardIndex(normalized)) jobCardIndex.set(k, v)
       // 会话清单 + 空的对话历史槽（历史随后按 sessionFile 回放）
       const chats: Record<string, ChatData> = {}
       for (const s of restoredSessions) chats[s.id] = { title: s.title, history: [] }
@@ -437,8 +460,8 @@ export const useCanvasStore = create<CanvasState>()(
           : (restoredSessions[0]?.id ?? null)
       hydrated = true
       set({
-        nodes: restored,
-        nodesById: buildNodeIndex(restored),
+        nodes: normalized,
+        nodesById: buildNodeIndex(normalized),
         view: metaView ?? { x: 0, y: 0, scale: 1 },
         sessions: restoredSessions,
         chatsMap: chats,
@@ -446,6 +469,8 @@ export const useCanvasStore = create<CanvasState>()(
         injectedAssetIds: [],
         tempAttachments: [],
         activeGenerateId: null,
+        // 在途生成链不跨工作区存活：载入即重置，取消/续跑由 runtime 自行处理
+        chainRun: null,
         activeSessionId: restoredActive,
         ...recomputeChatDerived(chats, restoredActive)
       })
@@ -559,6 +584,7 @@ export const useCanvasStore = create<CanvasState>()(
       injectedAssetIds: [],
       tempAttachments: [],
       activeGenerateId: null,
+      chainRun: null,
       libraries: [],
       inboxDir: null,
       dirFiles: [],
