@@ -461,6 +461,11 @@ async function main() {
       assert(c.body.parameters.resolution === '720P' && c.body.parameters.ratio === '16:9', `参数形态不对：${JSON.stringify(c.body.parameters)}`)
       assert(c.body.parameters.duration === 15, `duration 应 clamp 到 15：${c.body.parameters.duration}`)
 
+      // ③' happyhorse-1.1-t2v 时长**下限 3**（官方 3~15）：回归钉——t2v 分支曾把下限
+      //   写成 2，与自家 media 分支/文件头矛盾；现两分支共用 dashscope.ts 的 videoDurationWindow 族表
+      await adapter.submit('dashscope/happyhorse-1.1-t2v', { prompt: 'p', width: 1280, height: 720, durationSeconds: 1 })
+      assert(calls.at(-1).body.parameters.duration === 3, `happyhorse t2v 下限应为 3：${calls.at(-1).body.parameters.duration}`)
+
       // ④ happyhorse-1.1-i2v 图生视频：media 数组 + duration 下限 3（官方 3~15 秒）
       await adapter.submit('dashscope/happyhorse-1.1-i2v', { prompt: 'p', durationSeconds: 1, refs: [refImg(refPng, 'first_frame')] })
       c = calls.at(-1)
@@ -472,6 +477,86 @@ async function main() {
       c = calls.at(-1)
       assert(c.body.input.media?.[0]?.type === 'first_frame', 'wan3.0-video-prime 应走 media 形态')
       assert(c.body.parameters.duration === 30, `wan3.0-video-prime duration 应 clamp 到 30：${c.body.parameters.duration}`)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  await checkAsync('token-plan 文生图（同步）/文生视频（异步）协议形态（2026-10-25 官方 token-plan-multimodal-gen 核实）', async () => {
+    const effective = mergeCatalog(BUILTIN_PROVIDERS.filter((p) => p.id === 'token-plan'), {})
+    const created = adapters.createAdapters(effective, { mediaDir: () => null, resolveKey: async () => 'sk-dry' })
+    const adapter = created.find((a) => a.id === 'token-plan')
+    assert(adapter, 'token-plan 适配器未实例化')
+    assert(adapter.type === 'gateway-token-plan', `适配器类型不对：${adapter.type}`)
+
+    const calls = []
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const urlText = String(url)
+      if (init?.method === 'POST' && !urlText.includes('/cancel')) {
+        calls.push({ url: urlText, body: JSON.parse(init.body), headers: init.headers ?? {} })
+        if (urlText.includes('multimodal-generation')) {
+          return new Response(JSON.stringify({ output: { choices: [{ message: { content: [{ type: 'image', image: 'https://cdn/i.png' }] } }] } }), { status: 200 })
+        }
+        return new Response(JSON.stringify({ output: { task_id: 'task-tp-1' } }), { status: 200 })
+      }
+      // GET 轮询：回终态成功
+      return new Response(JSON.stringify({ output: { task_status: 'SUCCEEDED', video_url: 'https://cdn/v.mp4' } }), { status: 200 })
+    }
+
+    try {
+      // ① 文生图：token-plan 专属同步端点（**不是**标准百炼的 image-generation/generation）、
+      //   不带 X-DashScope-Async，URL 产物编码进 jobId，poll 首轮直接成功
+      const jobImage = await adapter.submit('token-plan/qwen-image-3.0-pro', { prompt: 'p', width: 1024, height: 1024 })
+      let c = calls.at(-1)
+      assert(c.url === 'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation', `图片端点不对：${c.url}`)
+      assert(c.headers['X-DashScope-Async'] === undefined, '同步文生图不该带异步头')
+      assert(c.body.input.messages[0].content.length === 1 && c.body.input.messages[0].content[0].text === 'p', '文生图 content 应只有 text')
+      assert(c.body.parameters.size === '1024*1024', `size 不对：${c.body.parameters.size}`)
+      assert(jobImage === 'tp-url|https://cdn/i.png', `同步结果 URL 应编进 jobId：${jobImage}`)
+      const imgPoll = await adapter.poll('token-plan/qwen-image-3.0-pro', jobImage)
+      assert(imgPoll.status === 'succeeded' && imgPoll.resultUrl === 'https://cdn/i.png', `tp-url 通道 poll 应直接回成功：${JSON.stringify(imgPoll)}`)
+
+      // ② 未给像素：不传 size（吃网关缺省 1024*1024，官方示例值）
+      await adapter.submit('token-plan/wan2.7-image', { prompt: 'p' })
+      c = calls.at(-1)
+      assert(c.body.parameters === undefined, `未给像素应整个缺省 parameters：${JSON.stringify(c.body.parameters)}`)
+
+      // ②' 宽高覆盖项裸传：边长按族窗口 [512,2048] clamp（IPC「高级覆盖」直通适配器，
+      //   比例闸门拦不住；同 slug 在 gateway-dashscope 会被归一，行为必须一致不裸传 400）
+      await adapter.submit('token-plan/qwen-image-3.0-pro', { prompt: 'p', width: 3000, height: 300 })
+      c = calls.at(-1)
+      assert(c.body.parameters.size === '2048*512', `size 边长应 clamp 到 [512,2048]：${c.body.parameters.size}`)
+
+      // ③ 文生视频：video-synthesis + 异步头、input.prompt 形态、resolution/ratio/duration、无 n
+      const jobVideo = await adapter.submit('token-plan/happyhorse-1.1-t2v', { prompt: 'p', width: 1280, height: 720, durationSeconds: 99 })
+      c = calls.at(-1)
+      assert(c.url === 'https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis', `视频端点不对：${c.url}`)
+      assert(c.headers['X-DashScope-Async'] === 'enable', '视频必须带异步头')
+      assert(c.body.input.prompt === 'p' && c.body.input.media === undefined, '文生视频应走 prompt 形态')
+      assert(c.body.parameters.resolution === '720P' && c.body.parameters.ratio === '16:9', `分辨率/比例归档不对：${JSON.stringify(c.body.parameters)}`)
+      assert(c.body.parameters.duration === 15, `happyhorse duration 应 clamp 到 15：${c.body.parameters.duration}`)
+      assert(c.body.parameters.n === undefined, '视频端点无 n 字段（同标准百炼）')
+      assert(jobVideo === 'tp-task|task-tp-1', `任务 jobId 形态不对：${jobVideo}`)
+      const vPoll = await adapter.poll('token-plan/happyhorse-1.1-t2v', jobVideo)
+      assert(vPoll.status === 'succeeded' && vPoll.resultUrl === 'https://cdn/v.mp4', `视频 poll 不对：${JSON.stringify(vPoll)}`)
+
+      // ③' ratio 与宽高并存：**像素优先**派生 ratio（与 gateway-dashscope 同端点族同规则；
+      //   input.ratio 压过宽高会与成对下发的 resolution 打架）；只给 ratio 时补 720P 缺省档
+      await adapter.submit('token-plan/happyhorse-1.1-t2v', { prompt: 'p', ratio: '1:1', width: 1920, height: 1080, durationSeconds: 5 })
+      c = calls.at(-1)
+      assert(c.body.parameters.ratio === '16:9' && c.body.parameters.resolution === '1080P', `并存时应按像素派生 ratio：${JSON.stringify(c.body.parameters)}`)
+      await adapter.submit('token-plan/happyhorse-1.1-t2v', { prompt: 'p', ratio: '3:4', durationSeconds: 5 })
+      c = calls.at(-1)
+      assert(c.body.parameters.ratio === '3:4' && c.body.parameters.resolution === '720P', `只给 ratio 应补 resolution 缺省档：${JSON.stringify(c.body.parameters)}`)
+
+      // ④ 时长下限（happyhorse 3 秒）与 wan3.0 上限 30 秒、高度 ≥1000 归 1080P
+      await adapter.submit('token-plan/happyhorse-1.1-t2v', { prompt: 'p', width: 1024, height: 1024, durationSeconds: 1 })
+      assert(calls.at(-1).body.parameters.duration === 3, `happyhorse duration 下限应为 3：${calls.at(-1).body.parameters.duration}`)
+      await adapter.submit('token-plan/wan3.0-video', { prompt: 'p', width: 1920, height: 1080, durationSeconds: 99 })
+      c = calls.at(-1)
+      assert(c.body.parameters.duration === 30, `wan3.0 duration 应 clamp 到 30：${c.body.parameters.duration}`)
+      assert(c.body.parameters.resolution === '1080P', `高度≥1000 应归 1080P：${c.body.parameters.resolution}`)
     } finally {
       globalThis.fetch = originalFetch
     }

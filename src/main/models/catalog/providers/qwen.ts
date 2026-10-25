@@ -22,6 +22,8 @@ import { defineProvider } from '../define'
  * thinking_budget（预算上限，思考 token 全额计费），无档位枚举——档位经 pi 预算换算。
  *
  * 未入目录（等官方复核，勿凭印象补数字）：`qwen-plus`/`qwen3-max` 稳定别名、Qwen3-VL 系视觉模型。
+ * 2026-10-25 对照 Token Plan 官方「支持的模型」表复核：qwen3.8-max 与 qwen3.7-plus 均标注
+ * 「视觉理解」（与 pi qwen-token-plan-cn 上游 input 一致），两条 input 修正为 text+image。
  * Key 按地域绑定、跨地域 401（§2.3-4），故 auth.hint 原文提示。
  */
 export default defineProvider({
@@ -41,7 +43,7 @@ export default defineProvider({
       id: 'qwen3.8-max',
       label: 'Qwen3.8 Max',
       reasoning: true,
-      input: ['text'],
+      input: ['text', 'image'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       costSource: 'unverified',
       // 价格未复核就按目录自检的规则挂 beta（validateBuiltinCatalog 会拒 stable+unverified 组合）
@@ -61,7 +63,7 @@ export default defineProvider({
       id: 'qwen3.7-plus',
       label: 'Qwen3.7 Plus',
       reasoning: true,
-      input: ['text'],
+      input: ['text', 'image'],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       costSource: 'unverified',
       status: 'beta',

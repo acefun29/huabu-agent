@@ -35,6 +35,7 @@ import { Field, Select, Toggle, inputCls } from './ui'
 const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHint?: string }[] = [
   { value: 'gateway-openai-compat', label: 'OpenAI 兼容（图片 / 视频 / 语音合成）', baseUrlHint: 'https://api.openai.com/v1' },
   { value: 'gateway-dashscope', label: '阿里云百炼（异步任务）' },
+  { value: 'gateway-token-plan', label: '阿里云 Token Plan（订阅制：文生图同步 / 文生视频异步）', baseUrlHint: 'https://token-plan.cn-beijing.maas.aliyuncs.com' },
   { value: 'gateway-volcark', label: '火山方舟' },
   { value: 'gateway-minimax', label: 'MiniMax（海螺视频 / 图片）' },
   { value: 'gateway-tencent', label: '腾讯混元（生图 / 生视频）' }
@@ -49,6 +50,7 @@ const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHi
 const MEDIA_API_KEY_URLS: Record<string, { url: string; label: string }> = {
   openai: { url: 'https://platform.openai.com/api-keys', label: 'OpenAI 平台' },
   dashscope: { url: 'https://bailian.console.aliyun.com/?apiKey=1', label: '阿里云百炼' },
+  'token-plan': { url: 'https://bailian.console.aliyun.com/cn-beijing/subscription/overview', label: '百炼 Token Plan 订阅页' },
   volcark: { url: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', label: '火山方舟' },
   minimax: { url: 'https://platform.minimaxi.com/user-center/basic-information/interface-key', label: 'MiniMax 开放平台' },
   tencent: { url: 'https://console.cloud.tencent.com/cam/capi', label: '腾讯云（API 密钥管理）' },

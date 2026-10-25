@@ -136,7 +136,13 @@ export function mediaKindOfPath(pathOrName: string): { kind: MediaKind; mime: st
  * 每个类型必须在 src/main/media/adapters/registry.ts 里注册了工厂（catalog:check 校验），
  * 不允许出现「声明了类型却没有实现」的幽灵条目。
  */
-export type MediaProviderType = 'gateway-dashscope' | 'gateway-volcark' | 'gateway-openai-compat' | 'gateway-minimax' | 'gateway-tencent'
+export type MediaProviderType =
+  | 'gateway-dashscope'
+  | 'gateway-volcark'
+  | 'gateway-openai-compat'
+  | 'gateway-minimax'
+  | 'gateway-tencent'
+  | 'gateway-token-plan'
 
 /**
  * 参考素材的角色（2026-10 官方文档核实：方舟 Seedance 与 MiniMax V2 的 role 枚举逐字相同，

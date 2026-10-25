@@ -10,6 +10,7 @@ import './volcark'
 import './openaiCompat'
 import './minimax'
 import './tencent'
+import './tokenPlan'
 
 export {
   adapterRefCaps,

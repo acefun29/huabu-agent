@@ -307,10 +307,8 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
       parameters.resolution = input.height >= 1000 ? '1080P' : '720P'
     }
     if (input.durationSeconds) {
-      // 时长上限逐族：wan3.0-video 官方 2~30 秒，happyhorse 官方 3~15 秒，
-      // wan2.x-i2v 官方 2~15 秒（官方 API 参考核实）
-      const maxDuration = isWan3Video(requestModel) ? 30 : 15
-      const minDuration = isHappyHorse(requestModel) ? 3 : 2
+      // 时长窗口逐族（官方 API 参考核实），与 t2v 分支共用 videoDurationWindow 表
+      const [minDuration, maxDuration] = videoDurationWindow(requestModel)
       parameters.duration = clamp(Math.round(input.durationSeconds), minDuration, maxDuration)
     }
     return {
@@ -329,12 +327,16 @@ async function videoBody(requestModel: string, input: ProviderSubmitInput): Prom
 
   const parameters: Record<string, unknown> = { n: 1, ...dashExtras(input) }
   if (isNewVideoParams(requestModel)) {
-    // wan2.7 t2v 起：resolution + ratio + duration 整数 [2,15]（官方文档核实，无 size 字段）
+    // wan2.7 t2v 起：resolution + ratio + duration 整数（官方文档核实，无 size 字段）；
+    // 时长窗口走 videoDurationWindow 族表（happyhorse 官方下限 3 秒，此前被写死为 2）
     if (input.width && input.height) {
       parameters.resolution = input.height >= 1000 ? '1080P' : '720P'
       parameters.ratio = nearestRatio(input.width, input.height)
     }
-    if (input.durationSeconds) parameters.duration = clamp(Math.round(input.durationSeconds), 2, 15)
+    if (input.durationSeconds) {
+      const [minDuration, maxDuration] = videoDurationWindow(requestModel)
+      parameters.duration = clamp(Math.round(input.durationSeconds), minDuration, maxDuration)
+    }
   } else {
     if (input.width && input.height) {
       parameters.size = `${clamp(input.width, 512, 1440)}*${clamp(input.height, 512, 1440)}`
@@ -382,8 +384,24 @@ function wan26PixelSize(width: number, height: number): string {
   return `${w}*${h}`
 }
 
-function clamp(value: number, min: number, max: number): number {
+export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.round(value)))
+}
+
+/**
+ * 百炼协议族（gateway-dashscope 与 gateway-token-plan 共用同一 video-synthesis 端点族）
+ * 的视频时长窗口 [min, max]（秒，官方 API 参考逐族核实）：
+ * - wan3.0-video(-prime)：2~30
+ * - happyhorse 全系（t2v/i2v）：3~15
+ * - wan2.x t2v/i2v：2~15
+ *
+ * 时长窗口是模型族的事实、不是某家网关的私有事实——两处各写一份迟早漂移
+ * （历史上 t2v 分支就把 happyhorse 下限写成了 2），所以这里单点声明、两家消费。
+ */
+export function videoDurationWindow(requestModel: string): [number, number] {
+  if (isWan3Video(requestModel)) return [2, 30]
+  if (isHappyHorse(requestModel)) return [3, 15]
+  return [2, 15]
 }
 
 registerAdapter(

@@ -184,7 +184,31 @@ const EXPECTED_WIRE = {
   'glm/glm-5.2': { thinking: { type: 'enabled', clear_thinking: false }, reasoning_effort: 'high', enable_thinking: null },
   'glm/glm-4.7': { thinking: { type: 'enabled', clear_thinking: false }, reasoning_effort: null, enable_thinking: null },
   'qwen/qwen3.8-max': { thinking: null, reasoning_effort: null, enable_thinking: true },
-  'qwen/qwen3.7-plus': { thinking: null, reasoning_effort: null, enable_thinking: true }
+  'qwen/qwen3.7-plus': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  // token-plan：兼容端点在 token-plan 域（detectPm 判 effort 默认为 true），各家模型统一
+  // thinkingFormat:'qwen' → enable_thinking:true；effort=false 的不带 reasoning_effort。
+  // qwen3.8 两条虽 tlm.high:null，pi 复刻 `tlm[lvl] ?? lvl` 仍落 'high'。
+  'token-plan/MiniMax-M2.5': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/deepseek-v3.2': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/deepseek-v4-flash': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/deepseek-v4-flash-0731': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/deepseek-v4-pro': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/deepseek-v4-pro-0813': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/glm-5': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/glm-5.1': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/glm-5.2': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/glm-5.3': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/kimi-k2.5': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/kimi-k2.6': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/kimi-k2.7-code': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/qwen3.6-flash': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/qwen3.6-plus': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/qwen3.7-max': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/qwen3.7-plus': { thinking: null, reasoning_effort: null, enable_thinking: true },
+  'token-plan/qwen3.8-flash': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/qwen3.8-max': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/deepseek-v4.1-flash': { thinking: null, reasoning_effort: 'high', enable_thinking: true },
+  'token-plan/deepseek-v4.1-flash-1017': { thinking: null, reasoning_effort: 'high', enable_thinking: true }
 }
 
 async function main() {

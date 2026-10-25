@@ -5,6 +5,7 @@ import glm from './providers/glm'
 import qwen from './providers/qwen'
 import anthropic from './providers/anthropic'
 import openai from './providers/openai'
+import tokenPlan from './providers/tokenPlan'
 
 /**
  * 内置聊天模型目录（架构计划 §3 目录层）。
@@ -29,7 +30,7 @@ import openai from './providers/openai'
  * 维护约定：模型 `id` 合入后不得改名；`compat` 一律显式写、不靠 pi 的域名自动探测
  * （moonshot/zai 域名会静默关掉 `supportsReasoningEffort`，见 §2.5 推论1）。
  */
-export const BUILTIN_CHAT_PROVIDERS: ChatProviderDef[] = [deepseek, kimi, glm, qwen, anthropic, openai]
+export const BUILTIN_CHAT_PROVIDERS: ChatProviderDef[] = [deepseek, kimi, glm, qwen, anthropic, openai, tokenPlan]
 
 export { CHAT_MODEL_APIS, isChatModelApi } from '../types'
 export {

@@ -4,6 +4,7 @@ import volcark from './providers/volcark'
 import openai from './providers/openai'
 import minimax from './providers/minimax'
 import tencent from './providers/tencent'
+import tokenPlan from './providers/tokenPlan'
 
 /**
  * 内置媒体模型目录（catalog 架构 §2 目录层）。
@@ -16,7 +17,7 @@ import tencent from './providers/tencent'
  * auth.env 命名约定、能力档位升序、逐供应商 dry-run 实例化。
  */
 
-export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [dashscope, volcark, openai, minimax, tencent]
+export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [dashscope, volcark, openai, minimax, tencent, tokenPlan]
 
 export { browseCatalog } from './browse'
 export { mergeCatalog, sanitizeCapabilities, sanitizeUserProvider, PROVIDER_ID_PATTERN, MODEL_ID_PATTERN } from './merge'

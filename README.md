@@ -25,8 +25,8 @@ Agent 基于开源 Coding Agent Harness [Pi](https://github.com/earendil-works/p
   Agent 每轮都能看到素材库摘要与画布态势。
 - **素材库**：OS 文件拖入画布自动归档 `assets/<分类>/`；命名素材库、标签与笔记、
   `#标签` 搜索、内联重命名 / 删除（标签索引随迁）、在文件管理器中显示、拖拽归档到库。
-- **媒体生成**：内置 fal.ai、阿里云百炼（DashScope）、火山引擎（ARK）、OpenAI 兼容
-  四类供应商目录，覆盖文生图 / 图生图 / 图生视频；生成卡片自带内联参数控制台，
+- **媒体生成**：内置 fal.ai、阿里云百炼（DashScope）、阿里云 Token Plan（订阅制）、火山引擎（ARK）、OpenAI 兼容
+  五类供应商目录，覆盖文生图 / 图生图 / 图生视频；生成卡片自带内联参数控制台，
   变更类操作走「确认闸门」逐条放行，产物自动回喂素材库并广播。
 - **Agent 能看图**：`read_media` 工具按路径把图片交给 Agent 看，素材引用契约闭环——
   拖入即参考。
@@ -56,9 +56,10 @@ Agent 基于开源 Coding Agent Harness [Pi](https://github.com/earendil-works/p
 | --- | --- |
 | fal.ai（媒体） | `FAL_KEY` |
 | 阿里云百炼（媒体） | `DASHSCOPE_KEY` |
+| 阿里云 Token Plan（媒体，`sk-sp-` 前缀 Key） | `TOKEN_PLAN_KEY` |
 | 火山引擎（媒体） | `ARK_KEY` |
 | OpenAI 兼容（媒体） | `OPENAI_API_KEY` |
-| 对话模型 | 走 Pi 的凭据约定，如 `ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY` 等 |
+| 对话模型 | 走 Pi 的凭据约定，如 `ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY` 等；Token Plan 订阅通道用 `TOKEN_PLAN_KEY` |
 
 ## 从源码构建
 
@@ -150,8 +151,8 @@ Huabu ("canvas" in Chinese) is an Electron desktop app that turns an infinite ca
 agent workspace: asset files live on the canvas as reference cards (not copies), and a bottom
 chat dock hosts multiple concurrent agent sessions (create / switch / fork) powered by the
 open-source [Pi](https://github.com/earendil-works/pi) coding-agent harness embedded as an SDK.
-It ships built-in media-generation providers (fal.ai, Alibaba DashScope, Volcengine ARK,
-OpenAI-compatible) for text-to-image / image-to-image / image-to-video with a confirmation gate,
+It ships built-in media-generation providers (fal.ai, Alibaba DashScope, Alibaba Token Plan,
+Volcengine ARK, OpenAI-compatible) for text-to-image / image-to-image / image-to-video with a confirmation gate,
 a taggable asset library, structured session replay with context-usage transparency, and
 built-in chat-model catalogs (Anthropic / DeepSeek / GLM / Kimi / OpenAI / Qwen) plus custom
 multi-protocol providers. Windows x64 builds are available on the Releases page. MIT licensed.
