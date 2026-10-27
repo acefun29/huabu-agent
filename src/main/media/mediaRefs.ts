@@ -36,6 +36,8 @@ const REF_KIND_LABEL: Record<MediaKind, string> = {
 export interface ResolvedMediaRefs {
   refs: ProviderMediaRef[]
   notes: string[]
+  /** 实际进入请求的参考素材回执（原样 path + 定位到的 absPath），随任务状态回传渲染端成链 */
+  echo: Array<{ role: MediaRefRole; path?: string; absPath?: string; url?: string }>
 }
 
 /** 上传所需的一次性上下文（每次提交构造，同批素材共用） */
@@ -96,7 +98,7 @@ export async function resolveMediaRefs(
     ...(request.refPaths ?? []).map((path) => ({ role: legacyRole, path }))
   ]
   const notes: string[] = []
-  if (inputs.length === 0) return { refs: [], notes }
+  if (inputs.length === 0) return { refs: [], notes, echo: [] }
 
   type Located = MediaRefInput & { mediaType: MediaKind; mime: string; bytes: number; absPath?: string }
   const located: Located[] = []
@@ -128,6 +130,14 @@ export async function resolveMediaRefs(
     throw new Error(`模型 ${modelLabel} 拒绝这组参考素材：${checked.issues.map((i) => i.message).join('；')}`)
   }
   notes.push(...checked.notes)
+  // 生成事实回执：判定通过、真正会进请求的素材（含定位到的绝对路径），随任务状态
+  // 回传渲染端 —— 引用链在渲染端据此自动形成，画布与 Agent 两个入口同构。
+  const echo = checked.accepted.map((ref) => ({
+    role: ref.role,
+    ...(ref.path ? { path: ref.path } : {}),
+    ...(ref.absPath ? { absPath: ref.absPath } : {}),
+    ...(ref.url ? { url: ref.url } : {})
+  }))
 
   const refs: ProviderMediaRef[] = []
   let encodedBytes = 0
@@ -221,8 +231,8 @@ export async function resolveMediaRefs(
   }
   if (refCaps.maxBodyBytes && encodedBytes > refCaps.maxBodyBytes) {
     throw new Error(
-      `参考素材合计 ${Math.round(encodedBytes / 1024 / 1024)}MB 超出该网关单次请求 ${Math.round(refCaps.maxBodyBytes / 1024 / 1024)}MB 上限，请减少素材或用更小的文件`
+      `参考素材合计 ${Math.round(encodedBytes / 1024 / 1024)}MB 超出该网关单次请求 ${Math.round(refCaps.maxBodyBytes / 1024 / 1024)}MB 上限，请减少素材或用更小的素材`
     )
   }
-  return { refs, notes }
+  return { refs, notes, echo }
 }

@@ -280,7 +280,7 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     get().libraries.find((l) => l.id === id)?.name ?? (id === BUILTIN_LIBRARY ? '画布素材' : id)
 
   /**
-   * 移动结果回写画布：引用该文件的卡片（含生成卡片的当前版本与历史版本）改指新位置。
+   * 移动结果回写画布：引用该文件的卡片（含生成卡的当前版本与历史版本）改指新位置。
    * 移动后文件一定在工作区内（库目录都在工作区根下），storage 统一成 ws、pathRoot 作废。
    */
   const applyMovedToNodes = (moved: Array<{ from: string; to: string; name: string }>, libraryId: string) => {
@@ -296,11 +296,11 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
           const { pathRoot: _drop, ...rest } = data
           void _drop
           nextData = { ...rest, name: hit.name, storage: 'ws', path: hit.to, libraryId }
-        } else if (data.gen) {
-          // 生成卡片：历史版本里引用同一文件的条目也要跟上（它们是独立的旧版本文件，
+        } else if (data.versions?.length) {
+          // 带生成历史的卡：历史版本里引用同一文件的条目也要跟上（它们是独立的旧版本文件，
           // 只有路径恰好等于本次被移动文件的那条才会命中）
           let touched = false
-          const versions = data.gen.versions.map((v) => {
+          const versions = data.versions.map((v) => {
             const vHit = byFrom.get(nodeRelPath(v) ?? '')
             if (!vHit) return v
             touched = true
@@ -309,7 +309,7 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
             return { ...rest, name: vHit.name, storage: 'ws' as const, path: vHit.to }
           })
           if (!touched) return node
-          nextData = { ...data, gen: { ...data.gen, versions } }
+          nextData = { ...data, versions }
         }
         return nextData ? { ...node, data: nextData } : node
       })
@@ -499,9 +499,9 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
           void _drop
           return { ...n, data: { ...rest, name: finalName, storage: 'ws' as const, path: newRel } }
         }
-        if (d.gen) {
+        if (d.versions?.length) {
           let touched = false
-          const versions = d.gen.versions.map((v) => {
+          const versions = d.versions.map((v) => {
             if (nodeRelPath(v) !== entry.relPath) return v
             touched = true
             const { pathRoot: _vDrop, ...rest } = v
@@ -509,7 +509,7 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
             return { ...rest, name: finalName, storage: 'ws' as const, path: newRel }
           })
           if (!touched) return n
-          return { ...n, data: { ...d, gen: { ...d.gen, versions } } }
+          return { ...n, data: { ...d, versions } }
         }
         return n
       })

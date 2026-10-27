@@ -587,6 +587,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       nodes: s.nodes,
       tempAttachments: s.tempAttachments,
       workspaceDir: ws.path,
+      jobStates: s.jobStates,
       libraries: s.libraries,
       previousDigests: lastRoundDigests.get(sid),
       genSummarySeen: genSummarySeen.get(sid)

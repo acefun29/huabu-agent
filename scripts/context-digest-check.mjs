@@ -71,7 +71,9 @@ transpileAll([
   path.join('src', 'renderer', 'src', 'harness', 'assetCategories.ts'),
   path.join('src', 'renderer', 'src', 'harness', 'prompt.ts'),
   path.join('src', 'renderer', 'src', 'types.ts'),
+  path.join('src', 'renderer', 'src', 'lib', 'mediaReferenceGraph.ts'),
   path.join('src', 'shared', 'assets.ts'),
+  path.join('src', 'shared', 'media.ts'),
   path.join('src', 'shared', 'prompt.ts'),
   path.join('src', 'shared', 'injection.ts')
 ])
@@ -168,25 +170,46 @@ check('T10 injected（非 selected）标「已注入上下文」', () => {
   return 'chip 语义区分'
 })
 
-check('T10 生成卡 ⇒ 状态 + 提示词 + 参考数 + 版本数；无产物标「尚无产物」', () => {
+/** 新结构：带生成历史的产物卡（versions[].inputs 定格；refSnap 供血脉/参考数） */
+function genCard(name, { prompt = '一只猫', ratio = '1:1', model = 'prov:m', refNames = [], versionCount = 1 } = {}) {
+  const [provider, modelId] = model.includes(':') ? model.split(/:(.*)/s) : [model, model]
+  const refs = refNames.map((src, i) => ({
+    referenceId: `s:${src}:reference_image`,
+    sourceNodeId: src,
+    role: 'reference_image',
+    sourceName: src,
+    storage: 'ws',
+    path: `assets/images/${src}.png`,
+    order: i
+  }))
+  const versions = Array.from({ length: versionCount }, (_, i) => ({
+    id: `v${i + 1}`,
+    storage: 'ws',
+    path: `assets/images/${name}-v${i + 1}.png`,
+    name: `${name}-v${i + 1}.png`,
+    prompt,
+    inputs: { prompt, params: { ratio, model }, provider, model: modelId, refs, createdAt: 1 },
+    createdAt: String(i + 1)
+  }))
+  return card(name, { storage: 'ws', path: versions[0].path, versions, activeVersionId: versions[0].id })
+}
+
+check('T10 生成中的占位卡 ⇒ 态势标注生成中；带历史的卡 ⇒ 生成产物 + 提示词 + 参考数 + 版本数 + 血脉', () => {
   const nodes = [
-    card('生成中卡', {
-      gen: { prompt: '一只猫', refs: ['x'], params: { ratio: '1:1' }, status: 'running', progress: 0.5, versions: [] }
-    }),
-    card('已完成的卡', {
-      storage: 'ws',
-      path: 'assets/images/cat.png',
-      gen: { prompt: '', refs: [], params: { ratio: '9:16' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
-    })
+    card('生成中卡', { kind: 'image' }),
+    genCard('已完成的卡', { prompt: '一只猫', refNames: ['src'], versionCount: 2 }),
+    card('src', { storage: 'ws', path: 'assets/images/src.png' })
   ]
-  const text = collector.buildCanvasDigest(nodes, [], [])
+  const text = collector.buildCanvasDigest(nodes, [], [], { 生成中卡: { status: 'running', progress: 0.5 } })
   assert(text.includes('生成中'), `缺 running 标注：${text}`)
-  assert(text.includes('尚无产物'), '无产物的生成卡没有标注')
+  assert(text.includes('50%'), '缺进度百分比')
+  assert(text.includes('生成产物'), '历史卡缺「生成产物」标注')
   assert(text.includes('提示词"一只猫"'), '缺提示词')
   assert(text.includes('参考 1 张'), '缺参考数')
-  assert(text.includes('1 版'), '缺版本数')
-  assert(text.includes('已完成'), 'succeeded 卡缺状态词')
-  return '两张生成卡'
+  assert(text.includes('共 2 版'), '缺版本数')
+  assert(text.includes('血脉'), '缺血脉段')
+  assert(text.includes('src(参考图)'), '血脉里应含来源卡名')
+  return '占位卡 + 历史卡'
 })
 
 check('T10 卡片超上限 ⇒ 折叠为「另有 N 张卡片」', () => {
@@ -198,24 +221,13 @@ check('T10 卡片超上限 ⇒ 折叠为「另有 N 张卡片」', () => {
 
 /* ---------------- T11 生成卡回喂 ---------------- */
 
-check('T11 带 gen 的卡片 ⇒ attachment 附 genSummary（状态/提示词/参数/版本数）', () => {
+check('T11 带生成历史的卡 ⇒ attachment 附 genSummary（提示词/参数/模型/版本数/血脉）', () => {
   const out = collector.collectRoundContext({
     selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS,
     tempAttachments: [],
     nodes: [
-      card('g', {
-        storage: 'ws',
-        path: 'assets/images/cat.png',
-        gen: {
-          prompt: 'a cute cat poster',
-          refs: [],
-          params: { ratio: '3:4', model: 'dashscope/wan2.7-image' },
-          status: 'succeeded',
-          progress: 1,
-          versions: [{ id: 'v1' }, { id: 'v2' }],
-          activeVersionId: 'v2'
-        }
-      })
+      genCard('g', { prompt: 'a cute cat poster', ratio: '3:4', model: 'dashscope:wan2.7-image', refNames: ['src'], versionCount: 2 }),
+      card('src', { storage: 'ws', path: 'assets/images/src.png' })
     ],
     libraries: []
   })
@@ -224,8 +236,9 @@ check('T11 带 gen 的卡片 ⇒ attachment 附 genSummary（状态/提示词/�
   assert(typeof s === 'string' && s.length > 0, 'genSummary 缺失')
   assert(s.includes('a cute cat poster'), '缺提示词')
   assert(s.includes('3:4'), '缺比例')
-  assert(s.includes('dashscope/wan2.7-image'), '缺模型')
+  assert(s.includes('dashscope:wan2.7-image'), '缺模型')
   assert(s.includes('共 2 版'), '缺版本数')
+  assert(s.includes('血脉'), '缺血脉段')
   return s.slice(0, 60)
 })
 
@@ -233,12 +246,7 @@ check('T11 长提示词 ⇒ genSummary 截断到 80 字符（清单不吃上下�
   const long = '喵'.repeat(200)
   const out = collector.collectRoundContext({
     selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
-    nodes: [
-      card('g', {
-        storage: 'ws', path: 'assets/images/x.png',
-        gen: { prompt: long, refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v' }] }
-      })
-    ],
+    nodes: [genCard('g', { prompt: long })],
     libraries: []
   })
   const s = out.attachments[0].genSummary
@@ -256,18 +264,15 @@ check('T11 无 gen 的卡片 ⇒ 不带 genSummary 字段（普通引用行不�
   return '普通卡片零变化'
 })
 
-check('T11 无产物的生成卡（queued/running）不进引用载荷，只进画布态势', () => {
+check('T11 生成中的占位卡（jobStates 在途）不进引用载荷，只进画布态势', () => {
   const out = collector.collectRoundContext({
     selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
-    nodes: [
-      card('g', {
-        gen: { prompt: 'x', refs: [], params: { ratio: '1:1' }, status: 'queued', progress: 0, versions: [] }
-      })
-    ],
+    nodes: [card('g', { kind: 'image' })],
+    jobStates: { g: { status: 'queued', progress: 0 } },
     libraries: []
   })
   assert(out.attachments.length === 0, `无产物不应发路径：${JSON.stringify(out.attachments)}`)
-  assert(out.contextText.includes('排队中') && out.contextText.includes('尚无产物'), '画布态势里看不到它')
+  assert(out.contextText.includes('生成中'), '画布态势里看不到它')
   return '载荷干净 + 态势可见'
 })
 
@@ -288,12 +293,8 @@ check('buildReferencePayload ⇒ genSummary 附加在引用行尾', () => {
 
 /* ---------------- 逐轮去重（token 经济） ---------------- */
 
-check('向后兼容：不带新参数 ⇒ contextText 仍为两段全文拼接、genSummary 照带（旧版行为逐字一致）', () => {
-  const genCard = card('g', {
-    storage: 'ws', path: 'assets/images/cat.png',
-    gen: { prompt: '一只猫', refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
-  })
-  const nodes = [card('封面.png', { storage: 'ws', path: 'assets/images/封面.png' }), genCard]
+check('基线：不带去重参数 ⇒ contextText 为两段全文拼接、genSummary 照带、签名为新口径', () => {
+  const nodes = [card('封面.png', { storage: 'ws', path: 'assets/images/封面.png' }), genCard('g', { prompt: '一只猫' })]
   const out = collector.collectRoundContext({
     selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
     nodes,
@@ -303,11 +304,11 @@ check('向后兼容：不带新参数 ⇒ contextText 仍为两段全文拼接�
     collector.buildLibraryDigest([lib('产品图库', ['libraries/产品图库/poster.png'])], WS),
     collector.buildCanvasDigest(nodes, ['g'], [])
   ].filter(Boolean).join('\n\n')
-  assert(out.contextText === expected, `contextText 与旧版全文拼接不一致：${out.contextText}`)
-  assert(!out.contextText.includes('（与上轮一致'), '不带新参数不应出现折叠占位')
-  assert(typeof out.attachments.find((a) => a.name === 'g')?.genSummary === 'string', '不带新参数 genSummary 应照带')
+  assert(out.contextText === expected, `contextText 与两段全文拼接不一致：${out.contextText}`)
+  assert(!out.contextText.includes('（与上轮一致'), '不带去重参数不应出现折叠占位')
+  assert(typeof out.attachments.find((a) => a.name === 'g')?.genSummary === 'string', 'genSummary 应照带')
   assert(out.digests.library.includes('poster.png') && out.digests.canvas.includes('封面.png'), 'digests 出参应为全文')
-  assert(out.genSummarySeen.g === 'succeeded|1|一只猫', `签名口径不符：${out.genSummarySeen.g}`)
+  assert(String(out.genSummarySeen.g).includes('一只猫'), `签名应含提示词（新口径：激活版本|版本数|提示词|血脉指纹）：${out.genSummarySeen.g}`)
 })
 
 check('去重：两段摘要与上轮一致 ⇒ 各折叠为「头+未变化」单行占位；digests 出参仍是全文', () => {
@@ -356,36 +357,30 @@ check('去重：genSummary 首轮带 ⇒ 签名一致二轮不带 ⇒ 改提示�
   const round = (prompt, seen) =>
     collector.collectRoundContext({
       selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
-      nodes: [
-        card('g', {
-          storage: 'ws', path: 'assets/images/cat.png',
-          gen: { prompt, refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
-        })
-      ],
+      nodes: [genCard('g', { prompt })],
       libraries: [],
       ...(seen ? { genSummarySeen: seen } : {})
     })
   const first = round('一只猫')
   assert(first.attachments[0].genSummary?.includes('一只猫'), '首轮应携带 genSummary')
-  assert(first.genSummarySeen.g === 'succeeded|1|一只猫', `签名口径不符：${first.genSummarySeen.g}`)
+  assert(String(first.genSummarySeen.g).includes('一只猫'), `签名应含提示词：${first.genSummarySeen.g}`)
   const second = round('一只猫', first.genSummarySeen)
   assert(second.attachments[0].genSummary === undefined, '签名一致不应重复携带 genSummary')
-  assert(second.genSummarySeen.g === 'succeeded|1|一只猫', '仍在附件集合里的卡片签名应保留在表中')
+  assert(String(second.genSummarySeen.g) === String(first.genSummarySeen.g), '仍在附件集合里的卡片签名应保留在表中')
   const third = round('一只狗', second.genSummarySeen)
   assert(third.attachments[0].genSummary?.includes('一只狗'), '提示词变化应重新携带 genSummary')
-  assert(third.genSummarySeen.g === 'succeeded|1|一只狗', '签名应随内容更新')
+  assert(String(third.genSummarySeen.g).includes('一只狗'), '签名应随内容更新')
 })
 
 check('去重：genSummary 签名表只含当前仍在附件集合里的卡片（离场即出局）', () => {
-  const gen = { prompt: 'x', refs: [], params: { ratio: '1:1' }, status: 'succeeded', progress: 1, versions: [{ id: 'v1' }] }
   const withCard = collector.collectRoundContext({
     selectedAssetIds: ['g'], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
-    nodes: [card('g', { storage: 'ws', path: 'assets/images/x.png', gen })], libraries: []
+    nodes: [genCard('g', { prompt: 'x' })], libraries: []
   })
-  assert(Object.keys(withCard.genSummarySeen).length === 1, '带产物的生成卡应在签名表里')
+  assert(Object.keys(withCard.genSummarySeen).length === 1, '带历史的卡应在签名表里')
   const withoutCard = collector.collectRoundContext({
     selectedAssetIds: [], injectedAssetIds: [], workspaceDir: WS, tempAttachments: [],
-    nodes: [card('g', { storage: 'ws', path: 'assets/images/x.png', gen })], libraries: [],
+    nodes: [genCard('g', { prompt: 'x' })], libraries: [],
     genSummarySeen: withCard.genSummarySeen
   })
   assert(Object.keys(withoutCard.genSummarySeen).length === 0, '不在附件集合里的卡片签名应出局')

@@ -109,35 +109,35 @@ export function installDomHelpers() {
     return { ok: true }
   }
 
-  /** 生成卡片可观测状态：状态/进度/版本/产物路径/内联提示词 */
+  /** 统一媒体卡可观测状态：运行态（内存 jobStates → data-status）来自卡片 DOM；
+   *  产物路径/版本来自 store（卡面已纯净，生成信息收进「卡片检视」浮层） */
   const genSnapshot = (id) => {
     const el = nodeWrap(id)
     if (!el) return null
-    const gen = q('[data-testid="gen-node"]', el)
-    if (!gen) return null
-    const status = gen.getAttribute('data-status')
-    const statusPill = qa('span', gen).map((s2) => (s2.textContent || '').trim())
+    const card = q('[data-testid="asset-node"]', el)
+    if (!card) return null
+    const status = card.getAttribute('data-status') ?? 'idle'
+    const statusPill = qa('span', card).map((s2) => (s2.textContent || '').trim())
     const progressMatch = statusPill.find((t) => /生成中 \d+%/.test(t))
-    const pathEl = qa('span.font-mono', gen)
-      .map((s2) => (s2.textContent || '').trim())
-      .find((t) => t.includes('/'))
-    const promptTa = q('textarea', gen)
+    const nodeData = window.__huabuCanvas?.state?.().nodes.find((n) => n.id === id)?.data
+    const inspector = q('[data-testid="card-inspector"]')
     return {
       id,
       status,
-      prompt: promptTa ? promptTa.value : null,
+      prompt: null, // 提示词在生成 Popover / 卡片检视浮层，不在卡上
       progress: progressMatch
         ? Number(progressMatch.match(/\d+%/)[0].replace('%', '')) / 100
         : status === 'succeeded'
           ? 1
           : 0,
-      versionButton: q('[data-testid="switch-version"]', gen)
-        ? (q('[data-testid="switch-version"]', gen).textContent || '').trim()
+      versionCount: nodeData?.versions?.length ?? 0,
+      pathText: nodeData?.path ?? null,
+      versionButton: q('[data-testid="switch-version"]', inspector)
+        ? (q('[data-testid="switch-version"]', inspector).textContent || '').trim()
         : null,
-      pathText: pathEl ?? null,
-      retryVisible: Boolean(q('[data-testid="retry-generate"]', gen)),
-      regenerateVisible: Boolean(q('[data-testid="regenerate"]', gen)),
-      errorText: status === 'failed' ? (gen.textContent || '').slice(0, 300) : null
+      retryVisible: Boolean(q('[data-testid="retry-generate"]', card)),
+      regenerateVisible: Boolean(q('[data-testid="regenerate-from"]', inspector)),
+      errorText: status === 'failed' ? (card.textContent || '').slice(0, 300) : null
     }
   }
 

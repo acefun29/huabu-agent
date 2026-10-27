@@ -32,7 +32,6 @@ export type MediaAccessMode = 'full' | 'confirm'
  */
 export const MEDIA_RATIOS = ['1:1', '3:4', '4:3', '9:16', '16:9', '21:9'] as const
 export type MediaRatio = (typeof MEDIA_RATIOS)[number]
-export const DEFAULT_MEDIA_PROVIDER = 'dashscope'
 export const DEFAULT_MEDIA_RATIO: MediaRatio = '16:9'
 /** 新建生成卡片 / Agent 工具的默认时长（秒） */
 export const DEFAULT_MEDIA_DURATION_S = 5
@@ -623,6 +622,19 @@ export interface MediaGenerateRequest {
 
 export type MediaJobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
 
+/**
+ * 实际进入请求的参考素材回执（生成事实，引用链的权威输入）。
+ * path = 调用方原样传入的工作区相对路径；absPath = 闸门定位到的绝对路径
+ * （URL 参考没有）。渲染端据 absPath 反查画布卡片自动成链（查不到 = 画布外
+ * 文件，历史保留但链条不画）。
+ */
+export interface MediaJobRefEcho {
+  role: MediaRefRole
+  path?: string
+  absPath?: string
+  url?: string
+}
+
 /** 已落盘产物描述。渲染端用 `huabu-media://media/<相对路径>` 播放 */
 export interface MediaArtifact {
   /** 相对当前工作区 `.huabu/media/` 的路径（POSIX 风格，跨平台稳定） */
@@ -667,6 +679,11 @@ export interface MediaJobStatus {
    * 类型不匹配 / 超出模型上限 → 丢弃但必须在这里说一声，不再让素材凭空消失。
    */
   notes?: string[]
+  /**
+   * 实际进入请求的参考素材回执（见 MediaJobRefEcho）。渲染端生成终态时用它
+   * 反查来源卡片，把生成事实写进版本 inputs —— 引用链由系统自动形成。
+   */
+  refs?: MediaJobRefEcho[]
   /**
    * 协商后的实际生成参数（clamp/归档之后的值）。Agent 工具结果与画布卡片以这里为准，
    * 避免"Agent 声明 1:1、卡片按默认 16:9"的错位

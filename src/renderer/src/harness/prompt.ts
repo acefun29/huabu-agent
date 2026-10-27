@@ -21,8 +21,9 @@ const ORIGIN_LABEL: Record<MessageAttachment['origin'], string> = {
 /**
  * 用户消息里引用素材的载荷格式：每条一个绝对路径，不携带文件内容。
  * 绝对路径是契约的核心 —— Agent 不依赖当前目录、无需拼接即可访问。
- * 生成卡片的产物附 genSummary（T11）：状态/提示词/参数/版本数，Agent 借此知道
- * 这张图的来龙去脉（"基于刚生成的这张图换个风格"类指令靠它成立）。
+ * 带生成历史的卡片附 genSummary：激活版本的提示词/参数 + 血脉链（递归祖先），
+ * Agent 借此知道这张图的来龙去脉与引用链条（"基于刚生成的这张图换个风格"
+ * 类指令靠它成立）。
  */
 export function buildReferencePayload(attachments: MessageAttachment[]): string {
   if (attachments.length === 0) return ''

@@ -9,27 +9,26 @@ import type {
   WorkspaceDeleteResult,
   WorkspaceInfo
 } from '@shared/ipc'
-import type { MediaRefRole } from '@shared/media'
-import { useSettings } from './settingsStore'
+import type { MediaKind, ResolvedRefCaps } from '@shared/media'
+import { useSettings, useSettingsUi } from './settingsStore'
 import type {
   AssetData,
-  AssetGen,
   CanvasNode,
   ChatData,
   ChatMessage,
   DirEntry,
-  GenerationChainRun,
+  GenComposerTarget,
   MaterialLibrary,
-  MediaKind,
   MessageAttachment,
   SessionMeta,
   UndoEntry,
   ViewState,
   Workspace
 } from '../types'
-import { withGenerateReferences } from '../lib/mediaReferenceGraph'
+import { migrateCanvasNodes } from '../lib/genMigration'
 import { createChatRuntime } from './canvas/chatRuntime'
 import { createJobRuntime } from './canvas/jobRuntime'
+import type { GenerationRequest, JobCardRuntime } from './canvas/jobRuntime'
 import { createNodeOps } from './canvas/nodeOps'
 import { createLibraryOps } from './canvas/libraryOps'
 import {
@@ -133,13 +132,10 @@ export interface CanvasState {
   /** 直接拖入会话输入框的临时文件（工作区之外，只传绝对路径给 Agent） */
   tempAttachments: MessageAttachment[]
   removeTempAttachment: (id: string) => void
-  activeGenerateId: string | null
-  setActiveGenerate: (id: string | null) => void
 
   /* 节点操作 */
   updateNode: (id: string, updates: Partial<Pick<CanvasNode, 'x' | 'y' | 'width' | 'height' | 'data'>>) => void
   bringToFront: (id: string) => void
-  createGenerateNode: (kind: MediaKind, at?: { x: number; y: number }, refs?: string[]) => string
   requestRemoveNode: (id: string) => void
   /** 批量取消钉住（划选后的批量移除）：只删画布上的引用卡片，文件不动 */
   removeNodes: (ids: string[]) => void
@@ -150,25 +146,28 @@ export interface CanvasState {
   /** @internal 供自动保存订阅与探针使用 */
   undoEntry: UndoEntry | null
 
-  /* 生成卡片（引用链契约：实现一律由生成任务域 jobRuntime 提供，装配层只声明签名） */
-  updateGenerate: (nodeId: string, patch: Partial<AssetGen>) => void
-  /** 加入一条生成参考（引用链显式记录）：role 缺省按素材大类与序数派生；实现含配额校验/单值槽替换/撤销 */
-  addGenerateRef: (nodeId: string, refId: string, role?: MediaRefRole) => void
-  /** 移除一条生成参考：referenceId 优先，兼容老 sourceNodeId 入参 */
-  removeGenerateRef: (nodeId: string, refId: string) => void
-  /** 设置一条参考的角色（referenceId 优先，兼容老 sourceNodeId） */
-  setGenerateRefRole: (nodeId: string, referenceId: string, role: MediaRefRole) => void
-  /** 参考在序列里前移/后移一位（referenceId 优先） */
-  moveGenerateRef: (nodeId: string, referenceId: string, direction: -1 | 1) => void
-  /** 以该卡为终点执行生成链（上游拓扑先跑；范围确认由实现内部处理，调用方不二次弹窗） */
-  runGenerationChain: (nodeId: string, prompt?: string) => Promise<void>
-  /** 取消该卡所在的生成链（chainRun → cancelled 由生成任务域写） */
-  cancelGeneration: (nodeId: string) => Promise<void>
-  /** 生成链运行态（由生成任务域写；画布载入/切换工作区时重置 null，在途链取消由 runtime 处理） */
-  chainRun: GenerationChainRun | null
+  /* 生成（引用链契约：链条由生成事实自动派生，用户与 Agent 都不能手动建链；
+     实现一律由生成任务域 jobRuntime 提供，装配层只声明签名） */
+  /** 卡片的生成运行态（内存：进度/失败信息；成功终态即清除） */
+  jobStates: Record<string, JobCardRuntime>
+  /** 直接生成（生成 Popover / 再次生成共用）：冻结 inputs → 落卡 → IPC 提交；成功附带产物卡 id */
+  submitGeneration: (request: GenerationRequest) => Promise<{ ok: boolean; error?: string; nodeId?: string }>
+  /** 失败重试：按 pendingJob 定格的输入快照重新提交 */
+  retryGeneration: (nodeId: string) => Promise<void>
+  /** 指定模型的参考配额（Popover 即时反馈用；权威判定在提交时） */
+  mediaCapsFor: (kind: GenerationRequest['kind'], modelId?: string) => ResolvedRefCaps
   clearGenerateVersions: (nodeId: string) => void
   requestClearGenerateVersions: (nodeId: string) => void
-  submitGeneration: (nodeId: string, prompt: string) => Promise<void>
+
+  /* 生成 Popover（直接生成入口，锚定卡片/划选/画布光标；生命周期短，不持久化） */
+  genComposer: GenComposerTarget | null
+  openGenComposer: (target: GenComposerTarget) => void
+  closeGenComposer: () => void
+
+  /* 卡片检视浮层（血脉图 + 提示词详情，所有媒体卡的统一入口；锚定卡片右侧） */
+  cardInspector: string | null
+  openCardInspector: (nodeId: string) => void
+  closeCardInspector: () => void
 
   /* 素材库（工作区级共享；清单由主进程现算） */
   libraries: MaterialLibrary[]
@@ -322,9 +321,9 @@ export const useCanvasStore = create<CanvasState>()(
       })
     }
 
-    /** 会话切换时的瞬时态清理（选中/注入/生成激活都是「这一轮」的，不跟会话走） */
+    /** 会话切换时的瞬时态清理（选中/注入/临时附件都是「这一轮」的，不跟会话走） */
     const clearTransient = () => {
-      set({ activeGenerateId: null, selectedAssetIds: [], injectedAssetIds: [], tempAttachments: [] })
+      set({ selectedAssetIds: [], injectedAssetIds: [], tempAttachments: [] })
     }
 
     /* ---------------- 画布快照（canvas.json v3） ---------------- */
@@ -438,14 +437,10 @@ export const useCanvasStore = create<CanvasState>()(
       } else if (!result.ok) {
         console.warn('[canvas] 载入画布失败：', result.error)
       }
-      // 引用记录轻规范：仅对已带 references 的卡去重/重排序号并同步 legacy 视图；
-      // 旧数据（refs/refRoles）不在此固化角色 —— 由 getGenerateReferences 按当前
-      // 模型 caps 懒读迁移，避免 settings 未就绪时把默认角色错存（见 mediaReferenceGraph）。
-      const normalized = restored.map((node) => {
-        const gen = node.data.gen
-        if (!gen || !Array.isArray(gen.references) || gen.references.length === 0) return node
-        return { ...node, data: { ...node.data, gen: withGenerateReferences(gen, gen.references) } }
-      })
+      // 旧结构迁移（AssetData.gen → versions/pendingJob/references 平铺）：版本与引用链
+      // 无损搬运，空壳生成卡（无版本无文件无在途任务）剔除。legacy refs/refRoles 刻意
+      // 不在载入期固化角色 —— 由 getCardReferences 按当前模型 caps 懒读迁移。
+      const normalized = migrateCanvasNodes(restored)
       const maxZ = normalized.reduce((max, node) => Math.max(max, node.zIndex), 10)
       zCounter.current = maxZ + 1
       // 重建任务绑定索引：重载后同一任务的后续事件依然只由既有卡片承接
@@ -468,9 +463,10 @@ export const useCanvasStore = create<CanvasState>()(
         selectedAssetIds: [],
         injectedAssetIds: [],
         tempAttachments: [],
-        activeGenerateId: null,
-        // 在途生成链不跨工作区存活：载入即重置，取消/续跑由 runtime 自行处理
-        chainRun: null,
+        // 运行态随画布重置；在途任务的对账恢复由 reconcileJobs 完成
+        jobStates: {},
+        genComposer: null,
+        cardInspector: null,
         activeSessionId: restoredActive,
         ...recomputeChatDerived(chats, restoredActive)
       })
@@ -583,8 +579,9 @@ export const useCanvasStore = create<CanvasState>()(
       selectedAssetIds: [],
       injectedAssetIds: [],
       tempAttachments: [],
-      activeGenerateId: null,
-      chainRun: null,
+      jobStates: {},
+      genComposer: null,
+      cardInspector: null,
       libraries: [],
       inboxDir: null,
       dirFiles: [],
@@ -620,6 +617,10 @@ export const useCanvasStore = create<CanvasState>()(
       },
       openViewer: (nodeId: string) => set({ viewer: { nodeId } }),
       closeViewer: () => set({ viewer: null }),
+      openGenComposer: (target: GenComposerTarget) => set({ genComposer: target }),
+      closeGenComposer: () => set({ genComposer: null }),
+      openCardInspector: (nodeId: string) => set({ cardInspector: nodeId }),
+      closeCardInspector: () => set({ cardInspector: null }),
       openGuide: () => set({ guideOpen: true }),
       closeGuide: () => set({ guideOpen: false }),
       refreshWorkspaceState,
@@ -670,7 +671,7 @@ function installCanvasProbe() {
         sessions: s.sessions,
         chats: s.chatsMap,
         activeSessionId: s.activeSessionId,
-        activeGenerateId: s.activeGenerateId,
+        jobStates: s.jobStates,
         selectedAssetIds: s.selectedAssetIds,
         injectedAssetIds: s.injectedAssetIds,
         tempAttachments: s.tempAttachments,
@@ -684,13 +685,11 @@ function installCanvasProbe() {
       forkSession: useCanvasStore.getState().forkSession,
       requestRemoveSession: useCanvasStore.getState().requestRemoveSession,
       switchSession: useCanvasStore.getState().switchSession,
-      createGenerateNode: useCanvasStore.getState().createGenerateNode,
       requestRemoveNode: useCanvasStore.getState().requestRemoveNode,
       removeNodes: useCanvasStore.getState().removeNodes,
       clearCanvas: useCanvasStore.getState().clearCanvas,
       requestClearGenerateVersions: useCanvasStore.getState().requestClearGenerateVersions,
       undo: useCanvasStore.getState().undo,
-      setActiveGenerate: useCanvasStore.getState().setActiveGenerate,
       setAssetSelection: useCanvasStore.getState().setAssetSelection,
       injectAsset: useCanvasStore.getState().injectAsset,
       importFromDirectory: useCanvasStore.getState().importFromDirectory,
@@ -698,7 +697,13 @@ function installCanvasProbe() {
       dropFilesToCanvas: useCanvasStore.getState().dropFilesToCanvas,
       dropFilesToComposer: useCanvasStore.getState().dropFilesToComposer,
       submitGeneration: useCanvasStore.getState().submitGeneration,
-      updateGenerate: useCanvasStore.getState().updateGenerate,
+      retryGeneration: useCanvasStore.getState().retryGeneration,
+      openGenComposer: useCanvasStore.getState().openGenComposer,
+      closeGenComposer: useCanvasStore.getState().closeGenComposer,
+      openCardInspector: useCanvasStore.getState().openCardInspector,
+      closeCardInspector: useCanvasStore.getState().closeCardInspector,
+      // @internal：失败注入等 E2E 场景走真实事件路径（与 IPC 订阅同一入口）
+      handleJobEvent: useCanvasStore.getState().handleJobEvent,
       sendMessage: useCanvasStore.getState().sendMessage,
       stopChat: useCanvasStore.getState().stopChat,
       compactSession: useCanvasStore.getState().compactSession,
@@ -754,25 +759,41 @@ function installCanvasProbe() {
         for (let i = 0; i < opts.gens; i += 1) {
           const idx = created.length
           zCounter.current += 1
+          const versionId = crypto.randomUUID()
           push({
             id: crypto.randomUUID(),
             type: 'asset',
             x: (idx % cols) * 340,
             y: Math.floor(idx / cols) * 450,
-            width: 320,
-            height: 430,
+            width: 280,
+            height: 320,
             zIndex: zCounter.current,
             data: {
               name: `bench-gen-${i}`,
               kind: 'image',
-              gen: {
-                prompt: 'bench 基准卡片提示词',
-                refs: [],
-                params: { ratio: '1:1' },
-                status: 'idle',
-                progress: 0,
-                versions: []
-              }
+              storage: 'ws',
+              path: opts.images[i % opts.images.length],
+              bytes: 2_300_000,
+              meta: 'bench',
+              versions: [
+                {
+                  id: versionId,
+                  storage: 'ws',
+                  path: opts.images[i % opts.images.length],
+                  name: `bench-gen-${i}.png`,
+                  prompt: 'bench 基准卡片提示词',
+                  inputs: {
+                    prompt: 'bench 基准卡片提示词',
+                    params: { ratio: '1:1' },
+                    provider: 'bench',
+                    model: 'bench-model',
+                    refs: [],
+                    createdAt: Date.now()
+                  },
+                  createdAt: new Date().toISOString()
+                }
+              ],
+              activeVersionId: versionId
             } satisfies AssetData
           })
         }
@@ -878,11 +899,13 @@ function useCanvasBootstrap() {
 export function CanvasProvider({ children }: { children: ReactNode }) {
   // settings 仍是 Context：把最新实例交给 store action 跨域调用（resolveMediaModel / refreshAll 等）
   const settings = useSettings()
+  // UI 域的 openSettings 并入 bridge：生成被拦的 toast「去设置」需要从 store 域直达设置页
+  const { openSettings } = useSettingsUi()
   // 渲染体里直接写 ref 是渲染期副作用（StrictMode 双渲染会双写），移到提交后同步；
   // 不写依赖数组 = 每次渲染后都刷新为最新实例。卸载时刻意不清空：bridge 语义是
   // 「最近一次挂载的实例」，清空反而让卸载瞬间在途的跨域调用读不到 settings。
   useEffect(() => {
-    settingsBridgeRef.current = settings
+    settingsBridgeRef.current = { ...settings, openSettings }
   })
   useCanvasBootstrap()
   return <>{children}</>

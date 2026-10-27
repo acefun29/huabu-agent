@@ -346,10 +346,10 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
     label,
     description:
       kind === 'image'
-        ? '根据文字描述生成一张图片，可用 reference_images 垫图（以参考图为底生成，条数上限由模型决定）。调用会阻塞到生成完成，结果里包含实际参数与产物路径；产物同时作为媒体节点出现在画布上。'
+        ? '根据文字描述生成一张图片，可用 reference_images 垫图（以参考图为底生成，条数上限由模型决定）。调用会阻塞到生成完成，结果里包含实际参数与产物路径；产物会作为媒体卡片钉在画布上（贴近参考图落位），系统会自动把本次用到的参考图与产物连成引用链——不需要也无法手动建链。'
         : kind === 'video'
-          ? '根据文字描述生成一段短视频。参考素材按角色分槽：first_frame/last_frame 是首帧/首尾帧图生视频，reference_images/reference_videos/reference_audios 是全模态参考（哪种角色可用由当前模型决定，混用首帧与 reference_* 会报错）。成本较高：调用前需先向用户确认，得到同意后传 confirmed=true。调用会阻塞到生成完成（可能数分钟），结果里包含实际参数与产物路径。'
-          : '根据文字描述生成一段音频（音效/配乐），可选 voice 指定音色。调用会阻塞到生成完成，结果里包含实际参数与产物路径。',
+          ? '根据文字描述生成一段短视频。参考素材按角色分槽：first_frame/last_frame 是首帧/首尾帧图生视频，reference_images/reference_videos/reference_audios 是全模态参考（哪种角色可用由当前模型决定，混用首帧与 reference_* 会报错）。成本较高：调用前需先向用户确认，得到同意后传 confirmed=true。调用会阻塞到生成完成（可能数分钟），结果里包含实际参数与产物路径；产物会作为媒体卡片钉在画布上，系统自动与参考素材形成引用链。'
+          : '根据文字描述生成一段音频（音效/配乐），可选 voice 指定音色。调用会阻塞到生成完成，结果里包含实际参数与产物路径；产物会作为媒体卡片钉在画布上。',
     parameters,
     execute: async (_toolCallId, params, signal, onUpdate) => {
       const input = params as ToolParams
@@ -482,7 +482,7 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         `产物：${final.artifact.relPath}（${final.artifact.mime}` +
         `${final.artifact.width ? `，${final.artifact.width}×${final.artifact.height}px` : ''}` +
         `${final.artifact.durationSeconds ? `，${final.artifact.durationSeconds}s` : ''}），` +
-        `已作为媒体节点出现在画布上（来源标记为当前会话）。`
+        `已作为媒体卡片钉在画布上（贴近参考图落位）；本次用到的参考素材已由系统自动连成引用链，把这张卡再引用进上下文时携带它的血脉信息。`
       // 参考素材的处置留痕必须转告：用户挂了 5 张而模型只吃 1 张时，"生成成功"不等于
       // "按全部参考生成"——不说清就是Agent 在替网关撒谎
       if (final.notes?.length) {

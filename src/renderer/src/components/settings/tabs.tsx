@@ -406,6 +406,16 @@ export function AppearanceTab() {
         desc="在画布背景显示细点阵，关闭后为纯净底色"
         control={<Toggle checked={appearance.showGrid} onChange={(v) => setAppearance({ showGrid: v })} />}
       />
+      <Row
+        title="引用链连线"
+        desc="显示卡片间的引用链（生成时系统自动形成，只读不可拖拽）；快捷键 Shift+E"
+        control={
+          <Toggle
+            checked={appearance.showReferenceEdges}
+            onChange={(v) => setAppearance({ showReferenceEdges: v })}
+          />
+        }
+      />
     </div>
   )
 }

@@ -1,14 +1,12 @@
 /**
- * 生成参考引用链（media reference chain）纯函数模块。
+ * 引用链（media reference chain）纯函数模块。
  *
- * 职责：统一「参考记录」的读/写/校验/规划。AssetGen.references 是唯一事实源，
- * legacy refs/refRoles 是兼容视图，本模块是两者之间唯一的换算口：
- * - 读：getGenerateReferences —— references 缺席的旧数据按 refs/refRoles + 当前
- *   模型 caps 懒派生（刻意不在载入期固化，避免 settings 未就绪时把
- *   reference_image 专用视频模型的默认角色错存成 first_frame）；
- * - 写：withGenerateReferences —— references 去重重排后反写 legacy 双视图；
- * - 判：wouldCreateReferenceCycle / validateGenerateReferences /
- *   getReferenceUpdateState / planGenerationChain。
+ * 链条是生成事实的只读投影：权威来源 = 激活版本 inputs.refs（生成时由系统自动
+ * 写入，用户与 Agent 都不能手动建链/删链）。本模块职责：
+ * - 读：getCardReferences —— 三级解析（激活版本 inputs.refs → data.references
+ *   迁移手动链 → legacy refs/refRoles 懒派生），连线绘制/新鲜度/血脉共用；
+ * - 血脉：deriveLineage / formatLineageText —— 递归祖先链（防环、可截断）；
+ * - 判：validateRefSet（提交前结构校验）/ getReferenceUpdateState（上游漂移）。
  *
  * 硬约束：electron-free / store-free / window-free；不 import 任何 store、React、
  * window/electron API；类型 import 一律 type-only。渲染端与脚本两侧可复用。
@@ -23,7 +21,7 @@ import {
 } from '@shared/media'
 import type { MediaGenMode, MediaKind, MediaRefRole, ResolvedRefCaps } from '@shared/media'
 import { KIND_LABEL } from '../types'
-import type { AssetGen, AssetKind, CanvasNode, GenerateReference } from '../types'
+import type { AssetKind, CanvasNode, GenerateReference, GenerateVersion } from '../types'
 
 /** legacy 引用的稳定 id（同一输入恒得同一 id）：`目标:来源:角色` */
 export function legacyReferenceId(targetNodeId: string, sourceNodeId: string, role: MediaRefRole): string {
@@ -42,43 +40,52 @@ export function defaultRefRole(sourceKind: AssetKind, targetKind: MediaKind, ind
   return 'reference_image'
 }
 
-/** 素材卡是否已有可投递文件（storage 明确且 path 非空）。生成卡未产出 = false */
+/** 素材卡是否已有可投递文件（storage 明确且 path 非空）。生成中的占位卡 = false */
 export function isReferenceSourceProduced(source: CanvasNode): boolean {
   const data = source.data
   return (data.storage === 'media' || data.storage === 'ws') && Boolean(data.path)
 }
 
-/** 单卡的参考来源序列（不含角色信息；图/链遍历共用）。无 gen 的素材卡 = 空 */
-function referenceSourcesOf(node: CanvasNode, nodes: readonly CanvasNode[]): string[] {
-  if (!node.data.gen) return []
-  return getGenerateReferences(node, nodes).map((r) => r.sourceNodeId)
+/** 卡片的激活版本（activeVersionId 缺失/失效时回退最新版本）；无版本 = undefined */
+export function activeVersionOf(node: CanvasNode): GenerateVersion | undefined {
+  const versions = node.data.versions
+  if (!versions || versions.length === 0) return undefined
+  return versions.find((v) => v.id === node.data.activeVersionId) ?? versions[0]
 }
 
 /**
- * 卡片的权威参考列表。references 数组存在（含显式空数组 = 用户已清空）即权威，
- * 原样返回（防外部改动的浅拷贝）；缺席的旧数据按 refs/refRoles 懒派生：显式
- * refRoles 优先，否则按 caps 派生（同 jobRuntime 历史语义），派生不出也保留
- * （占位角色，供 validate 报 role_unsupported）。
+ * 卡片的当前引用链（三级解析，权威在前）：
+ * 1. 激活版本 inputs.refs —— 新权威：生成时系统自动写入的定格快照；
+ * 2. data.references —— 迁移自旧结构 AssetGen.references 的手动链（legacy 只读展示）；
+ * 3. refs/refRoles —— 更旧的 legacy 视图，按当前 caps 懒派生（刻意不在载入期固化，
+ *    避免 settings 未就绪时把 reference_image 专用视频模型的默认角色错存成 first_frame）。
+ *
+ * 画布外文件（Agent 引用了临时上传等，快照里 sourceNodeId 缺省）不画链。
  */
-export function getGenerateReferences(
+export function getCardReferences(
   node: CanvasNode,
   nodes: readonly CanvasNode[],
   caps?: ResolvedRefCaps
 ): GenerateReference[] {
-  const gen = node.data.gen
-  if (!gen) return []
-  if (Array.isArray(gen.references)) {
-    return gen.references
+  const data = node.data
+  const active = activeVersionOf(node)
+  if (active?.inputs) {
+    return active.inputs.refs
+      .filter((r) => r && typeof r.sourceNodeId === 'string' && MEDIA_REF_ROLES.includes(r.role))
+      .map((r, index) => ({ id: r.referenceId, sourceNodeId: r.sourceNodeId as string, role: r.role, order: index }))
+  }
+  if (Array.isArray(data.references)) {
+    return data.references
       .filter((r) => r && typeof r.id === 'string' && typeof r.sourceNodeId === 'string' && MEDIA_REF_ROLES.includes(r.role))
       .map((r) => ({ ...r }))
       .sort((a, b) => a.order - b.order)
   }
   const byId = new Map(nodes.map((n) => [n.id, n]))
-  const targetKind = (node.data.kind as MediaKind) ?? 'image'
-  return (gen.refs ?? []).map((sourceId, index): GenerateReference => {
+  const targetKind = (data.kind as MediaKind) ?? 'image'
+  return (data.refs ?? []).map((sourceId, index): GenerateReference => {
     const source = byId.get(sourceId)
     const sourceKind = (source?.data.kind as MediaKind | undefined) ?? 'image'
-    const explicit = gen.refRoles?.[sourceId]
+    const explicit = data.refRoles?.[sourceId]
     const role =
       explicit ??
       (caps ? deriveRefRole(sourceKind, targetKind, index, caps.quota) ?? defaultRefRole(sourceKind, targetKind, index) : defaultRefRole(sourceKind, targetKind, index))
@@ -87,82 +94,57 @@ export function getGenerateReferences(
 }
 
 /**
- * 以 references 为唯一权威写回 AssetGen：入参去重（按 id 保序）并重排序号，
- * 同步反推 legacy 视图 —— refs = 去重后的 sourceNodeId 序列；refRoles = 按首现身
- * 角色 × sourceNodeId 的映射（legacy 表达不了同源多角色，真相在 references）。
+ * 为一组来源卡派生参考角色（生成 Popover 选卡后由系统分配，用户不手动指定）。
+ * 同源去重（按 id 保序），序号即 order；派生不出时用 defaultRefRole 占位，
+ * 占位角色会在 validateRefSet 里报 role_unsupported，由提交前校验拦截。
  */
-export function withGenerateReferences(gen: AssetGen, references: GenerateReference[]): AssetGen {
+export function assignRefRoles(
+  targetNodeId: string,
+  sources: readonly CanvasNode[],
+  targetKind: MediaKind,
+  caps?: ResolvedRefCaps
+): GenerateReference[] {
   const seen = new Set<string>()
-  const normalized: GenerateReference[] = []
-  for (const ref of references) {
-    if (!ref || seen.has(ref.id)) continue
-    seen.add(ref.id)
-    normalized.push({ ...ref, order: normalized.length })
+  const refs: GenerateReference[] = []
+  for (const source of sources) {
+    if (seen.has(source.id)) continue
+    seen.add(source.id)
+    const sourceKind = (source.data.kind as MediaKind) ?? 'image'
+    const role =
+      caps
+        ? deriveRefRole(sourceKind, targetKind, refs.length, caps.quota) ??
+          defaultRefRole(sourceKind, targetKind, refs.length)
+        : defaultRefRole(sourceKind, targetKind, refs.length)
+    refs.push({ id: legacyReferenceId(targetNodeId, source.id, role), sourceNodeId: source.id, role, order: refs.length })
   }
-  const refs: string[] = []
-  const refRoles: Record<string, MediaRefRole> = {}
-  for (const ref of normalized) {
-    if (!refs.includes(ref.sourceNodeId)) refs.push(ref.sourceNodeId)
-    if (!(ref.sourceNodeId in refRoles)) refRoles[ref.sourceNodeId] = ref.role
-  }
-  return { ...gen, references: normalized, refs, refRoles }
+  return refs
 }
 
 /**
- * 加边 target → source（target 引用 source 作参考）是否成环：
- * 自引直接成环；否则从 source 沿既有引用边向上走，能回到 target 即成环。
- */
-export function wouldCreateReferenceCycle(nodes: readonly CanvasNode[], sourceNodeId: string, targetNodeId: string): boolean {
-  if (sourceNodeId === targetNodeId) return true
-  const byId = new Map(nodes.map((n) => [n.id, n]))
-  const visited = new Set<string>([sourceNodeId])
-  const stack = [sourceNodeId]
-  while (stack.length > 0) {
-    const current = stack.pop() as string
-    const node = byId.get(current)
-    if (!node) continue
-    for (const next of referenceSourcesOf(node, nodes)) {
-      if (next === targetNodeId) return true
-      if (!visited.has(next)) {
-        visited.add(next)
-        stack.push(next)
-      }
-    }
-  }
-  return false
-}
-
-/**
- * 生成前的引用校验（纯连接/结构层面，不做模型解析）。
+ * 提交生成前的参考校验（纯连接/结构层面，不做模型解析）。
  *
  * 返回契约：
- * - errors：严格校验的全部中文硬错误（保持既有语义：有错就报，不做静默裁剪），
- *   其中也含「未产出」类错误（源卡存在、类型匹配但没有可投递文件）；
+ * - errors：严格校验的全部中文硬错误（有错就报，不做静默裁剪），其中也含
+ *   「未产出」类错误（源卡存在、类型匹配但没有可投递文件）；
  * - unproduced：errors 中「未产出」条目的原串子集（unproduced ⊆ errors）。
- *   runtime 用 `errors.filter((e) => !unproduced.includes(e))` 得纯连接错误，
- *   或直接读它区分"链式生成应先跑上游"与"直接提交应拦截"。
  *
  * 校验项：来源缺失 / 素材大类与角色不符 / 逐角色配额（0 = 模型不接受该角色）/
- * 总量闸 / 模式可达 / 尾帧依赖。角色/数量/模式按「存在且类型匹配」的全部引用判——
- * 未产出的生成卡同样占配额、同样参与组合判定（搭链时上游本轮会产出，但结构错误
- * 不该被"还没产出"掩盖，等产出了才报就是纯负向体验）；未产出另以 unproduced
- * 单独留痕。引用列表不裁剪，超量以错误报告。
+ * 总量闸 / 模式可达 / 尾帧依赖。角色/数量/模式按「存在且类型匹配」的全部引用判。
+ * 引用列表不裁剪，超量以错误报告。
  */
-export function validateGenerateReferences(
-  node: CanvasNode,
+export function validateRefSet(
+  targetKind: MediaKind,
+  refs: readonly GenerateReference[],
   nodes: readonly CanvasNode[],
   caps: ResolvedRefCaps
-): { references: GenerateReference[]; errors: string[]; unproduced: string[] } {
-  const references = getGenerateReferences(node, nodes, caps)
+): { errors: string[]; unproduced: string[] } {
   const errors: string[] = []
   const unproduced: string[] = []
-  if (!node.data.gen) return { references, errors, unproduced }
   const byId = new Map(nodes.map((n) => [n.id, n]))
-  const targetKind = (node.data.kind as MediaKind) ?? 'image'
   // 存在且类型匹配的引用全部参与配额/总量/模式判定（未产出只额外加一条留痕错误）
   const usable: GenerateReference[] = []
 
-  for (const ref of references) {
+  for (const ref of refs) {
     const roleLabel = REF_ROLE_LABEL[ref.role]
     const source = byId.get(ref.sourceNodeId)
     if (!source) {
@@ -208,49 +190,35 @@ export function validateGenerateReferences(
       errors.push(`这些参考素材的组合不属于该模型支持的任何用法（支持：${modes || '无'}）`)
     }
   }
-  return { references, errors, unproduced }
+  return { errors, unproduced }
 }
 
 /**
  * 引用新鲜度（相对激活版本.inputs 快照）：unknown 无从比对 / current 未过期 /
  * changed 已过期 / missing 来源已消失。
+ *
+ * 链条本身就是从激活版本 inputs 派生的，所以「引用列表是否被改过」不再可比；
+ * 这里比对的是**上游卡片的当前状态**：来源是生成卡再比激活版本 id（上游再生成
+ * 即过期，只改提示词不换版本不触发）+ 文件落点（path/pathRoot，防"版本没变但
+ * 产物引用被清/挪"漏报）；来源是普通文件比 storage/path/pathRoot（改名/移动即过期）。
  */
 export type GenerateRefUpdateState = 'unknown' | 'current' | 'changed' | 'missing'
 
-/**
- * 卡片当前参考相对激活版本 inputs 快照的新鲜度。
- *
- * - missing 以**当前引用**为基准：现在挂着的任何一条参考，其来源卡已不在画布即
- *   missing（用户主动移除的引用不算——快照里多出来的条目走 changed；老版本没有
- *   inputs 快照也照样能报 missing，这个判定不依赖快照）。
- * - 其余比对以快照为基准，位置对位置：条数、referenceId、sourceNodeId、role、
- *   顺序任一变化即 changed；来源是生成卡再比激活版本 id（上游再生成即过期，
- *   只改提示词不换版本不触发）+ 文件落点（path/pathRoot，防"版本没变但产物
- *   引用被清/挪"漏报）；来源是普通文件比 storage/path/pathRoot（改名/移动即过期）。
- * - 老版本无 inputs / 卡无激活版本 → unknown（无从比对，不冤枉）。
- */
 export function getReferenceUpdateState(node: CanvasNode, nodes: readonly CanvasNode[]): GenerateRefUpdateState {
-  const gen = node.data.gen
-  if (!gen) return 'unknown'
-  const byId = new Map(nodes.map((n) => [n.id, n]))
-  const current = getGenerateReferences(node, nodes)
-  // 来源缺失优先（以当前引用为基准）：占位引用还没恢复，其它状态没有意义
-  for (const ref of current) {
-    if (!byId.has(ref.sourceNodeId)) return 'missing'
-  }
-  const active = gen.activeVersionId ? gen.versions.find((v) => v.id === gen.activeVersionId) : undefined
+  const active = activeVersionOf(node)
   if (!active?.inputs) return 'unknown'
-  const snapshotRefs = active.inputs.refs
-  if (snapshotRefs.length !== current.length) return 'changed'
-  for (let i = 0; i < snapshotRefs.length; i += 1) {
-    const snap = snapshotRefs[i]
-    const now = current[i]
-    if (snap.referenceId !== now.id || snap.sourceNodeId !== now.sourceNodeId || snap.role !== now.role) return 'changed'
-    const source = byId.get(now.sourceNodeId) as CanvasNode
-    if (source.data.gen) {
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const snapshotRefs = active.inputs.refs.filter((r) => r.sourceNodeId)
+  for (const snap of snapshotRefs) {
+    if (!byId.has(snap.sourceNodeId as string)) return 'missing'
+  }
+  for (const snap of snapshotRefs) {
+    const source = byId.get(snap.sourceNodeId as string) as CanvasNode
+    const sourceActive = activeVersionOf(source)
+    if (sourceActive) {
       // 有版本的来源：激活版本 id 不同 = 上游再生成过（只改提示词不换版本不触发）；
       // 版本相同也要核对文件落点——path/pathRoot 可被清掉或移动而 activeVersion 不动
-      if ((snap.sourceVersionId ?? null) !== (source.data.gen.activeVersionId ?? null)) return 'changed'
+      if ((snap.sourceVersionId ?? null) !== (source.data.activeVersionId ?? sourceActive.id)) return 'changed'
       if ((snap.path ?? null) !== (source.data.path ?? null)) return 'changed'
       if ((snap.pathRoot ?? null) !== (source.data.pathRoot ?? null)) return 'changed'
     } else {
@@ -263,40 +231,65 @@ export function getReferenceUpdateState(node: CanvasNode, nodes: readonly Canvas
   return 'current'
 }
 
+/** 血脉链上的一个祖先条目（BFS 序） */
+export interface LineageEntry {
+  nodeId: string
+  name: string
+  /** 到达该祖先的直接父边角色（depth=1 = 本卡引用它时用的角色） */
+  role?: MediaRefRole
+  /** 1 = 直接参考，2 = 参考的参考…… */
+  depth: number
+}
+
 /**
- * 以 target 为终点的生成链规划：把全部上游生成卡依赖按拓扑序（上游在前、
- * target 最后）输出。不做模型解析、不决定运行复用（runtime 负责）；普通素材卡
- * 是叶子，不进 nodeIds。循环 / 目标缺失 / 引用悬空以错误报告，不产出半截链。
+ * 卡片的血脉链（递归祖先，BFS 序、防环、可截断）。
+ * 生成事实可能在激活版本投影里成环（A←B 后又 B←A 的 ping-pong 迭代合法），
+ * visited 去重保证终止。maxDepth/maxNodes 截断保证上下文摘要体积可控。
  */
-export function planGenerationChain(targetNodeId: string, nodes: readonly CanvasNode[]): { nodeIds: string[]; errors: string[] } {
+export function deriveLineage(
+  nodeId: string,
+  nodes: readonly CanvasNode[],
+  opts?: { maxDepth?: number; maxNodes?: number }
+): LineageEntry[] {
+  const maxDepth = opts?.maxDepth ?? 3
+  const maxNodes = opts?.maxNodes ?? 8
   const byId = new Map(nodes.map((n) => [n.id, n]))
-  const errors = new Set<string>()
-  const nodeIds: string[] = []
-  const state = new Map<string, 'visiting' | 'done'>()
-  const visit = (id: string, trail: readonly string[]) => {
-    const node = byId.get(id)
-    if (!node) {
-      errors.add(`引用的素材卡片不存在（${id}），请先恢复或移除该参考`)
-      return
+  const visited = new Set<string>([nodeId])
+  const entries: LineageEntry[] = []
+  let queue: { id: string; role?: MediaRefRole; depth: number }[] = [{ id: nodeId, depth: 0 }]
+  while (queue.length > 0 && entries.length < maxNodes) {
+    const next: { id: string; role?: MediaRefRole; depth: number }[] = []
+    for (const item of queue) {
+      if (item.depth >= maxDepth) continue
+      const node = byId.get(item.id)
+      if (!node) continue
+      for (const ref of getCardReferences(node, nodes)) {
+        if (visited.has(ref.sourceNodeId)) continue
+        const source = byId.get(ref.sourceNodeId)
+        if (!source) continue
+        visited.add(ref.sourceNodeId)
+        if (entries.length >= maxNodes) break
+        entries.push({ nodeId: source.id, name: source.data.name, role: ref.role, depth: item.depth + 1 })
+        next.push({ id: source.id, role: ref.role, depth: item.depth + 1 })
+      }
     }
-    const mark = state.get(id)
-    if (mark === 'done') return
-    if (mark === 'visiting') {
-      const start = trail.indexOf(id)
-      const cycle = [...trail.slice(start), id]
-      const names = cycle.map((cid) => byId.get(cid)?.data.name ?? cid)
-      errors.add(`参考链存在循环依赖：${names.join(' → ')}`)
-      return
-    }
-    state.set(id, 'visiting')
-    for (const sourceId of referenceSourcesOf(node, nodes)) visit(sourceId, [...trail, id])
-    state.set(id, 'done')
-    // 只有生成卡需要执行；普通素材卡只是链上的现成叶子
-    if (node.data.gen) nodeIds.push(id)
+    queue = next
   }
-  if (!byId.get(targetNodeId)) {
-    return { nodeIds: [], errors: [`目标卡片不存在（${targetNodeId}）`] }
+  return entries
+}
+
+/** 血脉链的紧凑中文文本：`图A(首帧)、图B(参考图) ← 图C(首帧)`（按深度分组，空链 = ''） */
+export function formatLineageText(entries: readonly LineageEntry[]): string {
+  if (entries.length === 0) return ''
+  const byDepth = new Map<number, string[]>()
+  for (const entry of entries) {
+    const label = entry.role ? `${entry.name}(${REF_ROLE_LABEL[entry.role]})` : entry.name
+    const group = byDepth.get(entry.depth) ?? []
+    group.push(label)
+    byDepth.set(entry.depth, group)
   }
-  visit(targetNodeId, [])
-  return { nodeIds, errors: [...errors] }
+  return [...byDepth.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, labels]) => labels.join('、'))
+    .join(' ← ')
 }

@@ -162,19 +162,6 @@ textarea,
   pointer-events: none;
 }
 
-/* 指针拖拽参考投放的悬停高亮（CanvasWorkspace beginDrag 直写 class）：
-   同 node-ring-overlay 的道理，ring 画在 gen-node 内部伪元素，避免被
-   NodeFrame 的 content-visibility paint containment 裁成四角月牙 */
-[data-testid='gen-node'].gen-ref-hover::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  z-index: 10;
-  border-radius: 16px;
-  border: 2px solid var(--accent);
-  pointer-events: none;
-}
-
 /* 自研 resize 手柄（右下角，等价旧 react-rnd 的 bottomRight 18px 热区） */
 .node-resize-handle {
   position: absolute;
@@ -222,9 +209,8 @@ textarea,
 .reference-edge.ref-edge-active .reference-edge-line {
   stroke: color-mix(in srgb, var(--accent) 55%, transparent);
 }
-.reference-edge.ref-edge-selected .reference-edge-line {
+.reference-edge:hover .reference-edge-line {
   stroke: var(--accent);
-  stroke-width: 2.5;
 }
 
 /* 箭头 marker（方向感：源出目标入）；CSS 变量只能走类，不能写进 presentation 属性 */
@@ -265,39 +251,8 @@ textarea,
   transition: opacity 0.12s ease;
 }
 .reference-edge:hover .reference-edge-label,
-.reference-edge.ref-edge-active .reference-edge-label,
-.reference-edge.ref-edge-selected .reference-edge-label {
+.reference-edge.ref-edge-active .reference-edge-label {
   opacity: 1;
-}
-
-/* 移除按钮：随 label 一起浮现；只在可见时可点（隐形不吃事件） */
-.reference-edge-remove {
-  opacity: 0;
-  pointer-events: none;
-  cursor: pointer;
-  transition: opacity 0.12s ease;
-}
-.reference-edge-remove circle {
-  fill: var(--surface-card);
-  stroke: var(--outline);
-}
-.reference-edge-remove path {
-  fill: none;
-  stroke: var(--danger);
-  stroke-width: 1.6;
-  stroke-linecap: round;
-}
-.reference-edge:hover .reference-edge-remove,
-.reference-edge.ref-edge-selected .reference-edge-remove {
-  opacity: 1;
-  pointer-events: auto;
-}
-.reference-edge-remove:hover circle {
-  fill: var(--danger);
-  stroke: var(--danger);
-}
-.reference-edge-remove:hover path {
-  stroke: #fff;
 }
 
 /* 右键菜单 / 弹层 / 确认框 / Toast 的入场动效（替代原型里的 motion 库） */

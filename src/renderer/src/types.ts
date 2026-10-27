@@ -6,7 +6,9 @@
  * - 画布上只有文件卡片（按图片/视频/音频/文档/代码/其他区分）——会话不再上画布，
  *   会话 = 一段对话历史（SessionMeta + ChatData），呈现在底部对话坞；
  * - 画布卡片 = 工作区文件的引用（引用而非副本）：删卡片 ≠ 删文件；
- * - 带 gen 字段的文件卡片同时是媒体生成的执行单元（生成是状态，不是独立卡片类型）；
+ * - 生成产物就是普通媒体卡片：生成历史（版本栈）存在卡片详情里，生成信息随
+ *   版本的 inputs 定格快照持久化；引用链是生成事实的只读投影，由生成时自动
+ *   形成（mediaReferenceGraph.getCardReferences），用户与 Agent 都不能手动连线；
  * - 会话里引用素材只传绝对路径（MessageAttachment），文件内容不进上下文。
  */
 import type { ChatMessageBlock, ChatStopReason } from './chatBlocks'
@@ -47,8 +49,8 @@ export interface MessageAttachment {
    */
   origin: 'workspace-asset' | 'temp-upload'
   /**
-   * 生成卡片的产物回喂摘要（T11）：状态 + 提示词 + 参数 + 版本数。
-   * 只有带 gen 状态的画布卡片才有；buildReferencePayload 把它附在引用行尾。
+   * 生成历史回喂摘要：激活版本的提示词/参数 + 血脉链（deriveLineage）。
+   * 只有带生成历史（versions）的画布卡片才有；buildReferencePayload 把它附在引用行尾。
    */
   genSummary?: string
 }
@@ -159,13 +161,48 @@ export interface AssetData {
   meta?: string
   /** 由哪段会话产出（Agent 写回工作目录时标记；会话已不上画布，仅存引用关系） */
   fromChatId?: string
-  /** 生成状态：提示词/参考/参数/进度/版本（媒体卡片的一种状态，非独立卡片类型） */
-  gen?: AssetGen
+  /**
+   * 生成历史（版本栈，新版本插头部）。产物即媒体卡：生成信息全部在版本里
+   * （prompt/model/inputs 定格），没有独立的"生成卡片"形态。
+   */
+  versions?: GenerateVersion[]
+  /** 当前展示的版本；切换版本时同步覆写 storage/path/... 指向该版文件 */
+  activeVersionId?: string
+  /** 在途生成任务绑定（transient：提交时写入、终态清除；重启后 reconcileJobs 对账） */
+  pendingJob?: AssetPendingJob
+  /**
+   * legacy 引用链：迁移自旧结构 AssetGen.references 的手动链，只读展示，新代码不写。
+   * 当前链条的权威来源是激活版本 inputs.refs，解析顺序见 getCardReferences。
+   */
+  references?: GenerateReference[]
+  /** 更旧的 legacy 兼容视图（refs/refRoles），解析链最末级才读 */
+  refs?: string[]
+  refRoles?: Record<string, MediaRefRole>
 }
 
-export type GenerateStatus = 'idle' | 'queued' | 'running' | 'succeeded' | 'failed'
+/** 在途生成任务绑定：卡片上的最小持久化痕迹，运行态（进度/错误）在 jobRuntime 内存 */
+export interface AssetPendingJob {
+  jobId: string
+  /** 提交时冻结的输入定格（任务成功时整体落进新版本 inputs） */
+  inputs?: GenerateInputSnapshot
+}
 
-/** 生成参数：参数在节点面板调（chip 下拉），提示词写在卡片上 */
+/**
+ * 生成 Popover 的打开目标（直接生成入口，锚定卡片/划选/画布光标）。
+ * 引用链由生成事实自动形成：这里只选"这次生成用哪些卡当参考"，
+ * 角色由系统按当前模型能力派生，用户不指定。
+ */
+export interface GenComposerTarget {
+  /** Popover 锚点（画布世界坐标；CanvasWorkspace 负责换算视口定位） */
+  at: { x: number; y: number }
+  /** 预选参考卡 id（"以此为参考生成"）；缺省 = 无 */
+  refs?: string[]
+  /** 再次生成的目标卡（就地加新版本，Popover 回填其激活版本输入）；缺省 = 生成新卡 */
+  targetNodeId?: string
+  kind?: MediaKind
+}
+
+/** 生成参数：在生成 Popover 调（chip 下拉），提交时随 GenerateInputSnapshot 定格 */
 export interface GenerateParams {
   /**
    * 画面比例。可选：挂了首帧图的视频模型常常"比例随首帧"（官方 adaptive），
@@ -202,23 +239,26 @@ export interface GenerateVersion {
 }
 
 /**
- * 一条生成参考的显式记录（引用链事实源）。AssetGen.references 存在时它是唯一权威，
- * legacy refs/refRoles 退化为兼容视图：读一律走 lib/mediaReferenceGraph 的
- * getGenerateReferences（references 缺席时按 refs/refRoles + 当前 caps 懒派生），
- * 写一律经 withGenerateReferences 回填双份，不要绕开它直接改 refs/refRoles。
+ * 一条引用链记录（引用边的模型）。链条是生成事实的只读投影：权威来源 =
+ * 激活版本 inputs.refs（生成时自动写入）；data.references 仅承载迁移自旧结构
+ * AssetGen.references 的手动链（legacy 展示）。读一律走 getCardReferences。
  */
 export interface GenerateReference {
   id: string
   sourceNodeId: string
   role: MediaRefRole
-  /** 在该卡参考序列中的位次（0 起；写入时由 withGenerateReferences 统一重排） */
+  /** 在该卡参考序列中的位次（0 起） */
   order: number
 }
 
 /** 提交生成时一条参考素材的定格快照（GenerateInputSnapshot.refs 的元素） */
 export interface GenerateRefSnapshot {
   referenceId: string
-  sourceNodeId: string
+  /**
+   * 来源卡片 id。Agent 引用画布外文件（临时上传等）时反查不到卡片 → 缺省：
+   * 历史与文件落点保留在快照里，但链条不画。
+   */
+  sourceNodeId?: string
   role: MediaRefRole
   sourceName: string
   /** 来源是生成卡时被引用的版本 id：上游再生成（activeVersionId 变化）即可判 changed；只改提示词不算 */
@@ -230,7 +270,7 @@ export interface GenerateRefSnapshot {
   bytes?: number
 }
 
-/** 一次提交的输入定格（版本级事实源）：引用新鲜度比对与历史回放都以它为准 */
+/** 提交生成的输入定格（版本级事实源）：历史回放、引用链派生、血脉推导都以它为准 */
 export interface GenerateInputSnapshot {
   prompt: string
   params: GenerateParams
@@ -238,61 +278,6 @@ export interface GenerateInputSnapshot {
   model: string
   refs: GenerateRefSnapshot[]
   createdAt: number
-}
-
-/**
- * 生成链运行态（引用链批量生成）。由生成任务域（jobRuntime）创建与推进；
- * 画布载入/切换工作区时重置为 null，在途链的取消由 runtime 自行处理。
- */
-export interface GenerationChainRun {
-  id: string
-  targetNodeId: string
-  /** 按上游拓扑排序的待执行生成卡（含目标卡自身，target 排最后；planGenerationChain 产出） */
-  nodeIds: string[]
-  completedNodeIds: string[]
-  currentNodeId?: string
-  status: 'running' | 'cancelled' | 'failed' | 'succeeded'
-  error?: string
-}
-
-/** 文件卡片上的生成状态 */
-export interface AssetGen {
-  /** 最近一次提交的提示词（回显进卡片输入框，可改一字再生成） */
-  prompt: string
-  /**
-   * 参考资产节点 id 序列（legacy 兼容视图）。references 存在时由
-   * withGenerateReferences 从 references 反向同步（去重、按首现身排序），
-   * 只读不写；新写入一律走 references（连线绘制仍读它取来源节点）。
-   */
-  refs: string[]
-  /**
-   * legacy 兼容视图：`sourceNodeId → 显式角色`。references 存在时由
-   * withGenerateReferences 同步（同源多角色时取首现身角色的映射，legacy 表达力如此）；
-   * references 缺席的旧数据里它仍有效（缺席项 = 按素材大类与序数派生的历史语义）。
-   */
-  refRoles?: Record<string, MediaRefRole>
-  /**
-   * 显式参考记录（引用链唯一事实源）。缺席 = 尚未归一化的旧数据，读路径按
-   * refs/refRoles + 当前模型 caps 懒派生（getGenerateReferences），
-   * 刻意不在载入期用默认 caps 固化，避免"reference_image 专用视频模型被存成 first_frame"。
-   */
-  references?: GenerateReference[]
-  /** 提交成功后、任务终态前的输入定格暂存（runtime 绑定 job；succeeded 时落进版本.inputs） */
-  pendingInputs?: GenerateInputSnapshot
-  /** 关联的生成链运行 id（GenerationChainRun.id；链式生成的成员卡标记） */
-  chainRunId?: string
-  params: GenerateParams
-  status: GenerateStatus
-  /** 0..1 */
-  progress: number
-  /** 进行中的任务 id（media:job 事件按它回填） */
-  jobId?: string
-  /** status=failed 时的可操作错误文本 */
-  error?: string
-  /** 参考素材的处置留痕（哪条没进请求、为什么），来自任务状态 */
-  notes?: string[]
-  versions: GenerateVersion[]
-  activeVersionId?: string
 }
 
 /**
@@ -327,6 +312,4 @@ export interface Workspace {
 export interface UndoEntry {
   nodes: CanvasNode[]
   label: string
-  /** 该节点删除前的「当前生成」身份，撤销时一并恢复 */
-  wasActiveGenerate: boolean
 }

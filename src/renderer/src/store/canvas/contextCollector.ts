@@ -1,6 +1,7 @@
 import type { AssetLibrary } from '@shared/ipc'
-import type { AssetData, AssetGen, CanvasNode, MessageAttachment } from '../../types'
+import type { AssetData, CanvasNode, MessageAttachment } from '../../types'
 import { assetAbsPath } from '../../harness/assetCategories'
+import { activeVersionOf, deriveLineage, formatLineageText, getCardReferences } from '../../lib/mediaReferenceGraph'
 import { CANVAS_DIGEST_HEADER, DIGEST_UNCHANGED_NOTE, LIBRARY_DIGEST_HEADER } from '@shared/injection'
 
 /**
@@ -11,11 +12,11 @@ import { CANVAS_DIGEST_HEADER, DIGEST_UNCHANGED_NOTE, LIBRARY_DIGEST_HEADER } fr
  * （拼进 outbound 消息文本），不进静态系统提示词：
  *
  * - 引用载荷（attachments）：画布选中/已注入卡片 + 临时上传 inbox 文件；
- *   带生成状态的卡片携带结构化 genSummary（T11：当前版本产物路径 + 提示词 +
- *   参数 + 版本数），配合 read_media 让 Agent 能看自己产出的图；
+ *   带生成历史的卡片携带结构化 genSummary（激活版本提示词/参数 + 血脉链），
+ *   让人和 Agent 都能知晓引用链条（生成事实的只读投影）；
  * - 素材库摘要（T9）：库名 + 文件相对路径，条数上限 + 截断；
- * - 画布态势摘要（T10）：卡片清单（类型/路径/选中态/生成状态与参数），
- *   含尚未产出产物的生成卡片（它们进不了引用载荷，但 Agent 应当知道它们存在）。
+ * - 画布态势摘要（T10）：卡片清单（类型/路径/选中态/生成历史与血脉），
+ *   含生成中的占位卡（它们进不了引用载荷，但 Agent 应当知道它们存在）。
  *
  * 纯函数：输入是发送瞬间的状态快照，输出是附件与注入文本；不做 IPC、不读 store，
  * 因此能被 Node 自检直接断言（scripts/context-digest-check.mjs）。逐轮去重（token
@@ -34,6 +35,8 @@ export interface MessageContextInput {
   tempAttachments: MessageAttachment[]
   /** 工作区根（media 形态卡片解析绝对路径用） */
   workspaceDir: string
+  /** 卡片的生成运行态（jobStates 快照：画布态势里标注生成中的占位卡） */
+  jobStates?: Record<string, { status: string; progress: number; error?: string }>
 }
 
 export interface RoundContextInput extends MessageContextInput {
@@ -84,7 +87,8 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
         // 直接按工作区根拼会得出 <工作区>/<裸文件名>，Agent 侧只表现为"引用文件不存在"
         const absPath = assetAbsPath(data, input.workspaceDir)
         if (!absPath) return []
-        const genSig = data.gen ? genSummarySignature(data.gen) : undefined
+        const node = input.nodes.find((n) => n.id === nodeId) as CanvasNode
+        const genSig = node.data.versions?.length ? genSummarySignature(node, input.nodes) : undefined
         if (genSig !== undefined) carriedGenSigs[nodeId] = genSig
         return [
           {
@@ -93,16 +97,19 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
             kind: data.kind,
             absPath,
             origin: 'workspace-asset' as const,
-            // T11：生成卡片的产物回喂——Agent 拿到的不只是一个路径，还有这张卡片的
-            // 来龙去脉；签名与上轮一致时省去 genSummary 括注（未变内容不逐轮重复计 token）
-            ...(data.gen && seenGenSigs[nodeId] !== genSig ? { genSummary: genSummaryFor(data) } : {})
+            // 生成历史回喂：Agent 拿到的不只是一个路径，还有这张卡片的来龙去脉与血脉链
+            //（引用卡片进上下文即携带血缘信息，人与 Agent 都能知晓引用链条）；
+            // 签名与上轮一致时省去 genSummary 括注（未变内容不逐轮重复计 token）
+            ...(node.data.versions?.length && seenGenSigs[nodeId] !== genSig
+              ? { genSummary: genSummaryFor(node, input.nodes) }
+              : {})
           }
         ]
       }),
     ...input.tempAttachments
   ]
   const libraryDigest = buildLibraryDigest(input.libraries, input.workspaceDir)
-  const canvasDigest = buildCanvasDigest(input.nodes, input.selectedAssetIds, input.injectedAssetIds)
+  const canvasDigest = buildCanvasDigest(input.nodes, input.selectedAssetIds, input.injectedAssetIds, input.jobStates)
   // 摘要逐轮去重（token 经济）：与上轮全文一致的段折叠为「头 + 未变化后缀」单行占位
   // （占位行仍以头前缀开头，isInjectionHeaderLine 按前缀匹配，回放拆分无需感知）；
   // digests 出参始终存本轮全文，供调用方作为下轮的 previousDigests
@@ -124,39 +131,46 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
   }
 }
 
-/* ---------------- T11：生成卡片的产物回喂摘要 ---------------- */
+/* ---------------- 生成历史回喂摘要（含血脉链） ---------------- */
 
-const GEN_STATUS_LABEL: Record<AssetGen['status'], string> = {
-  idle: '待生成',
-  queued: '排队中',
-  running: '生成中',
-  succeeded: '已完成',
-  failed: '失败'
-}
+/** 血脉段截断预算：递归祖先最多 3 层 / 8 个节点（deriveLineage 默认值同源） */
+const LINEAGE_MAX_DEPTH = 3
+const LINEAGE_MAX_NODES = 8
 
-function genSummaryFor(d: AssetData): string {
-  const gen = d.gen!
-  const params: string[] = [gen.params.ratio ? `比例 ${gen.params.ratio}` : '比例 自动']
-  if (gen.params.durationSeconds) params.push(`${gen.params.durationSeconds}s`)
-  if (gen.params.model) params.push(`模型 ${gen.params.model}`)
+/**
+ * 带生成历史卡片的回喂摘要：激活版本的提示词/参数 + 血脉链（递归祖先，
+ * 防环截断）。血脉来自生成事实（版本 inputs）的只读投影，人和 Agent 都能
+ * 据此知晓这张卡"从哪来"。
+ */
+function genSummaryFor(node: CanvasNode, nodes: readonly CanvasNode[]): string {
+  const d = node.data
+  const active = activeVersionOf(node)
+  const inputs = active?.inputs
+  const params: string[] = [inputs?.params.ratio ? `比例 ${inputs.params.ratio}` : '比例 自动']
+  if (inputs?.params.durationSeconds) params.push(`${inputs.params.durationSeconds}s`)
+  if (inputs?.model) params.push(`模型 ${inputs.provider}:${inputs.model}`)
+  const lineage = deriveLineage(node.id, nodes, { maxDepth: LINEAGE_MAX_DEPTH, maxNodes: LINEAGE_MAX_NODES })
+  const lineageText = formatLineageText(lineage)
   return [
-    `生成卡片「${d.name}」：${GEN_STATUS_LABEL[gen.status] ?? gen.status}`,
-    gen.prompt ? `提示词"${gen.prompt.slice(0, 80)}"` : '（无提示词）',
-    params.join(' · '),
-    `共 ${gen.versions.length} 版，当前版本即本附件`,
-    gen.versions.length > 1 ? '历史版本也在工作目录内，可按需读取' : ''
+    `「${d.name}」由${inputs ? `${inputs.provider}:${inputs.model} 生成` : '历史生成'}，${params.join(' · ')}`,
+    inputs?.prompt ? `提示词"${inputs.prompt.slice(0, 80)}"` : '',
+    `共 ${d.versions?.length ?? 0} 版，当前版本即本附件`,
+    lineageText ? `血脉：${lineageText}` : ''
   ]
     .filter(Boolean)
     .join('，')
 }
 
 /**
- * genSummary 的去重签名（逐轮 token 经济）：`状态|版本数|提示词`，覆盖 Agent 关心的
- * 三类变化——状态流转（生成中→已完成）、版本追加、提示词改写；比例/模型等参数
- * 微调不触发重发（genSummary 里的参数段随状态段一起出现，单独变化不值得重发整段）。
+ * genSummary 的去重签名（逐轮 token 经济）：`激活版本|版本数|提示词|血脉指纹`，
+ * 覆盖 Agent 关心的变化——版本切换/追加、提示词改写、上游血脉更新（祖先卡
+ * 再生成即换版本，指纹随之变化）；参数微调不单独触发重发。
  */
-function genSummarySignature(gen: AssetGen): string {
-  return `${gen.status}|${gen.versions.length}|${gen.prompt}`
+function genSummarySignature(node: CanvasNode, nodes: readonly CanvasNode[]): string {
+  const active = activeVersionOf(node)
+  const lineage = deriveLineage(node.id, nodes, { maxDepth: LINEAGE_MAX_DEPTH, maxNodes: LINEAGE_MAX_NODES })
+  const lineageFingerprint = lineage.map((e) => `${e.nodeId}@${e.depth}`).join('|')
+  return `${node.data.activeVersionId ?? active?.id ?? ''}|${node.data.versions?.length ?? 0}|${active?.inputs?.prompt ?? ''}|${lineageFingerprint}`
 }
 
 /* ---------------- T9：素材库清单摘要 ---------------- */
@@ -193,13 +207,14 @@ export function buildLibraryDigest(libraries: AssetLibrary[], workspaceDir: stri
 /* ---------------- T10：画布态势摘要 ---------------- */
 
 /**
- * 当前画布上有什么卡片（类型/路径/选中态/生成状态与参数）。选中/注入集合负责
+ * 当前画布上有什么卡片（类型/路径/选中态/生成历史与血脉）。选中/注入集合负责
  * "用户正在指哪张"——「把选中的这张垫给下一张」类指代靠它成立；空画布返回空串。
  */
 export function buildCanvasDigest(
   nodes: CanvasNode[],
   selectedAssetIds: string[],
-  injectedAssetIds: string[]
+  injectedAssetIds: string[],
+  jobStates?: Record<string, { status: string; progress: number; error?: string }>
 ): string {
   if (nodes.length === 0) return ''
   const selected = new Set(selectedAssetIds)
@@ -211,16 +226,30 @@ export function buildCanvasDigest(
     const tags: string[] = []
     if (selected.has(node.id)) tags.push('已选中')
     else if (injected.has(node.id)) tags.push('已注入上下文')
-    if (d.gen) {
-      const gen = d.gen
-      tags.push(GEN_STATUS_LABEL[gen.status] ?? gen.status)
-      const loc = d.path ? `${d.path}` : '（尚无产物）'
-      lines.push(
-        `- 卡片「${d.name}」（${kindLabel(d.kind)}，${loc}，${tags.join('，')}${gen.prompt ? `，提示词"${gen.prompt.slice(0, 60)}"` : ''}，参考 ${gen.refs.length} 张，${gen.versions.length} 版）`
-      )
-    } else {
-      lines.push(`- 卡片「${d.name}」（${kindLabel(d.kind)}，${d.path ?? '（无路径）'}${tags.length > 0 ? `，${tags.join('，')}` : ''}）`)
+    const runtime = jobStates?.[node.id]
+    if (runtime?.status === 'queued' || runtime?.status === 'running') {
+      // 生成中的占位卡：还没有产物，进不了引用载荷，但 Agent 应当知道它存在
+      const pct = runtime.status === 'running' ? `（${Math.round(runtime.progress * 100)}%）` : ''
+      lines.push(`- 卡片「${d.name}」（${kindLabel(d.kind)}，生成中${pct}，${tags.join('，') || '无标记'}）`)
+      continue
     }
+    if (d.versions?.length) {
+      const active = activeVersionOf(node)
+      const inputs = active?.inputs
+      const refs = getCardReferences(node, nodes)
+      const lineageText = formatLineageText(
+        deriveLineage(node.id, nodes, { maxDepth: LINEAGE_MAX_DEPTH, maxNodes: LINEAGE_MAX_NODES })
+      )
+      lines.push(
+        `- 卡片「${d.name}」（${kindLabel(d.kind)}，${d.path ?? '（无路径）'}，${['生成产物', ...tags].join('，')}${inputs?.prompt ? `，提示词"${inputs.prompt.slice(0, 60)}"` : ''}，参考 ${refs.length} 张，共 ${d.versions.length} 版${lineageText ? `，血脉：${lineageText}` : ''}）`
+      )
+      continue
+    }
+    if (runtime?.status === 'failed') {
+      lines.push(`- 卡片「${d.name}」（${kindLabel(d.kind)}，生成失败，${tags.join('，') || '无标记'}）`)
+      continue
+    }
+    lines.push(`- 卡片「${d.name}」（${kindLabel(d.kind)}，${d.path ?? '（无路径）'}${tags.length > 0 ? `，${tags.join('，')}` : ''}）`)
   }
   const rest = nodes.length - shown.length
   if (rest > 0) lines.push(`-（另有 ${rest} 张卡片未列出）`)

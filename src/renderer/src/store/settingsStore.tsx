@@ -39,6 +39,8 @@ export type SettingsTabKey = 'guide' | 'providers' | 'media' | 'skills' | 'mcp' 
 export interface AppearanceSettings {
   theme: 'light' | 'dark'
   showGrid: boolean
+  /** 画布引用链（生成事实的只读投影）显隐；快捷键 Shift+E 同步切换 */
+  showReferenceEdges: boolean
 }
 
 /** 某个 kind 当前生效的模型（`provider:model` 复合串），走完整回退链后的结果 */
@@ -135,7 +137,7 @@ interface SettingsState {
 
 const STORAGE_KEY = 'huabu-settings-ui'
 
-const DEFAULT_APPEARANCE: AppearanceSettings = { theme: 'light', showGrid: true }
+const DEFAULT_APPEARANCE: AppearanceSettings = { theme: 'light', showGrid: true, showReferenceEdges: true }
 
 interface PersistedUi {
   appearance: AppearanceSettings

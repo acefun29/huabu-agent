@@ -462,10 +462,10 @@ group('D1-对话闭环')
     const agentGenCard = await pollUntil(
       session,
       () => storeState(),
-      (st) => st.nodes.some((n) => n.type === 'asset' && n.data.gen && String(n.data.fromChatId ?? '').length > 0),
+      (st) => st.nodes.some((n) => n.type === 'asset' && Boolean(n.data.versions?.length || n.data.pendingJob) && String(n.data.fromChatId ?? '').length > 0),
       { timeout: 20_000, interval: 400, label: 'agent-gen-card' }
     )
-    record('Agent 发起的生成卡片自动出现在会话旁', !agentGenCard.timedOut, `genCards=${agentGenCard.value?.nodes?.filter((n) => n.data.gen)?.length}`)
+    record('Agent 发起的生成卡片自动出现在会话旁', !agentGenCard.timedOut, `genCards=${agentGenCard.value?.nodes?.filter((n) => n.data.versions?.length || n.data.pendingJob)?.length}`)
     const agentDone = await pollUntil(
       session,
       () => evalp('window.huabu.media.jobs()'),
@@ -483,12 +483,12 @@ group('D1-对话闭环')
       () => storeState(),
       (st) =>
         st.nodes.some(
-          (n) => n.type === 'asset' && (n.data.gen?.versions ?? []).some((v) => v.path === artifactPath)
+          (n) => n.type === 'asset' && (n.data.versions ?? []).some((v) => v.path === artifactPath)
         ),
       { timeout: 20_000, interval: 400, label: 'agent-card-settled' }
     )
     const boundCards = (cardPoll.value?.nodes ?? []).filter(
-      (n) => n.type === 'asset' && (n.data.gen?.versions ?? []).some((v) => v.path === artifactPath)
+      (n) => n.type === 'asset' && (n.data.versions ?? []).some((v) => v.path === artifactPath)
     ).length
     record('同一任务只建一张承接卡片（事件去重）', boundCards === 1, `cards=${boundCards} path=${artifactPath}`)
     } // end hasMock（Agent 媒体工具链）
@@ -532,69 +532,63 @@ group('D2-生成与编排')
     seedImagePath ? String(seedImagePath) : hasMock ? '(missing)' : MEDIA_SKIP_REASON
   )
 
-  // 1) 生成卡片全生命周期（提示词写在卡片内联控制台，不再占用底部输入框）
-  const genId = await storeAction('createGenerateNode', 'image')
-  record('新建生成卡片并进入生成模式', Boolean(genId), `id=${genId}`)
-  await sleep(300)
-  const consoleSnap = await callHelper(session, 'genSnapshot', genId)
-  record(
-    '生成卡片自带内联提示词控制台',
-    consoleSnap !== null && consoleSnap.prompt === '' && consoleSnap.regenerateVisible === true,
-    `prompt=${JSON.stringify(consoleSnap?.prompt)}`
-  )
+  // 1) 直接生成全生命周期（产物即媒体卡：提交 → spawn 产物卡 → 排队/生成 → 版本落卡）
   const composerChat = await callHelper(session, 'composer')
   record(
-    '底部输入框保持对话身份（不随生成卡片切换）',
+    '底部输入框保持对话身份（生成走锚定 Popover，不占输入框）',
     composerChat !== null && /会话:/.test(composerChat.status ?? ''),
     `status=${JSON.stringify(composerChat?.status)}`
   )
+  let genId = null
   if (hasMock) {
-    await storeAction('submitGeneration', genId, 'e2e lifecycle poster, minimal')
+    const submitted = await storeAction('submitGeneration', { kind: 'image', prompt: 'e2e lifecycle poster, minimal', params: {}, refs: [] })
+    genId = submitted?.nodeId ?? null
+    record('直接生成提交即落产物卡', Boolean(genId), `id=${genId}`)
     const queued = await callHelper(session, 'genSnapshot', genId)
     record('提交后卡片进入排队/生成中', queued?.status === 'queued' || queued?.status === 'running', `status=${queued?.status}`)
-    // 2) 生成中重复提交拦截（必须在 running 窗口内验证）
-    await storeAction('submitGeneration', genId, 'should be blocked')
+    // 2) 生成中重复提交拦截（必须在 running 窗口内验证：同目标卡再交一笔）
+    await storeAction('submitGeneration', { kind: 'image', prompt: 'should be blocked', params: {}, refs: [], targetNodeId: genId })
     await sleep(400)
     const blockedToast = await callHelper(session, 'toastText')
     record('生成中重复提交被拦截并提示', Boolean(blockedToast && blockedToast.includes('生成中')), JSON.stringify(blockedToast))
     const done = await pollUntil(
       session,
       () => callHelper(session, 'genSnapshot', genId),
-      (s) => s && s.status === 'succeeded',
+      (s) => s && s.status !== 'queued' && s.status !== 'running' && Boolean(s.pathText),
       { timeout: 30_000, interval: 300, label: 'gen-done' }
     )
-    record('生成完成：卡片状态 succeeded', !done.timedOut, `status=${done.value?.status} path=${done.value?.pathText}`)
+    record('生成完成：产物版本落卡', !done.timedOut, `status=${done.value?.status} path=${done.value?.pathText}`)
 
-    // （重复提交拦截已提前到 running 窗口内验证）
-
-    // 3) 再生成 → 版本数 2 → 版本切换
+    // 3) 再生成 → 版本数 2 → 版本切换（就地加版本，输入定格预填在 Popover）
     const state1 = await storeState()
-    const versions1 = state1.nodes.find((n) => n.id === genId)?.data?.gen?.versions?.length ?? 0
-    await storeAction('submitGeneration', genId, 'e2e lifecycle poster v2')
+    const versions1 = state1.nodes.find((n) => n.id === genId)?.data?.versions?.length ?? 0
+    await storeAction('submitGeneration', { kind: 'image', prompt: 'e2e lifecycle poster v2', params: {}, refs: [], targetNodeId: genId })
     const done2 = await pollUntil(
       session,
       () => storeState(),
-      (st) => (st.nodes.find((n) => n.id === genId)?.data?.gen?.versions?.length ?? 0) >= versions1 + 1,
+      (st) => (st.nodes.find((n) => n.id === genId)?.data?.versions?.length ?? 0) >= versions1 + 1,
       { timeout: 30_000, interval: 400, label: 'gen-v2' }
     )
-    record('再生成产出新版本（版本历史保留）', !done2.timedOut, `versions=${done2.value?.nodes?.find((n) => n.id === genId)?.data?.gen?.versions?.length}`)
-    await storeAction('setActiveGenerate', genId)
-    await evalp(`document.querySelector('[data-testid="switch-version"]')?.click()`)
+    record('再生成产出新版本（版本历史保留）', !done2.timedOut, `versions=${done2.value?.nodes?.find((n) => n.id === genId)?.data?.versions?.length}`)
+    // 版本切换：经「卡片检视」浮层（卡面已纯净，版本 chips 在检视层里）
+    await storeAction('openCardInspector', genId)
+    await sleep(250)
+    await evalp(`document.querySelector('[data-testid="card-inspector"] [data-testid="switch-version"]:not(.bg-\\(--active-tint\\))')?.click() || document.querySelectorAll('[data-testid="card-inspector"] [data-testid="switch-version"]')[0]?.click()`)
     await sleep(200)
+    await storeAction('closeCardInspector')
+    await sleep(150)
     const stateSwitched = await storeState()
-    const genNow = stateSwitched.nodes.find((n) => n.id === genId)?.data?.gen
+    const genNow = stateSwitched.nodes.find((n) => n.id === genId)?.data
     record(
       '版本切换：卡片指向对应版本文件',
-      Boolean(genNow?.activeVersionId) && genNow.versions.length >= 2,
-      `active=${genNow?.activeVersionId} path=${stateSwitched.nodes.find((n) => n.id === genId)?.data?.path}`
+      Boolean(genNow?.activeVersionId) && (genNow?.versions?.length ?? 0) >= 2,
+      `active=${genNow?.activeVersionId} path=${genNow?.path}`
     )
   } else {
-    // 无 mock：卡片不会真实提交，为让"清空保留提示词 / 失败态重试入口"两条
-    // 依赖 gen.prompt 的断言回到测试本意，这里模拟用户在卡片控制台输入过提示词
-    await storeAction('updateGenerate', genId, { prompt: 'e2e lifecycle poster, minimal' })
+    record('直接生成提交即落产物卡', 'SKIP', MEDIA_SKIP_REASON)
     record('提交后卡片进入排队/生成中', 'SKIP', MEDIA_SKIP_REASON)
     record('生成中重复提交被拦截并提示', 'SKIP', MEDIA_SKIP_REASON)
-    record('生成完成：卡片状态 succeeded', 'SKIP', MEDIA_SKIP_REASON)
+    record('生成完成：产物版本落卡', 'SKIP', MEDIA_SKIP_REASON)
     record('再生成产出新版本（版本历史保留）', 'SKIP', MEDIA_SKIP_REASON)
     record('版本切换：卡片指向对应版本文件', 'SKIP', MEDIA_SKIP_REASON)
   }
@@ -615,21 +609,23 @@ group('D2-生成与编排')
   } else {
     record('从工作目录导入（目录里没有图片文件）', 'SKIP', '种子文件缺失，跳过导入用例')
   }
-  // 参考关系：优先用导入的工作区文件卡片作参考（refs 存于卡片数据，提交时作垫图/首帧）
+  // 参考与生成面板：预选参考卡 → Popover 展示角色 chip（角色由系统派生，链在生成后自动形成）
   const refTargetId = importedCardId ?? (await storeState()).nodes.find((n) => n.type === 'asset' && n.data.storage === 'media' && n.id !== genId)?.id ?? null
-  const gen2Id = refTargetId ? await storeAction('createGenerateNode', 'video', null, [refTargetId]) : null
-  await sleep(300)
-  const st2 = await storeState()
-  const gen2Refs = refTargetId ? (st2.nodes.find((n) => n.id === gen2Id)?.data?.gen?.refs ?? []) : []
-  record('参考关系存于卡片数据（refs）', refTargetId ? gen2Refs.includes(refTargetId) : false, `refs=${JSON.stringify(gen2Refs)}`)
-  // 以此生成（垫图）路径
   if (refTargetId) {
-    const deriveId = await storeAction('createGenerateNode', 'image', null, [refTargetId])
-    const stDerive = await storeState()
-    const deriveNode = stDerive.nodes.find((n) => n.id === deriveId)
-    record('「以此生成」新卡片自带参考且待生成', deriveNode?.data?.gen?.refs?.includes(refTargetId) === true, `refs=${JSON.stringify(deriveNode?.data?.gen?.refs)}`)
-    await storeAction('requestRemoveNode', deriveId)
+    await storeAction('openGenComposer', { at: { x: 420, y: 260 }, refs: [refTargetId], kind: 'video' })
+    await sleep(300)
+    const composerRefs = await evalp(`document.querySelectorAll('[data-testid="gen-composer"] [data-testid="gen-composer-ref"]').length`)
+    record(
+      '「以此为参考生成」面板带参考 chip（角色系统派生）',
+      (composerRefs?.value ?? 0) >= 1,
+      `refs=${composerRefs?.value}`
+    )
+    await evalp(`document.querySelector('[data-testid="gen-composer-backdrop"]')?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+    await sleep(200)
+  } else {
+    record('「以此为参考生成」面板带参考 chip（角色系统派生）', 'SKIP', '没有可作为参考的卡片')
   }
+  const gen2Id = null
 
   // 5) fork：只复制对话历史，画布公用不动（会话坞模型）
   const chatId = await storeAction('createSession', 'fork 母会话')
@@ -672,13 +668,15 @@ group('D2-生成与编排')
     `label=${forkMeta?.forkedFromLabel}`
   )
 
-  // 6) 生成卡片回喂对话（第九节缺口修复）
-  await storeAction('injectAsset', genId)
-  await sleep(200)
+  // 6) 生成产物卡回喂对话（第九节缺口修复）
+  if (genId) {
+    await storeAction('injectAsset', genId)
+    await sleep(200)
+  }
   const compFeed = await callHelper(session, 'composer')
   record(
     '生成卡片可注入对话上下文（chips 出现）',
-    (compFeed.chips ?? []).length >= 1,
+    genId ? (compFeed.chips ?? []).length >= 1 : 'SKIP',
     `chips=${JSON.stringify(compFeed.chips)}`
   )
   if (chatCapable && forkMeta) {
@@ -708,31 +706,50 @@ group('D2-生成与编排')
   } else {
     record('删除会话确认框', 'SKIP', 'fork 会话不存在（fork 未执行）')
   }
-  // 待生成卡片直接删除（无版本）→ 不弹确认，可撤销
-  await storeAction('requestRemoveNode', gen2Id ?? genId)
-  await sleep(200)
-  const confirm2 = await callHelper(session, 'confirmDialog')
-  record('无版本的卡片删除不弹确认', confirm2.visible === false || confirm2.accepted === true, JSON.stringify(confirm2).slice(0, 80))
-  await storeAction('undo')
-  await sleep(150)
-  const stUndo = await storeState()
-  record('Toast 撤销：卡片被恢复', stUndo.nodes.some((n) => n.id === (gen2Id ?? genId)), '')
+  // 无版本卡片直接删除 → 不弹确认，可撤销
+  const plainCardId = importedCardId ?? null
+  if (plainCardId) {
+    await storeAction('requestRemoveNode', plainCardId)
+    await sleep(200)
+    const confirm2 = await callHelper(session, 'confirmDialog')
+    record('无版本的卡片删除不弹确认', confirm2.visible === false || confirm2.accepted === true, JSON.stringify(confirm2).slice(0, 80))
+    await storeAction('undo')
+    await sleep(150)
+    const stUndo = await storeState()
+    record('Toast 撤销：卡片被恢复', stUndo.nodes.some((n) => n.id === plainCardId), '')
+  } else {
+    record('无版本的卡片删除不弹确认', 'SKIP', '没有无版本卡片（导入用例未执行）')
+    record('Toast 撤销：卡片被恢复', 'SKIP', '同上')
+  }
 
-  // 8) 清空结果（有版本 → 确认框）
-  await storeAction('requestClearGenerateVersions', genId)
-  await sleep(200)
-  const confirm3 = await callHelper(session, 'confirmDialog', true)
-  record('清空结果走确认框（不可逆护栏）', confirm3.accepted === true, '')
-  await sleep(200)
-  const stCleared = await storeState()
-  const clearedGen = stCleared.nodes.find((n) => n.id === genId)?.data?.gen
-  record('清空后保留卡片与提示词、版本清空', Boolean(clearedGen && clearedGen.versions.length === 0 && clearedGen.prompt), `versions=${clearedGen?.versions?.length}`)
+  // 8) 清空生成历史（有版本 → 确认框；保留卡片与当前文件）
+  if (genId) {
+    await storeAction('requestClearGenerateVersions', genId)
+    await sleep(200)
+    const confirm3 = await callHelper(session, 'confirmDialog', true)
+    record('清空生成历史走确认框（不可逆护栏）', confirm3.accepted === true, '')
+    await sleep(200)
+    const stCleared = await storeState()
+    const cleared = stCleared.nodes.find((n) => n.id === genId)?.data
+    record('清空后保留卡片与文件、版本与链清空', Boolean(cleared && !cleared.versions && cleared.path), `versions=${cleared?.versions?.length ?? 0}`)
 
-  // 9) 失败路径与重试（未知 provider 提交失败 → failed → 重试按钮可见）
-  await storeAction('updateGenerate', genId, { versions: [], status: 'failed', error: 'e2e-injected-failure' })
-  await sleep(200)
-  const failedSnap = await callHelper(session, 'genSnapshot', genId)
-  record('失败态呈现错误与重试入口', failedSnap.status === 'failed' && failedSnap.retryVisible === true, JSON.stringify(failedSnap.errorText).slice(0, 80))
+    // 9) 失败路径与重试：注入 pendingJob 绑定 + failed 事件（真实 runtime 路径）
+    const stPre = await storeState()
+    const preData = stPre.nodes.find((n) => n.id === genId)?.data
+    await storeAction(
+      'updateNode',
+      genId,
+      { data: { ...preData, pendingJob: { jobId: 'e2e-fake-job', inputs: { prompt: 'e2e injected', params: {}, provider: 'x', model: 'y', refs: [], createdAt: 1 } } } }
+    )
+    await storeAction('handleJobEvent', { jobId: 'e2e-fake-job', provider: 'x', model: 'y', kind: 'image', prompt: 'e2e injected', state: 'failed', progress: 0, error: 'e2e-injected-failure', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+    await sleep(200)
+    const failedSnap = await callHelper(session, 'genSnapshot', genId)
+    record('失败态呈现错误与重试入口', failedSnap.status === 'failed' && failedSnap.retryVisible === true, JSON.stringify(failedSnap.errorText).slice(0, 80))
+  } else {
+    record('清空生成历史走确认框（不可逆护栏）', 'SKIP', MEDIA_SKIP_REASON)
+    record('清空后保留卡片与文件、版本与链清空', 'SKIP', MEDIA_SKIP_REASON)
+    record('失败态呈现错误与重试入口', 'SKIP', MEDIA_SKIP_REASON)
+  }
 
   // 10) 媒体查看器（图片放大）—— 需要卡片带真实产物（path），故挂在 hasMock 上
   if (hasMock) {

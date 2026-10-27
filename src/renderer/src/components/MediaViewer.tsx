@@ -3,6 +3,7 @@ import { useCanvasStore } from '../store/canvasStore'
 import { assetSrc } from '../lib/media'
 import { useEsc } from '../lib/hooks'
 import type { AssetData, GenerateVersion } from '../types'
+import { activeVersionOf } from '../lib/mediaReferenceGraph'
 
 /**
  * 媒体查看器：图片放大查看、视频/音频真实播放（补齐「媒体只有缩略图」的缺口）。
@@ -17,9 +18,7 @@ export function MediaViewer() {
 
   if (!viewer || !node) return null
   const data = node.data as AssetData
-  const gen = data.gen
-  const version: GenerateVersion | undefined =
-    gen?.versions.find((v) => v.id === gen.activeVersionId) ?? gen?.versions[0]
+  const version: GenerateVersion | undefined = activeVersionOf(node)
   const src = version ? assetSrc(version) : assetSrc(data)
   if (!src) return null
 

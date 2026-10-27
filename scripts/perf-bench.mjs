@@ -257,7 +257,7 @@ async function main() {
     const vp = await evalp(session, '({ w: innerWidth, h: innerHeight })')
 
     // 拖卡目标：视口内、离中心最近的图片卡中心（屏幕坐标）
-    const nodes = (await evalp(session, 'window.__huabuCanvas.state().nodes')).filter((n) => !n.data.gen)
+    const nodes = (await evalp(session, 'window.__huabuCanvas.state().nodes')).filter((n) => !n.data.versions)
     const view = await evalp(session, 'window.__huabuCanvas.state().view')
     const canvasRect = await evalp(
       session,

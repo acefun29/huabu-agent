@@ -208,7 +208,7 @@ export class MediaJobManager {
       ? relative(wsRoot, outputDirAbs ?? mediaRoot).split(sep).join('/')
       : undefined
     const conf = ctx.providers.find((p) => p.id === adapter.id)
-    const { refs: mediaRefs, notes: refNotes } = await resolveMediaRefs(
+    const { refs: mediaRefs, notes: refNotes, echo: refEcho } = await resolveMediaRefs(
       request,
       request.kind,
       capabilities,
@@ -253,6 +253,8 @@ export class MediaJobManager {
         ...(artifactDirRel ? { artifactDirRel } : {}),
         // 参考素材的处置留痕（哪条没进请求、为什么），卡片与工具结果透出
         ...(refNotes.length > 0 ? { notes: refNotes } : {}),
+        // 实际进入请求的参考回执：渲染端终态时据 absPath 反查来源卡自动成链
+        ...(refEcho.length > 0 ? { refs: refEcho } : {}),
         // 协商后的实际参数（比例校验/时长归档/像素换算都已完成），工具结果与画布卡片以此为准
         ...((request.ratio || width || height || durationSeconds)
           ? {

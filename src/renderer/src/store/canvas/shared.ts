@@ -3,7 +3,7 @@ import type {
   MediaKind
 } from '../../types'
 import { isAgentAvailable } from '../../lib/agent'
-import type { useSettings } from '../settingsStore'
+import type { useSettings, SettingsUiState } from '../settingsStore'
 
 /**
  * 画布四域（会话/节点/生成任务/素材库）之间的共享常量、纯函数与模块级可变状态。
@@ -22,7 +22,7 @@ export const MEDIA_LABEL: Record<MediaKind, string> = { image: '图片', video: 
 export const LIBRARY_ASSET_MIME = 'application/x-huabu-library-asset'
 /** 拖拽载荷 MIME：画布卡片 → 会话输入框 = 批量引用（JSON id 数组；会话侧只把绝对路径传给 Agent） */
 export const ASSET_IDS_MIME = 'application/x-huabu-assets'
-/** 遗留单卡通道（载荷 = 节点 id 字符串）：仍被生成卡加参考、输入框单卡注入消费，勿新增使用 */
+/** 遗留单卡通道（载荷 = 节点 id 字符串）：输入框单卡注入仍消费，勿新增使用 */
 export const LEGACY_ASSET_MIME = 'application/x-huabu-asset'
 
 /** 纯浏览器打开 dev server（无 window.huabu）时的提示 */
@@ -30,8 +30,12 @@ export const BRIDGE_UNAVAILABLE = 'IPC 未联通：请在 Electron 窗口内使�
 
 export const BRIDGE_AVAILABLE = isAgentAvailable()
 
-/** settings 仍是 Context：由 CanvasProvider 每次渲染把最新实例写进来，供 store action 跨域调用 */
-export type SettingsApi = ReturnType<typeof useSettings>
+/**
+ * settings 仍是 Context：由 CanvasProvider 每次渲染把最新实例写进来，供 store action 跨域调用。
+ * openSettings 来自 UI 域（面板开合），由 CanvasProvider 一并并入 bridge——生成被拦的
+ * toast「去设置」跳转经它直达设置页，不必把 UI 域灌进数据域 value。
+ */
+export type SettingsApi = ReturnType<typeof useSettings> & Pick<SettingsUiState, 'openSettings'>
 export const settingsBridgeRef: { current: SettingsApi | null } = { current: null }
 
 /** 画布空白处的默认落点（新节点按画布节点数错开） */
@@ -46,11 +50,11 @@ export function newNodeId(): string {
 /** 全局 z 序计数器：任何新建/置顶/撤销都从它取层，保证新卡片永远在最上 */
 export const zCounter = { current: 10 }
 
-/** jobId → 卡片 nodeId（只有仍在跑的任务，其卡片才持有 jobId） */
+/** jobId → 卡片 nodeId（只有仍在跑的任务，其卡片才持有 pendingJob.jobId） */
 export function buildJobCardIndex(nodes: CanvasNode[]): Map<string, string> {
   const index = new Map<string, string>()
   for (const node of nodes) {
-    const jobId = node.data.gen?.jobId
+    const jobId = node.data.pendingJob?.jobId
     if (jobId) index.set(jobId, node.id)
   }
   return index
@@ -58,7 +62,7 @@ export function buildJobCardIndex(nodes: CanvasNode[]): Map<string, string> {
 
 /**
  * jobId → 承接卡片的 nodeId。媒体事件去重的同步事实源：
- * zustand 的 set 同步执行，patchGenByJob 的 handled 标志立即生效；
+ * zustand 的 set 同步执行，patchJobTerminal 的 handled 标志立即生效；
  * 索引仍在（scan 结果可能滞后于状态提交，索引命中同样算「已有卡片承接」）。
  */
 export const jobCardIndex = new Map<string, string>()

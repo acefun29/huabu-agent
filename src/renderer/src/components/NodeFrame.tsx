@@ -17,8 +17,6 @@ import { AssetNode } from './AssetNode'
 export interface NodeGestureApi {
   beginDrag: (node: CanvasNode, el: HTMLElement, e: React.MouseEvent) => void
   beginResize: (node: CanvasNode, el: HTMLElement, e: React.MouseEvent) => void
-  /** 非 gen 卡片按下时取消生成卡片高亮（保持旧交互） */
-  onCardMouseDown: (node: CanvasNode) => void
   /** 拖动/缩放结束后的假 click 由这里吃掉；返回 true = 已消费 */
   consumeSuppressedClick: () => boolean
 }
@@ -51,7 +49,6 @@ export const NodeFrame = memo(function NodeFrame({
         transition: 'opacity 0.2s ease'
       }}
       onMouseDown={(e) => {
-        api.onCardMouseDown(node)
         api.beginDrag(node, frameRef.current ?? e.currentTarget, e)
       }}
       onClickCapture={(e) => {
