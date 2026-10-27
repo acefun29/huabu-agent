@@ -10,7 +10,6 @@ import {
   Image as ImageIcon,
   MessageSquare,
   Plus,
-  Square,
   Trash2,
   Video,
   X,
@@ -270,8 +269,8 @@ export function ChatDock() {
   const activeChat = useCanvasStore((s) => (s.activeSessionId ? (s.chatsMap[s.activeSessionId] ?? null) : null))
   const session = useCanvasStore((s) => s.sessions.find((x) => x.id === s.activeSessionId) ?? null)
   const activeSessionId = useCanvasStore((s) => s.activeSessionId)
-  // 压缩/fork 走输入框 / 命令（用户裁决）；头部只留 + 新建对话、停止、删除
-  const { createSession, requestRemoveSession, stopChat, fetchContextBreakdown } =
+  // 压缩/fork 走输入框 / 命令（用户裁决）；头部只留 + 新建对话、删除；停止在 Composer 的发送按钮上
+  const { createSession, requestRemoveSession, fetchContextBreakdown } =
     useCanvasStore.getState()
   const [expanded, setExpanded] = useState(false)
   const [expandedH, setExpandedH] = useState(520)
@@ -416,16 +415,6 @@ export function ChatDock() {
                 >
                   <Plus size={12} />
                 </button>
-                {running && (
-                  <button
-                    onClick={() => void stopChat(session.id)}
-                    className="flex items-center gap-1 rounded-full px-1.5 py-1 text-[10.5px] text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"
-                    title="停止当前生成"
-                  >
-                    <Square size={11} />
-                    停止
-                  </button>
-                )}
                 <button
                   onClick={() => requestRemoveSession(session.id)}
                   className="rounded-full p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"

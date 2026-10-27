@@ -1,10 +1,10 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
-import { ArrowUp, ChevronDown, FolderOpen, MessageSquare, Paperclip, ShieldAlert, SlashSquare, X } from 'lucide-react'
+import { ArrowUp, Brain, ChevronDown, FolderOpen, Plus, ShieldAlert, ShieldCheck, SlashSquare, Square, X } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
 import { hasBridge, useSettings } from '../store/settingsStore'
 import { useDismiss } from '../lib/hooks'
 import { parseAssetIdsPayload, parseLegacyAssetPayload } from '../lib/dragPayload'
-import { THINKING_LEVEL_LABEL, type ChatModelOption, type MediaAccessMode, type ThinkingLevelName } from '@shared/ipc'
+import { THINKING_LEVEL_LABEL, type MediaAccessMode, type ThinkingLevelName } from '@shared/ipc'
 import { KIND_LABEL, type AssetData, type CanvasNode } from '../types'
 import { filterCommands, isCommandInput } from '../lib/chatCommands'
 import { kindIcon } from './AssetNode'
@@ -58,12 +58,11 @@ const levelLabel = (level: string) => THINKING_LEVEL_LABEL[level as ThinkingLeve
  * 拖入电脑文件 = 临时引用（存工作区外的 inbox，不进素材库）。
  *
  * memo（零 props）：ChatDock 订阅流式 chatsMap（32ms 一次 flush，约 30Hz），
- * 不 memo 的话本组件每次 flush 都全量重渲（modelGroups 构建等）；内部全是
+ * 不 memo 的话本组件每次 flush 都全量重渲；内部全是
  * 自有 hook 订阅与事件回调，没有依赖「每次渲染都执行」的副作用，可安全 memo。
  */
 export const Composer = memo(function Composer() {
   // 精确订阅：chips 用字符串 key 派生（引用稳定，选中集没变不重渲染）；actions 恒定引用
-  const workspaceName = useCanvasStore((s) => s.workspace?.name ?? '未选择')
   const activeSession = useCanvasStore((s) => s.sessions.find((x) => x.id === s.activeSessionId) ?? null)
   const isChatRunning = useCanvasStore((s) => s.isChatRunning)
   const libraries = useCanvasStore((s) => s.libraries)
@@ -89,14 +88,14 @@ export const Composer = memo(function Composer() {
     resolveApproval,
     sendMessage,
     runChatCommand,
-    setSessionModel,
-    setSessionThinking
+    setSessionThinking,
+    stopChat
   } = useCanvasStore.getState()
-  const { defaultModel, chatProviders, chatModels } = useSettings()
+  const { defaultModel, chatModels } = useSettings()
   const [text, setText] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [attachOpen, setAttachOpen] = useState(false)
-  const [menuOpen, setMenuOpen] = useState<null | 'model' | 'thinking' | 'access'>(null)
+  const [menuOpen, setMenuOpen] = useState<null | 'thinking' | 'access'>(null)
   // Agent 媒体访问模式（初始假定完全访问，挂载/切工作区后按主进程实际值回显）
   const [accessMode, setAccessMode] = useState<MediaAccessMode>('full')
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -120,15 +119,6 @@ export const Composer = memo(function Composer() {
   const currentModel = activeSession?.modelId ?? defaultModel ?? ''
   const currentModelEntry = currentModel ? chatModels.find((m) => m.id === currentModel) : undefined
   const currentLevels = currentModelEntry?.thinkingLevels ?? []
-  const currentModelShort = currentModel ? currentModel.split('/').pop() || '自动选择' : '自动选择'
-  // 模型菜单按 provider 分组（chatModels 已按认证状态排好，组内保持原顺序）
-  const modelGroups = new Map<string, ChatModelOption[]>()
-  for (const m of chatModels) {
-    const group = modelGroups.get(m.provider)
-    if (group) group.push(m)
-    else modelGroups.set(m.provider, [m])
-  }
-  const providerName = (id: string) => chatProviders.find((p) => p.id === id)?.name ?? id
 
   const chipAssetNodes = chipsKey
     ? chipsKey
@@ -180,12 +170,6 @@ export const Composer = memo(function Composer() {
   const commandMatches = commandInput ? filterCommands(text) : []
 
   // 菜单条目点击：关菜单后落到 store action（按钮打开时已保证有活动会话）
-  const pickModel = (modelId: string) => {
-    setMenuOpen(null)
-    if (!activeSession) return
-    void setSessionModel(activeSession.id, modelId)
-  }
-
   const pickThinking = (level: string) => {
     setMenuOpen(null)
     if (!activeSession) return
@@ -288,11 +272,8 @@ export const Composer = memo(function Composer() {
         </div>
       )}
 
-      {(activeSession || chipAssetNodes.length > 0 || tempAttachments.length > 0) && (
+      {(chipAssetNodes.length > 0 || tempAttachments.length > 0) && (
         <div className="flex flex-wrap items-center gap-1.5 px-1 pb-2">
-          {activeSession && (
-            <Chip icon={<MessageSquare size={11} />} label={activeSession.title} testid="active-chat-chip" />
-          )}
           {chipAssetNodes.map((n) => (
             <Chip
               key={n.id}
@@ -352,16 +333,37 @@ export const Composer = memo(function Composer() {
         </div>
       )}
 
-      <div className="flex items-end gap-1.5">
+      <textarea
+        ref={taRef}
+        rows={1}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value)
+          autoResize()
+        }}
+        onKeyDown={(e) => {
+          // 输入法组词过程中的回车不触发发送
+          const sendByEnter = e.key === 'Enter' && !e.shiftKey
+          if (sendByEnter && !e.nativeEvent.isComposing) {
+            e.preventDefault()
+            submit()
+          }
+        }}
+        placeholder="向 Agent 描述你的需求；选中画布资源、拖入文件（临时引用）即作为上下文…"
+        className="max-h-36 w-full resize-none bg-transparent py-1.5 text-[13px] leading-relaxed outline-none placeholder:text-(--on-surface-muted)"
+      />
+
+      {/* 控制条：+ 钉引用、访问、思考在左，发送在右 */}
+      <div className="mt-0.5 flex items-center">
         <div ref={attachRef} className="relative">
           <button
             onClick={() => setAttachOpen((v) => !v)}
-            className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-(--outline-soft) ${
+            className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:bg-(--outline-soft) ${
               attachOpen ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface-variant)'
             }`}
             title="从素材库钉入文件引用"
           >
-            <Paperclip size={16} />
+            <Plus size={16} />
           </button>
           {attachOpen && (
             <div data-scrollable="" className="ctx-menu absolute bottom-full left-0 z-30 mb-2 max-h-80 w-80 overflow-y-auto rounded-2xl bg-(--surface-card) p-1.5 shadow-lg ring-1 ring-(--outline)">
@@ -403,162 +405,92 @@ export const Composer = memo(function Composer() {
             </div>
           )}
         </div>
-        <textarea
-          ref={taRef}
-          rows={1}
-          value={text}
-          onChange={(e) => {
-            setText(e.target.value)
-            autoResize()
-          }}
-          onKeyDown={(e) => {
-            // 输入法组词过程中的回车不触发发送
-            const sendByEnter = e.key === 'Enter' && !e.shiftKey
-            if (sendByEnter && !e.nativeEvent.isComposing) {
-              e.preventDefault()
-              submit()
-            }
-          }}
-          placeholder="向 Agent 描述你的需求；选中画布资源、拖入文件（临时引用）即作为上下文…"
-          className="max-h-36 flex-1 resize-none bg-transparent py-1.5 text-[13px] leading-relaxed outline-none placeholder:text-(--on-surface-muted)"
-        />
-        <button
-          data-testid="composer-submit"
-          onClick={submit}
-          disabled={!text.trim() || isChatRunning}
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-(--fab-bg) text-(--fab-text) shadow-sm transition hover:opacity-90 disabled:opacity-30"
-          title={isChatRunning ? '生成中…' : '发送'}
-        >
-          <ArrowUp size={15} strokeWidth={2.5} />
-        </button>
-      </div>
-
-      <div className="flex items-center justify-between px-1 pt-1.5 text-[10.5px] text-(--on-surface-muted)">
-        <div className="flex min-w-0 items-center gap-1">
-          <span data-testid="composer-status" className="min-w-0 truncate" title={`工作区: ${workspaceName}`}>
-            会话: {activeSession ? activeSession.title : '（发送时自动新建）'} · 工作区: {workspaceName}
-          </span>
-          <div ref={menuRef} className="relative flex shrink-0 items-center">
+        <div ref={menuRef} className="relative ml-0.5 flex items-center">
+          <button
+            onClick={() => setMenuOpen((v) => (v === 'access' ? null : 'access'))}
+            className={`flex items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1.5 text-[12px] font-medium text-(--accent) transition-colors hover:bg-(--outline-soft) ${
+              menuOpen === 'access' ? 'bg-(--surface-chip)' : ''
+            }`}
+            title="Agent 媒体访问模式：完全访问 = 生成直接执行；变更前确认 = 每次生成前弹卡，接受后才执行"
+          >
+            {accessMode === 'confirm' ? <ShieldAlert size={13} /> : <ShieldCheck size={13} />}
+            {accessMode === 'confirm' ? '变更前确认' : '完全访问'}
+            <ChevronDown size={12} />
+          </button>
+          {currentModelEntry && (
             <button
               onClick={() => {
                 if (!activeSession) {
                   useCanvasStore.getState().showToast('发送后自动新建会话，届时可再切换')
                   return
                 }
-                setMenuOpen((v) => (v === 'model' ? null : 'model'))
+                setMenuOpen((v) => (v === 'thinking' ? null : 'thinking'))
               }}
-              className={`flex items-center gap-0.5 whitespace-nowrap rounded-full px-1.5 py-0.5 transition-colors hover:bg-(--outline-soft) ${
-                menuOpen === 'model' ? 'bg-(--surface-chip) text-(--on-surface)' : ''
+              disabled={currentLevels.length === 0}
+              className={`flex items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1.5 text-[12px] transition-colors hover:bg-(--outline-soft) disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:opacity-40 ${
+                menuOpen === 'thinking' ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface-variant)'
               }`}
-              title="切换会话模型（已建会话即时生效）"
+              title={currentLevels.length === 0 ? '该模型不支持思考档位' : '设置思考档位'}
             >
-              模型: {currentModelShort}
-              <ChevronDown size={10} />
+              <Brain size={13} />
+              思考: {activeSession?.thinkingLevel ? levelLabel(activeSession.thinkingLevel) : '默认'}
+              <ChevronDown size={12} />
             </button>
-            {currentModelEntry && (
+          )}
+          {menuOpen === 'thinking' && (
+            <div className="ctx-menu absolute bottom-full left-0 z-30 mb-1 w-40 rounded-2xl bg-(--surface-card) p-1.5 shadow-lg ring-1 ring-(--outline)">
+              {currentLevels.map((level) => (
+                <button
+                  key={level}
+                  onClick={() => pickThinking(level)}
+                  className={`flex w-full items-center rounded-xl px-2.5 py-1.5 text-left text-[12px] transition-colors hover:bg-(--outline-soft) ${
+                    level === activeSession?.thinkingLevel
+                      ? 'bg-(--surface-chip) text-(--on-surface)'
+                      : 'text-(--on-surface)'
+                  }`}
+                >
+                  {levelLabel(level)}
+                </button>
+              ))}
+            </div>
+          )}
+          {menuOpen === 'access' && (
+            <div className="ctx-menu absolute bottom-full left-0 z-30 mb-1 w-52 rounded-2xl bg-(--surface-card) p-1.5 shadow-lg ring-1 ring-(--outline)">
               <button
-                onClick={() => {
-                  if (!activeSession) {
-                    useCanvasStore.getState().showToast('发送后自动新建会话，届时可再切换')
-                    return
-                  }
-                  setMenuOpen((v) => (v === 'thinking' ? null : 'thinking'))
-                }}
-                disabled={currentLevels.length === 0}
-                className={`flex items-center gap-0.5 whitespace-nowrap rounded-full px-1.5 py-0.5 transition-colors hover:bg-(--outline-soft) disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:opacity-40 ${
-                  menuOpen === 'thinking' ? 'bg-(--surface-chip) text-(--on-surface)' : ''
+                onClick={() => pickAccess('full')}
+                className={`flex w-full items-center rounded-xl px-2.5 py-1.5 text-left text-[12px] transition-colors hover:bg-(--outline-soft) ${
+                  accessMode === 'full' ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface)'
                 }`}
-                title={currentLevels.length === 0 ? '该模型不支持思考档位' : '设置思考档位'}
               >
-                思考: {activeSession?.thinkingLevel ? levelLabel(activeSession.thinkingLevel) : '默认'}
-                <ChevronDown size={10} />
+                完全访问 · 生成直接执行
               </button>
-            )}
-            <button
-              onClick={() => setMenuOpen((v) => (v === 'access' ? null : 'access'))}
-              className={`flex items-center gap-0.5 whitespace-nowrap rounded-full px-1.5 py-0.5 transition-colors hover:bg-(--outline-soft) ${
-                menuOpen === 'access' ? 'bg-(--surface-chip) text-(--on-surface)' : ''
-              }`}
-              title="Agent 媒体访问模式：完全访问 = 生成直接执行；变更前确认 = 每次生成前弹卡，接受后才执行"
-            >
-              访问: {accessMode === 'confirm' ? '变更前确认' : '完全访问'}
-              <ChevronDown size={10} />
-            </button>
-            {menuOpen === 'model' && (
-              <div
-                data-scrollable=""
-                className="ctx-menu absolute bottom-full left-0 z-30 mb-1 max-h-80 w-72 overflow-y-auto rounded-2xl bg-(--surface-card) p-1.5 shadow-lg ring-1 ring-(--outline)"
+              <button
+                onClick={() => pickAccess('confirm')}
+                className={`flex w-full items-center rounded-xl px-2.5 py-1.5 text-left text-[12px] transition-colors hover:bg-(--outline-soft) ${
+                  accessMode === 'confirm' ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface)'
+                }`}
               >
-                {Array.from(modelGroups.entries()).map(([provider, models]) => (
-                  <div key={provider}>
-                    <div className="px-2.5 pb-0.5 pt-1.5 text-[10.5px] font-medium text-(--on-surface-variant)">
-                      {providerName(provider)}
-                    </div>
-                    {models.map((m) => (
-                      <button
-                        key={m.id}
-                        onClick={() => pickModel(m.id)}
-                        className="flex w-full items-center gap-2 rounded-xl px-2.5 py-1.5 text-left transition-colors hover:bg-(--outline-soft)"
-                      >
-                        <span
-                          className={`truncate text-[12px] ${
-                            m.authConfigured ? 'text-(--on-surface)' : 'text-(--on-surface-muted)'
-                          }`}
-                        >
-                          {m.model}
-                        </span>
-                        {!m.authConfigured && (
-                          <span className="ml-auto shrink-0 text-[9.5px] text-(--on-surface-muted)">未配置 Key</span>
-                        )}
-                      </button>
-                    ))}
-                  </div>
-                ))}
-                {modelGroups.size === 0 && (
-                  <div className="px-2.5 py-1.5 text-[10.5px]">暂无可用模型（先在设置里配置对话供应商）</div>
-                )}
-              </div>
-            )}
-            {menuOpen === 'thinking' && (
-              <div className="ctx-menu absolute bottom-full left-0 z-30 mb-1 w-40 rounded-2xl bg-(--surface-card) p-1.5 shadow-lg ring-1 ring-(--outline)">
-                {currentLevels.map((level) => (
-                  <button
-                    key={level}
-                    onClick={() => pickThinking(level)}
-                    className={`flex w-full items-center rounded-xl px-2.5 py-1.5 text-left text-[12px] transition-colors hover:bg-(--outline-soft) ${
-                      level === activeSession?.thinkingLevel
-                        ? 'bg-(--surface-chip) text-(--on-surface)'
-                        : 'text-(--on-surface)'
-                    }`}
-                  >
-                    {levelLabel(level)}
-                  </button>
-                ))}
-              </div>
-            )}
-            {menuOpen === 'access' && (
-              <div className="ctx-menu absolute bottom-full left-0 z-30 mb-1 w-52 rounded-2xl bg-(--surface-card) p-1.5 shadow-lg ring-1 ring-(--outline)">
-                <button
-                  onClick={() => pickAccess('full')}
-                  className={`flex w-full items-center rounded-xl px-2.5 py-1.5 text-left text-[12px] transition-colors hover:bg-(--outline-soft) ${
-                    accessMode === 'full' ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface)'
-                  }`}
-                >
-                  完全访问 · 生成直接执行
-                </button>
-                <button
-                  onClick={() => pickAccess('confirm')}
-                  className={`flex w-full items-center rounded-xl px-2.5 py-1.5 text-left text-[12px] transition-colors hover:bg-(--outline-soft) ${
-                    accessMode === 'confirm' ? 'bg-(--surface-chip) text-(--on-surface)' : 'text-(--on-surface)'
-                  }`}
-                >
-                  变更前确认 · 生成前需确认
-                </button>
-              </div>
-            )}
-          </div>
+                变更前确认 · 生成前需确认
+              </button>
+            </div>
+          )}
         </div>
-        <span className="shrink-0">Enter 发送 · Shift+Enter 换行 · / 命令 · 引用只传绝对路径</span>
+        {/* 会话进行中该按钮变停止：再点一次中断生成（不再在对话历史头部单设停止按钮） */}
+        <button
+          data-testid="composer-submit"
+          onClick={() => {
+            if (isChatRunning) {
+              if (activeSession) void stopChat(activeSession.id)
+              return
+            }
+            submit()
+          }}
+          disabled={!isChatRunning && !text.trim()}
+          className="ml-auto flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-(--fab-bg) text-(--fab-text) shadow-sm transition hover:opacity-90 disabled:opacity-30"
+          title={isChatRunning ? '停止生成' : '发送'}
+        >
+          {isChatRunning ? <Square size={12} fill="currentColor" /> : <ArrowUp size={15} strokeWidth={2.5} />}
+        </button>
       </div>
     </div>
   )
