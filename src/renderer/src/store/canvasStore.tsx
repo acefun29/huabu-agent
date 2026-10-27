@@ -3,7 +3,6 @@ import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import type {
   AssetLibraryFile,
-  ChatContextBreakdownInfo,
   MediaConfirmPayload,
   MediaJobStatus,
   WorkspaceDeleteResult,
@@ -231,8 +230,6 @@ export interface CanvasState {
   stopChat: (sessionId: string) => Promise<void>
   /** 手动压缩会话上下文（T2；门控在 runChatCommand/compactGate：running/compacting 时拦截） */
   compactSession: (sessionId: string) => Promise<void>
-  /** 上下文分布明细（T3；水位条展开面板时按需拉取） */
-  fetchContextBreakdown: (sessionId: string) => Promise<ChatContextBreakdownInfo | null>
   /**
    * 斜杠命令分发（/compact、/fork）。'not-command' = 调用方按普通消息发送；
    * 'ok' 已执行；'unknown'/'rejected' 已拦截（toast 说明，输入保留）。
@@ -699,7 +696,6 @@ function installCanvasProbe() {
       sendMessage: useCanvasStore.getState().sendMessage,
       stopChat: useCanvasStore.getState().stopChat,
       compactSession: useCanvasStore.getState().compactSession,
-      fetchContextBreakdown: useCanvasStore.getState().fetchContextBreakdown,
       runChatCommand: useCanvasStore.getState().runChatCommand,
       openViewer: useCanvasStore.getState().openViewer,
       closeViewer: useCanvasStore.getState().closeViewer,

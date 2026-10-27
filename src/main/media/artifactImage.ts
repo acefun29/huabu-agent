@@ -1,4 +1,5 @@
 import { existsSync } from 'fs'
+import { readFile } from 'fs/promises'
 import { nativeImage } from 'electron'
 import { resolve, sep } from 'path'
 
@@ -11,14 +12,24 @@ import { resolve, sep } from 'path'
  * 本文件不管"哪些路径允许读"：那套规则是纯函数、在 shared/assets.ts（能被
  * `pnpm asset-path:check` 断言），调用方先把绝对路径解析出来再交给这里。
  * 唯一留在下面的越界检查是"最后一道兜底"，不替代调用方的解析。
+ *
+ * IO 走异步（fs/promises）：素材读取发生在主进程，同步读盘会把聊天流/画布事件
+ * 卡到磁盘回包为止。nativeImage 的解码/缩放本身仍是同步 CPU—— Electron 没有
+ * 异步解码 API，路径上限（read_media 的 MAX_IMAGE_BYTES）就是它的护栏。
  */
 
-export function readImageFileAsBase64(
+export async function readImageFileAsBase64(
   absPath: string,
   maxEdge = 1024
-): { data: string; mimeType: string; width: number; height: number } | undefined {
+): Promise<{ data: string; mimeType: string; width: number; height: number } | undefined> {
   if (!absPath || !existsSync(absPath)) return undefined
-  let image = nativeImage.createFromPath(absPath)
+  let bytes: Buffer
+  try {
+    bytes = await readFile(absPath)
+  } catch {
+    return undefined
+  }
+  let image = nativeImage.createFromBuffer(bytes)
   if (image.isEmpty()) return undefined
   const { width, height } = image.getSize()
   const edge = Math.max(width, height)
@@ -37,11 +48,11 @@ export function readImageFileAsBase64(
  * M13 语义保持不变：只允许解析到媒体产物目录之内（防 Agent 侧伪造相对路径越界读文件）。
  * read_media 走的是另一条更宽的路（工作区 + 产物 + inbox），由 shared/assets.ts 的解析器把关。
  */
-export function readArtifactAsBase64(
+export async function readArtifactAsBase64(
   relPath: string,
   mediaDirAbs: string,
   maxEdge = 1024
-): { data: string; mimeType: string } | undefined {
+): Promise<{ data: string; mimeType: string } | undefined> {
   const root = resolve(mediaDirAbs)
   const target = resolve(root, relPath.replace(/\\/g, '/'))
   if (!target.startsWith(root + sep) && target !== root) return undefined

@@ -7,7 +7,6 @@ import type {
   AssetRenameResult,
   AssetTransferRequest,
   AssetTransferResult,
-  ChatContextBreakdownInfo,
   ChatContextUsage,
   ChatCreateInfo,
   ChatCreateRequest,
@@ -152,8 +151,6 @@ export interface ChatApi {
   /** 查询会话当前上下文水位（tokens=null 如实透传，UI 显示"—"） */
   contextUsage(request: ChatNodeRequest): Promise<ChatResult<ChatContextUsage>>
 
-  /** 查询上下文占用分布（分桶估算；估算值非账单） */
-  contextBreakdown(request: ChatNodeRequest): Promise<ChatResult<ChatContextBreakdownInfo>>
 
   /**
    * 手动压缩上下文。SDK 语义：先 abort 当前 agent 操作且不续跑被打断的 turn，

@@ -117,6 +117,8 @@ void app
       path.join('src', 'main', 'agent', 'mediaTools.ts'),
       // mediaTools.ts 引用其 MEDIA_SRC_MARKER（产物路径标记行）
       path.join('src', 'main', 'agent', 'contextEviction.ts'),
+      // read_media / videoTools 的共用件（入口守卫 / 路径解析 / 文案助手）
+      path.join('src', 'main', 'agent', 'mediaReadCommon.ts'),
       path.join('src', 'main', 'agent', 'readMediaTool.ts'),
       path.join('src', 'main', 'agent', 'videoTools.ts'),
       path.join('src', 'main', 'media', 'artifactImage.ts'),
@@ -388,6 +390,22 @@ void app
       await imageTool.execute('c14', { prompt: 'p' })
       assert(approvalCalls.length === 0, 'full 模式不应调用确认口')
       return '接受 + full 直通'
+    })
+
+    await check('变更前确认：视频 confirmed=true（对话已同意）⇒ 跳卡直提，不再二次确认', async () => {
+      mediaConfigValue = { ...mediaConfigValue, accessMode: 'confirm' }
+      approvalCalls = []
+      const before = submitted.length
+      const out = await byName.get('generate_video').execute('c15', { prompt: 'p', confirmed: true })
+      const text = out.content.filter((b) => b.type === 'text').map((b) => b.text).join('\n')
+      assert(approvalCalls.length === 0, `对话已同意应跳过确认卡，实际调了 ${approvalCalls.length} 次`)
+      assert(submitted.length === before + 1, 'confirmed=true 应直接提交')
+      assert(/已生成成功/.test(text), `应正常完成生成：${text.slice(0, 60)}`)
+      // 对照：图像没有 confirmed 等价参数，confirm 模式下一律走卡
+      approvalCalls = []
+      await imageTool.execute('c16', { prompt: 'p' })
+      assert(approvalCalls.length === 1, '图像在 confirm 模式仍应走确认卡')
+      return 'confirmed=true 直提 + 图像仍走卡'
     })
 
     await check('落库链直测：默认库 / 已删库回退公共库 / 空库兜底画布素材 / none / builtin / 类型默认优先', () => {

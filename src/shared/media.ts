@@ -731,3 +731,29 @@ export interface MediaCatalogBrowseItem {
   /** 已在生效清单中（内置精选或用户已添加） */
   enabled: boolean
 }
+
+/**
+ * Agent 工具层的失败分类（结构化）。产出方（编排层的参数校验/解析/超时）抛
+ * MediaFailureError，消费方（agent/mediaTools 的 failureGuidance）按 kind 取文案，
+ * 不再依赖我们自己的中文措辞做子串匹配——措辞可以随意改，分类不漂。
+ * 远端错误（网关 401/配额文案等）没有结构化形态，仍由消费方按文本兜底分类。
+ */
+export type MediaFailureKind = 'config' | 'params' | 'refs' | 'timeout' | 'auth'
+
+/** 带失败分类的错误。message 照常面向用户/Agent，kind 只给程序化分类用 */
+export class MediaFailureError extends Error {
+  constructor(
+    message: string,
+    readonly failureKind: MediaFailureKind
+  ) {
+    super(message)
+    this.name = 'MediaFailureError'
+  }
+}
+
+/** 从任意抛出物里读失败分类；不是结构化失败返回 undefined（消费方走文本兜底） */
+export function mediaFailureKindOf(error: unknown): MediaFailureKind | undefined {
+  if (error instanceof MediaFailureError) return error.failureKind
+  const kind = (error as { mediaFailure?: MediaFailureKind } | null | undefined)?.mediaFailure
+  return typeof kind === 'string' ? kind : undefined
+}

@@ -2,7 +2,7 @@
  * chat 域 IPC（M3 + M9 扩展）。
  *
  * 覆盖通道：chat:runtime / chat:create / chat:prompt / chat:steer / chat:abort /
- * chat:dispose / chat:history / chat:context-usage / chat:context-breakdown /
+ * chat:dispose / chat:history / chat:context-usage /
  * chat:compact / chat:fork / chat:set-model / chat:set-thinking。
  * 流式增量经 shared.ts 的 broadcastChatEvent（AgentHost onUpdate）以 chat:event 推送。
  * chat:create 装配媒体生成工具（mediaManager/mediaContext/requestMediaApproval 取自 ctx）；
@@ -11,6 +11,7 @@
 import { ipcMain } from 'electron'
 import { resolveSessionFile } from '../agent/workspace'
 import { assembleBlockoutTool } from '../agent/blockoutTools'
+import { assembleNoteTool } from '../agent/noteTool'
 import { assembleMediaTools } from '../agent/mediaToolAssembly'
 import { inboxRoot } from '../assets/manager'
 import {
@@ -75,10 +76,13 @@ export function registerChatIpc(ctx: IpcContext): void {
     // 默认惰性——创建后被 host 摘除，Agent 读 blockout-shot 技能时再激活（P2）
     const blockoutTool = assembleBlockoutTool({ currentDir })
 
+    // 文本卡创建工具：文本上画布的唯一通道（write 落盘的文本不上画布，见 noteTool 头注）
+    const noteTool = assembleNoteTool({ currentDir })
+
     return host.create(createRequest, {
       currentDir: current?.path ?? null,
       defaultModel: current?.defaultModel,
-      customTools: [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool],
+      customTools: [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool, noteTool],
       // 工作区技能禁用名单（写 workspace.json skills 段；读取同源，见 listWorkspaceSkills）
       ...(current ? { disabledSkills: store.skillsDisabled() } : {})
     })
@@ -136,11 +140,6 @@ export function registerChatIpc(ctx: IpcContext): void {
     return host.contextUsage(request.nodeId)
   })
 
-  ipcMain.handle(IpcChannel.ChatContextBreakdown, (_event, payload: unknown) => {
-    const request = asNodeRequest(payload)
-    if (!request) return invalidPayload('chat:context-breakdown 需要 nodeId')
-    return host.contextBreakdown(request.nodeId)
-  })
 
   ipcMain.handle(IpcChannel.ChatCompact, (_event, payload: unknown) => {
     const request = asNodeRequest(payload)

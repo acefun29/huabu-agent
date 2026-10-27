@@ -12,11 +12,10 @@ import {
   Plus,
   Trash2,
   Video,
-  X,
 } from 'lucide-react'
 import { motion } from 'motion/react'
 import type { AssetKind, ChatMessage } from '../types'
-import type { ChatContextBreakdownInfo, ChatContextUsage, ChatHistoryImage } from '@shared/ipc'
+import type { ChatContextUsage, ChatHistoryImage } from '@shared/ipc'
 import { useCanvasStore } from '../store/canvasStore'
 import { bumpRender } from '../lib/perfProbe'
 import { compactTokens } from '../lib/format'
@@ -181,76 +180,6 @@ const MessageBubble = memo(function MessageBubble({ m, expanded }: { m: ChatMess
   )
 })
 
-/** 分布明细桶的展示名与说明（key 语义见 shared/ipc.ts ChatContextBucket） */
-const BUCKET_LABEL: Record<ChatContextBreakdownInfo['buckets'][number]['key'], string> = {
-  user: '用户消息',
-  assistant_text: '助手文本',
-  thinking: '思维链',
-  tool_call: '工具调用',
-  tool_result: '工具结果',
-  images: '图片',
-  compaction: '压缩摘要',
-  unattributed: '未归因（系统提示词/工具定义/估算误差）'
-}
-
-/** 上下文占用分布面板（T3）：分桶条形 + 占比；全部是估算值 */
-function BreakdownPanel({
-  breakdown,
-  onClose,
-}: {
-  breakdown: ChatContextBreakdownInfo
-  onClose: () => void
-}) {
-  return (
-    <div
-      data-testid="context-breakdown"
-      className="pointer-events-auto w-full max-w-3xl rounded-2xl bg-(--surface-card) p-3 shadow-xl ring-1 ring-(--outline)"
-    >
-      <div className="mb-2 flex items-center gap-2">
-        <span className="text-[12px] font-medium text-(--on-surface)">上下文占用分布（估算）</span>
-        <span className="text-[10.5px] text-(--on-surface-muted)">
-          {breakdown.totalTokens !== null
-            ? `合计约 ${formatTokens(breakdown.totalTokens)} tokens`
-            : '暂无可校准的用量（发一轮对话后可校准）'}
-        </span>
-        <button
-          onClick={onClose}
-          className="ml-auto rounded-full p-1 text-(--on-surface-muted) transition-colors hover:bg-(--outline-soft)"
-          title="收起分布明细"
-        >
-          <X size={12} />
-        </button>
-      </div>
-      <div className="space-y-1.5">
-        {breakdown.buckets.map((bucket) => (
-          <div key={bucket.key} className="flex items-center gap-2" title={bucket.summary}>
-            <span className="w-44 shrink-0 truncate text-[11px] text-(--on-surface-variant)" title={BUCKET_LABEL[bucket.key]}>
-              {BUCKET_LABEL[bucket.key]}
-              {bucket.images ? `（${bucket.images} 张）` : ''}
-            </span>
-            <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-(--surface-chip)">
-              <div
-                className={`h-full rounded-full ${bucket.key === 'unattributed' ? 'bg-(--outline)' : 'bg-(--accent)'}`}
-                style={{ width: `${Math.min(100, Math.max(0, bucket.share * 100))}%` }}
-              />
-            </div>
-            <span className="w-14 shrink-0 text-right font-mono text-[10.5px] text-(--on-surface-muted)">
-              {bucket.tokens > 0 ? formatTokens(bucket.tokens) : '—'}
-            </span>
-            <span className="w-10 shrink-0 text-right font-mono text-[10.5px] text-(--on-surface-muted)">
-              {bucket.share > 0.001 ? `${Math.round(bucket.share * 100)}%` : ''}
-            </span>
-          </div>
-        ))}
-      </div>
-      <div className="mt-2 text-[10px] leading-relaxed text-(--on-surface-muted)">
-        估算口径：字符数/4、图片 1200 token/张，并用最近一次用量校准；这是分布参考，不是精确账单。
-        {breakdown.contextWindow ? ` 上下文窗口 ${formatTokens(breakdown.contextWindow)}。` : ''}
-      </div>
-    </div>
-  )
-}
-
 /** 折叠态高度上限：恰好露出最近一到两轮对话；内容不足时高度自适应收紧 */
 const COLLAPSED_MAX_H = 148
 /** 折叠态渲染的尾部消息条数（溢出部分本来就被裁掉，不必进 DOM） */
@@ -270,12 +199,10 @@ export function ChatDock() {
   const session = useCanvasStore((s) => s.sessions.find((x) => x.id === s.activeSessionId) ?? null)
   const activeSessionId = useCanvasStore((s) => s.activeSessionId)
   // 压缩/fork 走输入框 / 命令（用户裁决）；头部只留 + 新建对话、删除；停止在 Composer 的发送按钮上
-  const { createSession, requestRemoveSession, fetchContextBreakdown } =
-    useCanvasStore.getState()
+  const { createSession, requestRemoveSession } = useCanvasStore.getState()
   const [expanded, setExpanded] = useState(false)
   const [expandedH, setExpandedH] = useState(520)
   const [contentH, setContentH] = useState(0)
-  const [breakdown, setBreakdown] = useState<ChatContextBreakdownInfo | null>(null)
   const bodyRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
 
@@ -313,21 +240,10 @@ export function ChatDock() {
     if (el) el.scrollTop = el.scrollHeight
   }, [history, expanded])
 
-  // 切换会话后回到默认折叠态，分布面板随之关闭（数据是按会话拉的）
+  // 切换会话后回到默认折叠态
   useEffect(() => {
     setExpanded(false)
-    setBreakdown(null)
   }, [activeSessionId])
-
-  const toggleBreakdown = async () => {
-    if (breakdown) {
-      setBreakdown(null)
-      return
-    }
-    if (!activeSessionId) return
-    const data = await fetchContextBreakdown(activeSessionId)
-    if (data) setBreakdown(data)
-  }
 
   const collapsedH = Math.min(COLLAPSED_MAX_H, HEADER_H + contentH)
   const clipped = HEADER_H + contentH > COLLAPSED_MAX_H
@@ -335,12 +251,11 @@ export function ChatDock() {
   const usageTitle = usage
     ? usage.tokens === null
       ? '上下文水位待更新（压缩后需一轮新响应）'
-      : `上下文约占 ${Math.round(usage.percent ?? 0)}%（${usage.tokens}/${usage.contextWindow} tokens）${expanded ? '\n点击查看分布明细' : ''}`
+      : `上下文约占 ${Math.round(usage.percent ?? 0)}%（${usage.tokens}/${usage.contextWindow} tokens）`
     : undefined
 
   return (
     <div className="pointer-events-none absolute bottom-4 left-[72px] right-4 z-30 flex flex-col items-center gap-2.5">
-      {breakdown && <BreakdownPanel breakdown={breakdown} onClose={() => setBreakdown(null)} />}
       {history.length > 0 && (
         <motion.div
           data-testid="chat-dock"
@@ -383,12 +298,8 @@ export function ChatDock() {
             {/* 水位段（T1）：percent + tokens/window；≥80% 变色提示（接近 pi 自动压缩触发线） */}
             {usage?.contextWindow ? (
               <span
-                onClick={(e) => {
-                  e.stopPropagation()
-                  if (expanded) void toggleBreakdown()
-                }}
                 data-testid="context-usage"
-                className={`mt-1 flex shrink-0 cursor-pointer items-center gap-1 rounded-full px-1.5 py-0.5 font-mono text-[10.5px] ${
+                className={`mt-1 flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 font-mono text-[10.5px] ${
                   usageCritical ? 'bg-(--danger)/10 font-medium text-(--danger)' : 'text-(--on-surface-muted)'
                 }`}
                 title={usageTitle}

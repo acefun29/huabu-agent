@@ -8,7 +8,6 @@ import { homedir } from 'os'
 import { isAbsolute, join, relative } from 'path'
 import { createInterface as createLineReader } from 'readline'
 import type {
-  ChatContextBreakdownInfo,
   ChatContextUsage,
   ChatCreateInfo,
   ChatCreateRequest,
@@ -36,7 +35,6 @@ import { THINKING_LEVELS } from '../../shared/ipc'
 import { EventTranslator, toContextUsageEvent } from './serialize'
 import { CUSTOM_COMPACTION_INSTRUCTIONS } from './compaction'
 import { evictAllImages } from './contextEviction'
-import { computeContextBreakdown } from './breakdown'
 import { buildSessionHistory, type BuiltHistory, type HistoryImageSlot } from './history'
 import { makeHistoryThumbnail } from './historyThumbs'
 import { BLOCKOUT_SKILL_NAME, BLOCKOUT_TOOL_NAME, isBlockoutSkillReadPath, resolveBuiltinSkillsRoots } from './blockoutTools'
@@ -803,7 +801,7 @@ export class AgentHost {
   }
 
   /* ---------------------------------------------------------------------- */
-  /* 上下文可见性域（水位 / 压缩 / 分布 / 分叉）                                  */
+  /* 上下文可见性域（水位 / 压缩 / 分叉）                                       */
   /* ---------------------------------------------------------------------- */
 
   /**
@@ -833,34 +831,6 @@ export class AgentHost {
       return ok(undefined)
     } catch (error) {
       return fail('unknown', `压缩上下文失败：${describeError(error)}`)
-    }
-  }
-
-  /**
-   * 上下文分布明细（计划 T3）：当前分支、压缩后视图的分桶估算。
-   * 估算口径见 agent/breakdown.ts；percent 与桶占比都是估算值，UI 必须注明。
-   */
-  contextBreakdown(nodeId: string): ChatResult<ChatContextBreakdownInfo> {
-    const entry = this.sessions.get(nodeId)
-    if (!entry) return fail('session_missing', `节点未绑定会话：${nodeId}`)
-    const pi = this.pi
-    if (!pi) return fail('host_not_ready', 'Agent 运行时未就绪')
-    try {
-      const usage = entry.session.getContextUsage()
-      const breakdown = computeContextBreakdown(
-        entry.session.sessionManager.buildContextEntries() as unknown[],
-        // pi 的签名收 AgentMessage/Usage，本模块口径是 unknown（纯函数可注入）：
-        // 调用点窄化，deps 保持宽松
-        {
-          estimateTokens: (message) => pi.estimateTokens(message as Parameters<typeof pi.estimateTokens>[0]),
-          calculateContextTokens: (usage2) =>
-            pi.calculateContextTokens(usage2 as Parameters<typeof pi.calculateContextTokens>[0])
-        },
-        usage?.contextWindow ?? null
-      )
-      return ok(breakdown)
-    } catch (error) {
-      return fail('unknown', `统计上下文分布失败：${describeError(error)}`)
     }
   }
 

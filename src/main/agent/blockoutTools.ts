@@ -1,6 +1,6 @@
 import { spawn } from 'child_process'
-import { existsSync, readFileSync } from 'fs'
-import { unlink } from 'fs/promises'
+import { existsSync } from 'fs'
+import { readFile, unlink } from 'fs/promises'
 import { basename, isAbsolute, join, relative, resolve as resolvePath } from 'path'
 import { app } from 'electron'
 import { Type } from 'typebox'
@@ -348,7 +348,8 @@ export function assembleBlockoutTool(deps: BlockoutToolDeps): ToolDefinitionLike
       const imageTarget = typeof parsed?.image === 'string' ? (parsed.image as string) : imagePath
       if (run.code === 0 && imageTarget && existsSync(imageTarget)) {
         try {
-          const png = readFileSync(imageTarget)
+          // 异步读：拼版 PNG 上百 KB~数 MB，同步读盘会卡住主进程里正在穿插的聊天/任务事件
+          const png = await readFile(imageTarget)
           content.push({ type: 'image', data: png.toString('base64'), mimeType: 'image/png' })
           text += `\n拼版已随本条结果附上（文件：${relative(workspaceDir, imageTarget).replace(/\\/g, '/')}）；数值与图对照着看，不要从像素里量坐标。`
           content[0] = { type: 'text', text }

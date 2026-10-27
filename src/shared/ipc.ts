@@ -43,8 +43,6 @@ export const IpcChannel = {
   ChatHistory: 'chat:history',
   /** 查询会话当前上下文水位（getContextUsage 原样透传；tokens=null 如实传） */
   ChatContextUsage: 'chat:context-usage',
-  /** 查询上下文占用分布（buildContextEntries 分桶估算；估算值非账单） */
-  ChatContextBreakdown: 'chat:context-breakdown',
   /** 手动压缩上下文（SDK 语义：先 abort 当前操作且不续跑被打断的 turn；门控在渲染端） */
   ChatCompact: 'chat:compact',
   /** 原生文件级分叉：SessionManager.forkFrom 全量拷贝源会话 JSONL，返回新 sessionFile */
@@ -352,8 +350,8 @@ export type ChatEvent =
       resultText: string
       /**
        * 工具结构化结果的瘦子集（主进程 JSON 序列化 + 体积截断后的字符串，非透传原对象）。
-       * 目前只有 blockout 用：video 发布后带 { published: { relPath, name, kind, bytes } }，
-       * 渲染端据此钉画布卡片——发布产物最终路径（importToWorkspace 去重后）只有主进程知道。
+       * blockout 成片与 create_note 文本卡用：带 { published: { relPath, name, kind, bytes } }，
+       * 渲染端据此钉画布卡片——发布产物最终路径（主进程去重/归档后）只有主进程知道。
        */
       details?: string
     }
@@ -448,41 +446,6 @@ export interface ChatCompactionDivider {
   tokensBefore?: number
   /** 压缩后的估算 token（pi 未必给出） */
   estimatedTokensAfter?: number
-}
-
-/**
- * 上下文分布明细的单个桶（估算，非账单）。
- *
- * 估算口径与 pi 一致：chars/4、图片块恒 1200 token/张；末次 assistant usage 作
- * 校准总量，桶合计与总量的差值全部进 unattributed（系统提示词/工具定义/估算误差）。
- */
-export interface ChatContextBucket {
-  key:
-    | 'user'
-    | 'assistant_text'
-    | 'thinking'
-    | 'tool_call'
-    | 'tool_result'
-    | 'images'
-    | 'compaction'
-    | 'unattributed'
-  tokens: number
-  /** 占校准总量的比例（0..1；无校准总量时按桶合计为分母） */
-  share: number
-  /** key=images 时为图片张数 */
-  images?: number
-  /** key=compaction 时为最新一次压缩的摘要（已截断） */
-  summary?: string
-  /** 工具桶的按工具名细分（降序，前 5） */
-  tools?: Array<{ name: string; tokens: number }>
-}
-
-/** chat:context-breakdown 返回：当前分支、压缩后视图的分桶估算 */
-export interface ChatContextBreakdownInfo {
-  buckets: ChatContextBucket[]
-  /** 校准总量（末次 assistant usage + 尾随估算）；null = 尚无可校准的 usage */
-  totalTokens: number | null
-  contextWindow: number | null
 }
 
 /** 单个可选模型。认证字段只暴露「是否已配置 / 来源 / 环境变量名」，绝不含密钥内容 */

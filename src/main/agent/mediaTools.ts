@@ -7,9 +7,11 @@ import {
   REF_ROLE_LABEL,
   checkMediaRefs,
   mediaKindOfPath,
+  mediaFailureKindOf,
   nearestMediaRatio,
   normalizeMediaCaps,
   type MediaAccessMode,
+  type MediaFailureKind,
   type MediaJobStatus,
   type MediaKind,
   type MediaRatio,
@@ -35,6 +37,8 @@ export type ToolDefinitionLike = ToolDefinition
  * 2. **视频确认闸门**（workspace.json media.confirmVideo，默认 true）：视频成本高，
  *    未带 confirmed=true 调用时返回「需用户确认」的指令文本，由 Agent 在对话中向用户求证，
  *    用户答复确认后 Agent 再带 confirmed=true 重调 —— 以对话作为确认 UI，防止误烧配额。
+ *    变更前确认模式（accessMode='confirm'）下由确认卡取代这道闸；视频带 confirmed=true
+ *    （对话里已同意）时跳过卡片，不再让用户对同一次生成点两次头。
  * 3. **provider/model 由配置解析**（数据驱动）：工具只描述意图（kind+参数），
  *    具体用哪个 provider/模型由宿主按 workspace.json 解析，本文件不出现模型名；
  *    参数 schema 是静态全集，当前模型能力的校验在 execute 内现读（改默认模型即时生效）。
@@ -105,8 +109,8 @@ export interface MediaToolContext {
   capabilities?: (kind: MediaKind) => ModelCapabilities | undefined
   /** 当前会话的对话模型是否支持图片输入（决定成功结果是否携带产物图片） */
   supportsImageInput?: () => boolean
-  /** 读取媒体产物为缩放后的 base64（主进程内完成，路径越界返回 undefined） */
-  readArtifactAsBase64?: (relPath: string, maxEdge?: number) => { data: string; mimeType: string } | undefined
+  /** 读取媒体产物为缩放后的 base64（主进程内完成，路径越界返回 undefined）；IO 异步 */
+  readArtifactAsBase64?: (relPath: string, maxEdge?: number) => Promise<{ data: string; mimeType: string } | undefined>
   /** 读取视频产物首帧关键帧为 base64（宿主在主进程抽帧；失败/不支持返回 undefined，绝不影响生成成功结果） */
   readVideoPosterAsBase64?: (artifact: {
     relPath: string
@@ -242,49 +246,66 @@ interface ToolParams {
 }
 
 /**
- * 失败分类 → 可操作文案。错误串来自编排层（manager/resolveAgentMedia），按稳定短语匹配；
- * 兜底原样透出。所有文案都要求 Agent 转告用户并给出下一步。
+ * 失败分类 → 可操作文案。
+ *
+ * 分类来源优先级：调用方传入的结构化分类（编排层抛的 MediaFailureError）> 文本兜底。
+ * 文本兜底只服务没有结构化形态的错误：远端网关的自由文案（401/配额等）与尚未
+ * 结构化的旧路径——我们自己产出、已带 kind 的错误不再依赖措辞，措辞怎么改分类都不漂。
+ * 所有文案都要求 Agent 转告用户并给出下一步。
  */
-function failureGuidance(kind: MediaKind, error: string | undefined, provider?: string, model?: string): string {
+function classifyFailureText(text: string): MediaFailureKind | undefined {
+  if (text.includes('没有可用的') || text.includes('未配置凭据')) return 'config'
+  if (text.includes('不支持比例') || text.includes('不支持时长') || text.includes('没有模型') || text.includes('没有音色')) return 'params'
+  if (text.includes('参考素材') || text.includes('参考（') || text.includes('只接受公网') || text.includes('上传通道')) return 'refs'
+  if (text.includes('超时')) return 'timeout'
+  if (/401|403|invalid.{0,8}key|unauthorized|鉴权|认证/i.test(text)) return 'auth'
+  return undefined
+}
+
+function failureGuidance(
+  kind: MediaKind,
+  error: string | undefined,
+  opts?: { provider?: string; model?: string; failure?: MediaFailureKind }
+): string {
   const label = KIND_LABEL[kind]
-  const where = provider ? `（provider=${provider}${model ? ` · model=${model}` : ''}）` : ''
+  const where = opts?.provider
+    ? `（provider=${opts.provider}${opts?.model ? ` · model=${opts.model}` : ''}）`
+    : ''
   const text = error ?? '未知错误'
-  if (text.includes('没有可用的') || text.includes('未配置凭据')) {
-    return (
-      `${label}生成不可用：${text}${where}。` +
-      `选择供应商、录入 API Key 和挑选默认模型都是用户自己的配置任务（对话供应商的 Key 与媒体生成是两套独立配置）。` +
-      `请转告用户打开「设置 → 媒体生成」完成这三步，并如实说明当前缺的是哪一步；配置完成前不要再次尝试生成，也不要替用户挑选模型。`
-    )
+  switch (opts?.failure ?? classifyFailureText(text)) {
+    case 'config':
+      return (
+        `${label}生成不可用：${text}${where}。` +
+        `选择供应商、录入 API Key 和挑选默认模型都是用户自己的配置任务（对话供应商的 Key 与媒体生成是两套独立配置）。` +
+        `请转告用户打开「设置 → 媒体生成」完成这三步，并如实说明当前缺的是哪一步；配置完成前不要再次尝试生成，也不要替用户挑选模型。`
+      )
+    case 'params':
+      return (
+        `生成参数不被当前模型接受：${text}${where}。` +
+        `请按错误信息里的支持列表调整参数后重试，或改用其他模型，并向用户说明原因。`
+      )
+    case 'refs':
+      return (
+        `参考素材不被当前模型接受：${text}${where}。` +
+        `请按错误信息里的支持范围调整：换用声明了这种参考的模型、减少素材条数、或把素材换成更小/更少的图片。` +
+        `提示「只接受公网 URL」时，可以让用户提供公网可访问的地址（放进对应槽位的 URL），不要反复用同一组素材重试。`
+      )
+    case 'timeout':
+      return (
+        `生成任务超时：${text}${where}。` +
+        `请告诉用户任务已停止，可以重试一次或更换模型；若多次超时建议检查网络或供应商服务状态。`
+      )
+    case 'auth':
+      return (
+        `生成凭据被拒绝：${text}${where}。` +
+        `请告诉用户「设置 → 媒体生成」里该供应商的 API Key 可能无效或已过期，请检查后重新录入；配置好之前不要再尝试生成。`
+      )
+    default:
+      return (
+        `${label}生成失败：${text}${where}。请把失败原因转告用户；如果是临时性错误可以重试一次，` +
+        `若仍失败建议检查「设置 → 媒体生成」的供应商配置。`
+      )
   }
-  if (text.includes('不支持比例') || text.includes('不支持时长') || text.includes('没有模型') || text.includes('没有音色')) {
-    return (
-      `生成参数不被当前模型接受：${text}${where}。` +
-      `请按错误信息里的支持列表调整参数后重试，或改用其他模型，并向用户说明原因。`
-    )
-  }
-  if (text.includes('参考素材') || text.includes('参考（') || text.includes('只接受公网') || text.includes('上传通道')) {
-    return (
-      `参考素材不被当前模型接受：${text}${where}。` +
-      `请按错误信息里的支持范围调整：换用声明了这种参考的模型、减少素材条数、或把素材换成更小/更少的图片。` +
-      `提示「只接受公网 URL」时，可以让用户提供公网可访问的地址（放进对应槽位的 URL），不要反复用同一组素材重试。`
-    )
-  }
-  if (text.includes('超时')) {
-    return (
-      `生成任务超时：${text}${where}。` +
-      `请告诉用户任务已停止，可以重试一次或更换模型；若多次超时建议检查网络或供应商服务状态。`
-    )
-  }
-  if (/401|403|invalid.{0,8}key|unauthorized|鉴权|认证/i.test(text)) {
-    return (
-      `生成凭据被拒绝：${text}${where}。` +
-      `请告诉用户「设置 → 媒体生成」里该供应商的 API Key 可能无效或已过期，请检查后重新录入；配置好之前不要再尝试生成。`
-    )
-  }
-  return (
-    `${label}生成失败：${text}${where}。请把失败原因转告用户；如果是临时性错误可以重试一次，` +
-    `若仍失败建议检查「设置 → 媒体生成」的供应商配置。`
-  )
 }
 
 function paramsSummary(final: MediaJobStatus): string {
@@ -355,8 +376,12 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
       const input = params as ToolParams
       const refs = collectToolRefs(input, kind)
       // 变更前确认模式：所有生成提交前先弹确认卡（取代视频对话闸门 —— 反正都要用户点头）。
-      // 拒绝走「返回文本」而非抛错：这是用户的决定不是故障，Agent 应转告并等待新指示。
-      if ((ctx.accessMode?.() ?? 'full') === 'confirm') {
+      // 例外：视频带 confirmed=true（对话里已征得用户同意的既有协议）时跳过卡——
+      // 同一次生成要用户点两次头是打扰，对话里的明确同意与卡片回执同等有效。
+      // 图像/音频没有等价参数，一律走卡。拒绝走「返回文本」而非抛错：这是用户的决定
+      // 不是故障，Agent 应转告并等待新指示。
+      const confirmedInChat = kind === 'video' && input.confirmed === true
+      if ((ctx.accessMode?.() ?? 'full') === 'confirm' && !confirmedInChat) {
         onUpdate?.({
           content: [{ type: 'text', text: `等待用户确认（${KIND_LABEL[kind]}生成）…` }],
           details: { submitted: false, state: 'awaiting-approval' }
@@ -401,19 +426,26 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
       // 能力现读校验：schema 是静态全集，合法性按本次解析到的模型判——同会话改默认模型即时生效
       const caps = ctx.capabilities?.(kind)
       if (caps?.ratios?.length && input.ratio && !caps.ratios.includes(input.ratio)) {
-        throw new Error(failureGuidance(kind, `不支持比例 ${input.ratio}（当前模型支持：${caps.ratios.join(' / ')}）`))
+        throw new Error(
+          failureGuidance(kind, `不支持比例 ${input.ratio}（当前模型支持：${caps.ratios.join(' / ')}）`, {
+            failure: 'params'
+          })
+        )
       }
       if (caps?.durations?.length && input.duration_seconds && !caps.durations.includes(input.duration_seconds)) {
         throw new Error(
           failureGuidance(
             kind,
-            `不支持时长 ${input.duration_seconds}s（当前模型支持档位：${caps.durations.join(' / ')}）`
+            `不支持时长 ${input.duration_seconds}s（当前模型支持档位：${caps.durations.join(' / ')}）`,
+            { failure: 'params' }
           )
         )
       }
       if (caps?.voices?.length && input.voice && !caps.voices.some((v) => v.id === input.voice)) {
         throw new Error(
-          failureGuidance(kind, `没有音色 ${input.voice}（当前模型支持：${caps.voices.map((v) => v.id).join(' / ')}）`)
+          failureGuidance(kind, `没有音色 ${input.voice}（当前模型支持：${caps.voices.map((v) => v.id).join(' / ')}）`, {
+            failure: 'params'
+          })
         )
       }
       // 参考素材前置检查用编排层同一份纯函数（角色、类型、模式互斥）：这里拦下省一次任务记录，
@@ -426,7 +458,9 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         )
         if (checked.issues.length > 0) {
           throw new Error(
-            failureGuidance(kind, `参考素材不被当前模型接受：${checked.issues.map((i) => i.message).join('；')}`)
+            failureGuidance(kind, `参考素材不被当前模型接受：${checked.issues.map((i) => i.message).join('；')}`, {
+              failure: 'refs'
+            })
           )
         }
       }
@@ -459,9 +493,10 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
           onProgress
         )
       } catch (error) {
-        // 提交阶段失败（无工作区/无可用模型/凭据缺失/参数非法）——抛错让卡片落失败态，错误必须可操作
+        // 提交阶段失败（无工作区/无可用模型/凭据缺失/参数非法）——抛错让卡片落失败态，错误必须可操作。
+        // 结构化分类优先：编排层抛 MediaFailureError 时按 kind 取文案，措辞变更不影响分类
         const message = error instanceof Error ? error.message : String(error)
-        throw new Error(failureGuidance(kind, message))
+        throw new Error(failureGuidance(kind, message, { failure: mediaFailureKindOf(error) }))
       }
 
       if (final.state === 'cancelled') {
@@ -472,7 +507,12 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
       }
       if (final.state !== 'succeeded' || !final.artifact) {
         // 抛错而非返回：pi 会把工具结果标为 error（卡片红色失败态），错误文本照样进模型上下文
-        throw new Error(failureGuidance(kind, final.error ?? final.message, final.provider, final.model))
+        throw new Error(
+          failureGuidance(kind, final.error ?? final.message, {
+            provider: final.provider,
+            model: final.model
+          })
+        )
       }
 
       // 成功：文本摘要必回；产物画面且对话模型支持视觉时随结果附上（多模态感知）。
@@ -495,7 +535,7 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         ctx.readArtifactAsBase64 &&
         final.artifact.mime.startsWith('image/')
       ) {
-        const image = ctx.readArtifactAsBase64(final.artifact.relPath)
+        const image = await ctx.readArtifactAsBase64(final.artifact.relPath)
         if (image) images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
       }
       // 视频生成成本最高、动辄数分钟，成功后 Agent"看不到"产物就得再手动调 read_media：

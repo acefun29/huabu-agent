@@ -114,7 +114,6 @@ const api: HuabuApi = {
 
     contextUsage: (request) => ipcRenderer.invoke(IpcChannel.ChatContextUsage, request),
 
-    contextBreakdown: (request) => ipcRenderer.invoke(IpcChannel.ChatContextBreakdown, request),
 
     compact: (request) => ipcRenderer.invoke(IpcChannel.ChatCompact, request),
 

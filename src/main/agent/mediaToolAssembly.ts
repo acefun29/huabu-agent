@@ -1,6 +1,6 @@
 import { join } from 'path'
 import type { MediaJobStatus } from '@shared/ipc'
-import type { MediaRefInput } from '../../shared/media'
+import { MediaFailureError, type MediaRefInput } from '../../shared/media'
 import type { AdapterProviderConfig } from '../media/adapters'
 import { resolveMediaTarget } from '../../shared/mediaResolve'
 import { MEDIA_ROOT_REL, assetDirForKind } from '../../shared/assets'
@@ -124,8 +124,10 @@ export function resolveAgentMedia(
   })
   if (!resolved) {
     const label = kind === 'image' ? '图片' : kind === 'video' ? '视频' : '音频'
-    throw new Error(
-      `没有可用的${label}生成模型：${label}默认模型未选择或已失效，请在「设置 → 媒体生成」为${label}选择默认模型并录入 API Key`
+    // MediaFailureError('config')：工具层按结构化分类取指引文案，不依赖这句措辞做子串匹配
+    throw new MediaFailureError(
+      `没有可用的${label}生成模型：${label}默认模型未选择或已失效，请在「设置 → 媒体生成」为${label}选择默认模型并录入 API Key`,
+      'config'
     )
   }
   return { provider: resolved.provider, model: resolved.model }
@@ -203,8 +205,8 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
     },
     // 多模态回传开关：当前会话的对话模型支持图片输入才回传产物图
     supportsImageInput: () => deps.sessionModelSupportsImages(nodeId) ?? false,
-    // 产物读图在主进程完成（解码/缩放/JPEG），base64 不落渲染进程
-    readArtifactAsBase64: (relPath, maxEdge) => {
+    // 产物读图在主进程完成（解码/缩放/JPEG），base64 不落渲染进程；IO 异步
+    readArtifactAsBase64: async (relPath, maxEdge) => {
       const dir = mediaContext().mediaDir
       return dir ? readArtifactAsBase64(relPath, dir, maxEdge) : undefined
     },

@@ -1,5 +1,5 @@
 import { ChatBridge } from '../../lib/agent'
-import { ChatErrorCode, type ChatContextBreakdownInfo, type ChatEvent, type ChatHistoryMessage } from '@shared/ipc'
+import { ChatErrorCode, type ChatEvent, type ChatHistoryMessage } from '@shared/ipc'
 import { compactGate, createStreamState, draftToMessage, mergeStreamHistory, reduceChatEvent, type ChatDraft, type ChatStreamState } from '../../lib/chatStream'
 import { isCommandInput, parseChatCommand } from '../../lib/chatCommands'
 import { guessKind } from '../../lib/media'
@@ -15,7 +15,8 @@ import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, newNodeId, settingsBridgeRef, spa
  * 模块级 Map 群，旧 Provider 时代 ref 群的直系后代），以及：
  *
  * - 流式事件批处理（P0-3）：delta 缓冲 32ms 一次 fold，控制类事件即时；
- * - write 工具副作用：tool_end 成功后在画布钉产物卡片（pinWrittenFile）；
+ * - 画布钉卡：write 落盘媒体文件自动钉卡（pinWrittenFile，文本不钉）；
+ *   工具显式发布（blockout 成片 / create_note 文本卡）经 details.published 钉卡；
  * - 会话生命周期：新建/切换/fork/删除/改名（清单在 canvas.json meta.sessions，
  *   历史在 .huabu/sessions/*.jsonl，UI 只存引用）；
  * - 发送（路径引用契约）：collectRoundContext 采集 → buildReferencePayload
@@ -130,7 +131,12 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     }))
   }
 
-  /** Agent 用 write 工具写了文件 → 在画布上钉一张产物文件卡片（落点按现有卡片错开） */
+  /**
+   * Agent 用 write 工具写了媒体文件 → 在画布上钉一张媒体卡片（落点按现有卡片错开）。
+   * 画布拦截契约：媒体（图/视频/音频，含 svg）落盘即拦截成卡；文本不钉——
+   * Agent 工作中写的 author JSON/脚本/配置全是文本，「写了就上画布」只会制造垃圾卡，
+   * 文本上画布的唯一通道是 create_note 工具（其钉卡走 details.published）。
+   */
   const pinWrittenFile = (sessionId: string, rawPath: string) => {
     const wsRoot = get().workspace?.path
     if (!wsRoot) return
@@ -140,7 +146,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     if (rel.startsWith(rootPrefix)) rel = rel.slice(rootPrefix.length)
     if (rel.startsWith('/') || rel.includes('..')) return
     const kind: AssetKind = guessKind(rel)
-    if (kind !== 'doc' && kind !== 'code') return
+    if (kind !== 'image' && kind !== 'video' && kind !== 'audio') return
     const exists = get().nodes.some((n) => n.data.path === rel && n.data.fromChatId === sessionId)
     if (exists) return
     zCounter.current += 1
@@ -159,6 +165,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
           kind,
           storage: 'ws',
           path: rel,
+          ...(kind === 'video' ? { mime: 'video/mp4' } : {}),
           meta: 'Agent 写入',
           fromChatId: sessionId
         } satisfies AssetData
@@ -168,22 +175,27 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
   }
 
   /**
-   * blockout 成片发布 → 画布视频卡片（P4）。与 pinWrittenFile 的差异：
+   * 工具显式发布 → 画布卡片（blockout 成片、create_note 文本卡）。与 pinWrittenFile 的差异：
    * - 路径不来自工具参数而来自主进程 tool_end 的 details.published——
-   *   importToWorkspace 去重后的最终 relPath 只有主进程知道，渲染端推导必错；
-   * - kind 放开到 video（pinWrittenFile 只钉 doc/code）；
+   *   主进程去重/归档后的最终 relPath 只有主进程知道，渲染端推导必错；
+   * - kind 以 published 声明为准（doc/video/…），非法值退回按扩展名猜；
    * - 同镜头覆盖发布时 relPath 不变，去重只按 path（不限 fromChatId），
    *   重渲染不堆新卡（缩略图按内容 sha1 缓存，内容变了自动换图）。
    */
   const pinPublishedAsset = (
     sessionId: string,
-    published: { relPath: string; name: string; kind: string; bytes?: number }
+    published: { relPath: string; name: string; kind: string; bytes?: number },
+    /** 卡片角标来源文案（如「blockout 成片」「Agent 创建」） */
+    sourceLabel: string
   ) => {
     const wsRoot = get().workspace?.path
     if (!wsRoot) return
     const rel = published.relPath.replace(/\\/g, '/')
     if (rel.startsWith('/') || rel.includes('..')) return
-    const kind: AssetKind = published.kind === 'video' ? 'video' : guessKind(rel)
+    const declared = published.kind
+    const kind: AssetKind = ['image', 'video', 'audio', 'doc', 'code'].includes(declared)
+      ? (declared as AssetKind)
+      : guessKind(rel)
     if (get().nodes.some((n) => n.data.path === rel)) return
     zCounter.current += 1
     applyNodes((prev) => [
@@ -203,12 +215,12 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
           path: rel,
           ...(kind === 'video' ? { mime: 'video/mp4' } : {}),
           ...(typeof published.bytes === 'number' ? { bytes: published.bytes } : {}),
-          meta: 'blockout 成片',
+          meta: sourceLabel,
           fromChatId: sessionId
         } satisfies AssetData
       } satisfies CanvasNode
     ])
-    showToast(`blockout 成片已入库：${rel}`)
+    showToast(`${sourceLabel}已入库：${rel}`)
   }
 
   /** 把缓冲里的事件一次 fold 进流状态并同步一次渲染（write 工具副作用保持原时序语义） */
@@ -223,7 +235,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       for (const event of events) {
         if (event.type === 'agent_start') sawAgentStart = true
         state = reduceChatEvent(state, event)
-        // write 工具：tool_start 记下目标路径（带 sessionId 供清扫），tool_end 成功后钉产物卡片
+        // write 工具：tool_start 记下目标路径（带 sessionId 供清扫），tool_end 成功后钉媒体卡
         if (event.type === 'tool_start' && event.toolName === 'write') {
           const path = toolArgString(event.args as Record<string, unknown>, 'path')
           if (path) writeToolPaths.set(event.toolCallId, { sessionId, path })
@@ -233,13 +245,17 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
           writeToolPaths.delete(event.toolCallId)
           if (entry) pinWrittenFile(sessionId, entry.path)
         }
-        // blockout 成片发布：tool_end 的 details.published 带主进程落库后的最终路径
-        if (event.type === 'tool_end' && event.toolName === 'blockout' && !event.isError && event.details) {
+        // 工具显式发布：成功 tool_end 的 details.published 带主进程落库后的最终路径
+        //（blockout 成片、create_note 文本卡；写进 details 的路径才是权威——去重/归档发生在主进程）
+        if (event.type === 'tool_end' && !event.isError && event.details) {
           try {
             const details = JSON.parse(event.details) as {
               published?: { relPath: string; name: string; kind: string; bytes?: number }
             }
-            if (details.published) pinPublishedAsset(sessionId, details.published)
+            if (details.published) {
+              const sourceLabel = event.toolName === 'blockout' ? 'blockout 成片' : 'Agent 创建'
+              pinPublishedAsset(sessionId, details.published, sourceLabel)
+            }
           } catch {
             /* details 非法（截断/超限丢弃）即不钉卡，素材库面板仍会刷新 */
           }
@@ -699,17 +715,6 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     applySessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, thinkingLevel: level } : s)))
   }
 
-  /** 上下文分布明细（T3）：按需拉取，水位条展开面板时调用；失败返回 null 静默收起 */
-  const fetchContextBreakdown = async (sessionId: string): Promise<ChatContextBreakdownInfo | null> => {
-    if (!BRIDGE_AVAILABLE) return null
-    const result = await window.huabu.chat.contextBreakdown({ nodeId: sessionId })
-    if (!result.ok) {
-      console.warn('[canvas] 获取上下文分布失败：', result.error)
-      return null
-    }
-    return result.value
-  }
-
   /**
    * 斜杠命令分发（用户裁决：压缩 / fork 走输入框命令，不占对话坞头部按钮位）。
    *
@@ -759,7 +764,6 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     compactSession,
     setSessionModel,
     setSessionThinking,
-    fetchContextBreakdown,
     runChatCommand,
     /* ---- @internal：store 主体（载入/切换工作区）专用 ---- */
     handleChatEvent,

@@ -10,7 +10,12 @@ import type {
   MediaJobStatus,
   MediaProviderInfo
 } from '../../shared/media'
-import { DEFAULT_MEDIA_CONCURRENCY, ratioToPixels, sanitizeMediaExtra } from '../../shared/media'
+import {
+  DEFAULT_MEDIA_CONCURRENCY,
+  MediaFailureError,
+  ratioToPixels,
+  sanitizeMediaExtra
+} from '../../shared/media'
 import type { WorkspaceMediaConfig } from '../workspace/store'
 import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
 import type { AdapterProviderConfig } from './adapters/registry'
@@ -147,12 +152,12 @@ export class MediaJobManager {
     const adapter = this.adapters().find((a) => a.id === request.provider)
     if (!adapter) throw new Error(`未知媒体 provider：${request.provider}`)
     const model = adapter.models.find((m) => m.id === request.model)
-    if (!model) throw new Error(`provider ${request.provider} 下没有模型 ${request.model}（清单见 media:providers）`)
+    if (!model) throw new MediaFailureError(`provider ${request.provider} 下没有模型 ${request.model}（清单见 media:providers）`, 'params')
     if (model.kind !== request.kind) {
-      throw new Error(`模型 ${model.id} 是 ${model.kind} 生成，不能用于 ${request.kind}`)
+      throw new MediaFailureError(`模型 ${model.id} 是 ${model.kind} 生成，不能用于 ${request.kind}`, 'params')
     }
     if (!adapter.isConfigured()) {
-      throw new Error(`provider ${adapter.label} 未配置凭据，请先在设置面板录入`)
+      throw new MediaFailureError(`provider ${adapter.label} 未配置凭据，请先在设置面板录入`, 'config')
     }
 
     // 参数协商的唯一收口点（此前散在渲染端 RATIO_SIZE 与各适配器三处）：
@@ -160,7 +165,7 @@ export class MediaJobManager {
     // 适配器只做自家协议的约束调整（火山放大到像素下限、百炼 clamp 边长）。
     const capabilities = model.capabilities
     if (capabilities?.ratios?.length && request.ratio && !capabilities.ratios.includes(request.ratio)) {
-      throw new Error(`模型 ${model.id} 不支持比例 ${request.ratio}（支持：${capabilities.ratios.join(' / ')}）`)
+      throw new MediaFailureError(`模型 ${model.id} 不支持比例 ${request.ratio}（支持：${capabilities.ratios.join(' / ')}）`, 'params')
     }
     let durationSeconds = request.durationSeconds
     if (capabilities?.durations?.length && durationSeconds && !capabilities.durations.includes(durationSeconds)) {
@@ -176,12 +181,13 @@ export class MediaJobManager {
     // 猜个意思发出去是幻觉，悄悄丢掉是等于把用户的开关当成不存在
     const extra = sanitizeMediaExtra(capabilities?.extraParams, request.extra)
     if (extra.issues.length > 0) {
-      throw new Error(`模型 ${model.id} 拒绝了这些附加参数：${extra.issues.join('；')}`)
+      throw new MediaFailureError(`模型 ${model.id} 拒绝了这些附加参数：${extra.issues.join('；')}`, 'params')
     }
     // 音色：模型声明了清单就按 id 校验，不声明的（今天只有 openai-compat 的 TTS 吃 voice）不管
     if (request.voice && capabilities?.voices?.length && !capabilities.voices.some((v) => v.id === request.voice)) {
-      throw new Error(
-        `模型 ${model.id} 没有音色 ${request.voice}（支持：${capabilities.voices.map((v) => v.id).join(' / ')}）`
+      throw new MediaFailureError(
+        `模型 ${model.id} 没有音色 ${request.voice}（支持：${capabilities.voices.map((v) => v.id).join(' / ')}）`,
+        'params'
       )
     }
 
@@ -489,7 +495,7 @@ export class MediaJobManager {
     return new Promise<MediaJobStatus>((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
         cleanup()
-        rejectPromise(new Error(`等待任务结果超时（${Math.round(timeoutMs / 1000)}s）：${jobId}`))
+        rejectPromise(new MediaFailureError(`等待任务结果超时（${Math.round(timeoutMs / 1000)}s）：${jobId}`, 'timeout'))
       }, timeoutMs)
       const onSignal = () => {
         // 取消是协作式的：轮询循环（或 pending 收尾）落 cancelled 后由 waiter 唤醒

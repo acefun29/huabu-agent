@@ -442,9 +442,13 @@ const UnifiedAssetCard = memo(function UnifiedAssetCard({ node, data }: { node: 
                 className="absolute inset-0 h-full w-full object-cover"
               />
             )}
-            <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-white/90 shadow">
-              <Play size={16} className="ml-0.5 text-[#1f1f1f]" />
-            </div>
+            {/* Play 圆钮只在有产物文件时渲染：生成中/失败占位卡没有可播放的内容，
+                白圆叠在居中的 spinner/错误文案上会把它吞掉 */}
+            {src && (
+              <div className="relative flex h-10 w-10 items-center justify-center rounded-full bg-white/90 shadow">
+                <Play size={16} className="ml-0.5 text-[#1f1f1f]" />
+              </div>
+            )}
           </div>
         )}
         {(data.kind === 'code' || data.kind === 'doc') &&

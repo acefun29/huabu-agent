@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Clapperboard,
   Eye,
+  FilePlus,
   FileText,
   Film,
   Image as ImageIcon,
@@ -55,25 +56,29 @@ function toolVisual(name: string): { icon: LucideIcon; label: string } {
       return { icon: Clapperboard, label: '粗扫视频' }
     case 'read_video_frames':
       return { icon: Film, label: '读视频帧' }
+    case 'create_note':
+      return { icon: FilePlus, label: '创建文本卡' }
     default:
       return { icon: Wrench, label: name }
   }
 }
 
-/** 从参数里提取行内摘要：路径拆成「文件名 + 目录」两段，其余取首个字符串值 */
-function toolPreview(toolCall: ChatToolCallView): { primary: string; secondary?: string } {
+/**
+ * 从参数里提取行内摘要：路径只取文件名（目录段此前右对齐显示，长短不一时参差错乱，
+ * 已按用户要求删除），其余取首个字符串值。
+ */
+function toolPreview(toolCall: ChatToolCallView): { primary: string } {
   const args = (toolCall.args ?? {}) as Record<string, unknown>
   const pathKeys = ['path', 'file_path', 'file', 'relPath', 'artifactPath']
-  const otherKeys = ['command', 'prompt', 'query', 'url', 'dir']
   for (const key of pathKeys) {
     const value = args[key]
     if (typeof value === 'string' && value.trim()) {
       const normalized = value.replace(/\\/g, '/')
       const cut = normalized.lastIndexOf('/')
-      if (cut >= 0) return { primary: normalized.slice(cut + 1) || normalized, secondary: normalized.slice(0, cut + 1) }
-      return { primary: normalized }
+      return { primary: cut >= 0 ? normalized.slice(cut + 1) || normalized : normalized }
     }
   }
+  const otherKeys = ['command', 'prompt', 'query', 'url', 'dir']
   for (const key of otherKeys) {
     const value = args[key]
     if (typeof value === 'string' && value.trim()) return { primary: value }
@@ -147,11 +152,6 @@ function ToolCallCard({ toolCall }: { toolCall: ChatToolCallView }): JSX.Element
         <span className={`shrink-0 ${isError ? 'text-(--danger)' : 'text-(--on-surface-muted)'}`}>{label}</span>
         {preview.primary && (
           <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-(--on-surface-muted)">{preview.primary}</span>
-        )}
-        {preview.secondary && (
-          <span className="hidden max-w-[40%] shrink-0 truncate font-mono text-[11px] text-(--on-surface-muted) opacity-70 sm:block">
-            {preview.secondary}
-          </span>
         )}
         {isRunning && <Loader2 size={12} className="ml-auto shrink-0 animate-spin text-(--accent)" />}
         {isError && (
