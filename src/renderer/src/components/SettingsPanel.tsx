@@ -1,20 +1,18 @@
 // 设置面板壳：Tab 定义 + 面板骨架与 tab 分派（各 tab 实现见 ./settings/）
 
 import { useEffect, useState, type ReactNode } from 'react'
-import { Bot, Boxes, CirclePlay, Palette, PlugZap, Sparkles, Wand2, X } from 'lucide-react'
+import { Boxes, Palette, PlugZap, Sparkles, Wand2, X } from 'lucide-react'
 import { useSettingsUi, type SettingsTabKey } from '../store/settingsStore'
 import { useEsc } from '../lib/hooks'
-import { GuideTab, SkillsTab, McpTab, AgentTab, AppearanceTab } from './settings/tabs'
+import { SkillsTab, McpTab, AppearanceTab } from './settings/tabs'
 import { ProvidersTab } from './settings/ProvidersTab'
 import { MediaTab } from './settings/MediaTab'
 
 const TABS: { key: SettingsTabKey; label: string; icon: ReactNode }[] = [
-  { key: 'guide', label: '使用引导', icon: <CirclePlay size={15} /> },
   { key: 'providers', label: '模型供应商', icon: <Boxes size={15} /> },
   { key: 'media', label: '媒体生成', icon: <Wand2 size={15} /> },
   { key: 'skills', label: 'Skills', icon: <Sparkles size={15} /> },
   { key: 'mcp', label: 'MCP', icon: <PlugZap size={15} /> },
-  { key: 'agent', label: 'Agent 接入', icon: <Bot size={15} /> },
   { key: 'appearance', label: '外观', icon: <Palette size={15} /> },
 ]
 
@@ -75,12 +73,10 @@ export function SettingsPanel() {
                 </button>
               </div>
               <div data-scrollable="" className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
-                {tab === 'guide' && <GuideTab />}
                 {tab === 'providers' && <ProvidersTab />}
                 {tab === 'media' && <MediaTab />}
                 {tab === 'skills' && <SkillsTab />}
                 {tab === 'mcp' && <McpTab />}
-                {tab === 'agent' && <AgentTab />}
                 {tab === 'appearance' && <AppearanceTab />}
               </div>
             </div>

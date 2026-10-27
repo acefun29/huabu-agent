@@ -12,7 +12,6 @@ import { MediaConfigGate } from './components/MediaConfigGate'
 
 // 重组件按需加载：均为命名导出且只在自身 store 状态开启时显示，
 // lazy 化后首屏不必解析这些模块（内部 perfProbe 计数不受影响）
-const GuideTour = lazy(() => import('./components/GuideTour').then((m) => ({ default: m.GuideTour })))
 const SettingsPanel = lazy(() => import('./components/SettingsPanel').then((m) => ({ default: m.SettingsPanel })))
 const MediaViewer = lazy(() => import('./components/MediaViewer').then((m) => ({ default: m.MediaViewer })))
 
@@ -20,7 +19,6 @@ const MediaViewer = lazy(() => import('./components/MediaViewer').then((m) => ({
  * 应用根组件：设置 Provider → 画布 Provider → 自绘标题栏 + 满屏画布 + 悬浮 chrome。
  * 标题栏（窗口控制 + 工作区切换）常驻所有页面；左侧图标栏（会话/素材库/清空画布/设置）
  * 与底部对话坞都是浮层，画布属于整个工作区；未打开工作区时显示工作区选择页。
- * 分步演示的入口收在 设置 → 使用引导。
  */
 function WorkspaceBody() {
   const booted = useCanvasStore((s) => s.booted)
@@ -59,9 +57,6 @@ export default function App() {
           <TitleBar />
           <WorkspaceBody />
           <MediaConfigGate />
-          <Suspense fallback={null}>
-            <GuideTour />
-          </Suspense>
         </div>
         <Suspense fallback={null}>
           <SettingsPanel />

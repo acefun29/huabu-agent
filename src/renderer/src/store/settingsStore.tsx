@@ -34,7 +34,7 @@ import type { MediaKind } from '../types'
 export type { SkillInfo, McpServerConfig, McpServerRuntimeInfo }
 
 /** 设置面板的 tab 键（SettingsPanel 的导航分派；openSettings(tab) 直达用） */
-export type SettingsTabKey = 'guide' | 'providers' | 'media' | 'skills' | 'mcp' | 'agent' | 'appearance'
+export type SettingsTabKey = 'providers' | 'media' | 'skills' | 'mcp' | 'appearance'
 
 export interface AppearanceSettings {
   theme: 'light' | 'dark'

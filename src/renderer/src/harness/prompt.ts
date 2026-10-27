@@ -1,17 +1,11 @@
 /**
- * Agent 侧提示词与消息载荷的生成规则（真实实现版，对应原型 src/harness/prompt.ts）。
+ * Agent 侧消息载荷的生成规则（真实实现版，对应原型 src/harness/prompt.ts）。
  *
- * - @backend(prompt)：会话创建时由主进程把 buildAgentSystemPrompt 的产物经
- *   Pi DefaultResourceLoader 的 appendSystemPrompt 注入（main/agent/host.ts）；
- *   提示词本体在 shared/prompt.ts（主进程与设置面板预览共用同一份），这里只做转发。
  * - @backend(payload)：用户消息发出前，把 buildReferencePayload 的产物拼在该条消息
  *   文本末尾一并发给模型（canvasStore.sendMessage）。
  */
 import { KIND_LABEL, type MessageAttachment } from '../types'
-import { buildAgentSystemPrompt } from '@shared/prompt'
 import { REFERENCE_PAYLOAD_HEADER_PREFIX, REFERENCE_PAYLOAD_HEADER_SUFFIX } from '@shared/injection'
-
-export { buildAgentSystemPrompt }
 
 const ORIGIN_LABEL: Record<MessageAttachment['origin'], string> = {
   'workspace-asset': '工作区素材',

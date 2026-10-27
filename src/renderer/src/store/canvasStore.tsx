@@ -257,11 +257,6 @@ export interface CanvasState {
   /** 确认卡回执：接受/拒绝（调 IPC 后由 onConfirmResolved 撤卡，这里只发回执） */
   resolveApproval: (requestId: string, accepted: boolean) => void
 
-  /* 分步演示（操作引导浮层） */
-  guideOpen: boolean
-  openGuide: () => void
-  closeGuide: () => void
-
   /* @internal：Provider 引导 / 自动保存 / 探针用，业务组件不要订阅 */
   refreshWorkspaceState: () => Promise<void>
   handleJobEvent: (job: MediaJobStatus) => void
@@ -596,7 +591,6 @@ export const useCanvasStore = create<CanvasState>()(
       pendingApprovals: [],
       undoEntry: null,
       canUndo: false,
-      guideOpen: false,
 
       /* ---- actions ---- */
       openDirDialog,
@@ -621,8 +615,6 @@ export const useCanvasStore = create<CanvasState>()(
       closeGenComposer: () => set({ genComposer: null }),
       openCardInspector: (nodeId: string) => set({ cardInspector: nodeId }),
       closeCardInspector: () => set({ cardInspector: null }),
-      openGuide: () => set({ guideOpen: true }),
-      closeGuide: () => set({ guideOpen: false }),
       refreshWorkspaceState,
       handleJobEvent: job.handleJobEvent,
       saveCanvasNow
