@@ -136,7 +136,6 @@ export function CanvasWorkspace() {
   const hasNodes = useCanvasStore((s) => s.nodes.length > 0)
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
-  const workspace = useCanvasStore((s) => s.workspace)
   const { appearance, setAppearance } = useSettings()
   const [menu, setMenu] = useState<MenuState | null>(null)
   /** 标签筛选：非 null 时只亮带该标签的卡片（其余降透明度） */
@@ -790,11 +789,6 @@ export function CanvasWorkspace() {
         </div>
       )}
 
-      <div className="pointer-events-none absolute bottom-2 left-3 right-3 truncate text-[11px] text-(--on-surface-muted)">
-        工作目录 {workspace?.path ?? '未打开'}（Agent 可读写全部文件）· 缩放 {Math.round(view.scale * 100)}% ·
-        左键拖动框选 · 中键 / 空格+左键平移 · 滚轮缩放 · 右键卡片「以此生成…」= 参考生成（链自动形成） ·
-        Shift+E 显隐引用链 · 清空画布在右上角
-      </div>
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
     </div>
   )
