@@ -14,6 +14,25 @@
 Agent 基于开源 Coding Agent Harness [Pi](https://github.com/earendil-works/pi)
 （`@earendil-works/pi-coding-agent`）以 SDK 方式嵌入主进程，不走子进程、不依赖 CLI。
 
+## 宣传片
+
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <a href="https://cdn.jsdelivr.net/gh/acefun29/huabu-agent@main/docs/assets/videos/huabu-promo-1080p.mp4">
+        <img src="docs/assets/videos/huabu-promo-poster.jpg" alt="Huabu 宣传片" width="100%" />
+      </a>
+      <sub><b>Huabu 宣传片</b> · 0:40 · 点击封面播放</sub>
+    </td>
+    <td width="50%" align="center" valign="top">
+      <a href="https://cdn.jsdelivr.net/gh/acefun29/huabu-agent@main/docs/assets/videos/huabu-skills-1080p.mp4">
+        <img src="docs/assets/videos/huabu-skills-poster.jpg" alt="Huabu 技能体系：12 个工种" width="100%" />
+      </a>
+      <sub><b>Huabu 技能体系</b> · 1:04 · 点击封面播放</sub>
+    </td>
+  </tr>
+</table>
+
 ## 核心特性
 
 - **无限画布**：素材卡片平移/缩放/框选/批量拖拽；卡片是对磁盘文件的**引用**而非副本，
@@ -129,7 +148,7 @@ huabu/
 │   └── shared/                # 主/渲染进程共用契约（IPC 通道名、载荷类型、HuabuApi）
 ├── scripts/                   # 自检/探针/基准脚本（见 package.json scripts）
 ├── build/icon.png             # 应用图标
-├── docs/assets/               # README 图片资源（logo 等）
+├── docs/assets/               # README 媒体资源（logo、宣传视频等）
 ├── electron.vite.config.ts
 ├── electron-builder.yml
 └── package.json

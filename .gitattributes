@@ -11,6 +11,9 @@
 *.zip binary
 *.exe binary
 *.node binary
+*.mp4 binary
+*.mov binary
+*.webm binary
 
 # Windows 脚本保留 CRLF
 *.bat text eol=crlf
