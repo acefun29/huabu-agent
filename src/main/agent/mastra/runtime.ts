@@ -31,10 +31,12 @@ import type {
   ChatUsage,
 } from '../../../shared/ipc'
 import type { AgentRuntime } from '../runtime'
+import type { ToolDefinitionLike } from '../mediaTools'
 import { aiSdkLanguageModel, createModelGateway } from './modelGateway'
 import type { ModelGateway } from './modelGateway'
 import { mastraMemoryFor } from './memory'
 import { MEMORY_RESOURCE } from './storage'
+import { toMastraTools, type AdaptedToolOutput } from './tools'
 
 export interface MastraRuntimeDeps {
   broadcast(event: ChatEvent): void
@@ -44,6 +46,8 @@ export interface MastraRuntimeDeps {
   managerForWorkspace(dir: string): Promise<ChatModelManager | null>
   /** 运行时信息（模型列表/已配置 provider）：与 Pi 侧同一份目录数据 */
   runtimeInfo(dir: string): Promise<ChatResult<ChatRuntimeInfo>>
+  /** 工具装配（Phase 3 迁移面）：read_media / generate_* / 视频两工具 / create_note 等框架无关工具 */
+  assembleTools(nodeId: string): Promise<ToolDefinitionLike[]>
 }
 
 interface MastraSession {
@@ -56,6 +60,7 @@ interface MastraSession {
   memory: Memory
   gateway: ModelGateway
   manager: ChatModelManager
+  piTools: ToolDefinitionLike[]
   run: AbortController | null
   lastUsage: ChatUsage | null
 }
@@ -137,6 +142,7 @@ export class MastraAgentRuntime implements AgentRuntime {
     }
 
     const memory = await mastraMemoryFor(dir)
+    const piTools = await this.deps.assembleTools(req.nodeId)
     this.sessions.set(req.nodeId, {
       nodeId: req.nodeId,
       threadId,
@@ -146,6 +152,7 @@ export class MastraAgentRuntime implements AgentRuntime {
       thinkingLevel: req.thinkingLevel ?? 'medium',
       memory,
       manager,
+      piTools,
       gateway: createModelGateway({ registrations: () => manager.registrations() }),
       run: null,
       lastUsage: null,
@@ -160,7 +167,7 @@ export class MastraAgentRuntime implements AgentRuntime {
       cwd: dir,
       sessionId: threadId,
       sessionFile: `${MASTRA_SESSION_PREFIX}${threadId}`,
-      activeTools: [],
+      activeTools: piTools.map((tool) => tool.name),
     })
   }
 
@@ -199,6 +206,10 @@ export class MastraAgentRuntime implements AgentRuntime {
           modelId: session.modelRef.model.id,
         }),
         memory: session.memory,
+        // 每轮重包装：onUpdate 桥的 signal 要挂当轮 controller（abort 会话即取消工具等待）
+        ...(session.piTools.length
+          ? { tools: toMastraTools(session.piTools, { nodeId: session.nodeId, broadcast, signal: controller.signal }) }
+          : {}),
       })
       const events = await agent.stream(text, {
         memory: { thread: session.threadId, resource: MEMORY_RESOURCE },
@@ -224,16 +235,20 @@ export class MastraAgentRuntime implements AgentRuntime {
               args: asToolArgs(chunk.payload.args),
             })
             break
-          case 'tool-result':
+          case 'tool-result': {
+            // tools.ts 适配后的输出形状：{text, isError?, images?, details?}
+            const out = chunk.payload.result as AdaptedToolOutput | undefined
             broadcast({
               nodeId,
               type: 'tool_end',
               toolCallId: chunk.payload.toolCallId,
               toolName: chunk.payload.toolName,
-              isError: chunk.payload.isError === true,
-              resultText: summarizeResult(chunk.payload.result),
+              isError: out?.isError === true || chunk.payload.isError === true,
+              resultText: typeof out?.text === 'string' ? truncate(out.text) : summarizeResult(out),
+              ...(out?.details !== undefined ? { details: safeJson(out.details, 1200) } : {}),
             })
             break
+          }
           case 'response-metadata': {
             const mid = (chunk.payload as Record<string, unknown>).modelId
             if (typeof mid === 'string' && mid) responseModel = mid
@@ -413,6 +428,15 @@ function summarizeResult(result: unknown): string {
 
 function truncate(text: string, max = 2000): string {
   return text.length > max ? text.slice(0, max) + '…' : text
+}
+
+/** details 序列化（钉卡契约的最小保证：可 JSON 化 + 截断；环引用等异常降级为字符串） */
+function safeJson(value: unknown, max: number): string | undefined {
+  try {
+    return truncate(JSON.stringify(value), max)
+  } catch {
+    return truncate(String(value), max)
+  }
 }
 
 /** MastraDBMessage.content（{ format, parts: [{type:'text', text}] }，见 agent.ts 的落库构造）与工具结果的文本抽取 */

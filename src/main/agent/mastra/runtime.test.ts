@@ -62,6 +62,7 @@ function stubDeps(overrides: Partial<MastraRuntimeDeps> = {}): MastraRuntimeDeps
       ok: true as const,
       value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo,
     }),
+    assembleTools: async () => [],
     ...overrides,
   }
 }
@@ -178,6 +179,7 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
           ok: true as const,
           value: { ready: true, models: [], configuredProviders: ['deepseek'] } satisfies ChatRuntimeInfo,
         }),
+        assembleTools: async () => [],
       })
 
       const created = await rt.create({ nodeId: 'e2e-1' })
@@ -241,6 +243,7 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         defaultModel: () => 'deepseek/deepseek-flash',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
       })
       // 上一用例的 thread（node-e2e-1）落在同一个工作区库里
       const created = await rt2.create({ nodeId: 'e2e-2', sessionFile: 'mastra:node-e2e-1' })
@@ -252,6 +255,7 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         defaultModel: () => 'deepseek/deepseek-flash',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
       })
       // 用 e2e-2（绑定同 thread）继续问，历史应可见
       await rt3.create({ nodeId: 'e2e-2', sessionFile: 'mastra:node-e2e-1' })
@@ -263,6 +267,55 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       await rt3.dispose({ nodeId: 'e2e-2' })
     },
     240_000
+  )
+
+  it(
+    '工具链路：模型调用工具 → tool_start/tool_end + details 钉卡透传 → 定稿消息',
+    async () => {
+      const toolEvents: ChatEvent[] = []
+      // 框架无关的假工具（真实工具经 chat.ts 的 assembleTools 组装，链路同一适配层）
+      const fakeTool = {
+        name: 'echo_card',
+        label: '回声卡片',
+        description: '在画布上创建一张回声卡片。用户要求创建卡片时必须调用本工具。',
+        parameters: { type: 'object', properties: { title: { type: 'string', description: '卡片标题' } }, required: ['title'] },
+        execute: async (_toolCallId: string, params: { title?: string }) => ({
+          content: [{ type: 'text' as const, text: `已创建卡片：${params.title ?? '?'}` }],
+          details: { published: { name: params.title ?? '?', kind: 'note' } },
+        }),
+      }
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rtTools = new MastraAgentRuntime({
+        broadcast: (e) => toolEvents.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [fakeTool as never],
+      })
+      const created = await rtTools.create({ nodeId: 'e2e-tools' })
+      expect(created.ok && created.value.activeTools).toEqual(['echo_card'])
+      const p = await rtTools.prompt({ nodeId: 'e2e-tools', text: '请调用 echo_card 创建一张标题为"测试卡片"的卡片，然后告诉我结果。' })
+      expect(p.ok).toBe(true)
+      const start = Date.now()
+      while (Date.now() - start < 120_000) {
+        if (toolEvents.some((e) => e.type === 'agent_end')) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      const toolStart = toolEvents.find((e) => e.type === 'tool_start') as Extract<ChatEvent, { type: 'tool_start' }> | undefined
+      expect(toolStart?.toolName).toBe('echo_card')
+      expect(toolStart?.args).toMatchObject({ title: '测试卡片' })
+      const toolEnd = toolEvents.find((e) => e.type === 'tool_end') as Extract<ChatEvent, { type: 'tool_end' }> | undefined
+      expect(toolEnd?.isError).toBe(false)
+      expect(toolEnd?.resultText).toContain('已创建卡片')
+      expect(toolEnd?.details).toContain('published')
+      const end = toolEvents.find((e) => e.type === 'agent_end') as Extract<ChatEvent, { type: 'agent_end' }> | undefined
+      expect(end?.stopReason).toBe('stop')
+      await rtTools.dispose({ nodeId: 'e2e-tools' })
+    },
+    180_000
   )
 
   it(
@@ -287,6 +340,7 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         defaultModel: () => 'deepseek/deepseek-flash',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
       })
       await rt4.create({ nodeId: 'e2e-rollback' })
       const p = await rt4.prompt({ nodeId: 'e2e-rollback', text: '只回复：好' })

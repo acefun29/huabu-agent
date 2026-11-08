@@ -73,7 +73,23 @@ export function registerChatIpc(ctx: IpcContext): void {
     currentDir,
     defaultModel: () => store.currentWorkspace?.defaultModel,
     managerForWorkspace: (dir) => host.chatManagerFor(dir),
-    runtimeInfo: (dir) => host.runtime(dir)
+    runtimeInfo: (dir) => host.runtime(dir),
+    // 工具装配（Phase 3 迁移面）：复用与 Pi 侧同一批组装函数——媒体三件套 + read_media
+    // + 视频两工具 + create_note。差异：不装 MCP（计划 §11.3 迁移期移除）与 blockout
+    // （惰性激活是 pi 会话机制）；vision 通道未接（Phase 0 遗留 #5），图片一律元数据降级
+    assembleTools: async (nodeId) => {
+      const { mediaTools, readMediaTool, videoTools } = assembleMediaTools(nodeId, {
+        store,
+        mediaManager,
+        requestApproval: requestMediaApproval,
+        sessionModelSupportsImages: () => false,
+        currentDir,
+        mediaContext,
+        inboxRoot
+      })
+      const noteTool = assembleNoteTool({ currentDir })
+      return [...mediaTools, readMediaTool, ...videoTools, noteTool]
+    }
   })
 
   const sessionRuntimes = new Map<string, AgentRuntime>()

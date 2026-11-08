@@ -72,8 +72,9 @@ const weatherTool = createTool({
     properties: { city: { type: 'string', description: '城市名' } },
     required: ['city'],
   } as Record<string, unknown>,
-  execute: async (input: unknown) => {
-    const c = ((input as { context?: unknown }).context ?? {}) as { city?: string }
+  execute: async (inputData: unknown) => {
+    // Mastra 1.82：第一个参数就是校验后的输入
+    const c = (inputData ?? {}) as { city?: string }
     return { city: c.city ?? '?', weather: '晴，24℃' }
   },
 })
