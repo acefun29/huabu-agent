@@ -348,6 +348,16 @@ export class AgentHost {
     }
   }
 
+  /**
+   * Mastra 运行时借用的目录访问器：目录 + overlay + 凭据状态与 Pi 侧同一个
+   * ChatModelManager 计算（清单每次现算不缓存，见 modelManager 注释）。
+   * 只借目录能力，不借会话能力——Mastra 会话不走 pi 的 session/tool 体系。
+   */
+  async chatManagerFor(workspaceDir: string): Promise<ChatModelManager | null> {
+    const entry = await this.runtimeFor(workspaceDir)
+    return entry.ok ? this.modelManager(entry.value) : null
+  }
+
   /** 运行时状态与模型清单（下拉用）。清单来自管理器（被删除的模型本就不在其中），返回不含任何密钥内容 */
   async runtime(workspaceDir: string): Promise<ChatResult<ChatRuntimeInfo>> {
     const runtimeResult = await this.runtimeFor(workspaceDir)

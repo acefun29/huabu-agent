@@ -10,11 +10,13 @@
  * chat:dispose 成功后经 media.ts 的 settleApprovalsForNode 把该节点的挂起确认按拒绝 settle。
  */
 import { ipcMain } from 'electron'
+import { broadcastChatEvent } from './shared'
 import { assembleBlockoutTool } from '../agent/blockoutTools'
 import { assembleNoteTool } from '../agent/noteTool'
 import { assembleMediaTools } from '../agent/mediaToolAssembly'
+import { MastraAgentRuntime } from '../agent/mastra/runtime'
 import { PiAgentRuntime } from '../agent/piRuntime'
-import { UnavailableRuntime, type AgentRuntime } from '../agent/runtime'
+import type { AgentRuntime } from '../agent/runtime'
 import { inboxRoot } from '../assets/manager'
 import {
   IpcChannel,
@@ -64,10 +66,15 @@ export function registerChatIpc(ctx: IpcContext): void {
       return [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool, noteTool]
     }
   })
-  const mastraRuntime = new UnavailableRuntime(
-    'mastra',
-    'agent.runtime=mastra：Mastra 运行时尚未实现（迁移 Phase 1），请切回 pi'
-  )
+  // Mastra 运行时（迁移 Phase 1）：会话/记忆走 LibSQL（.huabu/mastra.db），模型只经
+  // 自有 ModelGateway；compact/fork/steer 为显式未迁移失败（见 mastra/runtime.ts）
+  const mastraRuntime = new MastraAgentRuntime({
+    broadcast: broadcastChatEvent,
+    currentDir,
+    defaultModel: () => store.currentWorkspace?.defaultModel,
+    managerForWorkspace: (dir) => host.chatManagerFor(dir),
+    runtimeInfo: (dir) => host.runtime(dir)
+  })
 
   const sessionRuntimes = new Map<string, AgentRuntime>()
   const runtimeFor = (): AgentRuntime => (store.agentRuntime() === 'mastra' ? mastraRuntime : piRuntime)

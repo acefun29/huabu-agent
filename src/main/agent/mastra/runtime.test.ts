@@ -1,0 +1,267 @@
+/**
+ * MastraAgentRuntime 契约测试（Phase 1）。
+ *
+ * - 单测（无网络）：create 的校验矩阵、未迁移方法的显式失败、setModel/setThinking、
+ *   history 的 sessionFile 前缀闸门。
+ * - E2E（真模型，DEEPSEEK_API_KEY 存在时）：create → prompt → ChatEvent 事件序列 →
+ *   第二轮记忆连续性 → history 回放 → contextUsage → dispose → abort 幂等。
+ */
+
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, describe, expect, it } from 'vitest'
+import { InMemoryCredentialStore } from '@earendil-works/pi-ai'
+import { ChatModelManager } from '../../models/manager'
+import type { ChatEvent, ChatRuntimeInfo } from '../../../shared/ipc'
+import { MastraAgentRuntime, type MastraRuntimeDeps } from './runtime'
+
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY
+
+/** 极简目录：两家 provider 各一个模型，凭据不落盘（单测不需要真 key） */
+const STUB_BUILTIN = [
+  {
+    id: 'stub-a',
+    label: 'A',
+    baseUrl: 'https://a.example',
+    api: 'openai-completions' as const,
+    auth: { label: 'A Key', env: 'STUB_A_KEY' },
+    models: [
+      {
+        id: 'a1',
+        label: 'A1',
+        reasoning: false,
+        input: ['text' as const],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 8_192,
+      },
+    ],
+  },
+]
+
+const stubWsDirs: string[] = []
+
+function stubDeps(overrides: Partial<MastraRuntimeDeps> = {}): MastraRuntimeDeps {
+  const manager = new ChatModelManager({
+    credentials: new InMemoryCredentialStore(),
+    builtin: STUB_BUILTIN as never,
+    config: {},
+  })
+  return {
+    broadcast: () => {},
+    currentDir: () => {
+      // LibSQL 真实建库需要存在的目录；每个 stub 会话独立临时工作区
+      const wsDir = mkdtempSync(join(tmpdir(), 'mastra-rt-stub-'))
+      stubWsDirs.push(wsDir)
+      return wsDir
+    },
+    defaultModel: () => undefined,
+    managerForWorkspace: async () => manager,
+    runtimeInfo: async () => ({
+      ok: true as const,
+      value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo,
+    }),
+    ...overrides,
+  }
+}
+
+describe('MastraAgentRuntime 契约（无网络）', () => {
+  afterAll(() => {
+    for (const dir of stubWsDirs) {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // Windows 下 LibSQL 句柄未释放时删除失败；临时目录留给系统清理
+      }
+    }
+  })
+
+  it('未打开工作区：create 拒绝 cwd_rejected；runtime 返回未就绪信息', async () => {
+    const rt = new MastraAgentRuntime(stubDeps({ currentDir: () => null }))
+    const created = await rt.create({ nodeId: 'n1' })
+    expect(created).toMatchObject({ ok: false, code: 'cwd_rejected' })
+    const info = await rt.runtime()
+    expect(info.ok && info.value.ready).toBe(false)
+  })
+
+  it('显式模型不可用 → model_unavailable；合法请求返回 mastra: 会话句柄', async () => {
+    const rt = new MastraAgentRuntime(stubDeps())
+    const bad = await rt.create({ nodeId: 'n1', modelId: 'stub-a/nope' })
+    expect(bad).toMatchObject({ ok: false, code: 'model_unavailable' })
+
+    const good = await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1' })
+    expect(good.ok).toBe(true)
+    if (!good.ok) return
+    expect(good.value.modelId).toBe('stub-a/a1')
+    expect(good.value.sessionFile).toMatch(/^mastra:node-n1$/)
+    expect(good.value.activeTools).toEqual([])
+
+    const dup = await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1' })
+    expect(dup).toMatchObject({ ok: false, code: 'session_exists' })
+  })
+
+  it('旧 JSONL sessionFile / history 被前缀闸门挡下（Phase 5 迁移前不误读）', async () => {
+    const rt = new MastraAgentRuntime(stubDeps())
+    const created = await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1', sessionFile: 'W:\\fake-ws\\.huabu\\sessions\\x.jsonl' })
+    expect(created).toMatchObject({ ok: false, code: 'unknown' })
+    const history = await rt.history({ nodeId: 'n2', sessionFile: 'W:\\x.jsonl' })
+    expect(history).toMatchObject({ ok: false, code: 'unknown' })
+  })
+
+  it('未迁移方法显式失败：steer / compact / fork；prompt 未创建 → session_missing', async () => {
+    const rt = new MastraAgentRuntime(stubDeps())
+    expect(await rt.steer({ nodeId: 'n1', text: 'x' })).toMatchObject({ ok: false, code: 'unknown' })
+    expect(await rt.compact({ nodeId: 'n1' })).toMatchObject({ ok: false, code: 'unknown' })
+    expect(await rt.fork({ nodeId: 'n1', sessionFile: 'mastra:t' })).toMatchObject({ ok: false, code: 'unknown' })
+    expect(await rt.prompt({ nodeId: 'ghost', text: 'hi' })).toMatchObject({ ok: false, code: 'session_missing' })
+  })
+
+  it('setModel / setThinking：非法值拒绝，合法值更新会话', async () => {
+    const rt = new MastraAgentRuntime(stubDeps())
+    await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1' })
+    expect(await rt.setModel({ nodeId: 'n1', modelId: 'stub-a/ghost' })).toMatchObject({ ok: false, code: 'model_unavailable' })
+    const set = await rt.setModel({ nodeId: 'n1', modelId: 'stub-a/a1' })
+    expect(set.ok && set.value.modelId).toBe('stub-a/a1')
+    expect(await rt.setThinking({ nodeId: 'n1', thinkingLevel: 'off' })).toMatchObject({ ok: false, code: 'unknown' })
+    const thinking = await rt.setThinking({ nodeId: 'n1', thinkingLevel: 'high' })
+    expect(thinking.ok && thinking.value.thinkingLevel).toBe('high')
+    const ghost = await rt.setModel({ nodeId: 'ghost', modelId: 'stub-a/a1' })
+    expect(ghost).toMatchObject({ ok: false, code: 'session_missing' })
+  })
+
+  it('abort 空闲会话幂等 ok；ghost 节点 session_missing', async () => {
+    const rt = new MastraAgentRuntime(stubDeps())
+    await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1' })
+    expect(await rt.abort({ nodeId: 'n1' })).toMatchObject({ ok: true })
+    expect(await rt.abort({ nodeId: 'ghost' })).toMatchObject({ ok: false, code: 'session_missing' })
+  })
+})
+
+describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）', () => {
+  const wsDir = mkdtempSync(join(tmpdir(), 'mastra-rt-e2e-'))
+  const events: ChatEvent[] = []
+  let rt: MastraAgentRuntime
+
+  afterAll(() => {
+    try {
+      rmSync(wsDir, { recursive: true, force: true })
+    } catch {
+      // 同上：句柄未释放时的 best-effort 清理
+    }
+  })
+
+  function eventsOf(nodeId: string, type: ChatEvent['type']): ChatEvent[] {
+    return events.filter((e) => e.nodeId === nodeId && e.type === type)
+  }
+
+  async function waitForAgentEnd(nodeId: string, timeoutMs = 120_000): Promise<void> {
+    const start = Date.now()
+    while (!eventsOf(nodeId, 'agent_end').length) {
+      if (Date.now() - start > timeoutMs) throw new Error('等待 agent_end 超时')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  }
+
+  it(
+    'create → prompt → 事件序列 → 记忆连续性 → history → contextUsage → dispose',
+    async () => {
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      rt = new MastraAgentRuntime({
+        broadcast: (e) => events.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({
+          ok: true as const,
+          value: { ready: true, models: [], configuredProviders: ['deepseek'] } satisfies ChatRuntimeInfo,
+        }),
+      })
+
+      const created = await rt.create({ nodeId: 'e2e-1' })
+      expect(created.ok).toBe(true)
+      if (!created.ok) return
+      expect(created.value.sessionFile).toBe('mastra:node-e2e-1')
+
+      // 第一轮
+      const p1 = await rt.prompt({ nodeId: 'e2e-1', text: '我叫小明。请只回复：好的。' })
+      expect(p1.ok).toBe(true)
+      await waitForAgentEnd('e2e-1')
+      const seq = events.filter((e) => e.nodeId === 'e2e-1').map((e) => e.type)
+      expect(seq[0]).toBe('agent_start')
+      expect(seq[1]).toBe('turn_start')
+      expect(seq).toContain('delta')
+      expect(seq).toContain('message')
+      expect(seq.filter((t) => t === 'turn_end').length).toBe(1)
+      const end = eventsOf('e2e-1', 'agent_end')[0] as Extract<ChatEvent, { type: 'agent_end' }>
+      expect(['stop', 'toolUse']).toContain(end.stopReason)
+      expect(end.usage && end.usage.input + end.usage.output).toBeGreaterThan(0)
+
+      // busy 保护：agent_end 已发，prompt 可再进
+      // 第二轮：记忆连续性（thread 历史经网关回放）
+      events.length = 0
+      await rt.prompt({ nodeId: 'e2e-1', text: '我叫什么名字？只回答名字。' })
+      await waitForAgentEnd('e2e-1')
+      const msg = eventsOf('e2e-1', 'message')[0] as Extract<ChatEvent, { type: 'message' }> | undefined
+      const answer = (msg?.message.content ?? []).map((b) => b.text ?? '').join('')
+      expect(answer).toContain('小明')
+
+      // history 回放
+      const history = await rt.history({ nodeId: 'e2e-1', sessionFile: 'mastra:node-e2e-1' })
+      expect(history.ok).toBe(true)
+      if (history.ok) {
+        expect(history.value.messages.length).toBeGreaterThanOrEqual(4)
+        expect(history.value.messages.some((m) => m.role === 'user' && m.text.includes('小明'))).toBe(true)
+        expect(history.value.messages.some((m) => m.role === 'model')).toBe(true)
+      }
+
+      // contextUsage
+      const usage = await rt.contextUsage({ nodeId: 'e2e-1' })
+      expect(usage.ok && usage.value.tokens && usage.value.tokens > 0).toBe(true)
+      expect(usage.ok && usage.value.contextWindow && usage.value.contextWindow > 0).toBe(true)
+
+      // dispose 后 prompt → session_missing
+      expect(await rt.dispose({ nodeId: 'e2e-1' })).toMatchObject({ ok: true })
+      expect(await rt.prompt({ nodeId: 'e2e-1', text: 'x' })).toMatchObject({ ok: false, code: 'session_missing' })
+    },
+    240_000
+  )
+
+  it(
+    '重绑 mastra: 会话恢复历史（create 带已存在的 threadId）',
+    async () => {
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rt2 = new MastraAgentRuntime({
+        broadcast: () => {},
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+      })
+      // 上一用例的 thread（node-e2e-1）落在同一个工作区库里
+      const created = await rt2.create({ nodeId: 'e2e-2', sessionFile: 'mastra:node-e2e-1' })
+      expect(created.ok).toBe(true)
+      events.length = 0
+      const rt3 = new MastraAgentRuntime({
+        broadcast: (e) => events.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+      })
+      // 用 e2e-2（绑定同 thread）继续问，历史应可见
+      await rt3.create({ nodeId: 'e2e-2', sessionFile: 'mastra:node-e2e-1' })
+      await rt3.prompt({ nodeId: 'e2e-2', text: '再报一次我的名字？只回答名字。' })
+      await waitForAgentEnd('e2e-2')
+      const msg = eventsOf('e2e-2', 'message')[0] as Extract<ChatEvent, { type: 'message' }> | undefined
+      const answer = (msg?.message.content ?? []).map((b) => b.text ?? '').join('')
+      expect(answer).toContain('小明')
+      await rt3.dispose({ nodeId: 'e2e-2' })
+    },
+    240_000
+  )
+})
