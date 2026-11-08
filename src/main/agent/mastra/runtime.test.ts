@@ -7,7 +7,7 @@
  *   第二轮记忆连续性 → history 回放 → contextUsage → dispose → abort 幂等。
  */
 
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
@@ -261,6 +261,52 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       const answer = (msg?.message.content ?? []).map((b) => b.text ?? '').join('')
       expect(answer).toContain('小明')
       await rt3.dispose({ nodeId: 'e2e-2' })
+    },
+    240_000
+  )
+
+  it(
+    '回滚演练（数据层）：Mastra 写入不污染 Pi 会话数据——flag 切回 pi 后 JSONL/canvas 原样',
+    async () => {
+      // 预置 Pi 侧数据：一个 JSONL 会话 + canvas.json（内容签名记录）
+      const sessionsDir = join(wsDir, '.huabu', 'sessions')
+      mkdirSync(sessionsDir, { recursive: true })
+      const piSession = join(sessionsDir, 'pi-session.jsonl')
+      writeFileSync(piSession, '{"v":1,"role":"user","text":"pi 数据"}' + String.fromCharCode(10), 'utf8')
+      const canvasFile = join(wsDir, '.huabu', 'canvas.json')
+      writeFileSync(canvasFile, '{"version":1,"nodes":[]}', 'utf8')
+      const canvasBefore = readFileSync(canvasFile, 'utf8')
+      const piBefore = readFileSync(piSession, 'utf8')
+
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rt4 = new MastraAgentRuntime({
+        broadcast: () => {},
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+      })
+      await rt4.create({ nodeId: 'e2e-rollback' })
+      const p = await rt4.prompt({ nodeId: 'e2e-rollback', text: '只回复：好' })
+      expect(p.ok).toBe(true)
+      const start = Date.now()
+      while (Date.now() - start < 120_000) {
+        const usage = await rt4.contextUsage({ nodeId: 'e2e-rollback' })
+        if (usage.ok && usage.value.tokens !== null) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      await rt4.dispose({ nodeId: 'e2e-rollback' })
+
+      // 断言：Pi 的数据字节级未动；sessions 目录没有新增 Mastra 文件；mastra.db 独立存在
+      expect(readFileSync(piSession, 'utf8')).toBe(piBefore)
+      expect(readFileSync(canvasFile, 'utf8')).toBe(canvasBefore)
+      expect(readdirSync(sessionsDir)).toEqual(['pi-session.jsonl'])
+      expect(existsSync(join(wsDir, '.huabu', 'mastra.db'))).toBe(true)
+      // 前缀路由（chat:history 的 mastra: 键）：Mastra 会话历史在 pi flag 语义下仍可回放
+      const history = await rt4.history({ nodeId: 'ghost-after-rollback', sessionFile: 'mastra:node-e2e-rollback' })
+      expect(history.ok).toBe(true)
     },
     240_000
   )

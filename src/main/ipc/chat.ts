@@ -130,11 +130,16 @@ export function registerChatIpc(ctx: IpcContext): void {
   })
 
   ipcMain.handle(IpcChannel.ChatHistory, (_event, payload: unknown) => {
-    // 画布恢复时按文件回放历史；节点可能尚未 create，所以按当前 flag 选运行时
+    // 画布恢复时按文件回放历史；节点可能尚未 create。路由顺序（计划 v1.2 §7.3）：
+    // 已绑定会话 → 按绑定；mastra: 前缀 → Mastra 运行时（前缀即路由键，
+    // flag 切回 pi 后旧 Mastra 会话的历史仍可回放）；其余 → 当前 flag
     const request = payload as { nodeId?: unknown; sessionFile?: unknown } | null
     if (!isNonEmptyString(request?.sessionFile)) return invalidPayload('chat:history 需要 sessionFile')
     const nodeId = isNonEmptyString(request.nodeId) ? request.nodeId : ''
-    return runtimeFor().history({ nodeId, sessionFile: request.sessionFile })
+    const runtime =
+      (nodeId ? sessionRuntimes.get(nodeId) : undefined) ??
+      (request.sessionFile.startsWith('mastra:') ? mastraRuntime : runtimeFor())
+    return runtime.history({ nodeId, sessionFile: request.sessionFile })
   })
 
   ipcMain.handle(IpcChannel.ChatContextUsage, (_event, payload: unknown) => {
