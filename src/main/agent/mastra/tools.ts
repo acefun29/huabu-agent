@@ -34,8 +34,11 @@ interface PiPartialResult {
 export interface AdaptedToolOutput {
   text: string
   isError?: boolean
-  /** 图片元数据降级（vision 通道落地前的诚实形态） */
-  images?: Array<{ mimeType: string; bytes: number }>
+  /**
+   * 图片 part（vision 通道）：base64 原样给模型（V2 tool-result content/media），
+   * 事件层只用 mimeType/bytes 元数据——bytes 绝不进 ChatEvent（计划 §10.2）。
+   */
+  images?: Array<{ mimeType: string; bytes: number; data?: string }>
   details?: unknown
 }
 
@@ -56,6 +59,25 @@ function toMastraTool(tool: ToolDefinitionLike, ctx: ToolBridgeContext) {
     id: tool.name,
     description: description || tool.label || tool.name,
     inputSchema: tool.parameters as Record<string, unknown>,
+    /**
+     * 工具结果 → 模型消息形状（vision 通道）：
+     * 带图片时给 V2 tool-result 的 content/media（图片 base64 进模型），
+     * 纯文本时给 text output（与原行为一致，含 isError 前缀）。
+     */
+    toModelOutput: (output: unknown) => {
+      const out = output as AdaptedToolOutput | undefined
+      const images = (out?.images ?? []).filter((img) => img.data)
+      if (!images.length) {
+        return out?.isError ? { type: 'error-text', value: out.text } : { type: 'text', value: out?.text ?? '' }
+      }
+      const value: Array<{ type: 'text'; text: string } | { type: 'media'; data: string; mediaType: string }> = [
+        { type: 'text', text: out?.text ?? '' },
+      ]
+      for (const img of images) {
+        value.push({ type: 'media', data: img.data!, mediaType: img.mimeType })
+      }
+      return { type: 'content', value }
+    },
     // Mastra 1.82 的 execute 形状：(inputData=校验后的输入, context=执行上下文[toolCallId 等])
     execute: async (inputData: unknown, execContext: unknown) => {
       const params = inputData
@@ -88,11 +110,15 @@ function toMastraTool(tool: ToolDefinitionLike, ctx: ToolBridgeContext) {
           details?: unknown
         } | undefined
         const texts: string[] = []
-        const images: Array<{ mimeType: string; bytes: number }> = []
+        const images: Array<{ mimeType: string; bytes: number; data?: string }> = []
         for (const block of result?.content ?? []) {
           if (block.type === 'text' && block.text) texts.push(block.text)
           else if (block.type === 'image' && block.data) {
-            images.push({ mimeType: block.mimeType ?? 'image/png', bytes: block.data.length })
+            images.push({
+              mimeType: block.mimeType ?? 'image/png',
+              bytes: block.data.length,
+              data: block.data,
+            })
           }
         }
         const output: AdaptedToolOutput = {

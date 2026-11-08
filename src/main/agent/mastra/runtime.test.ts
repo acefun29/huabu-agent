@@ -311,6 +311,68 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
   )
 
   it(
+    'vision：工具返回图片经 toModelOutput content/media 进模型（模型描述图片内容）',
+    async () => {
+      // 8x8 纯红 PNG（大色块，避免 1x1 被模型误读成灰）
+      const RED_PNG_BASE64 =
+        'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC'
+      const visionEvents: ChatEvent[] = []
+      const visionTool = {
+        name: 'look_at_image',
+        label: '看图',
+        description: '读取一张测试图片并把图片内容交给模型。用户要求看图时必须调用本工具。',
+        parameters: { type: 'object', properties: {}, required: [] },
+        execute: async () => ({
+          content: [
+            { type: 'text' as const, text: '图片已读取（8x8 纯色块）' },
+            { type: 'image' as const, data: RED_PNG_BASE64, mimeType: 'image/png' },
+          ],
+          details: { width: 8, height: 8 },
+        }),
+      }
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rtV = new MastraAgentRuntime({
+        broadcast: (e) => visionEvents.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [visionTool as never],
+      })
+      await rtV.create({ nodeId: 'e2e-vision' })
+      // deepseek-flash 目录声明 input 含 image → 网关能力支持 vision
+      const handle = await (await import('./modelGateway')).createModelGateway({
+        registrations: () => manager.registrations(),
+      }).resolve({ providerId: 'deepseek', modelId: 'deepseek-flash' })
+      expect(handle.capabilities.imageInput).toBe(true)
+      const p = await rtV.prompt({
+        nodeId: 'e2e-vision',
+        text: '请调用 look_at_image 看图，然后只回答你看到的主色调是什么颜色（一个词）。',
+      })
+      expect(p.ok).toBe(true)
+      const start = Date.now()
+      while (Date.now() - start < 180_000) {
+        if (visionEvents.some((e) => e.type === 'agent_end')) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      const toolEnd = visionEvents.find((e) => e.type === 'tool_end') as Extract<ChatEvent, { type: 'tool_end' }> | undefined
+      // 事件层：图片不以 base64 进 ChatEvent（计划 §10.2）——resultText 只有文本部分
+      expect(toolEnd?.isError).toBe(false)
+      expect(toolEnd?.resultText).toContain('图片已读取')
+      expect(toolEnd?.resultText).not.toContain(RED_PNG_BASE64.slice(0, 40))
+      // 模型真的「看到」了图：回答包含红色（中文或英文）
+      const msg = visionEvents.find((e) => e.type === 'message') as Extract<ChatEvent, { type: 'message' }> | undefined
+      const answer = (msg?.message.content ?? []).map((b) => b.text ?? '').join(' ')
+      console.log('[debug] vision answer:', answer.slice(0, 120))
+      expect(/红|red/i.test(answer)).toBe(true)
+      await rtV.dispose({ nodeId: 'e2e-vision' })
+    },
+    240_000
+  )
+
+  it(
     'steer：运行中插话经 Mastra signals 投递（deliver 到活跃 run）',
     async () => {
       const stEvents: ChatEvent[] = []

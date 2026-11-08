@@ -97,6 +97,13 @@ export class MastraAgentRuntime implements AgentRuntime {
 
   constructor(private readonly deps: MastraRuntimeDeps) {}
 
+  /** 会话模型是否声明图片输入（read_media/视频工具的视觉闸门，与 Pi 侧同一份目录数据） */
+  sessionSupportsImages(nodeId: string): boolean | undefined {
+    const session = this.sessions.get(nodeId)
+    if (!session) return undefined
+    return session.modelRef.model.input?.includes('image') ?? false
+  }
+
   runtime(): Promise<ChatResult<ChatRuntimeInfo>> {
     const dir = this.deps.currentDir()
     if (!dir) {

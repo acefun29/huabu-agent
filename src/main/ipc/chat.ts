@@ -76,13 +76,14 @@ export function registerChatIpc(ctx: IpcContext): void {
     runtimeInfo: (dir) => host.runtime(dir),
     // 工具装配（Phase 3 迁移面）：复用与 Pi 侧同一批组装函数——媒体三件套 + read_media
     // + 视频两工具 + create_note。差异：不装 MCP（计划 §11.3 迁移期移除）与 blockout
-    // （惰性激活是 pi 会话机制）；vision 通道未接（Phase 0 遗留 #5），图片一律元数据降级
+    // （惰性激活是 pi 会话机制）。vision 已通（toModelOutput content/media）：按会话
+    // 模型目录 input 声明判定（与 Pi 侧同一份数据），模型不支持时工具内自动降级元数据
     assembleTools: async (nodeId) => {
       const { mediaTools, readMediaTool, videoTools } = assembleMediaTools(nodeId, {
         store,
         mediaManager,
         requestApproval: requestMediaApproval,
-        sessionModelSupportsImages: () => false,
+        sessionModelSupportsImages: (nid) => mastraRuntime.sessionSupportsImages(nid),
         currentDir,
         mediaContext,
         inboxRoot
