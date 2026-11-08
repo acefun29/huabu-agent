@@ -107,6 +107,18 @@ function toToolMessage(part: { toolCallId: string; toolName: string; output: unk
   }
 }
 
+/**
+ * 思考档位透传：Mastra Agent 的 providerOptions.hubu.thinkingLevel（自有网关命名空间，
+ * 计划 §7.7——供应商差异在网关内处理，不走 provider 私有 options）
+ */
+function reasoningOf(options: LanguageModelV2CallOptions): { reasoning: string } | Record<string, never> {
+  const huabu = (options.providerOptions as Record<string, unknown> | undefined)?.huabu as
+    | { thinkingLevel?: unknown }
+    | undefined
+  const level = huabu?.thinkingLevel
+  return typeof level === 'string' && level && level !== 'off' ? { reasoning: level } : {}
+}
+
 function safeParseArgs(input: unknown, toolCallId: string): Record<string, unknown> {
   if (typeof input !== 'string') {
     return input && typeof input === 'object' ? (input as Record<string, unknown>) : {}
@@ -145,6 +157,7 @@ export function aiSdkLanguageModel(gateway: ModelGateway, ref: ModelRef): Langua
       ...(tools.length ? { tools } : {}),
       ...(options.maxOutputTokens != null ? { maxOutputTokens: options.maxOutputTokens } : {}),
       ...(options.temperature != null ? { temperature: options.temperature } : {}),
+      ...reasoningOf(options),
     }
   }
 

@@ -126,6 +126,8 @@ describe('MastraAgentRuntime 契约（无网络）', () => {
     expect(await rt.setModel({ nodeId: 'n1', modelId: 'stub-a/ghost' })).toMatchObject({ ok: false, code: 'model_unavailable' })
     const set = await rt.setModel({ nodeId: 'n1', modelId: 'stub-a/a1' })
     expect(set.ok && set.value.modelId).toBe('stub-a/a1')
+    // stub 目录无 thinkingLevelMap → 全六档（不含 off）
+    expect(set.ok && set.value.thinkingLevels).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
     expect(await rt.setThinking({ nodeId: 'n1', thinkingLevel: 'off' })).toMatchObject({ ok: false, code: 'unknown' })
     const thinking = await rt.setThinking({ nodeId: 'n1', thinkingLevel: 'high' })
     expect(thinking.ok && thinking.value.thinkingLevel).toBe('high')
@@ -269,6 +271,41 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       await rt3.dispose({ nodeId: 'e2e-2' })
     },
     240_000
+  )
+
+  it(
+    '思考档位：setThinking(high) 后 thinking 流事件可见（网关 reasoning 通道）',
+    async () => {
+      const thEvents: ChatEvent[] = []
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rtTh = new MastraAgentRuntime({
+        broadcast: (e) => thEvents.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
+      })
+      await rtTh.create({ nodeId: 'e2e-thinking' })
+      expect(await rtTh.setThinking({ nodeId: 'e2e-thinking', thinkingLevel: 'high' })).toMatchObject({ ok: true })
+      const p = await rtTh.prompt({ nodeId: 'e2e-thinking', text: '3.11 和 3.9 哪个大？想清楚再答。' })
+      expect(p.ok).toBe(true)
+      const start = Date.now()
+      while (Date.now() - start < 120_000) {
+        if (thEvents.some((e) => e.type === 'agent_end')) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      // deepseek-flash 目录 thinkingLevelMap 含 high:'high' → 网关带 reasoning=high → thinking 流应出现
+      const thinking = thEvents.filter(
+        (e) => e.type === 'delta' && (e as { stream?: string }).stream === 'thinking'
+      ) as Array<{ delta: string }>
+      expect(thinking.length).toBeGreaterThan(0)
+      expect(thinking.map((d) => d.delta).join('').length).toBeGreaterThan(0)
+      await rtTh.dispose({ nodeId: 'e2e-thinking' })
+    },
+    180_000
   )
 
   it(

@@ -224,6 +224,8 @@ export class MastraAgentRuntime implements AgentRuntime {
       const events = await agent.stream(text, {
         memory: { thread: session.threadId, resource: MEMORY_RESOURCE },
         abortSignal: controller.signal,
+        // 思考档位经自有命名空间透传到网关（languageModel.reasoningOf 读取）
+        providerOptions: { huabu: { thinkingLevel: session.thinkingLevel } },
       })
       for await (const chunk of events.fullStream) {
         switch (chunk.type) {
@@ -389,8 +391,11 @@ export class MastraAgentRuntime implements AgentRuntime {
     if (!ref) return fail('model_unavailable', `模型不可用：${req.modelId}`)
     session.modelRef = ref
     session.contextWindow = ref.model.contextWindow ?? null
-    // 网关通道暂无思考档位控制（Phase 1 遗留）：按目录声明返回，实际注入等 Phase 2
-    return ok({ modelId: req.modelId, thinkingLevel: session.thinkingLevel, thinkingLevels: [] })
+    return ok({
+      modelId: req.modelId,
+      thinkingLevel: session.thinkingLevel,
+      thinkingLevels: thinkingLevelsOf(ref),
+    })
   }
 
   async setThinking(req: ChatSetThinkingRequest): Promise<ChatResult<ChatSetThinkingResult>> {
@@ -406,6 +411,19 @@ export class MastraAgentRuntime implements AgentRuntime {
   steer(_req: ChatSteerRequest): Promise<ChatResult> {
     return Promise.resolve(fail('unknown', 'steer 尚未迁移（Mastra signals 对接为 Phase 1 遗留项）'))
   }
+}
+
+/** 模型可用思考档位（ipc 注释口径：目录映射的非 null 档位；无映射 = 全六档，不含 off） */
+function thinkingLevelsOf(ref: ModelRef): string[] {
+  const map = ref.model.thinkingLevelMap as Record<string, string | null> | undefined
+  const all = THINKING_LEVELS.filter((level) => level !== 'off')
+  if (!map) return [...all]
+  const supported = new Set(
+    Object.entries(map)
+      .filter(([, value]) => value !== null)
+      .map(([level]) => level)
+  )
+  return all.filter((level) => supported.has(level))
 }
 
 /** 只放可结构化克隆的纯数据（ChatToolArgs 契约） */

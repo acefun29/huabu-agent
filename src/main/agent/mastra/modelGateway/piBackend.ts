@@ -27,6 +27,9 @@ type PiStreamFn = (
   options?: Record<string, unknown>
 ) => AsyncIterable<PiEvent>
 
+/** pi-ai compat 的 streamSimple（SimpleStreamOptions：多出 reasoning/toolChoice 等简单档位） */
+type PiStreamSimpleFn = PiStreamFn
+
 type PiEvent =
   | { type: 'start' }
   | { type: 'text_start' }
@@ -45,6 +48,16 @@ interface PiUsage {
   input: number
   output: number
   totalTokens?: number
+}
+
+/** 历史重放的 assistant 消息占位用量（结构完整，数值为零） */
+const ZERO_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 }
 
 export interface PiGatewayOptions {
@@ -69,7 +82,7 @@ interface ResolvedModel {
 export class PiModelGateway {
   private readonly options: PiGatewayOptions
   private readonly aborts = new Map<string, AbortController>()
-  private piStream: PiStreamFn | null = null
+  private piStream: PiStreamSimpleFn | null = null
 
   constructor(options: PiGatewayOptions) {
     this.options = options
@@ -135,8 +148,8 @@ export class PiModelGateway {
   async *stream(req: ModelRequest, signal: AbortSignal): AsyncIterable<ModelStreamPart> {
     const resolved = await this.resolveModel(req.ref)
     if (!this.piStream) {
-      const compat = (await import('@earendil-works/pi-ai/compat')) as { stream: PiStreamFn }
-      this.piStream = compat.stream
+      const compat = (await import('@earendil-works/pi-ai/compat')) as { streamSimple: PiStreamSimpleFn }
+      this.piStream = compat.streamSimple
     }
 
     // 网关侧 abort 控制：外部 signal 与 gateway.abort(runId) 都能终止底层请求
@@ -145,7 +158,7 @@ export class PiModelGateway {
     const forward = () => controller.abort()
     signal.addEventListener('abort', forward)
     try {
-      const context = this.toContext(req)
+      const context = this.toContext(req, resolved)
       const bearer = this.options.authStyle?.[resolved.providerId] === 'bearer' && resolved.apiKey
       const events = this.piStream(resolved.model, context, {
         ...(bearer
@@ -156,6 +169,8 @@ export class PiModelGateway {
         signal: controller.signal,
         ...(req.maxOutputTokens != null ? { maxTokens: req.maxOutputTokens } : {}),
         ...(req.temperature != null ? { temperature: req.temperature } : {}),
+        // 思考档位：pi 按模型 thinkingLevelMap 映射到供应商字段（目录数据随 Model 带入）
+        ...(req.reasoning ? { reasoning: req.reasoning } : {}),
       })
       for await (const ev of events) {
         for (const part of this.translate(ev)) {
@@ -178,10 +193,11 @@ export class PiModelGateway {
   }
 
   /** GatewayMessage[] → pi-ai Context（system 合并成单条 systemPrompt） */
-  private toContext(req: ModelRequest): Context {
+  private toContext(req: ModelRequest, resolved: ResolvedModel): Context {
     const systems: string[] = []
     const messages: unknown[] = []
     const timestamp = Date.now()
+    const piModelApi = (resolved.model as { api?: string }).api ?? 'openai-completions'
     for (const msg of req.messages) {
       if (msg.role === 'system') {
         systems.push(msg.content)
@@ -192,8 +208,14 @@ export class PiModelGateway {
         continue
       }
       if (msg.role === 'assistant') {
+        // pi AssistantMessage 的必需字段要补全：历史消息缺 usage 时 convertMessages
+        // 读 usage.totalTokens 会崩（streamSimple 路径实测）；网关重放的历史不带真实
+        // 用量，用零值占位——真实用量只从当轮 done 事件取
         messages.push({
           role: 'assistant',
+          api: piModelApi,
+          provider: resolved.providerId,
+          model: resolved.model.id,
           content: msg.content.map((part) => {
             if (part.type === 'text') return { type: 'text', text: part.text }
             if (part.type === 'thinking') return { type: 'thinking', thinking: part.text }
@@ -204,6 +226,8 @@ export class PiModelGateway {
               arguments: part.args,
             }
           }),
+          usage: ZERO_USAGE,
+          stopReason: 'stop',
           timestamp,
         })
         continue

@@ -52,6 +52,8 @@ export interface ModelRequest {
   tools?: GatewayToolDef[]
   maxOutputTokens?: number
   temperature?: number
+  /** 思考档位（pi ThinkingLevel：minimal..max，不含 off）；缺省 = 供应商默认 */
+  reasoning?: string
 }
 
 export type GatewayFinishReason = 'stop' | 'tool-calls' | 'length' | 'abort' | 'error' | 'other'
