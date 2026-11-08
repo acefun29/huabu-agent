@@ -1,0 +1,189 @@
+import type { Agent, AgentMemoryOption } from '@mastra/core/agent';
+import { coreFeatures } from '@mastra/core/features';
+import type { ObservabilityContext } from '@mastra/core/observability';
+import type { RequestContext } from '@mastra/core/request-context';
+import { z } from 'zod';
+
+import type { Extractor, ExtractorSource } from './extractor';
+import { buildExtractorPriorLines } from './extractor';
+import { hasAbortInChain, isTransientLLMError, RETRY_CONFIG, withRetry } from './retry';
+import type { OnAttemptActivity } from './retry';
+
+export interface StructuredExtractionResult {
+  values: Record<string, unknown>;
+  failures: Array<{ slug: string; error: string }>;
+}
+
+function isAbortError(error: unknown, abortSignal?: AbortSignal): boolean {
+  // Chain-aware so a cancellation wrapped by the provider SDK still rethrows
+  // instead of degrading into the json-prompt-injection fallback.
+  return abortSignal?.aborted === true || hasAbortInChain(error);
+}
+
+function hasEmptyObjectValue(object: Record<string, unknown>, extractor: Extractor<any>): boolean {
+  const value = object[extractor.slug];
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length === 0;
+}
+
+function shouldRetryEmptyStructuredObject(
+  object: Record<string, unknown>,
+  extractors: readonly Extractor<any>[],
+): boolean {
+  return extractors.some(
+    extractor =>
+      extractor.retryStructuredExtractionOnEmptyObject &&
+      (Object.keys(object).length === 0 || hasEmptyObjectValue(object, extractor)),
+  );
+}
+
+export async function extractStructuredValues(opts: {
+  agent: Agent<any, any, any, any>;
+  source: ExtractorSource;
+  extractors?: readonly Extractor<any>[];
+  memory?: AgentMemoryOption;
+  priorExtractedValues?: Record<string, unknown>;
+  requestContext?: RequestContext;
+  observabilityContext?: ObservabilityContext;
+  abortSignal?: AbortSignal;
+}): Promise<StructuredExtractionResult> {
+  const structuredExtractors = (opts.extractors ?? []).filter(extractor => extractor.mode === 'structured');
+  if (structuredExtractors.length === 0) {
+    return { values: {}, failures: [] };
+  }
+
+  const schema = z.object(
+    Object.fromEntries(structuredExtractors.map(extractor => [extractor.slug, extractor.schema.optional()])) as Record<
+      string,
+      z.ZodTypeAny
+    >,
+  );
+  const priorLines = buildExtractorPriorLines(structuredExtractors, opts.priorExtractedValues);
+  const extractorInstructions = structuredExtractors
+    .map(extractor => `- ${extractor.slug}: ${extractor.instructions}`)
+    .join('\n');
+  const subject = opts.source === 'reflector' ? 'reflection' : 'observations';
+  const prompt = `Extract structured data from the ${subject} you made.
+
+Return only the configured structured output object. Do not write observations, XML, markdown, or explanatory text.
+Omit any property that is not supported by the ${subject} you made and the conversation context.
+If a prior value is still applicable and carry-forward is enabled, return that prior value.
+
+## Extractors
+
+${extractorInstructions}${priorLines.length > 0 ? `\n\n## Prior Extracted Values\n\n${priorLines.join('\n\n')}` : ''}`;
+
+  const values: Record<string, unknown> = {};
+  const failures: Array<{ slug: string; error: string }> = [];
+
+  const streamWithStructuredOutput = async (jsonPromptInjection?: boolean | 'system' | 'inline') =>
+    // OM agents pin model-level `maxRetries: 0`. Extraction failures are tolerated
+    // (returned as `failures`), so use a small fixed budget rather than the
+    // Observer/Reflector `maxRetries`, which only governs the stage's model call.
+    withRetry((attemptSignal, onActivity) => streamOnce(jsonPromptInjection, attemptSignal, onActivity), {
+      label: `om-${opts.source}-structured-extraction`,
+      abortSignal: opts.abortSignal,
+      maxRetries: 1,
+      idleTimeoutMs: RETRY_CONFIG.modelCallIdleTimeoutMs,
+    });
+
+  const streamOnce = async (
+    jsonPromptInjection: boolean | 'system' | 'inline' | undefined,
+    abortSignal: AbortSignal,
+    onActivity: OnAttemptActivity,
+  ) => {
+    const output = await opts.agent.stream(prompt, {
+      structuredOutput: { schema, ...(jsonPromptInjection ? { jsonPromptInjection } : {}) },
+      ...(opts.memory ? { memory: opts.memory } : {}),
+      abortSignal,
+      onChunk: onActivity,
+      ...(opts.requestContext ? { requestContext: opts.requestContext } : {}),
+      ...opts.observabilityContext,
+    });
+    const object = await output.object;
+
+    if (object === undefined) {
+      throw new Error('structuredOutput object is undefined');
+    }
+
+    return object;
+  };
+
+  let object: Record<string, unknown>;
+  let retryEmptyObject = false;
+  try {
+    object = await streamWithStructuredOutput();
+    retryEmptyObject = shouldRetryEmptyStructuredObject(object, structuredExtractors);
+  } catch (error) {
+    if (isAbortError(error, opts.abortSignal)) {
+      throw error;
+    }
+
+    // The retry ladder already exhausted transient failures; the JSON-prompt
+    // fallback only helps providers that reject native structured output.
+    if (isTransientLLMError(error)) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        values,
+        failures: structuredExtractors.map(extractor => ({ slug: extractor.slug, error: message })),
+      };
+    }
+
+    try {
+      const fallbackJsonPromptInjection = coreFeatures.has('json-prompt-injection:inline') ? 'inline' : true;
+      object = await streamWithStructuredOutput(fallbackJsonPromptInjection);
+    } catch (fallbackError) {
+      if (isAbortError(fallbackError, opts.abortSignal)) {
+        throw fallbackError;
+      }
+
+      const message = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      return {
+        values,
+        failures: structuredExtractors.map(extractor => ({ slug: extractor.slug, error: message })),
+      };
+    }
+  }
+
+  if (retryEmptyObject) {
+    try {
+      const fallbackJsonPromptInjection = coreFeatures.has('json-prompt-injection:inline') ? 'inline' : true;
+      // Retry values win, but keep first-response values the retry omitted.
+      object = { ...object, ...(await streamWithStructuredOutput(fallbackJsonPromptInjection)) };
+    } catch (fallbackError) {
+      if (isAbortError(fallbackError, opts.abortSignal)) {
+        throw fallbackError;
+      }
+
+      const message = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      if (Object.keys(object).length === 0) {
+        return {
+          values,
+          failures: structuredExtractors.map(extractor => ({ slug: extractor.slug, error: message })),
+        };
+      }
+
+      // Keep the first response's other values; only the extractors that came back empty failed.
+      for (const extractor of structuredExtractors) {
+        if (extractor.retryStructuredExtractionOnEmptyObject && hasEmptyObjectValue(object, extractor)) {
+          failures.push({ slug: extractor.slug, error: message });
+          delete object[extractor.slug];
+        }
+      }
+    }
+  }
+
+  for (const extractor of structuredExtractors) {
+    const value = object[extractor.slug];
+    if (value === undefined || value === null || value === '') {
+      continue;
+    }
+    const parsed = extractor.schema.safeParse(value);
+    if (parsed.success) {
+      values[extractor.slug] = parsed.data;
+    } else {
+      failures.push({ slug: extractor.slug, error: parsed.error.message });
+    }
+  }
+
+  return { values, failures };
+}

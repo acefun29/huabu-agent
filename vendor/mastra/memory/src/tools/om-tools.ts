@@ -1,0 +1,2192 @@
+import type { MastraDBMessage } from '@mastra/core/agent';
+import type { MemoryConfigInternal } from '@mastra/core/memory';
+import { createTool } from '@mastra/core/tools';
+import type { JSONSchema7 } from 'json-schema';
+import { estimateTokenCount } from 'tokenx';
+
+import {
+  addRelativeTimeToObservations,
+  formatRelativeTime,
+  resolveTimeZone,
+} from '../processors/observational-memory/date-utils';
+import { getBufferedChunks } from '../processors/observational-memory/message-utils';
+import { parseObservationGroups } from '../processors/observational-memory/observation-groups';
+import { safeSlice } from '../processors/observational-memory/string-utils';
+import { decodeImageBuffer, isHttpUrlString } from '../processors/observational-memory/token-counter';
+import {
+  formatToolResultForObserver,
+  resolveToolResultValue,
+  truncateStringByTokens,
+} from '../processors/observational-memory/tool-result-helpers';
+import { groupCursor, pageObservationGroups, pagingCall, parseGroupCursor } from './om-observations';
+import type { OMTimelineEngine } from './om-observations';
+import { getVisibleSearchExcerpts, searchContextKey, sourceRangeOverlapsContext } from './om-search-context';
+
+export type RecallDetail = 'low' | 'high';
+
+function getMessageParts(msg: MastraDBMessage): any[] {
+  if (typeof msg.content === 'string') return [];
+  if (Array.isArray(msg.content)) return msg.content;
+  const parts = msg.content?.parts;
+  return Array.isArray(parts) ? parts : [];
+}
+
+/**
+ * Returns true if recall can render at least one visible part of a message.
+ * Mirrors the skip rules in `formatMessageParts` without formatting tool results.
+ */
+export function hasVisibleParts(msg: MastraDBMessage): boolean {
+  if (typeof msg.content === 'string') return true;
+  const parts = getMessageParts(msg);
+  if (parts.length === 0) return Boolean(msg.content?.content);
+  return parts.some(isVisiblePart);
+}
+
+function isVisiblePart(part: any): boolean {
+  const partType: string | undefined = part?.type;
+  switch (partType) {
+    case undefined:
+    case '':
+    case 'reasoning':
+    case 'redacted-reasoning':
+    case 'step-start':
+      return false;
+    case 'text':
+      return Boolean(part.text);
+    case 'tool-invocation': {
+      const inv = part.toolInvocation;
+      if (!inv?.toolName) return false;
+      return (inv.state !== 'partial-call' && inv.args != null) || inv.state === 'result';
+    }
+    case 'tool-call':
+    case 'tool-result':
+      return Boolean(part.toolName);
+    default:
+      return !partType.startsWith('data-');
+  }
+}
+
+type RecallThread = {
+  id: string;
+  title?: string;
+  resourceId: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type RecallSearchResult = {
+  threadId: string;
+  score: number;
+  groupId?: string;
+  recordId?: string;
+  range?: string;
+  text?: string;
+  observedAt?: Date;
+};
+
+export type RecallMemory = {
+  getMemoryStore: () => Promise<{
+    listMessagesById: (args: { messageIds: string[] }) => Promise<{ messages: MastraDBMessage[] }>;
+  }>;
+  recall: (args: {
+    threadId: string;
+    resourceId?: string;
+    page: number;
+    perPage: number | false;
+    orderBy?: { field: 'createdAt'; direction: 'ASC' | 'DESC' };
+    filter?: {
+      dateRange?: {
+        start?: Date;
+        end?: Date;
+        startExclusive?: boolean;
+        endExclusive?: boolean;
+      };
+    };
+  }) => Promise<{
+    messages: MastraDBMessage[];
+    total: number;
+    page: number;
+    perPage: number | false;
+    hasMore: boolean;
+  }>;
+  listThreads: (args: {
+    perPage?: number | false;
+    page?: number;
+    orderBy?: { field: string; direction: 'ASC' | 'DESC' };
+    filter?: { resourceId?: string; metadata?: Record<string, unknown> };
+  }) => Promise<{ threads: RecallThread[]; total: number; hasMore: boolean; page: number }>;
+  searchMessages?: (args: {
+    query: string;
+    resourceId: string;
+    topK?: number;
+    filter?: {
+      threadId?: string;
+      observedAfter?: Date;
+      observedBefore?: Date;
+    };
+  }) => Promise<{ results: RecallSearchResult[] }>;
+  getThreadById?: (args: { threadId: string }) => Promise<RecallThread | null>;
+};
+
+function parseRangeFormat(cursor: string): { startId: string; endId: string } | null {
+  // Comma-separated merged ranges: "id1:id2,id3:id4"
+  if (cursor.includes(',')) {
+    const parts = cursor
+      .split(',')
+      .map(p => p.trim())
+      .filter(Boolean);
+    if (parts.length >= 1) {
+      const first = parts[0]!;
+      const last = parts[parts.length - 1]!;
+      const firstColon = first.indexOf(':');
+      const lastColon = last.indexOf(':');
+      return {
+        startId: firstColon > 0 ? first.slice(0, firstColon) : first,
+        endId: lastColon > 0 ? last.slice(lastColon + 1) : last,
+      };
+    }
+  }
+
+  // Colon-delimited range: "startId:endId"
+  const colonIndex = cursor.indexOf(':');
+  if (colonIndex > 0 && colonIndex < cursor.length - 1) {
+    return { startId: cursor.slice(0, colonIndex), endId: cursor.slice(colonIndex + 1) };
+  }
+
+  return null;
+}
+
+async function resolveCursorMessage(
+  memory: RecallMemory,
+  cursor: string,
+  access?: { resourceId?: string; threadScope?: string; enforceThreadScope?: boolean },
+): Promise<MastraDBMessage | { hint: string; startId: string; endId: string }> {
+  const normalized = cursor.trim();
+
+  if (!normalized) {
+    throw new Error('Cursor is required');
+  }
+
+  const rangeIds = parseRangeFormat(normalized);
+  if (rangeIds) {
+    return {
+      hint: `The cursor "${cursor}" looks like a range. Use one of the individual message IDs as the cursor instead: start="${rangeIds.startId}" or end="${rangeIds.endId}".`,
+      ...rangeIds,
+    };
+  }
+
+  const memoryStore = await memory.getMemoryStore();
+  const result = await memoryStore.listMessagesById({ messageIds: [normalized] });
+  let message = result.messages.find(message => message.id === normalized) ?? null;
+
+  if (!message) {
+    message = await resolveCursorMessageByRecall(memory, normalized, access);
+  }
+
+  if (!message) {
+    throw new Error(`Could not resolve cursor message: ${cursor}`);
+  }
+
+  // Verify the cursor message belongs to the current resource
+  if (access?.resourceId && message.resourceId !== access.resourceId) {
+    throw new Error(`Could not resolve cursor message: ${cursor}`);
+  }
+
+  // In strict thread scope, verify the cursor belongs to the current thread
+  if (access?.enforceThreadScope && access.threadScope && message.threadId !== access.threadScope) {
+    throw new Error(`Could not resolve cursor message: ${cursor}`);
+  }
+
+  return message;
+}
+
+async function resolveCursorMessageByRecall(
+  memory: RecallMemory,
+  cursor: string,
+  access?: { resourceId?: string; threadScope?: string; enforceThreadScope?: boolean },
+): Promise<MastraDBMessage | null> {
+  if (access?.enforceThreadScope && access.threadScope) {
+    const result = await memory.recall({
+      threadId: access.threadScope,
+      resourceId: access.resourceId,
+      page: 0,
+      perPage: false,
+    });
+
+    return result.messages.find(message => message.id === cursor) ?? null;
+  }
+
+  if (!access?.resourceId) {
+    return null;
+  }
+
+  const threads = await memory.listThreads({
+    page: 0,
+    perPage: 100,
+    orderBy: { field: 'updatedAt', direction: 'DESC' },
+    filter: { resourceId: access.resourceId },
+  });
+
+  for (const thread of threads.threads) {
+    const result = await memory.recall({
+      threadId: thread.id,
+      resourceId: access.resourceId,
+      page: 0,
+      perPage: false,
+    });
+    const message = result.messages.find(message => message.id === cursor);
+    if (message) {
+      return message;
+    }
+  }
+
+  return null;
+}
+
+// ── Thread listing ──────────────────────────────────────────────────
+
+export async function listThreadsForResource({
+  memory,
+  resourceId,
+  currentThreadId,
+  page = 0,
+  limit = 20,
+  before,
+  after,
+}: {
+  memory: RecallMemory;
+  resourceId: string;
+  currentThreadId: string;
+  page?: number;
+  limit?: number;
+  before?: string;
+  after?: string;
+}): Promise<{
+  threads: string;
+  count: number;
+  page: number;
+  hasMore: boolean;
+}> {
+  if (!resourceId) {
+    throw new Error('Resource ID is required to list threads');
+  }
+
+  const MAX_LIMIT = 50;
+  const normalizedLimit = Math.min(Math.max(limit, 1), MAX_LIMIT);
+
+  const hasDateFilter = !!(before || after);
+  const beforeDate = before ? new Date(before) : null;
+  const afterDate = after ? new Date(after) : null;
+
+  // When date filtering, fetch all threads and filter client-side
+  // (storage layer doesn't support date range on threads)
+  const result = await memory.listThreads({
+    filter: { resourceId },
+    page: hasDateFilter ? 0 : page,
+    perPage: hasDateFilter ? false : normalizedLimit,
+    orderBy: { field: 'updatedAt', direction: 'DESC' },
+  });
+
+  let threads = result.threads;
+
+  if (beforeDate) {
+    threads = threads.filter(t => t.createdAt < beforeDate);
+  }
+  if (afterDate) {
+    threads = threads.filter(t => t.createdAt > afterDate);
+  }
+
+  // Apply client-side pagination when date-filtered
+  let hasMore: boolean;
+  if (hasDateFilter) {
+    const offset = page * normalizedLimit;
+    hasMore = offset + normalizedLimit < threads.length;
+    threads = threads.slice(offset, offset + normalizedLimit);
+  } else {
+    hasMore = result.hasMore;
+  }
+
+  if (threads.length === 0) {
+    return {
+      threads: 'No threads found matching the criteria.',
+      count: 0,
+      page,
+      hasMore: false,
+    };
+  }
+
+  const lines: string[] = [];
+  for (const thread of threads) {
+    const isCurrent = thread.id === currentThreadId;
+    const title = thread.title || '(untitled)';
+    const updated = formatTimestamp(thread.updatedAt);
+    const created = formatTimestamp(thread.createdAt);
+    const marker = isCurrent ? ' ← current' : '';
+    lines.push(`- **${title}**${marker}`);
+    lines.push(`  id: ${thread.id}`);
+    lines.push(`  updated: ${updated} | created: ${created}`);
+  }
+
+  return {
+    threads: lines.join('\n'),
+    count: threads.length,
+    page,
+    hasMore,
+  };
+}
+
+// ── Cross-thread search ─────────────────────────────────────────────
+
+export const SEARCH_NOT_CONFIGURED_MESSAGE =
+  'Search is not configured. Enable it with `retrieval: { vector: true }` and configure a vector store and an embedder, or a vector store that generates embeddings itself, on your Memory instance.';
+
+export async function searchMessagesForResource({
+  memory,
+  om,
+  resourceId,
+  currentThreadId,
+  query,
+  topK = 10,
+  maxTokens = DEFAULT_MAX_RESULT_TOKENS,
+  before,
+  after,
+  threadScope,
+  includeThreadId = true,
+  currentMessages = [],
+}: {
+  memory: RecallMemory;
+  om?: OMTimelineEngine | null;
+  resourceId: string;
+  currentThreadId?: string;
+  query: string;
+  topK?: number;
+  maxTokens?: number;
+  before?: string;
+  after?: string;
+  /** When set, restrict search results to only this thread */
+  threadScope?: string;
+  /** Whether paging calls name the thread; thread-scope retrieval can only page its own thread. */
+  includeThreadId?: boolean;
+  /** Current conversation at tool execution time, not an ever-seen history. */
+  currentMessages?: readonly MastraDBMessage[];
+}): Promise<{
+  results: string;
+  count: number;
+}> {
+  if (!memory.searchMessages) {
+    return {
+      results: SEARCH_NOT_CONFIGURED_MESSAGE,
+      count: 0,
+    };
+  }
+
+  const MAX_TOPK = 20;
+  const clampedTopK = Math.min(Math.max(topK, 1), MAX_TOPK);
+  const effectiveTopK = threadScope || before || after ? Math.max(clampedTopK * 3, clampedTopK + 10) : clampedTopK;
+  const searchTopK = Math.min(MAX_TOPK, effectiveTopK);
+
+  const beforeDate = before ? new Date(before) : undefined;
+  const afterDate = after ? new Date(after) : undefined;
+
+  const filter = {
+    ...(threadScope ? { threadId: threadScope } : {}),
+    ...(afterDate ? { observedAfter: afterDate } : {}),
+    ...(beforeDate ? { observedBefore: beforeDate } : {}),
+  };
+  const { results } = await memory.searchMessages({ query, resourceId, topK: searchTopK, filter });
+
+  if (results.length === 0) {
+    return {
+      results: 'No matching messages found.',
+      count: 0,
+    };
+  }
+
+  const threadIds = [...new Set(results.map(r => r.threadId))];
+  const threadMap = new Map<string, RecallThread>();
+  if (memory.getThreadById) {
+    await Promise.all(
+      threadIds.map(async id => {
+        const thread = await memory.getThreadById!({ threadId: id });
+        if (thread) threadMap.set(id, thread);
+      }),
+    );
+  }
+
+  const matchesFilter = (match: RecallSearchResult) => {
+    if (threadScope && match.threadId !== threadScope) return false;
+    if (beforeDate && match.observedAt && match.observedAt >= beforeDate) return false;
+    if (afterDate && match.observedAt && match.observedAt <= afterDate) return false;
+    return true;
+  };
+  const filteredMatches = results.filter(matchesFilter);
+
+  if (filteredMatches.length === 0) {
+    return { results: 'No matching messages found.', count: 0 };
+  }
+
+  const limitedMatches = filteredMatches.slice(0, clampedTopK);
+  const contentBudget = Math.max(0, Math.floor(maxTokens));
+  const perGroupBudget = Math.floor(contentBudget / limitedMatches.length);
+  const now = new Date();
+  const terms = excerptQueryTerms(query);
+  const setExcerpt = (entry: { body: string; excerpt: string; excerptContent: string }, budget: number) => {
+    const selected = selectSearchExcerpt(entry.body, terms, budget);
+    entry.excerpt = selected.text;
+    entry.excerptContent = selected.content;
+  };
+
+  // One history read per search: the current record supplies the user's timezone and
+  // the groups already in context. Hits are not resolved to their own generations.
+  const [currentRecord] = om && currentThreadId ? await om.getHistory(currentThreadId, resourceId, 1) : [];
+  const timeZone = resolveTimeZone(currentRecord?.observedTimezone ?? undefined);
+
+  // Reserve an excerpt for every hit before distributing spare space in similarity order.
+  // Metadata and navigation do not consume the observation-text allowance.
+  const prepareEntry = (match: RecallSearchResult, index: number, budget: number) => {
+    const rawBody = (match.text || '').trim() || '_Observation text unavailable._';
+    const body = match.groupId ? addRelativeTimeToObservations(rawBody, now, timeZone) : rawBody;
+    const entry = { match, index, body, excerpt: '', excerptContent: '', suppression: '' };
+    setExcerpt(entry, budget);
+    return entry;
+  };
+  const ordered = limitedMatches.map((match, index) => prepareEntry(match, index, perGroupBudget));
+  let remaining = contentBudget - ordered.reduce((sum, entry) => sum + estimateTokenCount(entry.excerpt), 0);
+  for (const entry of ordered) {
+    if (remaining <= 0) break;
+    if (entry.excerpt === entry.body) continue;
+    const previousTokens = estimateTokenCount(entry.excerpt);
+    setExcerpt(entry, previousTokens + remaining);
+    remaining -= estimateTokenCount(entry.excerpt) - previousTokens;
+  }
+
+  const visibleExcerpts = getVisibleSearchExcerpts(currentMessages);
+  // Groups in the current record are already in context: active ones as observations,
+  // unactivated buffered ones as their raw messages. Reflected-away groups are not.
+  const contextGroupIds = new Set<string>();
+  for (const observations of [
+    currentRecord?.activeObservations ?? '',
+    ...getBufferedChunks(currentRecord).map(chunk => chunk.observations),
+  ]) {
+    for (const group of parseObservationGroups(observations)) contextGroupIds.add(group.id);
+  }
+  const suppressCoveredEntry = (entry: (typeof ordered)[number]) => {
+    if (!entry.match.groupId) return;
+    if (
+      entry.excerptContent &&
+      visibleExcerpts.get(searchContextKey(entry.match))?.some(text => text.includes(entry.excerptContent))
+    ) {
+      entry.suppression = 'Excerpt already in current context.';
+    } else if (contextGroupIds.has(entry.match.groupId)) {
+      entry.suppression = 'Group already in current context.';
+    } else if (sourceRangeOverlapsContext({ match: entry.match, messages: currentMessages })) {
+      entry.suppression = 'Source range overlaps current context.';
+    }
+    if (entry.suppression) {
+      entry.excerpt = '';
+      entry.excerptContent = '';
+    }
+  };
+  ordered.forEach(suppressCoveredEntry);
+
+  let freshCount = ordered.filter(entry => !entry.suppression).length;
+  if (freshCount < ordered.length && contentBudget > 0) {
+    // Reserve space for the requested fresh-hit count before filling empty slots.
+    // An initial pool shortened by vector-group deduplication may have spent it all.
+    const backfillBudget = Math.floor(contentBudget / clampedTopK);
+    for (const entry of ordered) {
+      if (entry.suppression) continue;
+      setExcerpt(entry, backfillBudget);
+      suppressCoveredEntry(entry);
+    }
+    freshCount = ordered.filter(entry => !entry.suppression).length;
+    // At most one deeper query, independent of thread/date overfetch. Vector chunks
+    // may collapse into fewer groups, so a short first result is not exhaustion.
+    const candidateLimit = Math.max(searchTopK, Math.min(100, clampedTopK * 5));
+    const candidateKey = (match: RecallSearchResult) =>
+      match.groupId ? searchContextKey(match) : JSON.stringify([match.threadId, match.range, match.text]);
+    const seen = new Set(ordered.map(entry => candidateKey(entry.match)));
+    const addCandidates = async (candidates: RecallSearchResult[]) => {
+      for (const match of candidates.slice(0, candidateLimit)) {
+        if (freshCount >= clampedTopK || seen.size >= candidateLimit) break;
+        if (!matchesFilter(match)) continue;
+        const key = candidateKey(match);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (!threadMap.has(match.threadId) && memory.getThreadById) {
+          const thread = await memory.getThreadById({ threadId: match.threadId });
+          if (thread) threadMap.set(match.threadId, thread);
+        }
+        const entry = prepareEntry(match, ordered.length, backfillBudget);
+        suppressCoveredEntry(entry);
+        ordered.push(entry);
+        if (!entry.suppression) freshCount++;
+      }
+    };
+    await addCandidates(filteredMatches.slice(limitedMatches.length));
+    if (freshCount < clampedTopK && seen.size < candidateLimit && searchTopK < candidateLimit) {
+      const deeper = await memory.searchMessages({ query, resourceId, topK: candidateLimit, filter });
+      await addCandidates(deeper.results);
+    }
+  }
+
+  // Reuse the space from compact references without making a previously covered excerpt longer.
+  remaining = contentBudget - ordered.reduce((sum, entry) => sum + estimateTokenCount(entry.excerpt), 0);
+  for (const entry of ordered) {
+    if (remaining <= 0) break;
+    if (entry.suppression || entry.excerpt === entry.body) continue;
+    const previousTokens = estimateTokenCount(entry.excerpt);
+    setExcerpt(entry, previousTokens + remaining);
+    remaining -= estimateTokenCount(entry.excerpt) - previousTokens;
+  }
+
+  // Chronology controls presentation, not which hits get the available text budget.
+  ordered.sort((a, b) => {
+    const at = a.match.observedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+    const bt = b.match.observedAt?.getTime() ?? Number.POSITIVE_INFINITY;
+    if (at !== bt) return at < bt ? -1 : 1;
+    if (a.match.threadId !== b.match.threadId) return a.match.threadId.localeCompare(b.match.threadId);
+    return a.index - b.index;
+  });
+
+  const sections: string[] = [];
+  const compactCount = ordered.length - freshCount;
+  if (compactCount > 0) {
+    sections.push(
+      `Showing ${freshCount} excerpts and ${compactCount} already-in-context references.` +
+        (freshCount < clampedTopK ? ' Backfill is bounded; fewer excerpts do not mean history is exhausted.' : ''),
+    );
+  }
+  for (let i = 0; i < ordered.length; i++) {
+    const { match, body, excerpt, suppression } = ordered[i]!;
+    const thread = threadMap.get(match.threadId);
+    const title = thread?.title || '(untitled)';
+    const isCurrentThread = match.threadId === currentThreadId;
+    const generationLabel = isCurrentThread ? 'Current thread memory' : 'Memory from another thread';
+    const generationDetail = isCurrentThread
+      ? 'This result came from the current thread.'
+      : 'This result came from another thread.';
+    const threadLine = `- thread: ${match.threadId}${thread ? ` (${title})` : ''}`;
+    const observedLine = match.observedAt
+      ? `- observed: ${formatTimestamp(match.observedAt)} (${formatRelativeTime(match.observedAt, now, timeZone)})`
+      : undefined;
+    const sourceLine = match.range
+      ? `- source: raw messages from ID ${match.range.split(':')[0] ?? '(unknown)'} through ID ${match.range.split(':')[1] ?? '(unknown)'}`
+      : '- source: raw message range unavailable';
+    const groupLine = match.groupId ? `- observation group: ${groupCursor(match.groupId, match.recordId)}` : undefined;
+    const scoreLine = `- score: ${match.score.toFixed(2)}`;
+
+    const prev = i > 0 ? ordered[i - 1]!.match : undefined;
+    if (om && prev?.groupId && match.groupId && prev.threadId === match.threadId) {
+      sections.push(
+        `— Observation groups may be hidden between these results; continue with ${pagingCall(prev.groupId, 'after', includeThreadId ? prev.threadId : undefined, prev.recordId)} —`,
+      );
+    }
+
+    if (suppression) {
+      sections.push(`${groupLine}\n  thread: ${match.threadId}; ${suppression}`);
+      continue;
+    }
+    sections.push(
+      [
+        `### ${generationLabel}`,
+        '',
+        generationDetail,
+        threadLine,
+        observedLine,
+        sourceLine,
+        groupLine,
+        scoreLine,
+        '',
+        '```text',
+        excerpt,
+        '```',
+        excerpt !== body ? '[Excerpt truncated]' : undefined,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+  }
+
+  if (ordered.some(entry => !entry.suppression && entry.excerpt !== entry.body)) {
+    sections.push(
+      [
+        `All ${ordered.length} selected matching groups are shown; some excerpts are truncated.`,
+        om
+          ? 'To read a full group, use mode="observations" with its threadId and groupId, omitting direction.'
+          : undefined,
+        'Use mode="messages" with a source-range cursor for original messages.',
+      ]
+        .filter(Boolean)
+        .join(' '),
+    );
+  }
+
+  return {
+    results: sections.join('\n\n'),
+    count: ordered.length,
+  };
+}
+
+// ── Per-part formatting ─────────────────────────────────────────────
+
+const LOW_DETAIL_PART_TOKENS = 30;
+const AUTO_EXPAND_TEXT_TOKENS = 100;
+const AUTO_EXPAND_TOOL_TOKENS = 20;
+const HIGH_DETAIL_TOOL_RESULT_TOKENS = 4000;
+const DEFAULT_MAX_RESULT_TOKENS = 2000;
+
+function formatTimestamp(date: Date): string {
+  return date
+    .toISOString()
+    .replace('T', ' ')
+    .replace(/\.\d{3}Z$/, 'Z');
+}
+
+interface FormattedPart {
+  messageId: string;
+  partIndex: number;
+  role: string;
+  type: string;
+  text: string;
+  /** Full untruncated text — used for auto-expand when token budget allows */
+  fullText: string;
+  toolName?: string;
+}
+
+function truncateByTokens(text: string, maxTokens: number, hint?: string): { text: string; wasTruncated: boolean } {
+  if (estimateTokenCount(text) <= maxTokens) return { text, wasTruncated: false };
+  // Truncate content to maxTokens, then append hint outside the budget
+  const truncated = truncateStringByTokens(text, maxTokens);
+  const suffix = hint ? ` [${hint} for more]` : '';
+  return { text: truncated + suffix, wasTruncated: true };
+}
+
+function chunkTextByTokens(
+  text: string,
+  maxTokens: number,
+  charOffset = 0,
+): { text: string; nextCharOffset?: number; charOffset: number; truncated: boolean } {
+  let startOffset = Math.max(0, Math.min(Math.floor(charOffset), text.length));
+  // Caller-provided offsets can land between the two halves of a surrogate
+  // pair; skip the lone low surrogate so the chunk stays valid JSON text.
+  const startCode = text.charCodeAt(startOffset);
+  if (startCode >= 0xdc00 && startCode <= 0xdfff) startOffset += 1;
+  const remaining = text.slice(startOffset);
+
+  if (!remaining || estimateTokenCount(remaining) <= maxTokens) {
+    return { text: remaining, charOffset: startOffset, truncated: false };
+  }
+
+  let low = 0;
+  let high = remaining.length;
+  let best = '';
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = safeSlice(remaining, mid);
+    const candidateTokens = estimateTokenCount(candidate);
+
+    if (candidate && candidateTokens <= maxTokens) {
+      best = candidate;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  const nextCharOffset = startOffset + best.length;
+  return {
+    text: best,
+    charOffset: startOffset,
+    nextCharOffset,
+    truncated: nextCharOffset < text.length,
+  };
+}
+
+const EXCERPT_STOP_WORDS = new Set(
+  'the and for with that this from have has had what when where which while who whom why how many much did does was were are you your our their them they there been being some also just than then those these its into about any all can could would should not but user agent asked said mention mentioned total'.split(
+    ' ',
+  ),
+);
+
+function excerptQueryTerms(query: string): string[] {
+  const words = query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+  return [...new Set(words.filter(word => word.length >= 3 && !EXCERPT_STOP_WORDS.has(word)))];
+}
+
+const EXCERPT_OMISSION_MARKER = '[earlier lines omitted]';
+
+/**
+ * Fit an observation to a token budget. When it does not fit, start at the observation
+ * line matching the most query terms (keeping that line's date header) instead of the head,
+ * so repeated searches can reach text a head-only excerpt would never show.
+ * `content` is the slice of the body that is shown, used to recognize excerpts already in context.
+ */
+function selectSearchExcerpt(body: string, terms: string[], maxTokens: number): { text: string; content: string } {
+  const head = chunkTextByTokens(body, maxTokens);
+  if (!head.truncated || terms.length === 0) return { text: head.text, content: head.text };
+
+  // Observation lines begin with a date header or a bullet; vector chunks may join them on one line.
+  const starts = [0, ...[...body.matchAll(/(?<=\s)(?:Date: |\* )/g)].map(match => match.index)];
+  let best: { start: number; end: number; score: number } | undefined;
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i]!;
+    const end = starts[i + 1] ?? body.length;
+    const line = body.slice(start, end).toLowerCase();
+    const score = terms.filter(term => line.includes(term)).length;
+    if (score > (best?.score ?? 0)) best = { start, end, score };
+  }
+  if (!best || best.end <= head.text.length) return { text: head.text, content: head.text };
+
+  const dateStart = body.lastIndexOf('Date: ', best.start);
+  const dateHeader =
+    dateStart >= 0 && dateStart < best.start
+      ? body.slice(dateStart, starts.find(start => start > dateStart) ?? best.start).trim()
+      : '';
+  const prefix = `${dateHeader ? `${dateHeader} ` : ''}${EXCERPT_OMISSION_MARKER} `;
+  const window = chunkTextByTokens(body, maxTokens - estimateTokenCount(prefix), best.start);
+  if (!window.text) return { text: head.text, content: head.text };
+  return { text: prefix + window.text, content: window.text };
+}
+
+function lowDetailPartLimit(type: string): number {
+  if (type === 'text') return AUTO_EXPAND_TEXT_TOKENS;
+  if (type === 'tool-result' || type === 'tool-call') return AUTO_EXPAND_TOOL_TOKENS;
+  return LOW_DETAIL_PART_TOKENS;
+}
+
+function makePart(
+  msg: MastraDBMessage,
+  partIndex: number,
+  type: string,
+  fullText: string,
+  detail: RecallDetail,
+  toolName?: string,
+): FormattedPart {
+  if (detail === 'high') {
+    return { messageId: msg.id, partIndex, role: msg.role, type, text: fullText, fullText, toolName };
+  }
+  const hint = `recall cursor="${msg.id}" partIndex=${partIndex} detail="high"`;
+  const { text } = truncateByTokens(fullText, lowDetailPartLimit(type), hint);
+  return { messageId: msg.id, partIndex, role: msg.role, type, text, fullText, toolName };
+}
+
+const PROVIDER_FILE_ID_PATTERN = /^file-[A-Za-z0-9_-]+$/;
+// Scheme followed by `//` — matches http(s), gs, s3, file, etc. but not data:/blob: URIs or Windows paths.
+const REUSABLE_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+const DATA_URI_PATTERN = /^data:([^;,]*)/i;
+const INLINE_DATA_OMITTED = '(inline data omitted)';
+
+/**
+ * Reads the payload and media type of a stored image/file part. Stored parts use the v4
+ * (`data`/`mimeType`) or v5 (`url`/`mediaType`) shape; prompt-style image parts carry the
+ * payload in `image`. A data URI's header supplies the media type when none was stored.
+ */
+function readAttachmentPayload(part: Record<string, unknown>) {
+  const payload = part.image ?? part.data ?? part.url;
+  const payloadString = payload instanceof URL ? payload.href : typeof payload === 'string' ? payload.trim() : '';
+  const dataUriMatch = DATA_URI_PATTERN.exec(payloadString);
+  const mediaType = [part.mimeType, part.mediaType, dataUriMatch?.[1]].find(
+    (v): v is string => typeof v === 'string' && v.length > 0,
+  );
+  const hasBytes = payload instanceof Uint8Array || payload instanceof ArrayBuffer;
+  return { payload, payloadString, isDataUri: dataUriMatch !== null, hasBytes, mediaType };
+}
+
+/** Returns the reference text for a payload the agent can reuse, or undefined for inline data. */
+function describeReusableReference(payloadString: string): string | undefined {
+  if (PROVIDER_FILE_ID_PATTERN.test(payloadString)) return `file id: ${payloadString}`;
+  if (REUSABLE_URL_PATTERN.test(payloadString)) return `url: ${payloadString}`;
+  return undefined;
+}
+
+/**
+ * Renders an image/file part with its media type and, when the stored payload is a reusable
+ * reference (URL or provider file ID), that reference so the agent can reuse the attachment.
+ * Inline payloads (data URIs, base64, bytes) are never rendered.
+ */
+function formatAttachmentPart(partType: 'image' | 'file', part: Record<string, unknown>): string {
+  const filename = typeof part.filename === 'string' && part.filename ? `: ${part.filename}` : '';
+  const { payloadString, isDataUri, hasBytes, mediaType } = readAttachmentPayload(part);
+
+  let reference = '';
+  if (!isDataUri && payloadString) {
+    reference = describeReusableReference(payloadString) ?? INLINE_DATA_OMITTED;
+  } else if (isDataUri || hasBytes) {
+    reference = INLINE_DATA_OMITTED;
+  }
+
+  return [`[${partType === 'image' ? 'Image' : 'File'}${filename}]`, mediaType, reference].filter(Boolean).join(' ');
+}
+
+const INLINE_MEDIA_PART_TYPES = new Set(['media', 'image-data', 'file-data', 'image', 'file']);
+
+/**
+ * Replaces inline media payloads nested in a stored tool result (for example a `media` part in
+ * `modelOutput`, or a viewed attachment) with a placeholder, so rendering the result as text never
+ * dumps base64. URLs and provider file IDs are kept because the agent can reuse them.
+ */
+function omitInlineMediaPayloads(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
+  if (typeof value !== 'object' || value === null) return value;
+  if (seen.has(value)) return seen.get(value);
+
+  if (Array.isArray(value)) {
+    const items: unknown[] = [];
+    seen.set(value, items);
+    for (const item of value) items.push(omitInlineMediaPayloads(item, seen));
+    return items;
+  }
+
+  const record = value as Record<string, unknown>;
+  const isMediaPart = typeof record.type === 'string' && INLINE_MEDIA_PART_TYPES.has(record.type);
+  const result: Record<string, unknown> = {};
+  seen.set(value, result);
+  for (const [key, entry] of Object.entries(record)) {
+    const isPayloadKey = key === 'data' || key === 'image';
+    if (isMediaPart && isPayloadKey && typeof entry === 'string' && !describeReusableReference(entry.trim())) {
+      result[key] = INLINE_DATA_OMITTED;
+    } else {
+      result[key] = omitInlineMediaPayloads(entry, seen);
+    }
+  }
+  return result;
+}
+
+/**
+ * Media types the model can be handed directly. Mirrors the observational memory observer's
+ * default `observeAttachments` allowlist — anything else (docx, pptx, video, …) is not a type
+ * providers accept as an inline part, so it stays text-only.
+ */
+function isViewableAttachmentMediaType(mediaType: string | undefined): mediaType is string {
+  if (!mediaType) return false;
+  const normalized = mediaType.toLowerCase();
+  return normalized.startsWith('image/') || normalized === 'application/pdf';
+}
+
+/** Mirrors core's DEFAULT_MAX_MEDIA_BYTES cap on inline media results. */
+const MAX_VIEWABLE_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
+export type RecallAttachmentPart = { type: 'image' | 'file'; data: string; mimeType: string };
+
+export type RecallAttachmentContent = {
+  content: [{ type: 'text'; text: string }, RecallAttachmentPart];
+};
+
+function isRecallAttachmentContent(value: unknown): value is RecallAttachmentContent {
+  if (typeof value !== 'object' || value === null) return false;
+  const content = (value as { content?: unknown }).content;
+  if (!Array.isArray(content) || content.length !== 2) return false;
+  return content.every(part => {
+    if (typeof part !== 'object' || part === null) return false;
+    const { type, text, data, mimeType } = part as Record<string, unknown>;
+    if (type === 'text') return typeof text === 'string';
+    return (type === 'image' || type === 'file') && typeof data === 'string' && typeof mimeType === 'string';
+  });
+}
+
+/**
+ * Turns an attachment part into a model-viewable payload. Only inline payloads are returned, as
+ * base64 bytes. Everything else — remote URLs, provider file IDs, oversized payloads, unsupported
+ * media types — comes back as an explanation for the agent instead.
+ */
+function resolveViewableAttachment(
+  part: Record<string, unknown>,
+): { data: string; mimeType: string } | { note: string } {
+  const { payload, payloadString, isDataUri, hasBytes, mediaType } = readAttachmentPayload(part);
+
+  if (!payloadString && !hasBytes) {
+    return { note: 'This attachment has no stored payload to show.' };
+  }
+
+  if (!isViewableAttachmentMediaType(mediaType)) {
+    return {
+      note: mediaType
+        ? `Attachments of type ${mediaType} can't be shown inline. Use the attachment's url or file id if you need to reference it.`
+        : "This attachment has no media type recorded, so it can't be shown inline.",
+    };
+  }
+
+  // Remote URLs would need an `image-url`/`file-url` tool-result part, which AI SDK v5 providers
+  // don't support (they drop it to `null`), and the mapped output is replayed on every later turn.
+  if (isHttpUrlString(payloadString)) {
+    return {
+      note: "This attachment is stored at a remote URL, so it can't be shown inline. Use its url if you need to reference it.",
+    };
+  }
+
+  if (payloadString.length * 0.75 > MAX_VIEWABLE_ATTACHMENT_BYTES) {
+    return { note: 'This attachment is too large to show inline.' };
+  }
+
+  // decodeImageBuffer only recognizes a lowercase `data:` scheme.
+  const bytes = decodeImageBuffer(isDataUri ? `data:${payloadString.slice(5)}` : payloadString || payload);
+  if (!bytes) {
+    return { note: "This attachment's payload is not inline data, so it can't be shown." };
+  }
+
+  if (bytes.byteLength > MAX_VIEWABLE_ATTACHMENT_BYTES) {
+    return { note: 'This attachment is too large to show inline.' };
+  }
+
+  return { data: bytes.toString('base64'), mimeType: mediaType };
+}
+
+/**
+ * Presents a resolved attachment to the model as a native base64 `media` part alongside its text
+ * description.
+ */
+function recallAttachmentToModelOutput(output: unknown): unknown {
+  if (!isRecallAttachmentContent(output)) return undefined;
+  const [textPart, attachment] = output.content;
+  return {
+    type: 'content' as const,
+    value: [
+      { type: 'text' as const, text: textPart.text },
+      { type: 'media' as const, data: attachment.data, mediaType: attachment.mimeType },
+    ],
+  };
+}
+
+export function formatMessageParts(msg: MastraDBMessage, detail: RecallDetail): FormattedPart[] {
+  const parts: FormattedPart[] = [];
+
+  if (typeof msg.content === 'string') {
+    parts.push(makePart(msg, 0, 'text', msg.content, detail));
+    return parts;
+  }
+
+  const messageParts = getMessageParts(msg);
+  if (messageParts.length > 0) {
+    for (let i = 0; i < messageParts.length; i++) {
+      const part = messageParts[i]!;
+      const partType = (part as { type?: string }).type;
+
+      if (partType === 'text') {
+        const text = (part as { text?: string }).text;
+        if (text) {
+          parts.push(makePart(msg, i, 'text', text, detail));
+        }
+      } else if (partType === 'tool-invocation') {
+        const inv = (part as any).toolInvocation;
+        if (inv?.toolName) {
+          const hasArgs = inv.args != null;
+          if (inv.state !== 'partial-call' && hasArgs) {
+            const argsStr = detail === 'low' ? '' : `\n${JSON.stringify(inv.args, null, 2)}`;
+            const fullText = `[Tool Call: ${inv.toolName}]${argsStr}`;
+            parts.push({
+              messageId: msg.id,
+              partIndex: i,
+              role: msg.role,
+              type: 'tool-call',
+              text: fullText,
+              fullText,
+              toolName: inv.toolName,
+            });
+          }
+
+          if (inv.state === 'result') {
+            const { value: resultValue } = resolveToolResultValue(
+              part as { providerMetadata?: Record<string, any> },
+              inv.result,
+            );
+            const resultStr = formatToolResultForObserver(omitInlineMediaPayloads(resultValue), {
+              maxTokens: HIGH_DETAIL_TOOL_RESULT_TOKENS,
+            });
+            const fullText = `[Tool Result: ${inv.toolName}]\n${resultStr}`;
+            parts.push(makePart(msg, i, 'tool-result', fullText, detail, inv.toolName));
+          }
+        }
+      } else if (partType === 'tool-call') {
+        const toolName = (part as any).toolName;
+        if (toolName) {
+          const rawArgs = (part as any).input ?? (part as any).args;
+          const argsStr =
+            detail === 'low' || rawArgs == null
+              ? ''
+              : `\n${typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs, null, 2)}`;
+          const fullText = `[Tool Call: ${toolName}]${argsStr}`;
+          parts.push({
+            messageId: msg.id,
+            partIndex: i,
+            role: msg.role,
+            type: 'tool-call',
+            text: fullText,
+            fullText,
+            toolName,
+          });
+        }
+      } else if (partType === 'tool-result') {
+        const toolName = (part as any).toolName;
+        if (toolName) {
+          const rawResult = (part as any).output ?? (part as any).result;
+          const resultStr = formatToolResultForObserver(omitInlineMediaPayloads(rawResult), {
+            maxTokens: HIGH_DETAIL_TOOL_RESULT_TOKENS,
+          });
+          const fullText = `[Tool Result: ${toolName}]\n${resultStr}`;
+          parts.push(makePart(msg, i, 'tool-result', fullText, detail, toolName));
+        }
+      } else if (partType === 'reasoning' || partType === 'redacted-reasoning') {
+        // Stored provider reasoning must never become ordinary text in a recall result.
+      } else if (partType === 'image' || partType === 'file') {
+        parts.push(makePart(msg, i, partType, formatAttachmentPart(partType, part), detail));
+      } else if (partType === 'step-start' || partType?.startsWith('data-')) {
+        // Skip internal step boundaries and OM markers (buffering, observation, etc.).
+      } else if (partType) {
+        const fullText = `[${partType}]`;
+        parts.push({ messageId: msg.id, partIndex: i, role: msg.role, type: partType, text: fullText, fullText });
+      }
+    }
+  } else if (msg.content?.content) {
+    parts.push(makePart(msg, 0, 'text', msg.content.content, detail));
+  }
+
+  return parts;
+}
+
+function buildRenderedText(parts: FormattedPart[], timestamps: Map<string, Date>): string {
+  let currentMessageId = '';
+  const lines: string[] = [];
+
+  for (const part of parts) {
+    if (part.messageId !== currentMessageId) {
+      currentMessageId = part.messageId;
+      const ts = timestamps.get(part.messageId);
+      const tsStr = ts ? ` (${formatTimestamp(ts)})` : '';
+      if (lines.length > 0) lines.push(''); // blank line between messages
+      lines.push(`**${part.role}${tsStr}** [${part.messageId}]:`);
+    }
+
+    const indexLabel = `[p${part.partIndex}]`;
+    lines.push(`  ${indexLabel} ${part.text}`);
+  }
+
+  return lines.join('\n');
+}
+
+type RecallArgs = Parameters<RecallMemory['recall']>[0];
+
+/**
+ * Reads messages until `needed` of them are visible or storage is exhausted, growing the
+ * request each round. Hidden messages (reasoning-only, step boundaries, OM markers) don't
+ * count toward `needed`, so a run of them can't end paging early.
+ */
+async function recallVisibleMessages(
+  memory: RecallMemory,
+  args: Omit<RecallArgs, 'page' | 'perPage'>,
+  needed: number,
+  perPage = needed,
+): Promise<MastraDBMessage[]> {
+  let previousCount = -1;
+  while (true) {
+    const result = await memory.recall({ ...args, page: 0, perPage });
+    const visible = result.messages.filter(hasVisibleParts);
+    // Stop if storage is exhausted, or if a larger request returned nothing new.
+    if (visible.length >= needed || !result.hasMore || result.messages.length <= previousCount) {
+      return visible;
+    }
+    previousCount = result.messages.length;
+    perPage *= 2;
+  }
+}
+
+async function getNextVisibleMessage({
+  memory,
+  threadId,
+  resourceId,
+  after,
+}: {
+  memory: RecallMemory;
+  threadId: string;
+  resourceId?: string;
+  after: Date;
+}): Promise<MastraDBMessage | null> {
+  const visible = await recallVisibleMessages(
+    memory,
+    {
+      threadId,
+      resourceId,
+      orderBy: { field: 'createdAt', direction: 'ASC' },
+      filter: {
+        dateRange: {
+          start: after,
+          startExclusive: true,
+        },
+      },
+    },
+    1,
+    50,
+  );
+
+  return visible[0] ?? null;
+}
+
+const MAX_EXPAND_USER_TEXT_TOKENS = 200;
+const MAX_EXPAND_OTHER_TOKENS = 50;
+
+function expandLimit(part: FormattedPart): number {
+  if (part.role === 'user' && part.type === 'text') return MAX_EXPAND_USER_TEXT_TOKENS;
+  return MAX_EXPAND_OTHER_TOKENS;
+}
+
+function expandPriority(part: FormattedPart): number {
+  // Lower number = higher priority for expansion
+  if (part.role === 'user' && part.type === 'text') return 0;
+  if (part.type === 'text') return 1;
+  if (part.type === 'tool-result') return 2;
+  if (part.type === 'tool-call') return 3;
+  return 4;
+}
+
+function renderFormattedParts(
+  parts: FormattedPart[],
+  timestamps: Map<string, Date>,
+  options: { detail: RecallDetail; maxTokens: number },
+): { text: string; truncated: boolean; tokenOffset: number } {
+  // Step 1: render with per-part truncated text
+  const text = buildRenderedText(parts, timestamps);
+  let totalTokens = estimateTokenCount(text);
+
+  if (totalTokens > options.maxTokens) {
+    // Already over budget even with truncated text — hard-truncate
+    const truncated = truncateStringByTokens(text, options.maxTokens);
+    return { text: truncated, truncated: true, tokenOffset: totalTokens - options.maxTokens };
+  }
+
+  // Step 2: we're under budget — try expanding truncated parts with leftover room.
+  // Find parts where text !== fullText (i.e., they were truncated).
+  const truncatedIndices = parts
+    .map((p, i) => ({ part: p, index: i }))
+    .filter(({ part }) => part.text !== part.fullText)
+    .sort((a, b) => expandPriority(a.part) - expandPriority(b.part));
+
+  if (truncatedIndices.length === 0) {
+    return { text, truncated: false, tokenOffset: 0 };
+  }
+
+  let remaining = options.maxTokens - totalTokens;
+
+  for (const { part, index } of truncatedIndices) {
+    if (remaining <= 0) break;
+
+    const maxTokens = expandLimit(part);
+    const fullTokens = estimateTokenCount(part.fullText);
+    const currentTokens = estimateTokenCount(part.text);
+    // Cap at the expand limit for this part type
+    const targetTokens = Math.min(fullTokens, maxTokens);
+    const delta = targetTokens - currentTokens;
+
+    if (delta <= 0) continue; // already at or above expand limit
+
+    if (delta <= remaining && targetTokens >= fullTokens) {
+      // Full text fits within both expand limit and remaining budget
+      parts[index] = { ...part, text: part.fullText };
+      remaining -= delta;
+    } else {
+      // Partial expand — cap at expand limit or remaining budget, whichever is smaller
+      const expandedLimit = Math.min(currentTokens + remaining, maxTokens);
+      const hint = `recall cursor="${part.messageId}" partIndex=${part.partIndex} detail="high"`;
+      const { text: expanded } = truncateByTokens(part.fullText, expandedLimit, hint);
+      const expandedDelta = estimateTokenCount(expanded) - currentTokens;
+      parts[index] = { ...part, text: expanded };
+      remaining -= expandedDelta;
+    }
+  }
+
+  // Step 3: re-render with expanded parts
+  const expanded = buildRenderedText(parts, timestamps);
+  const expandedTokens = estimateTokenCount(expanded);
+
+  if (expandedTokens <= options.maxTokens) {
+    return { text: expanded, truncated: false, tokenOffset: 0 };
+  }
+
+  // Safety net: if token estimates drifted, hard-truncate
+  const hardTruncated = truncateStringByTokens(expanded, options.maxTokens);
+  return { text: hardTruncated, truncated: true, tokenOffset: expandedTokens - options.maxTokens };
+}
+
+// ── Single-part fetch ────────────────────────────────────────────────
+
+export async function recallPart({
+  memory,
+  threadId,
+  resourceId,
+  cursor,
+  partIndex,
+  charOffset,
+  threadScope,
+  retrievalScope = 'thread',
+  maxTokens = DEFAULT_MAX_RESULT_TOKENS,
+}: {
+  memory: RecallMemory;
+  threadId: string;
+  resourceId?: string;
+  cursor: string;
+  partIndex: number;
+  charOffset?: number;
+  threadScope?: string;
+  retrievalScope?: 'thread' | 'resource';
+  maxTokens?: number;
+}): Promise<{
+  text: string;
+  messageId: string;
+  partIndex: number;
+  role: string;
+  type: string;
+  truncated: boolean;
+  charOffset: number;
+  nextCharOffset?: number;
+  note?: string;
+}> {
+  if (!memory || typeof memory.getMemoryStore !== 'function') {
+    throw new Error('Memory instance is required for recall');
+  }
+
+  if (!threadId) {
+    throw new Error('Thread ID is required for recall');
+  }
+
+  const resolved = await resolveCursorMessage(memory, cursor, {
+    resourceId,
+    threadScope,
+    enforceThreadScope: retrievalScope !== 'resource',
+  });
+
+  if ('hint' in resolved) {
+    throw new Error(resolved.hint);
+  }
+
+  const allParts = formatMessageParts(resolved, 'high');
+
+  if (allParts.length === 0) {
+    throw new Error(
+      `Message ${cursor} has no visible content (it may be an internal system message). Try a neighboring message ID instead.`,
+    );
+  }
+
+  const target = [...allParts].reverse().find(p => p.partIndex === partIndex);
+
+  if (!target) {
+    const availableIndices = allParts.map(p => p.partIndex).join(', ');
+    const highestVisiblePartIndex = Math.max(...allParts.map(p => p.partIndex));
+
+    if (partIndex > highestVisiblePartIndex) {
+      const nextMessage = await getNextVisibleMessage({
+        memory,
+        threadId: resolved.threadId ?? threadId,
+        resourceId,
+        after: resolved.createdAt,
+      });
+
+      if (nextMessage) {
+        const nextParts = formatMessageParts(nextMessage, 'high');
+        const firstNextPart = nextParts[0];
+
+        if (firstNextPart) {
+          const fallbackNote = `Part index ${partIndex} not found in message ${cursor}; showing partIndex ${firstNextPart.partIndex} from next message ${firstNextPart.messageId}.\n\n`;
+          const fallbackText = `${fallbackNote}${firstNextPart.text}`;
+          const fallbackChunk = chunkTextByTokens(fallbackText, maxTokens, charOffset);
+          const fallbackContinuation = fallbackChunk.nextCharOffset
+            ? `To continue this part, call recall cursor="${cursor}" partIndex=${partIndex} detail="high" charOffset=${fallbackChunk.nextCharOffset}.`
+            : undefined;
+
+          return {
+            text: fallbackChunk.text,
+            messageId: firstNextPart.messageId,
+            partIndex: firstNextPart.partIndex,
+            role: firstNextPart.role,
+            type: firstNextPart.type,
+            truncated: fallbackChunk.truncated,
+            charOffset: fallbackChunk.charOffset,
+            nextCharOffset: fallbackChunk.nextCharOffset,
+            note: fallbackContinuation,
+          };
+        }
+      }
+    }
+
+    throw new Error(`Part index ${partIndex} not found in message ${cursor}. Available indices: ${availableIndices}`);
+  }
+
+  const chunk = chunkTextByTokens(target.text, maxTokens, charOffset);
+  const note = chunk.nextCharOffset
+    ? `To continue this part, call recall cursor="${target.messageId}" partIndex=${target.partIndex} detail="high" charOffset=${chunk.nextCharOffset}.`
+    : undefined;
+
+  return {
+    text: chunk.text,
+    messageId: target.messageId,
+    partIndex: target.partIndex,
+    role: target.role,
+    type: target.type,
+    truncated: chunk.truncated,
+    charOffset: chunk.charOffset,
+    nextCharOffset: chunk.nextCharOffset,
+    note,
+  };
+}
+
+// ── Attachment viewing ───────────────────────────────────────────────
+
+export async function recallAttachmentView({
+  memory,
+  threadId,
+  resourceId,
+  cursor,
+  partIndex,
+  threadScope,
+  retrievalScope = 'thread',
+}: {
+  memory: RecallMemory;
+  threadId: string;
+  resourceId?: string;
+  cursor: string;
+  partIndex: number;
+  threadScope?: string;
+  retrievalScope?: 'thread' | 'resource';
+}): Promise<RecallAttachmentContent | { messages: string }> {
+  if (!memory || typeof memory.getMemoryStore !== 'function') {
+    throw new Error('Memory instance is required for recall');
+  }
+
+  if (!threadId) {
+    throw new Error('Thread ID is required for recall');
+  }
+
+  const resolved = await resolveCursorMessage(memory, cursor, {
+    resourceId,
+    threadScope,
+    enforceThreadScope: retrievalScope !== 'resource',
+  });
+
+  if ('hint' in resolved) {
+    return { messages: resolved.hint };
+  }
+
+  const rawPart = getMessageParts(resolved)[partIndex] as { type?: string } | undefined;
+  const partType = rawPart?.type;
+
+  if (!rawPart || (partType !== 'image' && partType !== 'file')) {
+    return {
+      messages: `Part ${partIndex} of message ${cursor} is ${rawPart ? `a ${partType ?? 'unknown'}-type part` : 'missing'}, not an attachment. Call recall with the same cursor and partIndex without viewAttachment to read it.`,
+    };
+  }
+
+  const resolvedAttachment = resolveViewableAttachment(rawPart as Record<string, unknown>);
+  if ('note' in resolvedAttachment) {
+    return {
+      messages: `${formatAttachmentPart(partType, rawPart as Record<string, unknown>)} — ${resolvedAttachment.note}`,
+    };
+  }
+
+  return {
+    content: [
+      { type: 'text', text: formatAttachmentPart(partType, rawPart as Record<string, unknown>) },
+      {
+        type: partType === 'image' ? 'image' : 'file',
+        data: resolvedAttachment.data,
+        mimeType: resolvedAttachment.mimeType,
+      },
+    ],
+  };
+}
+
+// ── Paged recall ─────────────────────────────────────────────────────
+
+export interface RecallResult {
+  messages: string;
+  count: number;
+  cursor: string;
+  page: number;
+  limit: number;
+  detail: RecallDetail;
+  hasNextPage: boolean;
+  hasPrevPage: boolean;
+  truncated: boolean;
+  tokenOffset: number;
+}
+
+export async function recallMessages({
+  memory,
+  threadId,
+  resourceId,
+  cursor,
+  page = 1,
+  limit = 20,
+  detail = 'low',
+  partType,
+  toolName,
+  threadScope,
+  retrievalScope = 'thread',
+  maxTokens = DEFAULT_MAX_RESULT_TOKENS,
+}: {
+  memory: RecallMemory;
+  threadId: string;
+  resourceId?: string;
+  cursor: string;
+  page?: number;
+  limit?: number;
+  detail?: RecallDetail;
+  partType?: 'text' | 'tool-call' | 'tool-result' | 'reasoning' | 'image' | 'file';
+  toolName?: string;
+  threadScope?: string;
+  retrievalScope?: 'thread' | 'resource';
+  maxTokens?: number;
+}): Promise<RecallResult> {
+  if (!memory) {
+    throw new Error('Memory instance is required for recall');
+  }
+
+  if (!threadId) {
+    throw new Error('Thread ID is required for recall');
+  }
+
+  if (typeof memory.getMemoryStore !== 'function') {
+    throw new Error('recall requires a Memory instance with storage access');
+  }
+
+  const MAX_PAGE = 50;
+  const MAX_LIMIT = 20;
+  const rawPage = page === 0 ? 1 : page;
+  const normalizedPage = Math.max(Math.min(rawPage, MAX_PAGE), -MAX_PAGE);
+  const normalizedLimit = Math.min(limit, MAX_LIMIT);
+
+  const resolved = await resolveCursorMessage(memory, cursor, {
+    resourceId,
+    threadScope,
+    enforceThreadScope: retrievalScope === 'thread',
+  });
+
+  if ('hint' in resolved) {
+    return {
+      messages: resolved.hint,
+      count: 0,
+      cursor,
+      page: normalizedPage,
+      limit: normalizedLimit,
+      detail,
+      hasNextPage: false,
+      hasPrevPage: false,
+      truncated: false,
+      tokenOffset: 0,
+    };
+  }
+
+  const anchor = resolved;
+  const crossThreadId = anchor.threadId && anchor.threadId !== threadId ? anchor.threadId : undefined;
+
+  if (crossThreadId && threadScope) {
+    return {
+      messages: `Cursor does not belong to the active thread. Expected thread "${threadId}" but cursor "${cursor}" belongs to "${anchor.threadId}". Pass threadId="${anchor.threadId}" to browse that thread.`,
+      count: 0,
+      cursor,
+      page: normalizedPage,
+      limit: normalizedLimit,
+      detail,
+      hasNextPage: false,
+      hasPrevPage: false,
+      truncated: false,
+      tokenOffset: 0,
+    };
+  }
+
+  const resolvedThreadId = crossThreadId ?? threadId;
+  if (!resolvedThreadId) {
+    throw new Error('Thread ID is required for recall');
+  }
+
+  const isForward = normalizedPage > 0;
+  const pageIndex = Math.max(Math.abs(normalizedPage), 1) - 1;
+  const skip = pageIndex * normalizedLimit;
+
+  // Fetch skip + limit + 1 to detect whether another page exists beyond this one
+  const fetchCount = skip + normalizedLimit + 1;
+
+  // Messages without visible content are filtered out so they don't consume page slots.
+  const visibleMessages = await recallVisibleMessages(
+    memory,
+    {
+      threadId: resolvedThreadId,
+      resourceId,
+      orderBy: { field: 'createdAt', direction: isForward ? 'ASC' : 'DESC' },
+      filter: {
+        dateRange: isForward
+          ? {
+              start: anchor.createdAt,
+              startExclusive: true,
+            }
+          : {
+              end: anchor.createdAt,
+              endExclusive: true,
+            },
+      },
+    },
+    fetchCount,
+  );
+
+  // Memory.recall() always returns messages sorted chronologically (ASC) via MessageList.
+  // For forward pagination: take from the start of the ASC array (oldest first after cursor).
+  // For backward pagination: take from the END of the ASC array (closest to cursor).
+  //   DESC query ensures the DB returns the N messages closest to cursor, but MessageList
+  //   re-sorts them to ASC. So we slice from the end to get the right page window.
+  const total = visibleMessages.length;
+  const hasMore = total > skip + normalizedLimit;
+  let messages: typeof visibleMessages;
+  if (isForward) {
+    messages = visibleMessages.slice(skip, skip + normalizedLimit);
+  } else {
+    // For backward: closest-to-cursor messages are at the end of the ASC-sorted array.
+    // Page -1 (skip=0): last `limit` items; page -2 (skip=limit): next `limit` from end; etc.
+    const endIdx = Math.max(total - skip, 0);
+    const startIdx = Math.max(endIdx - normalizedLimit, 0);
+    messages = visibleMessages.slice(startIdx, endIdx);
+  }
+
+  // Compute pagination flags
+  const hasNextPage = isForward ? hasMore : pageIndex > 0;
+  const hasPrevPage = isForward ? pageIndex > 0 : hasMore;
+
+  // Format parts from returned messages
+  let allParts: FormattedPart[] = [];
+  const timestamps = new Map<string, Date>();
+  for (const msg of messages) {
+    timestamps.set(msg.id, msg.createdAt);
+    allParts.push(...formatMessageParts(msg, detail));
+  }
+
+  if (toolName) {
+    allParts = allParts.filter(p => (p.type === 'tool-call' || p.type === 'tool-result') && p.toolName === toolName);
+  }
+
+  if (partType) {
+    allParts = allParts.filter(p => p.type === partType);
+  }
+
+  // High detail: clamp to 1 message and 1 part to avoid token blowup
+  if (detail === 'high' && allParts.length > 0) {
+    const firstPart = allParts[0]!;
+    const sameMsgParts = allParts.filter(p => p.messageId === firstPart.messageId);
+    const otherMsgParts = allParts.filter(p => p.messageId !== firstPart.messageId);
+
+    const rendered = renderFormattedParts([firstPart], timestamps, { detail, maxTokens });
+
+    let text = rendered.text;
+
+    // Build continuation hints
+    const hints: string[] = [];
+    if (sameMsgParts.length > 1) {
+      const nextPart = sameMsgParts[1]!;
+      hints.push(`next part: partIndex=${nextPart.partIndex} on cursor="${firstPart.messageId}"`);
+    }
+    if (otherMsgParts.length > 0) {
+      const next = otherMsgParts[0]!;
+      hints.push(`next message: partIndex=${next.partIndex} on cursor="${next.messageId}"`);
+    } else if (hasNextPage) {
+      hints.push(`more messages available on page ${normalizedPage + 1}`);
+    }
+
+    if (hints.length > 0) {
+      text += `\n\nHigh detail returns 1 part at a time. To continue: ${hints.join(', or ')}.`;
+    }
+
+    return {
+      messages: text,
+      count: 1,
+      cursor,
+      page: normalizedPage,
+      limit: normalizedLimit,
+      detail,
+      hasNextPage: otherMsgParts.length > 0 || hasNextPage,
+      hasPrevPage,
+      truncated: rendered.truncated,
+      tokenOffset: rendered.tokenOffset,
+    };
+  }
+
+  const rendered = renderFormattedParts(allParts, timestamps, { detail, maxTokens });
+  const emptyMessage =
+    allParts.length === 0
+      ? partType || toolName
+        ? '(no message parts matched the current filters)'
+        : '(no visible message parts found for this page)'
+      : '(no messages found)';
+
+  return {
+    messages: rendered.text || emptyMessage,
+    count: messages.length,
+    cursor,
+    page: normalizedPage,
+    limit: normalizedLimit,
+    detail,
+    hasNextPage,
+    hasPrevPage,
+    truncated: rendered.truncated,
+    tokenOffset: rendered.tokenOffset,
+  };
+}
+
+// ── Thread browsing (no cursor) ─────────────────────────────────────
+
+export async function recallThreadFromStart({
+  memory,
+  threadId,
+  resourceId,
+  page = 1,
+  limit = 20,
+  detail = 'low',
+  partType,
+  toolName,
+  anchor = 'start',
+  maxTokens = DEFAULT_MAX_RESULT_TOKENS,
+}: {
+  memory: RecallMemory;
+  threadId: string;
+  resourceId?: string;
+  page?: number;
+  limit?: number;
+  detail?: RecallDetail;
+  partType?: 'text' | 'tool-call' | 'tool-result' | 'reasoning' | 'image' | 'file';
+  toolName?: string;
+  anchor?: 'start' | 'end';
+  maxTokens?: number;
+}): Promise<RecallResult> {
+  if (!memory) {
+    throw new Error('Memory instance is required for recall');
+  }
+  if (!threadId) {
+    throw new Error('Thread ID is required for recall');
+  }
+
+  // Verify the thread belongs to the current resource
+  if (resourceId && memory.getThreadById) {
+    const thread = await memory.getThreadById({ threadId });
+    if (!thread || thread.resourceId !== resourceId) {
+      throw new Error('Thread not found');
+    }
+  }
+
+  const MAX_PAGE = 50;
+  const MAX_LIMIT = 20;
+  const normalizedPage = Math.max(Math.min(page, MAX_PAGE), 1);
+  const normalizedLimit = Math.min(Math.max(limit, 1), MAX_LIMIT);
+  const pageIndex = normalizedPage - 1;
+  const fetchCount = pageIndex * normalizedLimit + normalizedLimit + 1;
+
+  const fetched = await recallVisibleMessages(
+    memory,
+    { threadId, resourceId, orderBy: { field: 'createdAt', direction: anchor === 'end' ? 'DESC' : 'ASC' } },
+    fetchCount,
+  );
+  const visibleMessages = anchor === 'end' ? fetched.reverse() : fetched;
+  const skip = pageIndex * normalizedLimit;
+  const messages = visibleMessages.slice(skip, skip + normalizedLimit);
+  const hasExtraMessage = visibleMessages.length > skip + messages.length;
+  const hasNextPage = messages.length > 0 ? (anchor === 'end' ? pageIndex > 0 : hasExtraMessage) : false;
+  const hasPrevPage = messages.length > 0 ? (anchor === 'end' ? hasExtraMessage : pageIndex > 0) : pageIndex > 0;
+
+  let allParts: FormattedPart[] = [];
+  const timestamps = new Map<string, Date>();
+  for (const msg of messages) {
+    timestamps.set(msg.id, msg.createdAt);
+    allParts.push(...formatMessageParts(msg, detail));
+  }
+
+  if (toolName) {
+    allParts = allParts.filter(p => (p.type === 'tool-call' || p.type === 'tool-result') && p.toolName === toolName);
+  }
+
+  if (partType) {
+    allParts = allParts.filter(p => p.type === partType);
+  }
+
+  const rendered = renderFormattedParts(allParts, timestamps, { detail, maxTokens });
+  const emptyMessage =
+    messages.length === 0
+      ? pageIndex > 0
+        ? `(no messages found on page ${normalizedPage} for this thread)`
+        : '(no messages in this thread)'
+      : partType || toolName
+        ? '(no message parts matched the current filters)'
+        : '(no messages found)';
+
+  return {
+    messages: rendered.text || emptyMessage,
+    count: messages.length,
+    cursor: messages[0]?.id || '',
+    page: normalizedPage,
+    limit: normalizedLimit,
+    detail,
+    hasNextPage,
+    hasPrevPage,
+    truncated: rendered.truncated,
+    tokenOffset: rendered.tokenOffset,
+  };
+}
+
+export const recallTool = (
+  _memoryConfig?: MemoryConfigInternal,
+  options?: {
+    retrievalScope?: 'thread' | 'resource';
+    searchEnabled?: boolean;
+    /** Resolves the observational memory engine so search hits can be dated and paged by observation group. */
+    getOMEngine?: () => Promise<OMTimelineEngine | null> | OMTimelineEngine | null;
+  },
+) => {
+  const retrievalScope = options?.retrievalScope ?? 'thread';
+  const isResourceScope = retrievalScope === 'resource';
+  const searchEnabled = options?.searchEnabled ?? true;
+  const getOMEngine = options?.getOMEngine;
+
+  const description = isResourceScope
+    ? `Browse conversation history. Use mode="threads" to list all threads for the current user. Use mode="messages" (default) to browse messages in the current thread or pass threadId to browse another thread in the active resource. When mode="messages" has no cursor or threadId, it defaults to the current thread and says so at the top of the result. If you pass only a cursor, it must belong to the current thread.${searchEnabled ? ' Use mode="search" to find messages by content across all threads; results come back oldest-first with markers where observation groups were skipped. Use mode="observations" with a groupId from a search result to page chronologically through the observation groups around it.' : ''}`
+    : `Browse conversation history in the current thread. Use mode="messages" (default) to page through messages near a cursor.${searchEnabled ? ' Use mode="search" to find messages by content in this thread; results come back oldest-first with markers where observation groups were skipped. Use mode="observations" with a groupId from a search result to page chronologically through the observation groups around it.' : ''} Use mode="threads" to get the current thread's ID and title.`;
+
+  const modeEnum = searchEnabled ? ['messages', 'threads', 'search', 'observations'] : ['messages', 'threads'];
+
+  return createTool({
+    id: 'recall',
+    description,
+    inputSchema: {
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      type: 'object',
+      properties: {
+        ...(isResourceScope
+          ? {
+              mode: {
+                type: 'string',
+                enum: modeEnum,
+                description: `What to retrieve. "messages" (default) pages through message history. "threads" lists all threads for the current user.${searchEnabled ? ' "search" finds messages by semantic similarity across all threads. "observations" pages observation groups chronologically around a groupId from a search result.' : ''}`,
+              },
+              threadId: {
+                type: 'string',
+                minLength: 1,
+                description:
+                  'Browse a different thread, or "current" for the active thread. Use mode="threads" first to discover thread IDs.',
+              },
+              before: {
+                type: 'string',
+                description:
+                  'Only show results before this date. Applies to mode="threads" (thread creation date) and mode="search" (observation date). ISO 8601 or natural date string (e.g. "2026-03-15", "2026-03-10T00:00:00Z").',
+              },
+              after: {
+                type: 'string',
+                description:
+                  'Only show results after this date. Applies to mode="threads" (thread creation date) and mode="search" (observation date). ISO 8601 or natural date string (e.g. "2026-03-01", "2026-03-10T00:00:00Z").',
+              },
+            }
+          : {
+              mode: {
+                type: 'string',
+                enum: modeEnum,
+                description: `What to retrieve. "messages" (default) pages through message history. "threads" returns info about the current thread.${searchEnabled ? ' "search" finds messages by semantic similarity in this thread. "observations" pages observation groups chronologically around a groupId from a search result.' : ''}`,
+              },
+            }),
+        ...(searchEnabled
+          ? {
+              ...(!isResourceScope
+                ? {
+                    before: {
+                      type: 'string',
+                      description: 'For mode="search": only show observations dated before this ISO 8601 date.',
+                    },
+                    after: {
+                      type: 'string',
+                      description: 'For mode="search": only show observations dated after this ISO 8601 date.',
+                    },
+                  }
+                : {}),
+              query: {
+                type: 'string',
+                minLength: 1,
+                description: 'Search query for mode="search". Finds messages semantically similar to this text.',
+              },
+              groupId: {
+                type: 'string',
+                minLength: 1,
+                description:
+                  'Observation group ID to page around, for mode="observations". Copy it exactly from the "observation group:" line of a search result or a continuation call.',
+              },
+              direction: {
+                type: 'string',
+                enum: ['before', 'after'],
+                description:
+                  'For mode="observations": page strictly before or after the groupId. Omit to read the full anchor group and following groups.',
+              },
+            }
+          : {}),
+        cursor: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'A message ID to use as the pagination cursor. For mode="messages", omit both cursor and threadId to browse the current thread. If only cursor is provided, it must belong to the current thread. Extract it from the start or end of an observation group range.',
+        },
+        anchor: {
+          type: 'string',
+          enum: ['start', 'end'],
+          description:
+            'For mode="messages" without a cursor, page from the start (oldest-first) or end (newest-first) of the thread. Defaults to "start".',
+        },
+        page: {
+          type: 'integer',
+          minimum: -50,
+          maximum: 50,
+          description:
+            'Pagination offset. For messages: positive pages move forward from cursor, negative move backward. For threads: page number (0-indexed). 0 is treated as 1 for messages.',
+        },
+        limit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 20,
+          description:
+            'Maximum items per page: defaults to 20 for messages, 5 for observations. For search, target number of excerpts (default 10), plus compact references for evidence already in context; bounded backfill may return fewer excerpts.',
+        },
+        detail: {
+          type: 'string',
+          enum: ['low', 'high'],
+          description:
+            'Detail level for messages. "low" (default) returns truncated text and tool names. "high" returns full content with tool args/results.',
+        },
+        partType: {
+          type: 'string',
+          enum: ['text', 'tool-call', 'tool-result', 'image', 'file'],
+          description: 'Filter results to only include parts of this type. Only applies to mode="messages".',
+        },
+        toolName: {
+          type: 'string',
+          minLength: 1,
+          description:
+            'Filter results to only include tool-call and tool-result parts matching this tool name. Only applies to mode="messages".',
+        },
+        partIndex: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'Fetch a single part from the cursor message by its positional index. When provided, returns only that part at high detail. Indices are shown as [p0], [p1], etc. in recall results.',
+        },
+        charOffset: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'Continue reading a truncated single part from this position. Pass the exact nextCharOffset value returned by a previous call; do not compute it yourself. Only applies with cursor and partIndex in mode="messages".',
+        },
+        viewAttachment: {
+          type: 'boolean',
+          description:
+            'Show the actual attachment instead of just describing it. Requires cursor and partIndex, and only applies when that part is an image or file. Use it after recall shows you an attachment you need to look at.',
+        },
+      },
+    } satisfies JSONSchema7,
+    execute: async (inputData, context) => {
+      const {
+        mode,
+        query,
+        groupId,
+        direction,
+        cursor,
+        threadId: explicitThreadId,
+        anchor,
+        page,
+        limit,
+        detail,
+        partType,
+        toolName,
+        partIndex,
+        charOffset,
+        before,
+        after,
+        viewAttachment,
+      } = inputData as {
+        mode?: 'messages' | 'threads' | 'search' | 'observations';
+        query?: string;
+        groupId?: string;
+        direction?: 'before' | 'after';
+        cursor?: string;
+        threadId?: string;
+        anchor?: 'start' | 'end';
+        page?: number;
+        limit?: number;
+        detail?: RecallDetail;
+        partType?: 'text' | 'tool-call' | 'tool-result' | 'reasoning' | 'image' | 'file';
+        toolName?: string;
+        partIndex?: number;
+        charOffset?: number;
+        before?: string;
+        after?: string;
+        viewAttachment?: boolean;
+      };
+      const memory = (context as any)?.memory as RecallMemory | undefined;
+      const currentThreadId = context?.agent?.threadId;
+      const resourceId = context?.agent?.resourceId;
+      const resolvedExplicitThreadId = explicitThreadId === 'current' ? currentThreadId : explicitThreadId;
+
+      if (!memory) {
+        throw new Error('Memory instance is required for recall');
+      }
+
+      if (explicitThreadId === 'current' && !currentThreadId) {
+        throw new Error('Could not resolve current thread.');
+      }
+
+      // Observation group paging mode
+      if (mode === 'observations') {
+        if (!searchEnabled) {
+          return { results: SEARCH_NOT_CONFIGURED_MESSAGE, count: 0 };
+        }
+        if (!groupId) {
+          throw new Error('groupId is required for mode="observations"');
+        }
+        if (!resourceId) {
+          throw new Error('Resource ID is required for recall');
+        }
+        const om = (await getOMEngine?.()) ?? null;
+        if (!om) {
+          return {
+            results:
+              'Observation group paging requires observational memory and a storage adapter supporting observation history search.',
+            count: 0,
+          };
+        }
+        const pagingThreadId = !isResourceScope ? currentThreadId : resolvedExplicitThreadId || currentThreadId;
+        if (!pagingThreadId) {
+          throw new Error('Could not resolve current thread.');
+        }
+        const thread = await memory.getThreadById?.({ threadId: pagingThreadId });
+        if (!thread || thread.resourceId !== resourceId) {
+          throw new Error('Thread not found');
+        }
+        return pageObservationGroups({
+          om,
+          threadId: pagingThreadId,
+          resourceId,
+          ...parseGroupCursor(groupId),
+          direction,
+          limit: Math.min(Math.max(limit ?? 5, 1), 20),
+          threadTitle: thread.title,
+          includeThreadId: isResourceScope,
+          countNewerMessages: async cursor => {
+            const store = await memory.getMemoryStore();
+            const end = (await store.listMessagesById({ messageIds: [cursor] })).messages.find(m => m.id === cursor);
+            if (!end || end.threadId !== pagingThreadId) return 0;
+            const { total } = await memory.recall({
+              threadId: pagingThreadId,
+              resourceId,
+              page: 0,
+              perPage: 1,
+              orderBy: { field: 'createdAt', direction: 'ASC' },
+              filter: { dateRange: { start: end.createdAt, startExclusive: true } },
+            });
+            return total;
+          },
+        });
+      }
+
+      // Search mode
+      if (mode === 'search') {
+        // Schema validation rejects mode="search" when search is disabled, but
+        // validation is skipped for resumed runs and builder-validated input —
+        // a stale search call on those paths would otherwise reach
+        // Memory.searchMessages and throw. Return guidance instead.
+        if (!searchEnabled) {
+          return { results: SEARCH_NOT_CONFIGURED_MESSAGE, count: 0 };
+        }
+        if (!query) {
+          throw new Error('query is required for mode="search"');
+        }
+        if (!resourceId) {
+          throw new Error('Resource ID is required for recall');
+        }
+        return searchMessagesForResource({
+          memory,
+          om: (await getOMEngine?.()) ?? null,
+          resourceId,
+          currentThreadId: currentThreadId || undefined,
+          currentMessages: context?.agent?.getMessages?.(),
+          query,
+          topK: limit ?? 10,
+          before,
+          after,
+          threadScope: !isResourceScope ? currentThreadId || undefined : resolvedExplicitThreadId || undefined,
+          includeThreadId: isResourceScope,
+        });
+      }
+
+      // Thread listing mode
+      if (mode === 'threads') {
+        const requestedCurrentThread = explicitThreadId === 'current';
+
+        // Thread scope: return current thread info only
+        if (!isResourceScope || requestedCurrentThread) {
+          if (!currentThreadId || !memory.getThreadById) {
+            return { error: 'Could not resolve current thread.' };
+          }
+          const thread = await memory.getThreadById({ threadId: currentThreadId });
+          if (!thread) {
+            return { error: 'Could not resolve current thread.' };
+          }
+          if (isResourceScope && resourceId && thread.resourceId !== resourceId) {
+            throw new Error('Thread does not belong to the active resource');
+          }
+          return {
+            threads: `- **${thread.title || '(untitled)'}** ← current\n  id: ${thread.id}\n  updated: ${formatTimestamp(thread.updatedAt)} | created: ${formatTimestamp(thread.createdAt)}`,
+            count: 1,
+            page: 0,
+            hasMore: false,
+          };
+        }
+        if (!resourceId) {
+          throw new Error('Resource ID is required for recall');
+        }
+        return listThreadsForResource({
+          memory,
+          resourceId,
+          currentThreadId: currentThreadId || '',
+          page: page ?? 0,
+          limit: limit ?? 20,
+          before,
+          after,
+        });
+      }
+
+      const usedDefaultThreadId = !explicitThreadId && !cursor && Boolean(currentThreadId);
+      const defaultThreadNote =
+        usedDefaultThreadId && isResourceScope ? `threadId wasn't passed so used default ${currentThreadId}.\n\n` : '';
+      // Reuse the shared `resolvedExplicitThreadId` ('current' -> currentThreadId) mapping,
+      // falling back to the current thread when no threadId or cursor was provided.
+      const resolvedThreadId = resolvedExplicitThreadId || (usedDefaultThreadId ? currentThreadId : undefined);
+      const hasResolvedThreadId = typeof resolvedThreadId === 'string' && resolvedThreadId.length > 0;
+      const hasCursor = typeof cursor === 'string' && cursor.length > 0;
+
+      if (!hasResolvedThreadId && !hasCursor) {
+        throw new Error(
+          isResourceScope
+            ? 'No active thread context and no cursor or threadId was provided for mode="messages". Pass a threadId (use mode="threads" to discover thread IDs) or a message ID as cursor.'
+            : 'No active thread context for mode="messages". This tool is limited to the current thread and no current thread could be resolved.',
+        );
+      }
+
+      let targetThreadId: string | undefined;
+      let threadScope: string | undefined;
+
+      if (!isResourceScope) {
+        targetThreadId = currentThreadId;
+        threadScope = currentThreadId || undefined;
+      } else if (hasResolvedThreadId) {
+        if (!resourceId) {
+          throw new Error('Resource ID is required for recall');
+        }
+        if (!memory.getThreadById) {
+          throw new Error('Memory instance cannot verify thread access for recall');
+        }
+
+        const thread = await memory.getThreadById({ threadId: resolvedThreadId! });
+        if (!thread || thread.resourceId !== resourceId) {
+          throw new Error('Thread does not belong to the active resource');
+        }
+
+        targetThreadId = thread.id;
+        threadScope = thread.id;
+      } else {
+        targetThreadId = currentThreadId;
+        threadScope = currentThreadId || undefined;
+      }
+
+      if (hasCursor && !hasResolvedThreadId && !currentThreadId) {
+        if (!isResourceScope) {
+          throw new Error('Current thread is required when browsing by cursor');
+        }
+
+        const resolved = await resolveCursorMessage(memory, cursor!, { resourceId });
+        if ('hint' in resolved) {
+          return {
+            messages: resolved.hint,
+            count: 0,
+            cursor: cursor!,
+            page: page ?? 1,
+            limit: Math.min(limit ?? 20, 20),
+            detail: detail ?? 'low',
+            hasNextPage: false,
+            hasPrevPage: false,
+            truncated: false,
+            tokenOffset: 0,
+          };
+        }
+
+        targetThreadId = resolved.threadId;
+      }
+
+      if (!targetThreadId) {
+        throw new Error('Thread ID is required for recall');
+      }
+
+      if (viewAttachment && (!cursor || partIndex === undefined || partIndex === null)) {
+        return {
+          messages:
+            'viewAttachment needs both cursor and partIndex so it knows which attachment to show. Call recall with cursor, partIndex, and viewAttachment: true.',
+        };
+      }
+
+      // No cursor — read from the start of the thread
+      if (!cursor) {
+        const result = await recallThreadFromStart({
+          memory,
+          threadId: targetThreadId,
+          resourceId: isResourceScope ? resourceId : undefined,
+          page: page ?? 1,
+          limit: limit ?? 20,
+          detail: detail ?? 'low',
+          partType,
+          toolName,
+          anchor: anchor ?? 'start',
+        });
+
+        if (defaultThreadNote) {
+          return { ...result, messages: `${defaultThreadNote}${result.messages}` };
+        }
+
+        return result;
+      }
+
+      // Single-part fetch mode
+      if (partIndex !== undefined && partIndex !== null) {
+        if (viewAttachment) {
+          return recallAttachmentView({
+            memory,
+            threadId: targetThreadId,
+            resourceId,
+            cursor,
+            partIndex,
+            threadScope,
+            retrievalScope,
+          });
+        }
+
+        return recallPart({
+          memory,
+          threadId: targetThreadId,
+          resourceId,
+          cursor,
+          partIndex,
+          charOffset,
+          threadScope,
+          retrievalScope,
+        });
+      }
+
+      return recallMessages({
+        memory,
+        threadId: targetThreadId,
+        resourceId,
+        cursor,
+        page,
+        limit,
+        detail: detail ?? 'low',
+        partType,
+        toolName,
+        threadScope,
+        retrievalScope,
+      });
+    },
+    toModelOutput: recallAttachmentToModelOutput,
+  });
+};

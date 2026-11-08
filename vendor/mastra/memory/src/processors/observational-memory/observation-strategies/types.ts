@@ -1,0 +1,140 @@
+import type { MastraDBMessage, MessageList } from '@mastra/core/agent';
+import type { ObservabilityContext } from '@mastra/core/observability';
+import type { ProcessorContext, ProcessorStreamWriter } from '@mastra/core/processors';
+import type { RequestContext } from '@mastra/core/request-context';
+import type { ObservationalMemoryRecord } from '@mastra/core/storage';
+import type { ProviderMetadata } from '@mastra/core/stream';
+
+import type { Extractor } from '../extractor';
+import type { ObservationGroup } from '../observation-groups';
+import type { ObservationModelContext, ObserveHooks, ObserveTrigger } from '../types';
+
+/** One observation group's vector write, as handed to `onIndexObservations`. */
+export interface ObservationIndexWrite {
+  text: string;
+  groupId: string;
+  range: string;
+  threadId: string;
+  resourceId: string;
+  observedAt?: Date;
+  recordId?: string;
+}
+
+/** Parameters for running an observation via a strategy. */
+export interface ObservationRunOpts {
+  record: ObservationalMemoryRecord;
+  threadId: string;
+  resourceId?: string;
+  messages: MastraDBMessage[];
+
+  /**
+   * Live MessageList for the in-flight agent turn, when observation runs inside
+   * an agent loop. Lets lifecycle markers land on the pending assistant response
+   * message before it reaches storage (see `streamMarker`).
+   */
+  messageList?: MessageList;
+
+  /** Pre-generated cycle ID (async buffer only — sync/resource auto-generate). */
+  cycleId?: string;
+  /** Pre-captured start timestamp (async buffer only). */
+  startedAt?: string;
+
+  writer?: ProcessorStreamWriter;
+  abortSignal?: AbortSignal;
+  reflectionHooks?: Pick<ObserveHooks, 'onReflectionStart' | 'onReflectionEnd'>;
+  /** Which pipeline path initiated this cycle; forwarded to transform hooks. */
+  trigger?: ObserveTrigger;
+  agent?: ProcessorContext['agent'];
+  sendSignal?: ProcessorContext['sendSignal'];
+  sendStateSignal?: ProcessorContext['sendStateSignal'];
+  requestContext?: RequestContext;
+  currentModel?: ObservationModelContext;
+  observabilityContext?: ObservabilityContext;
+  /**
+   * Async buffer only: called right after the buffered chunk is persisted, before
+   * post-persist work (indexing, thread title).
+   */
+  onBufferedChunkPersisted?: () => Promise<void>;
+}
+
+/** Output from calling the observer agent. */
+export interface ObserverOutput {
+  observations: string;
+  currentTask?: string;
+  suggestedContinuation?: string;
+  threadTitle?: string;
+  extractedValues?: Record<string, unknown>;
+  extractionFailures?: Array<{ slug: string; error: string }>;
+  extractors?: readonly Extractor<any>[];
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  providerMetadata?: ProviderMetadata;
+}
+
+/** Result returned from ObservationStrategy.run(). */
+export interface ObservationRunResult {
+  observed: boolean;
+  usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
+  providerMetadata?: ProviderMetadata;
+  /**
+   * The failure that ended the cycle, for strategies that swallow errors
+   * instead of rethrowing (async buffering). Lets callers report the failure
+   * (e.g. to ObserveHooks) even though the fire-and-forget path never throws.
+   */
+  error?: Error;
+}
+
+/** Processed observation ready for persistence. */
+export interface ProcessedObservation {
+  observations: string;
+  observationTokens: number;
+  cycleObservationTokens: number;
+  observedMessageIds: string[];
+  lastObservedAt: Date;
+  /** The observation group this cycle added, as composed. Only it needs a new vector write. */
+  newObservationGroup?: ObservationGroup;
+  threadMetadataUpdates?: Array<{
+    threadId: string;
+    lastObservedAt: string;
+    suggestedResponse?: string;
+    currentTask?: string;
+    threadTitle?: string;
+    extracted?: Record<string, unknown>;
+    extractionFailures?: Array<{ slug: string; error: string }>;
+    extractors?: readonly Extractor<any>[];
+    lastObservedMessageCursor?: { createdAt: string; id: string };
+  }>;
+  suggestedContinuation?: string;
+  currentTask?: string;
+  threadTitle?: string;
+  extractedValues?: Record<string, unknown>;
+  extractionFailures?: Array<{ slug: string; error: string }>;
+  extractors?: readonly Extractor<any>[];
+}
+
+/**
+ * What `persist()` did with a processed observation. A strategy returns nothing when there
+ * was nothing to commit: the cycle still completes, but `observationCommitted` settles false.
+ */
+export type ObservationPersistOutcome =
+  | {
+      /** The observation landed on the current head generation. */
+      status: 'committed';
+      /** The observation as committed (recomposed when the head changed under the cycle). */
+      processed: ProcessedObservation;
+      /**
+       * The generation the observation was written to (the head at write time). Later
+       * reflections may have superseded it by the time the outcome is returned.
+       */
+      record: ObservationalMemoryRecord;
+      /**
+       * Another instance had already committed observations for every message this cycle
+       * observed, so this cycle wrote nothing. The cycle still completes (its messages are
+       * observed), but nothing new was saved.
+       */
+      alreadyCovered?: boolean;
+    }
+  | {
+      /** Nothing was written; the cycle must not remove context or report completion. */
+      status: 'not-committed';
+      reason: string;
+    };

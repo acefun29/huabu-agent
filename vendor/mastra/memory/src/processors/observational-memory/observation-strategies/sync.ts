@@ -1,0 +1,350 @@
+import type { MastraDBMessage } from '@mastra/core/agent';
+import { getThreadOMMetadata, setThreadOMMetadata } from '@mastra/core/memory';
+import type { ObservationalMemoryRecord } from '@mastra/core/storage';
+
+import { omDebug } from '../debug';
+import {
+  applyExtractorHooks,
+  buildThreadMetadataFromExtractedValues,
+  getPriorExtractedValues,
+} from '../extracted-values';
+import {
+  createObservationEndMarker,
+  createObservationFailedMarker,
+  createObservationStartMarker,
+  createThreadUpdateMarker,
+} from '../markers';
+import { getLastObservedMessageCursor } from '../message-utils';
+
+import { buildMessageRange } from '../observational-memory';
+import { formatMessagesForObserver } from '../observer-agent';
+import { getLineageHead } from '../record-lineage';
+import { ObservationStrategy } from './base';
+import type { StrategyDeps } from './base';
+import { resolveThreadTitleUpdate } from './thread-title';
+import type { ObservationPersistOutcome, ObservationRunOpts, ObserverOutput, ProcessedObservation } from './types';
+
+export class SyncObservationStrategy extends ObservationStrategy {
+  private readonly startedAt = new Date().toISOString();
+  private readonly lastMessage: MastraDBMessage | undefined;
+  private cycleId?: string;
+  private tokensToObserve = 0;
+  private observerResult!: ObserverOutput;
+  private priorExtractedValues?: Record<string, unknown>;
+  /** Head text the processed observations were composed from (the commit's expected text). */
+  private composedFrom = '';
+
+  constructor(deps: StrategyDeps, opts: ObservationRunOpts) {
+    super(deps, opts);
+    this.lastMessage = opts.messages[opts.messages.length - 1];
+  }
+
+  protected override getObservedMessagesForThread(threadId: string) {
+    return threadId === this.opts.threadId ? this.opts.messages : undefined;
+  }
+
+  get needsLock() {
+    return true;
+  }
+  get needsReflection() {
+    return true;
+  }
+  get rethrowOnFailure() {
+    return true;
+  }
+
+  async prepare() {
+    const { record, threadId, messages } = this.opts;
+
+    this.deps.emitDebugEvent({
+      type: 'observation_triggered',
+      timestamp: new Date(),
+      threadId,
+      resourceId: record.resourceId ?? '',
+      previousObservations: record.activeObservations,
+      messages: messages.map(m => ({
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      })),
+    });
+
+    const bufferActivation = this.observationConfig.bufferActivation;
+    if (bufferActivation && bufferActivation < 1 && messages.length >= 1) {
+      const newestMsg = messages[messages.length - 1];
+      if (newestMsg?.content?.parts?.length) {
+        // Set message-level sealed flag (same pattern as OM.sealMessagesForBuffering on main)
+        if (!newestMsg.content.metadata) {
+          newestMsg.content.metadata = {};
+        }
+        const metadata = newestMsg.content.metadata as { mastra?: { sealed?: boolean } };
+        if (!metadata.mastra) {
+          metadata.mastra = {};
+        }
+        metadata.mastra.sealed = true;
+        omDebug(
+          `[OM:sync-obs] sealed newest message (${newestMsg.role}, ${newestMsg.content.parts.length} parts) for ratio-aware observation`,
+        );
+      }
+    }
+
+    this.tokensToObserve = await this.tokenCounter.countMessagesAsync(messages);
+
+    const freshRecord = await this.storage.getObservationalMemory(record.threadId, record.resourceId);
+    const existingObservations = freshRecord?.activeObservations ?? record.activeObservations ?? '';
+    return { messages, existingObservations, contextRecord: freshRecord };
+  }
+
+  async emitStartMarkers(cycleId: string) {
+    this.cycleId = cycleId;
+    if (this.lastMessage?.id) {
+      const startMarker = createObservationStartMarker({
+        cycleId,
+        operationType: 'observation',
+        tokensToObserve: this.tokensToObserve,
+        recordId: this.opts.record.id,
+        threadId: this.opts.threadId,
+        threadIds: [this.opts.threadId],
+        config: this.getObservationMarkerConfig(),
+      });
+      await this.streamMarker(startMarker);
+    }
+  }
+
+  async observe(observerContext: string, messages: MastraDBMessage[], wasTruncated: boolean) {
+    // Fetch prior thread metadata for observer prompt continuity
+    const thread = await this.storage.getThreadById({ threadId: this.opts.threadId });
+    const omMeta = thread ? getThreadOMMetadata(thread.metadata) : undefined;
+    this.priorExtractedValues = getPriorExtractedValues(omMeta, this.observationConfig.extractors);
+
+    const result = await this.deps.observer.call(observerContext, messages, this.opts.abortSignal, {
+      wasTruncated,
+      requestContext: this.opts.requestContext,
+      observabilityContext: this.opts.observabilityContext,
+      priorCurrentTask: omMeta?.currentTask,
+      priorSuggestedResponse: omMeta?.suggestedResponse,
+      priorThreadTitle: omMeta?.threadTitle,
+      priorExtractedValues: this.priorExtractedValues,
+      threadId: this.opts.threadId,
+      resourceId: this.opts.resourceId,
+      trigger: this.opts.trigger,
+      mainAgent: this.opts.agent,
+      timeZone: this.opts.record.observedTimezone,
+      currentModel: this.opts.currentModel,
+    });
+    const hookedValues = await applyExtractorHooks({
+      source: 'observer',
+      extractors: result.extractors ?? this.observationConfig.extractors,
+      values: result.extractedValues,
+      failures: result.extractionFailures,
+      previousValues: this.priorExtractedValues,
+      rawObservations: result.observations,
+      recentMessages: formatMessagesForObserver(this.opts.messages, {
+        maxPartLength: 500,
+        timeZone: this.opts.record.observedTimezone,
+      }),
+      threadId: this.opts.threadId,
+      resourceId: this.opts.resourceId,
+      mainAgent: this.opts.agent,
+      memory: this.deps.memory,
+      sendSignal: this.opts.sendSignal,
+      sendStateSignal: this.opts.sendStateSignal,
+      writer: this.opts.writer,
+      abortSignal: this.opts.abortSignal,
+      requestContext: this.opts.requestContext,
+      observationCommitted: this.observationCommitted,
+    });
+    const output = {
+      ...result,
+      extractedValues: hookedValues.values,
+      extractionFailures: hookedValues.failures,
+    };
+    this.observerResult = output;
+    return output;
+  }
+
+  async process(output: ObserverOutput, existingObservations: string): Promise<ProcessedObservation> {
+    const { record, threadId, messages } = this.opts;
+
+    this.composedFrom = existingObservations;
+    const processed = await this.compose(output, existingObservations, record);
+
+    this.deps.emitDebugEvent({
+      type: 'observation_complete',
+      timestamp: new Date(),
+      threadId,
+      resourceId: record.resourceId ?? '',
+      observations: processed.observations,
+      rawObserverOutput: output.observations,
+      previousObservations: record.activeObservations,
+      messages: messages.map(m => ({
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+      })),
+      usage: output.usage,
+    });
+
+    return processed;
+  }
+
+  /** Build the observations to commit on top of `existingObservations` (the head text). */
+  private async compose(
+    output: ObserverOutput,
+    existingObservations: string,
+    baseRecord: ObservationalMemoryRecord,
+  ): Promise<ProcessedObservation> {
+    const { threadId, messages } = this.opts;
+
+    const lastObservedAt = this.getMaxMessageTimestamp(messages);
+    // Build the group this cycle adds before merging it, so the commit carries exactly that group.
+    const newObservationGroup = this.createObservationGroup(output.observations, buildMessageRange(messages));
+    const newObservations = await this.wrapObservations(
+      output.observations,
+      existingObservations,
+      threadId,
+      lastObservedAt,
+      newObservationGroup,
+    );
+    const observationTokens = this.tokenCounter.countObservations(newObservations);
+    const cycleObservationTokens = this.tokenCounter.countObservations(output.observations);
+
+    const newMessageIds = messages.map(m => m.id);
+    const existingIds = baseRecord.observedMessageIds ?? [];
+    const observedMessageIds = [...new Set([...(Array.isArray(existingIds) ? existingIds : []), ...newMessageIds])];
+
+    return {
+      observations: newObservations,
+      observationTokens,
+      cycleObservationTokens,
+      observedMessageIds,
+      lastObservedAt,
+      newObservationGroup,
+      suggestedContinuation: output.suggestedContinuation,
+      currentTask: output.currentTask,
+      threadTitle: output.threadTitle,
+      extractedValues: output.extractedValues,
+      extractionFailures: output.extractionFailures,
+      extractors: output.extractors,
+    };
+  }
+
+  async persist(processed: ProcessedObservation): Promise<ObservationPersistOutcome | void> {
+    const { record, threadId, resourceId, messages } = this.opts;
+
+    // `Memory.deleteThread` and `om.clear` delete the record, so a cycle that finishes
+    // afterwards must not persist: not into a removed row (indexing vectors the finished
+    // cleanup will never delete), and not into a record created for the thread since.
+    // Keying off the record rather than the thread row matters: `observe()` is a
+    // public entry point that legitimately runs for a thread that was never
+    // persisted, in which case `getOrCreateRecord` has already created the record.
+    const liveRecord = await getLineageHead(this.storage, record);
+    if (!liveRecord) {
+      omDebug(`[OM:sync-obs] skipping persist for thread ${threadId}: observational memory record is gone`);
+      return { status: 'not-committed', reason: 'the observational memory record was cleared' };
+    }
+
+    // Commit first. The thread cursor and the completion marker below are what remove the
+    // observed messages from the live context, so they may only follow a commit that landed
+    // on the head generation.
+    const committed = await this.commitActiveObservationsToHead({
+      processed,
+      composedFrom: this.composedFrom,
+      target: liveRecord,
+      recompose: head => this.compose(this.observerResult, head.activeObservations ?? '', head),
+      cycleMessageIds: messages.map(m => m.id),
+    });
+    if (!committed) {
+      return { status: 'not-committed', reason: 'the observational memory head kept changing during the commit' };
+    }
+    processed = committed.processed;
+    // Index only the group this commit added, before anything below can fail the cycle. Earlier
+    // groups were indexed by the cycle that added them, and reflected groups are not observation
+    // output. A covered cycle added nothing.
+    if (!committed.alreadyCovered && processed.newObservationGroup) {
+      await this.indexNewObservationGroups(
+        [{ group: processed.newObservationGroup, threadId, observedAt: processed.lastObservedAt }],
+        resourceId,
+        committed.record.id,
+      );
+    }
+
+    // A covered cycle wrote nothing; the instance that did commit owns the thread's title,
+    // task, and cursor metadata, so this cycle's output must not overwrite them.
+    const thread = committed.alreadyCovered ? null : await this.storage.getThreadById({ threadId });
+    if (thread) {
+      const oldTitle = thread.title?.trim();
+      const newTitle = resolveThreadTitleUpdate(thread, processed.threadTitle);
+      const shouldUpdateThreadTitle = newTitle !== undefined;
+      const previousOmMetadata = getThreadOMMetadata(thread.metadata);
+      const metadataUpdate = buildThreadMetadataFromExtractedValues(
+        processed.extractors ?? this.observationConfig.extractors,
+        processed.extractedValues,
+      );
+      const newMetadata = setThreadOMMetadata(thread.metadata, {
+        suggestedResponse: metadataUpdate.suggestedResponse ?? processed.suggestedContinuation,
+        currentTask: metadataUpdate.currentTask ?? processed.currentTask,
+        threadTitle: metadataUpdate.threadTitle ?? processed.threadTitle,
+        extracted: {
+          ...(previousOmMetadata?.extracted ?? {}),
+          ...(metadataUpdate.extracted ?? {}),
+        },
+        lastObservedMessageCursor: getLastObservedMessageCursor(messages),
+      });
+      this.opts.abortSignal?.throwIfAborted();
+      await this.storage.patchThread({
+        id: threadId,
+        ...(shouldUpdateThreadTitle ? { title: newTitle } : {}),
+        metadata: newMetadata,
+      });
+
+      if (shouldUpdateThreadTitle) {
+        await this.streamMarker(
+          createThreadUpdateMarker({
+            cycleId: this.cycleId ?? crypto.randomUUID(),
+            threadId,
+            oldTitle,
+            newTitle,
+          }),
+        );
+      }
+    }
+
+    return { status: 'committed', processed, record: committed.record, alreadyCovered: committed.alreadyCovered };
+  }
+
+  async emitEndMarkers(cycleId: string, processed: ProcessedObservation) {
+    const actualTokensObserved = await this.tokenCounter.countMessagesAsync(this.opts.messages);
+    if (this.lastMessage?.id) {
+      const endMarker = createObservationEndMarker({
+        cycleId,
+        operationType: 'observation',
+        startedAt: this.startedAt,
+        tokensObserved: actualTokensObserved,
+        observationTokens: processed.cycleObservationTokens,
+        observations: this.observerResult.observations,
+        currentTask: this.observerResult.currentTask,
+        suggestedResponse: this.observerResult.suggestedContinuation,
+        extractedValues: this.observerResult.extractedValues,
+        extractionFailures: this.observerResult.extractionFailures,
+        recordId: this.opts.record.id,
+        threadId: this.opts.threadId,
+      });
+      await this.streamMarker(endMarker);
+    }
+  }
+
+  async emitFailedMarkers(cycleId: string, error: unknown) {
+    if (this.lastMessage?.id) {
+      const failedMarker = createObservationFailedMarker({
+        cycleId,
+        operationType: 'observation',
+        startedAt: this.startedAt,
+        tokensAttempted: this.tokensToObserve,
+        error,
+        failurePolicy: this.observationConfig.failurePolicy,
+        recordId: this.opts.record.id,
+        threadId: this.opts.threadId,
+      });
+      await this.streamMarker(failedMarker);
+    }
+  }
+}

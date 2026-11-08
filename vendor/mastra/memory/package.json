@@ -1,0 +1,91 @@
+{
+  "name": "@mastra/memory",
+  "version": "1.41.0",
+  "description": "",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./processors": {
+      "import": {
+        "types": "./dist/processors/index.d.ts",
+        "default": "./dist/processors/index.js"
+      },
+      "require": {
+        "types": "./dist/processors/index.d.ts",
+        "default": "./dist/processors/index.cjs"
+      }
+    },
+    "./hooks": {
+      "import": {
+        "types": "./dist/hooks.d.ts",
+        "default": "./dist/hooks.js"
+      },
+      "require": {
+        "types": "./dist/hooks.d.ts",
+        "default": "./dist/hooks.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsdown --silent --config tsdown.config.ts",
+    "build:watch": "tsdown --silent --config tsdown.config.ts --watch"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@mastra/schema-compat": "workspace:*",
+    "async-mutex": "^0.5.0",
+    "diff": "^9.0.0",
+    "json-schema": "^0.4.0",
+    "lru-cache": "^11.5.3",
+    "probe-image-size": "^7.4.0",
+    "xxhash-wasm": "^1.1.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@ai-sdk/openai-v5": "npm:@ai-sdk/openai@2.0.139",
+    "@copilotkit/aimock": "^1.46.0",
+    "@internal/ai-sdk-v4": "workspace:*",
+    "@internal/ai-sdk-v5": "workspace:*",
+    "@internal/ai-v6": "workspace:*",
+    "@internal/ai-v7": "workspace:*",
+    "@internal/types-builder": "workspace:*",
+    "@mastra/core": "workspace:*",
+    "@types/json-schema": "^7.0.15",
+    "@types/node": "22.19.15",
+    "tokenx": "^1.6.0",
+    "tsdown": "0.23.1",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@mastra/core": ">=1.80.0-0 <2.0.0-0"
+  },
+  "homepage": "https://mastra.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mastra-ai/mastra.git",
+    "directory": "packages/memory"
+  },
+  "bugs": {
+    "url": "https://github.com/mastra-ai/mastra/issues"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

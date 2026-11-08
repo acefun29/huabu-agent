@@ -1,0 +1,4133 @@
+import type { MastraDBMessage } from '@mastra/core/agent';
+import { standardSchemaToJSONSchema } from '@mastra/core/schema';
+import { InMemoryStore } from '@mastra/core/storage';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+import { Memory } from '../index';
+import {
+  formatMessageParts,
+  hasVisibleParts,
+  listThreadsForResource,
+  recallMessages,
+  recallPart,
+  recallThreadFromStart,
+  recallTool,
+  searchMessagesForResource,
+} from './om-tools';
+
+describe('om-tools', () => {
+  describe('hasVisibleParts', () => {
+    const message = (content: unknown) =>
+      ({
+        id: 'm',
+        role: 'assistant',
+        threadId: 't',
+        createdAt: new Date('2024-01-01T00:00:00Z'),
+        content,
+      }) as MastraDBMessage;
+    const withParts = (...parts: unknown[]) => message({ format: 2, parts });
+    const invocation = (toolInvocation: unknown) => ({ type: 'tool-invocation', toolInvocation });
+
+    it.each([
+      ['string content', message('hello'), true],
+      ['legacy content text', message({ format: 2, parts: [], content: 'hello' }), true],
+      ['no parts or content', message({ format: 2, parts: [] }), false],
+      ['text', withParts({ type: 'text', text: 'hello' }), true],
+      ['empty text', withParts({ type: 'text', text: '' }), false],
+      ['reasoning', withParts({ type: 'reasoning', reasoning: 'private', details: [] }), false],
+      ['redacted reasoning', withParts({ type: 'redacted-reasoning', data: 'private' }), false],
+      ['step start', withParts({ type: 'step-start' }), false],
+      ['data marker', withParts({ type: 'data-om-observation', data: {} }), false],
+      ['untyped part', withParts({ text: 'hello' }), false],
+      ['tool call with args', withParts(invocation({ state: 'call', toolName: 'lookup', args: {} })), true],
+      ['partial tool call', withParts(invocation({ state: 'partial-call', toolName: 'lookup', args: {} })), false],
+      ['tool call without args', withParts(invocation({ state: 'call', toolName: 'lookup' })), false],
+      ['tool result without args', withParts(invocation({ state: 'result', toolName: 'lookup', result: 1 })), true],
+      ['tool invocation without name', withParts(invocation({ state: 'result', args: {}, result: 1 })), false],
+      ['v5 tool call', withParts({ type: 'tool-call', toolName: 'lookup', input: {} }), true],
+      ['unnamed v5 tool result', withParts({ type: 'tool-result', output: 1 }), false],
+      ['image', withParts({ type: 'image', image: 'https://example.com/a.png' }), true],
+      ['unknown part type', withParts({ type: 'source', url: 'https://example.com' }), true],
+      ['only hidden parts', withParts({ type: 'reasoning', text: 'private' }, { type: 'step-start' }), false],
+      ['hidden then text', withParts({ type: 'reasoning', text: 'private' }, { type: 'text', text: 'hi' }), true],
+    ])('matches the formatter for %s', (_name, msg, visible) => {
+      expect(hasVisibleParts(msg)).toBe(visible);
+      expect(formatMessageParts(msg, 'low').length > 0).toBe(visible);
+    });
+
+    it('does not serialize tool results to decide visibility', () => {
+      const toJSON = vi.fn(() => ({ rows: 1 }));
+      const msg = withParts(invocation({ state: 'result', toolName: 'lookup', args: {}, result: { toJSON } }));
+
+      expect(hasVisibleParts(msg)).toBe(true);
+      expect(toJSON).not.toHaveBeenCalled();
+      formatMessageParts(msg, 'low');
+      expect(toJSON).toHaveBeenCalled();
+    });
+  });
+
+  describe('recalling visible content without stored reasoning', () => {
+    let memory: Memory;
+    const threadId = 'thread-visible-recall';
+    const resourceId = 'resource-visible-recall';
+    const hiddenParts = [
+      { type: 'reasoning', reasoning: 'private reasoning field', details: [] },
+      { type: 'reasoning', text: 'private reasoning text' },
+      { type: 'redacted-reasoning', data: 'private redacted data' },
+    ];
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:04:00Z'),
+        },
+      });
+      // Seed the real store with persisted provider shapes, including older reasoning parts.
+      const store = await memory.getMemoryStore();
+      await store.saveMessages({
+        messages: [
+          {
+            id: 'visible-anchor',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Question' }] },
+          },
+          {
+            id: 'mixed-reply',
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                ...hiddenParts,
+                { type: 'text', text: 'Public answer' },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    state: 'result',
+                    toolCallId: 'lookup-result',
+                    toolName: 'lookup',
+                    args: { query: 'public' },
+                    result: 'Public tool result',
+                  },
+                },
+              ],
+            },
+          },
+          {
+            id: 'private-only',
+            role: 'assistant',
+            content: { format: 2, parts: [...hiddenParts, { type: 'step-start' }] },
+          },
+          {
+            id: 'visible-next',
+            role: 'assistant',
+            content: { format: 2, parts: [{ type: 'text', text: 'Next public answer' }] },
+          },
+        ].map((message, index) => ({
+          ...message,
+          threadId,
+          resourceId,
+          createdAt: new Date(Date.parse('2024-01-01T10:00:00Z') + index * 60_000),
+        })) as MastraDBMessage[],
+      });
+    });
+
+    it.each([0, 1, 2])('does not return a hidden part at its stored index %i', async partIndex => {
+      await expect(recallPart({ memory, threadId, resourceId, cursor: 'mixed-reply', partIndex })).rejects.toThrow(
+        'Available indices: 3, 4, 4',
+      );
+    });
+
+    it('preserves stored indices for visible text and tool results', async () => {
+      const text = await recallPart({ memory, threadId, resourceId, cursor: 'mixed-reply', partIndex: 3 });
+      expect(text).toMatchObject({ messageId: 'mixed-reply', partIndex: 3, type: 'text', text: 'Public answer' });
+      const tool = await recallPart({ memory, threadId, resourceId, cursor: 'mixed-reply', partIndex: 4 });
+      expect(tool).toMatchObject({ messageId: 'mixed-reply', partIndex: 4, type: 'tool-result' });
+      expect(tool.text).toContain('Public tool result');
+    });
+
+    it.each(['low', 'high'] as const)('omits reasoning in %s detail through every paging entry point', async detail => {
+      const results = [
+        await recallMessages({ memory, threadId, resourceId, cursor: 'visible-anchor', detail }),
+        await recallMessages({ memory, threadId, resourceId, cursor: 'visible-next', page: -1, detail }),
+        await recallThreadFromStart({ memory, threadId, resourceId, detail }),
+        await recallThreadFromStart({ memory, threadId, resourceId, detail, anchor: 'end' }),
+      ];
+      for (const result of results) {
+        expect(result.messages).not.toMatch(/private|\[redacted-reasoning\]|\[step-start\]/);
+      }
+      expect(results.map(result => result.count)).toEqual(detail === 'low' ? [2, 2, 3, 3] : [1, 1, 3, 3]);
+      expect(results[0].messages).toContain('[p3] Public answer');
+      if (detail === 'low') {
+        expect(results[0].messages).toContain('[p4] [Tool Result: lookup]');
+        expect(results[0].messages).toContain('Public tool result');
+      }
+    });
+
+    it.each(['low', 'high'] as const)('cannot reveal reasoning with an explicit %s detail filter', async detail => {
+      const results = [
+        await recallMessages({ memory, threadId, resourceId, cursor: 'visible-anchor', detail, partType: 'reasoning' }),
+        await recallThreadFromStart({ memory, threadId, resourceId, detail, partType: 'reasoning' }),
+      ];
+      for (const result of results) {
+        expect(result.messages).not.toContain('private');
+        expect(result.messages).toContain('no message parts matched');
+      }
+    });
+
+    it('skips reasoning-only messages when continuing to the next visible message', async () => {
+      const result = await recallPart({ memory, threadId, resourceId, cursor: 'mixed-reply', partIndex: 5 });
+      expect(result).toMatchObject({ messageId: 'visible-next', partIndex: 0, type: 'text' });
+      expect(result.text).toContain('Next public answer');
+      expect(result.text).not.toContain('private');
+    });
+
+    describe('with long runs of hidden messages', () => {
+      const runThreadId = 'thread-hidden-runs';
+      const hidden = (id: string) => ({
+        id,
+        role: 'assistant',
+        content: { format: 2, parts: [{ type: 'reasoning', text: 'private run' }, { type: 'step-start' }] },
+      });
+      const visible = (id: string) => ({
+        id,
+        role: 'assistant',
+        content: { format: 2, parts: [{ type: 'text', text: `Public ${id}` }] },
+      });
+
+      beforeEach(async () => {
+        await memory.saveThread({
+          thread: {
+            id: runThreadId,
+            resourceId,
+            createdAt: new Date('2024-01-02T00:00:00Z'),
+            updatedAt: new Date('2024-01-02T00:00:00Z'),
+          },
+        });
+        const run = (prefix: string, count: number) =>
+          Array.from({ length: count }, (_, i) => hidden(`${prefix}-${i}`));
+        const store = await memory.getMemoryStore();
+        await store.saveMessages({
+          messages: [visible('a'), ...run('h1', 4), visible('b'), ...run('h2', 60), visible('c')].map(
+            (message, index) => ({
+              ...message,
+              threadId: runThreadId,
+              resourceId,
+              createdAt: new Date(Date.parse('2024-01-02T00:00:00Z') + index * 1000),
+            }),
+          ) as MastraDBMessage[],
+        });
+      });
+
+      it('pages from a cursor past hidden messages', async () => {
+        const forward = await recallMessages({ memory, threadId: runThreadId, resourceId, cursor: 'a', limit: 1 });
+        expect(forward).toMatchObject({ count: 1, hasNextPage: true });
+        expect(forward.messages).toContain('Public b');
+
+        const backward = await recallMessages({
+          memory,
+          threadId: runThreadId,
+          resourceId,
+          cursor: 'c',
+          page: -1,
+          limit: 1,
+        });
+        expect(backward).toMatchObject({ count: 1, hasPrevPage: true });
+        expect(backward.messages).toContain('Public b');
+      });
+
+      it('browses the thread from either end past hidden messages', async () => {
+        const start = await recallThreadFromStart({ memory, threadId: runThreadId, resourceId, limit: 1, page: 2 });
+        expect(start).toMatchObject({ count: 1, hasNextPage: true, hasPrevPage: true });
+        expect(start.messages).toContain('Public b');
+
+        const end = await recallThreadFromStart({
+          memory,
+          threadId: runThreadId,
+          resourceId,
+          limit: 1,
+          anchor: 'end',
+        });
+        expect(end).toMatchObject({ count: 1, hasPrevPage: true });
+        expect(end.messages).toContain('Public c');
+      });
+
+      it('continues to the next visible message past more than 50 hidden messages', async () => {
+        const result = await recallPart({ memory, threadId: runThreadId, resourceId, cursor: 'b', partIndex: 1 });
+        expect(result).toMatchObject({ messageId: 'c', partIndex: 0, type: 'text' });
+        expect(result.text).toContain('Public c');
+      });
+    });
+
+    it('does not offer reasoning as a recall filter', () => {
+      const schema = standardSchemaToJSONSchema(recallTool().inputSchema as any) as {
+        properties: { partType: { enum: string[] } };
+      };
+      expect(schema.properties.partType.enum).toEqual(['text', 'tool-call', 'tool-result', 'image', 'file']);
+    });
+
+    it('keeps stale reasoning filters safe when resumed tool calls skip schema validation', async () => {
+      const result = await recallTool().execute?.({ mode: 'messages', partType: 'reasoning' }, {
+        memory,
+        agent: { threadId, resourceId },
+        resumeData: { stale: true },
+      } as any);
+      expect(result).toMatchObject({ messages: '(no message parts matched the current filters)' });
+    });
+
+    it('rejects direct recall of a reasoning-only message', async () => {
+      await expect(recallPart({ memory, threadId, resourceId, cursor: 'private-only', partIndex: 0 })).rejects.toThrow(
+        'has no visible content',
+      );
+    });
+  });
+
+  describe('recallMessages', () => {
+    let memory: Memory;
+    const threadId = 'thread-om-tools';
+    const resourceId = 'resource-om-tools';
+    let messages: MastraDBMessage[];
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'OM tool test thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      messages = [
+        {
+          id: 'msg-1',
+          threadId,
+          resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Message 1' }] },
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+        },
+        {
+          id: 'msg-2',
+          threadId,
+          resourceId,
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'Message 2' }] },
+          createdAt: new Date('2024-01-01T10:01:00Z'),
+        },
+        {
+          id: 'msg-3',
+          threadId,
+          resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Message 3' }] },
+          createdAt: new Date('2024-01-01T10:02:00Z'),
+        },
+        {
+          id: 'msg-4',
+          threadId,
+          resourceId,
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'Message 4' }] },
+          createdAt: new Date('2024-01-01T10:03:00Z'),
+        },
+        {
+          id: 'msg-5',
+          threadId,
+          resourceId,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Message 5' }] },
+          createdAt: new Date('2024-01-01T10:04:00Z'),
+        },
+      ];
+
+      await memory.saveMessages({ messages });
+    });
+
+    it('should return forward results from a cursor', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-2',
+        page: 1,
+        limit: 2,
+      });
+
+      expect(result.count).toBe(2);
+      expect(result.cursor).toBe('msg-2');
+      expect(result.page).toBe(1);
+      expect(result.limit).toBe(2);
+      expect(result.messages).toContain('Message 3');
+      expect(result.messages).toContain('Message 4');
+      expect(result.messages).not.toContain('Message 5');
+    });
+
+    it('should return backward results when page is negative', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-4',
+        page: -1,
+        limit: 2,
+      });
+
+      expect(result.count).toBe(2);
+      expect(result.page).toBe(-1);
+      expect(result.messages).toContain('Message 2');
+      expect(result.messages).toContain('Message 3');
+      expect(result.messages).not.toContain('Message 1');
+    });
+
+    it('should treat page 0 as page 1', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-2',
+        page: 0,
+        limit: 1,
+      });
+
+      expect(result.page).toBe(1);
+      expect(result.count).toBe(1);
+      expect(result.messages).toContain('Message 3');
+    });
+
+    it('should use the default limit of 20', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+      });
+
+      expect(result.limit).toBe(20);
+      expect(result.count).toBe(4);
+      expect(result.messages).toContain('Message 2');
+      expect(result.messages).toContain('Message 5');
+    });
+
+    it('should browse the cursor thread in resource scope when the cursor belongs to another thread', async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'other-thread',
+          resourceId,
+          title: 'Other thread',
+          createdAt: new Date('2024-01-01T11:00:00Z'),
+          updatedAt: new Date('2024-01-01T11:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'other-1',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Wrong thread' }] },
+            createdAt: new Date('2024-01-01T11:00:00Z'),
+          },
+          {
+            id: 'other-2',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'assistant',
+            content: { format: 2, parts: [{ type: 'text', text: 'Follow-up in other thread' }] },
+            createdAt: new Date('2024-01-01T11:01:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'other-1',
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.messages).toContain('Follow-up in other thread');
+      expect(result.messages).not.toContain('Cursor does not belong to the active thread');
+    });
+
+    it('should name the other thread for cross-thread cursors in resource scope', async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'other-thread',
+          resourceId,
+          title: 'Other thread',
+          createdAt: new Date('2024-01-01T11:00:00Z'),
+          updatedAt: new Date('2024-01-01T11:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'other-1',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Wrong thread' }] },
+            createdAt: new Date('2024-01-01T11:00:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'other-1',
+        threadScope: threadId,
+        retrievalScope: 'resource',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.messages).toContain('Cursor does not belong to the active thread');
+      expect(result.messages).toContain('Pass threadId="other-thread"');
+      expect(result.messages).not.toContain('omit threadId');
+    });
+
+    it('should return a hint when cursor is a colon-delimited range', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1:msg-3',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.messages).toContain('start="msg-1"');
+      expect(result.messages).toContain('end="msg-3"');
+    });
+
+    it('should return a hint when cursor is a comma-separated merged range', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1:msg-2,msg-3:msg-4',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.messages).toContain('start="msg-1"');
+      expect(result.messages).toContain('end="msg-4"');
+    });
+
+    // ── Detail levels ───────────────────────────────────────────────
+
+    it('should default to low detail', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        limit: 2,
+      });
+
+      expect(result.detail).toBe('low');
+    });
+
+    it('should include part indices in output', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        limit: 2,
+      });
+
+      expect(result.messages).toContain('[p0]');
+    });
+
+    it('should include message IDs in output', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        limit: 2,
+      });
+
+      expect(result.messages).toContain('[msg-2]');
+      expect(result.messages).toContain('[msg-3]');
+    });
+
+    it('should exclude messages with no renderable parts from the page count', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-empty-text-part',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: '' }],
+            },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        page: 1,
+        limit: 1,
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.messages).toBe('(no visible message parts found for this page)');
+    });
+
+    it('should auto-expand low detail when full text fits in token budget', async () => {
+      // 200 chars ≈ 50 tokens — well under default 8000 budget
+      const longText = 'A'.repeat(200);
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-long',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: longText }] },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'low',
+      });
+
+      // Full text returned because it fits in budget — no truncation hint needed
+      expect(result.messages).toContain(longText);
+      expect(result.truncated).toBe(false);
+    });
+
+    it('should truncate in low detail when text exceeds budget after expansion', async () => {
+      // Text big enough that even after expansion it can't fully fit in a tight budget
+      const longText =
+        'The quick brown fox jumps over the lazy dog and then some more words to fill up tokens. '.repeat(30);
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-long',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: longText }] },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      // Budget smaller than the full text (~570 tokens) so expansion can't fully restore it
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'low',
+        maxTokens: 200,
+      });
+
+      // Part gets partially expanded but still truncated with hint
+      expect(result.messages).toContain('[truncated');
+      expect(result.messages).not.toContain(longText);
+    });
+
+    it('should auto-expand truncated parts when budget allows', async () => {
+      // Moderate text that exceeds per-part limit (500 tokens) but fits in total budget (2000)
+      const moderateText =
+        'The quick brown fox jumps over the lazy dog and then some more words to fill up tokens. '.repeat(30);
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-moderate',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: moderateText }] },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'low',
+      });
+
+      // Text (~570 tokens) exceeds 200-token user text expand cap — still truncated but expanded beyond initial 100
+      expect(result.messages).toContain('for more]');
+      // Should have more content than the initial 100-token per-part limit
+      const partMatch = result.messages.match(/\[p0\] ([\s\S]*?)(\n\.\.\.|$)/);
+      expect(partMatch).toBeTruthy();
+    });
+
+    it('should show tool names only in low detail, full args in high detail', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-tool',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-1',
+                    toolName: 'searchFiles',
+                    state: 'call',
+                    args: { query: 'test query', path: '/src' },
+                  },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      const lowResult = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'low',
+      });
+
+      expect(lowResult.messages).toContain('Tool Call: searchFiles');
+      // Low detail shouldn't include full JSON args
+      expect(lowResult.messages).not.toContain('"query": "test query"');
+
+      const highResult = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'high',
+      });
+
+      expect(highResult.messages).toContain('Tool Call: searchFiles');
+      expect(highResult.messages).toContain('"query": "test query"');
+    });
+
+    it('PR #25961 consumer proof: recall null falls back to raw result', async () => {
+      const rawSentinel = 'PR25961_NULL_RAW_RESULT_SENTINEL';
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-null-model-output',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-null-model-output',
+                    toolName: 'backgroundTask',
+                    state: 'result',
+                    args: {},
+                    result: { answer: rawSentinel },
+                  },
+                  providerMetadata: { mastra: { modelOutput: null } },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'high',
+        partType: 'tool-result',
+      });
+
+      expect(result.messages, 'PR25961_RECALL_NULL_RAW_FALLBACK').toContain(rawSentinel);
+    });
+
+    it('PR #25961 consumer proof: recall undefined falls back to raw result', async () => {
+      const rawSentinel = 'PR25961_UNDEFINED_RAW_RESULT_SENTINEL';
+      const message = {
+        id: 'msg-undefined-model-output',
+        threadId,
+        resourceId,
+        role: 'assistant',
+        content: {
+          format: 2,
+          parts: [
+            {
+              type: 'tool-invocation',
+              toolInvocation: {
+                toolCallId: 'tc-undefined-model-output',
+                toolName: 'legacyTool',
+                state: 'result',
+                args: {},
+                result: { answer: rawSentinel },
+              },
+              providerMetadata: { mastra: { modelOutput: undefined } },
+            },
+          ],
+        },
+        createdAt: new Date('2024-01-01T10:05:00Z'),
+      } as unknown as MastraDBMessage;
+      const recallSpy = vi.spyOn(memory, 'recall').mockResolvedValue({ messages: [message] } as any);
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'high',
+        partType: 'tool-result',
+      });
+      recallSpy.mockRestore();
+
+      expect(result.messages, 'PR25961_RECALL_UNDEFINED_RAW_FALLBACK').toContain(rawSentinel);
+    });
+
+    it('PR #25961 consumer proof: recall falsy stored outputs remain authoritative', async () => {
+      const rawSentinel = 'PR25961_FALSY_RAW_RESULT_SENTINEL';
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-zero-model-output',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-zero-model-output',
+                    toolName: 'zeroOutput',
+                    state: 'result',
+                    args: {},
+                    result: { answer: rawSentinel },
+                  },
+                  providerMetadata: { mastra: { modelOutput: 0 } },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+          {
+            id: 'msg-false-model-output',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-false-model-output',
+                    toolName: 'falseOutput',
+                    state: 'result',
+                    args: {},
+                    result: { answer: rawSentinel },
+                  },
+                  providerMetadata: { mastra: { modelOutput: false } },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:06:00Z'),
+          },
+          {
+            id: 'msg-empty-model-output',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-empty-model-output',
+                    toolName: 'emptyOutput',
+                    state: 'result',
+                    args: {},
+                    result: { answer: rawSentinel },
+                  },
+                  providerMetadata: { mastra: { modelOutput: '' } },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:07:00Z'),
+          },
+        ],
+      });
+
+      const zeroResult = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 1,
+        detail: 'high',
+        partType: 'tool-result',
+      });
+      expect(zeroResult.messages).toContain('[Tool Result: zeroOutput]\n0');
+      expect(zeroResult.messages).not.toContain(rawSentinel);
+
+      const falseResult = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-zero-model-output',
+        limit: 1,
+        detail: 'high',
+        partType: 'tool-result',
+      });
+      expect(falseResult.messages).toContain('[Tool Result: falseOutput]\nfalse');
+      expect(falseResult.messages).not.toContain(rawSentinel);
+
+      const emptyResult = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-false-model-output',
+        limit: 1,
+        detail: 'high',
+        partType: 'tool-result',
+      });
+      expect(emptyResult.messages).toContain('[Tool Result: emptyOutput]');
+      expect(emptyResult.messages).not.toContain(rawSentinel);
+    });
+
+    it('should filter recallMessages by partType', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-filter-parts',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                { type: 'text', text: 'Intro text' },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-filter-call',
+                    toolName: 'readFile',
+                    state: 'call',
+                    args: { path: '/src/index.ts' },
+                  },
+                },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-filter-result',
+                    toolName: 'readFile',
+                    state: 'result',
+                    args: { path: '/src/index.ts' },
+                    result: 'export const value = 1;',
+                  },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:06:00Z'),
+          },
+        ],
+      });
+
+      const toolResultOnly = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 2,
+        partType: 'tool-result',
+      });
+
+      expect(toolResultOnly.messages).toContain('Tool Result: readFile');
+      expect(toolResultOnly.messages).not.toContain('Tool Call: readFile');
+      expect(toolResultOnly.messages).not.toContain('Intro text');
+
+      const textOnly = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 2,
+        partType: 'text',
+      });
+
+      expect(textOnly.messages).toContain('Intro text');
+      expect(textOnly.messages).not.toContain('Tool Result: readFile');
+      expect(textOnly.messages).not.toContain('Tool Call: readFile');
+    });
+
+    it('should filter recallMessages by toolName and combine with partType', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-filter-tools',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-web-search',
+                    toolName: 'web_search',
+                    state: 'call',
+                    args: { query: 'mastra recall' },
+                  },
+                },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-read-file-result',
+                    toolName: 'readFile',
+                    state: 'result',
+                    args: { path: '/src/index.ts' },
+                    result: 'export const read = true;',
+                  },
+                },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-web-search-result',
+                    toolName: 'web_search',
+                    state: 'result',
+                    args: { query: 'mastra recall' },
+                    result: { results: ['doc-a', 'doc-b'] },
+                  },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:07:00Z'),
+          },
+        ],
+      });
+
+      const toolOnly = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 3,
+        toolName: 'web_search',
+        detail: 'high',
+      });
+
+      expect(toolOnly.messages).toContain('Tool Call: web_search');
+      expect(toolOnly.messages).toContain('next part: partIndex=2');
+      expect(toolOnly.messages).not.toContain('Tool Result: readFile');
+
+      const toolResultOnly = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 3,
+        toolName: 'web_search',
+        partType: 'tool-result',
+        detail: 'high',
+      });
+
+      expect(toolResultOnly.messages).toContain('Tool Result: web_search');
+      expect(toolResultOnly.messages).not.toContain('Tool Call: web_search');
+      expect(toolResultOnly.messages).not.toContain('Tool Result: readFile');
+
+      const toolCallOnly = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 3,
+        toolName: 'web_search',
+        partType: 'tool-call',
+        detail: 'high',
+      });
+
+      expect(toolCallOnly.messages).toContain('Tool Call: web_search');
+      expect(toolCallOnly.messages).toContain('"query": "mastra recall"');
+      expect(toolCallOnly.messages).not.toContain('Tool Result: web_search');
+    });
+
+    it('should return no rendered parts when filters match nothing', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-no-filter-match',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-no-match',
+                    toolName: 'readFile',
+                    state: 'result',
+                    args: { path: '/src/index.ts' },
+                    result: 'no match expected',
+                  },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:08:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 4,
+        toolName: 'web_search',
+      });
+
+      expect(result.messages).toBe('(no message parts matched the current filters)');
+      expect(result.count).toBe(1);
+    });
+
+    // ── High-detail clamping ──────────────────────────────────────
+
+    it('should clamp high detail to 1 part and include continuation hints', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        page: 1,
+        limit: 10,
+        detail: 'high',
+      });
+
+      // Should only render 1 part from the first message
+      expect(result.count).toBe(1);
+      expect(result.detail).toBe('high');
+      // Should include the first message's content
+      expect(result.messages).toContain('Message 2');
+      // Should NOT include later messages inline
+      expect(result.messages).not.toContain('Message 4');
+      // Should include continuation hint pointing to the next message
+      expect(result.messages).toContain('High detail returns 1 part at a time');
+      expect(result.messages).toContain('next message');
+      expect(result.messages).toContain('msg-3');
+    });
+
+    it('should show next partIndex hint when message has multiple parts', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-multi-part',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                { type: 'text', text: 'First part' },
+                { type: 'text', text: 'Second part' },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        limit: 5,
+        detail: 'high',
+      });
+
+      expect(result.messages).toContain('First part');
+      expect(result.messages).not.toContain('Second part');
+      expect(result.messages).toContain('partIndex=1');
+    });
+
+    it('should keep next-message continuation hints compatible with part overflow fallback', async () => {
+      const highDetail = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        page: 1,
+        limit: 10,
+        detail: 'high',
+      });
+
+      expect(highDetail.messages).toContain('next message: partIndex=0 on cursor="msg-3"');
+
+      const continued = await recallPart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-2',
+        partIndex: 1,
+      });
+
+      expect(continued.messageId).toBe('msg-3');
+      expect(continued.partIndex).toBe(0);
+      expect(continued.text).toContain(
+        'Part index 1 not found in message msg-2; showing partIndex 0 from next message msg-3.',
+      );
+      expect(continued.text).toContain('Message 3');
+    });
+
+    // ── Pagination flags ────────────────────────────────────────────
+
+    it('should report hasNextPage when more messages exist forward', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        page: 1,
+        limit: 2,
+      });
+
+      // After msg-1 we have msg-2, msg-3, msg-4, msg-5 (4 messages), limit 2 → hasNextPage
+      expect(result.hasNextPage).toBe(true);
+      expect(result.hasPrevPage).toBe(false);
+    });
+
+    it('should report hasPrevPage when on a later page forward', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        page: 2,
+        limit: 2,
+      });
+
+      // Page 2 of 4 messages → has prev page, no next page
+      expect(result.hasNextPage).toBe(false);
+      expect(result.hasPrevPage).toBe(true);
+    });
+
+    it('should report hasNextPage=false when all messages fit', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.hasNextPage).toBe(false);
+      expect(result.hasPrevPage).toBe(false);
+    });
+
+    it('should report hasPrevPage for backward pagination', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-5',
+        page: -1,
+        limit: 2,
+      });
+
+      // Before msg-5 we have msg-1, msg-2, msg-3, msg-4 (4 messages), limit 2 → hasPrevPage
+      expect(result.hasPrevPage).toBe(true);
+      expect(result.hasNextPage).toBe(false);
+    });
+
+    // ── Token limiting ──────────────────────────────────────────────
+
+    it('should report truncated=false when output fits token budget', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        limit: 2,
+      });
+
+      expect(result.truncated).toBe(false);
+      expect(result.tokenOffset).toBe(0);
+    });
+
+    it('should truncate and report tokenOffset when output exceeds token budget', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-1',
+        limit: 20,
+        maxTokens: 5, // extremely small budget
+      });
+
+      expect(result.truncated).toBe(true);
+      expect(result.tokenOffset).toBeGreaterThan(0);
+    });
+
+    // ── Data-only messages ────────────────────────────────────────
+
+    it('should skip data-only messages in paged recall output', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-data',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'data-om-buffering-start',
+                  data: { cycleId: 'test-cycle', operationType: 'observation' },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:02:30Z'),
+          },
+        ],
+      });
+
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-2',
+        page: 1,
+        limit: 5,
+      });
+
+      // msg-data is in the date range but has no visible content — should not appear
+      expect(result.messages).not.toContain('data-om-buffering-start');
+      expect(result.messages).not.toContain('msg-data');
+      // visible messages should still be present
+      expect(result.messages).toContain('Message 3');
+    });
+
+    // ── recallTool integration ──────────────────────────────────────
+
+    it('should surface missing memory context errors from the tool', async () => {
+      const tool = recallTool();
+
+      await expect(tool.execute?.({ cursor: 'msg-2' }, { agent: { threadId, resourceId } } as any)).rejects.toThrow(
+        'Memory instance is required for recall',
+      );
+    });
+  });
+
+  describe('access control', () => {
+    let memory: Memory;
+    const threadId = 'thread-owner';
+    const resourceId = 'resource-owner';
+    const otherThreadId = 'thread-other';
+    const otherResourceId = 'resource-other';
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+
+      // Thread belonging to the current resource
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Owner thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      // Thread belonging to a different resource
+      await memory.saveThread({
+        thread: {
+          id: otherThreadId,
+          resourceId: otherResourceId,
+          title: 'Other user thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'owner-msg-1',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Owner message' }] },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+          {
+            id: 'other-msg-1',
+            threadId: otherThreadId,
+            resourceId: otherResourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Other user message' }] },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+        ],
+      });
+    });
+
+    it('should reject cursor from a different resource in recallMessages', async () => {
+      await expect(
+        recallMessages({
+          memory: memory as any,
+          threadId: otherThreadId,
+          resourceId,
+          cursor: 'other-msg-1',
+        }),
+      ).rejects.toThrow('Could not resolve cursor message');
+    });
+
+    it('should not disclose the other thread for cross-thread cursors in strict thread scope', async () => {
+      // Thread scope fails closed with the same generic error as an unresolvable cursor,
+      // so probing message IDs reveals nothing about other threads.
+      await expect(
+        recallMessages({
+          memory: memory as any,
+          threadId: 'different-thread',
+          resourceId,
+          cursor: 'owner-msg-1',
+          threadScope: 'different-thread',
+        }),
+      ).rejects.toThrow('Could not resolve cursor message: owner-msg-1');
+    });
+
+    it('should name the other thread for cross-thread cursors when resource scope is explicit', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId: 'different-thread',
+        resourceId,
+        cursor: 'owner-msg-1',
+        threadScope: 'different-thread',
+        retrievalScope: 'resource',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.messages).toContain('Cursor does not belong to the active thread');
+      expect(result.messages).toContain(threadId);
+      expect(result.messages).toContain(`Pass threadId="${threadId}"`);
+      expect(result.messages).not.toContain('omit threadId');
+    });
+
+    it('should allow cursor from same resource in resource scope', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'owner-msg-1',
+        // no threadScope = resource scope
+      });
+      expect(result.count).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should reject recallPart cursor from a different resource', async () => {
+      await expect(
+        recallPart({
+          memory: memory as any,
+          threadId: otherThreadId,
+          resourceId,
+          cursor: 'other-msg-1',
+          partIndex: 0,
+        }),
+      ).rejects.toThrow('Could not resolve cursor message');
+    });
+
+    // Seeds a sibling thread that belongs to the *same* resource as `threadId`.
+    const seedSameResourceSiblingThread = async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'same-resource-other-thread',
+          resourceId,
+          title: 'Same resource other thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'same-resource-other-msg-1',
+            threadId: 'same-resource-other-thread',
+            resourceId,
+            role: 'assistant',
+            content: { format: 2, parts: [{ type: 'text', text: 'Same resource other thread message' }] },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+    };
+
+    it('should reject recallPart cursor from another thread when a thread scope is set', async () => {
+      await seedSameResourceSiblingThread();
+
+      await expect(
+        recallPart({
+          memory: memory as any,
+          threadId,
+          resourceId,
+          threadScope: threadId,
+          cursor: 'same-resource-other-msg-1',
+          partIndex: 0,
+        }),
+      ).rejects.toThrow('Could not resolve cursor message');
+    });
+
+    it('should allow recallPart to resolve a cursor from another thread in the same resource when no thread scope is set', async () => {
+      await seedSameResourceSiblingThread();
+
+      const result = await recallPart({
+        memory: memory as any,
+        threadId: 'same-resource-other-thread',
+        resourceId,
+        // no threadScope = resource scope, where cross-thread browsing is allowed
+        cursor: 'same-resource-other-msg-1',
+        partIndex: 0,
+      });
+
+      expect(result.messageId).toBe('same-resource-other-msg-1');
+      expect(result.partIndex).toBe(0);
+      expect(result.text).toContain('Same resource other thread message');
+    });
+
+    it('should reject recallThreadFromStart for a thread from another resource', async () => {
+      await expect(
+        recallThreadFromStart({
+          memory: memory as any,
+          threadId: otherThreadId,
+          resourceId,
+        }),
+      ).rejects.toThrow('Thread not found');
+    });
+
+    it('should allow recallThreadFromStart for own thread', async () => {
+      const result = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+      });
+      expect(result.count).toBe(1);
+      expect(result.messages).toContain('Owner message');
+    });
+
+    // Regression coverage for https://github.com/mastra-ai/mastra/issues/21863.
+    // The helper-level tests above always pass `resourceId` explicitly, so they never
+    // exercised the tool wiring that dropped it in thread scope. These drive the tool.
+    describe('recall tool scope enforcement (#21863)', () => {
+      it('should not return a cross-resource message body through partIndex in thread scope', async () => {
+        const tool = recallTool(undefined, { retrievalScope: 'thread', searchEnabled: false });
+
+        await expect(
+          tool.execute?.({ mode: 'messages', cursor: 'owner-msg-1', partIndex: 0 }, {
+            memory,
+            agent: { threadId: otherThreadId, resourceId: otherResourceId },
+          } as any),
+        ).rejects.toThrow('Could not resolve cursor message');
+      });
+
+      it('should not return a same-resource sibling thread body through partIndex in thread scope', async () => {
+        await seedSameResourceSiblingThread();
+
+        const tool = recallTool(undefined, { retrievalScope: 'thread', searchEnabled: false });
+
+        await expect(
+          tool.execute?.({ mode: 'messages', cursor: 'same-resource-other-msg-1', partIndex: 0 }, {
+            memory,
+            agent: { threadId, resourceId },
+          } as any),
+        ).rejects.toThrow('Could not resolve cursor message');
+      });
+
+      it('should still resolve a cross-thread cursor through partIndex in resource scope', async () => {
+        await seedSameResourceSiblingThread();
+
+        const tool = recallTool(undefined, { retrievalScope: 'resource', searchEnabled: false });
+
+        const result: any = await tool.execute?.(
+          { mode: 'messages', cursor: 'same-resource-other-msg-1', partIndex: 0 },
+          { memory, agent: { resourceId } } as any,
+        );
+
+        expect(result.messageId).toBe('same-resource-other-msg-1');
+        expect(result.text).toContain('Same resource other thread message');
+      });
+
+      it('should still resolve a cross-thread cursor through partIndex in resource scope with an active thread', async () => {
+        await seedSameResourceSiblingThread();
+
+        const tool = recallTool(undefined, { retrievalScope: 'resource', searchEnabled: false });
+
+        // context.agent.threadId is populated on every agent run, so this is the normal
+        // path for partIndex continuation notes, which deliberately omit threadId.
+        const result: any = await tool.execute?.(
+          { mode: 'messages', cursor: 'same-resource-other-msg-1', partIndex: 0 },
+          { memory, agent: { threadId, resourceId } } as any,
+        );
+
+        expect(result.messageId).toBe('same-resource-other-msg-1');
+        expect(result.text).toContain('Same resource other thread message');
+      });
+
+      it('should fall back to the next message in the cursor message thread, not the active thread', async () => {
+        await seedSameResourceSiblingThread();
+
+        await memory.saveMessages({
+          messages: [
+            {
+              id: 'same-resource-other-msg-2',
+              threadId: 'same-resource-other-thread',
+              resourceId,
+              role: 'assistant',
+              content: { format: 2, parts: [{ type: 'text', text: 'Sibling thread follow-up' }] },
+              createdAt: new Date('2024-01-01T12:30:00Z'),
+            },
+            {
+              id: 'active-thread-later-msg',
+              threadId,
+              resourceId,
+              role: 'assistant',
+              content: { format: 2, parts: [{ type: 'text', text: 'Active thread later message' }] },
+              createdAt: new Date('2024-01-01T13:00:00Z'),
+            },
+          ],
+        });
+
+        const tool = recallTool(undefined, { retrievalScope: 'resource', searchEnabled: false });
+
+        const result: any = await tool.execute?.(
+          { mode: 'messages', cursor: 'same-resource-other-msg-1', partIndex: 99 },
+          { memory, agent: { threadId, resourceId } } as any,
+        );
+
+        expect(result.messageId).toBe('same-resource-other-msg-2');
+        expect(result.text).toContain('Sibling thread follow-up');
+        expect(result.text).not.toContain('Active thread later message');
+      });
+
+      it('should reject a cross-resource cursor outright in thread scope without disclosing anything', async () => {
+        const tool = recallTool(undefined, { retrievalScope: 'thread', searchEnabled: false });
+
+        await expect(
+          tool.execute?.({ mode: 'messages', cursor: 'owner-msg-1' }, {
+            memory,
+            agent: { threadId: otherThreadId, resourceId: otherResourceId },
+          } as any),
+        ).rejects.toThrow('Could not resolve cursor message');
+      });
+
+      it('should not disclose the other thread when refusing a cross-thread cursor in thread scope', async () => {
+        await seedSameResourceSiblingThread();
+
+        const tool = recallTool(undefined, { retrievalScope: 'thread', searchEnabled: false });
+
+        // Thread scope fails closed with the same generic error as an unresolvable cursor,
+        // so probing message IDs reveals nothing about threads the caller may not browse.
+        await expect(
+          tool.execute?.({ mode: 'messages', cursor: 'same-resource-other-msg-1' }, {
+            memory,
+            agent: { threadId, resourceId },
+          } as any),
+        ).rejects.toThrow('Could not resolve cursor message: same-resource-other-msg-1');
+      });
+
+      it('should name the other thread when refusing a cross-thread cursor in resource scope', async () => {
+        await seedSameResourceSiblingThread();
+
+        const tool = recallTool(undefined, { retrievalScope: 'resource', searchEnabled: false });
+
+        const result: any = await tool.execute?.({ mode: 'messages', cursor: 'same-resource-other-msg-1' }, {
+          memory,
+          agent: { threadId, resourceId },
+        } as any);
+
+        expect(result.count).toBe(0);
+        expect(result.messages).toContain('Cursor does not belong to the active thread');
+        expect(result.messages).toContain('Pass threadId="same-resource-other-thread"');
+        expect(result.messages).not.toContain('omit threadId');
+      });
+    });
+  });
+
+  describe('recallPart', () => {
+    let memory: Memory;
+    const threadId = 'thread-om-tools';
+    const resourceId = 'resource-om-tools';
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'OM part test thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-multi',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                { type: 'text', text: 'Here is the result:' },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-1',
+                    toolName: 'readFile',
+                    state: 'result',
+                    args: { path: '/src/index.ts' },
+                    result: 'export function main() { console.log("hello"); }',
+                  },
+                },
+                { type: 'text', text: 'As you can see, it exports a main function.' },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+        ],
+      });
+    });
+
+    it('should fetch a specific part by index', async () => {
+      const result = await recallPart({
+        memory: memory as any,
+        threadId,
+        cursor: 'msg-multi',
+        partIndex: 0,
+      });
+
+      expect(result.messageId).toBe('msg-multi');
+      expect(result.partIndex).toBe(0);
+      expect(result.type).toBe('text');
+      expect(result.text).toContain('Here is the result:');
+    });
+
+    it('should fetch a tool result part at high detail', async () => {
+      const result = await recallPart({
+        memory: memory as any,
+        threadId,
+        cursor: 'msg-multi',
+        partIndex: 1,
+      });
+
+      expect(result.type).toBe('tool-result');
+      expect(result.text).toContain('readFile');
+      expect(result.text).toContain('export function main()');
+    });
+
+    it('should continue an oversized part from charOffset', async () => {
+      const fullText = Array.from({ length: 120 }, (_, index) => `segment-${index.toString().padStart(3, '0')}`).join(
+        ' ',
+      );
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-large-part',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: fullText }],
+            },
+            createdAt: new Date('2024-01-01T10:02:00Z'),
+          },
+        ],
+      });
+
+      const firstChunk = await recallPart({
+        memory: memory as any,
+        threadId,
+        cursor: 'msg-large-part',
+        partIndex: 0,
+        maxTokens: 12,
+      });
+
+      expect(firstChunk.truncated).toBe(true);
+      expect(firstChunk.charOffset).toBe(0);
+      expect(firstChunk.nextCharOffset).toBeGreaterThan(0);
+      expect(firstChunk.note).toContain('charOffset=');
+      expect(firstChunk.text).not.toContain('To continue');
+
+      const secondChunk = await recallPart({
+        memory: memory as any,
+        threadId,
+        cursor: 'msg-large-part',
+        partIndex: 0,
+        charOffset: firstChunk.nextCharOffset,
+        maxTokens: 12,
+      });
+
+      expect(secondChunk.charOffset).toBe(firstChunk.nextCharOffset);
+      expect(secondChunk.text).not.toBe(firstChunk.text);
+      expect(fullText).toContain(firstChunk.text);
+      expect(fullText).toContain(secondChunk.text);
+    });
+
+    it('should reproduce the original oversized part when chunks are concatenated', async () => {
+      const fullText = Array.from({ length: 45 }, (_, index) => `chunk-${index.toString().padStart(3, '0')}`).join(' ');
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-exact-chunks',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: fullText }],
+            },
+            createdAt: new Date('2024-01-01T10:02:00Z'),
+          },
+        ],
+      });
+
+      const chunks: string[] = [];
+      let nextCharOffset: number | undefined = 0;
+
+      while (nextCharOffset !== undefined) {
+        const charOffset: number = nextCharOffset;
+        const result = await recallPart({
+          memory: memory as any,
+          threadId,
+          cursor: 'msg-exact-chunks',
+          partIndex: 0,
+          charOffset,
+          maxTokens: 10,
+        });
+
+        if (result.nextCharOffset !== undefined) {
+          expect(result.nextCharOffset).toBeGreaterThan(charOffset);
+        }
+        chunks.push(result.text);
+        nextCharOffset = result.nextCharOffset;
+      }
+
+      expect(chunks.join('')).toBe(fullText);
+    });
+
+    it('should truncate an oversized part using the default token budget', async () => {
+      const fullText = Array.from(
+        { length: 1500 },
+        (_, index) => `default-budget-segment-${index.toString().padStart(4, '0')}`,
+      ).join(' ');
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-default-budget',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: fullText }],
+            },
+            createdAt: new Date('2024-01-01T10:02:00Z'),
+          },
+        ],
+      });
+
+      const chunks: string[] = [];
+      let nextCharOffset: number | undefined = 0;
+
+      while (nextCharOffset !== undefined) {
+        const charOffset: number = nextCharOffset;
+        const result = await recallPart({
+          memory: memory as any,
+          threadId,
+          cursor: 'msg-default-budget',
+          partIndex: 0,
+          charOffset,
+        });
+
+        if (result.nextCharOffset !== undefined) {
+          expect(result.truncated).toBe(true);
+          expect(result.nextCharOffset).toBeGreaterThan(charOffset);
+          expect(result.note).toContain(`charOffset=${result.nextCharOffset}`);
+        }
+        chunks.push(result.text);
+        nextCharOffset = result.nextCharOffset;
+      }
+
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.join('')).toBe(fullText);
+    });
+
+    it('should fall forward to the first part of the next visible message when partIndex overflows', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-single',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'Only part here' }],
+            },
+            createdAt: new Date('2024-01-01T10:02:00Z'),
+          },
+          {
+            id: 'msg-next-visible',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'This is the next visible message' }],
+            },
+            createdAt: new Date('2024-01-01T10:03:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallPart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-single',
+        partIndex: 1,
+      });
+
+      expect(result.messageId).toBe('msg-next-visible');
+      expect(result.partIndex).toBe(0);
+      expect(result.role).toBe('user');
+      expect(result.type).toBe('text');
+      expect(result.text).toContain(
+        'Part index 1 not found in message msg-single; showing partIndex 0 from next message msg-next-visible.',
+      );
+      expect(result.text).toContain('This is the next visible message');
+    });
+
+    it('should continue a truncated fall-forward part via charOffset', async () => {
+      const nextText = Array.from({ length: 200 }, (_, i) => `next-line ${i}`).join('\n');
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-ff-source',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'Only part here' }],
+            },
+            createdAt: new Date('2024-01-01T10:02:00Z'),
+          },
+          {
+            id: 'msg-ff-next',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: nextText }],
+            },
+            createdAt: new Date('2024-01-01T10:03:00Z'),
+          },
+        ],
+      });
+
+      const chunks: string[] = [];
+      let nextCharOffset: number | undefined = 0;
+
+      while (nextCharOffset !== undefined) {
+        const charOffset: number = nextCharOffset;
+        const result = await recallPart({
+          memory: memory as any,
+          threadId,
+          resourceId,
+          cursor: 'msg-ff-source',
+          partIndex: 1,
+          charOffset,
+          maxTokens: 50,
+        });
+
+        expect(result.messageId).toBe('msg-ff-next');
+        if (result.nextCharOffset !== undefined) {
+          expect(result.truncated).toBe(true);
+          expect(result.nextCharOffset).toBeGreaterThan(charOffset);
+          expect(result.note).toContain('cursor="msg-ff-source" partIndex=1');
+          expect(result.note).toContain(`charOffset=${result.nextCharOffset}`);
+          expect(result.text).not.toContain('To continue');
+        }
+        chunks.push(result.text);
+        nextCharOffset = result.nextCharOffset;
+      }
+
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.join('')).toBe(
+        `Part index 1 not found in message msg-ff-source; showing partIndex 0 from next message msg-ff-next.\n\n${nextText}`,
+      );
+    });
+
+    it('should skip data-only messages when falling forward to the next visible message', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-overflow-source',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'Source message' }],
+            },
+            createdAt: new Date('2024-01-01T10:02:00Z'),
+          },
+          {
+            id: 'msg-hidden-middle',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'data-om-buffering-start',
+                  data: { cycleId: 'test-cycle', operationType: 'observation' },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:03:00Z'),
+          },
+          {
+            id: 'msg-visible-after-hidden',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'Visible after hidden' }],
+            },
+            createdAt: new Date('2024-01-01T10:04:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallPart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-overflow-source',
+        partIndex: 1,
+      });
+
+      expect(result.messageId).toBe('msg-visible-after-hidden');
+      expect(result.text).toContain('Visible after hidden');
+      expect(result.text).not.toContain('msg-hidden-middle');
+    });
+
+    it('should throw for invalid part index when there is no next visible message', async () => {
+      await expect(
+        recallPart({
+          memory: memory as any,
+          threadId,
+          cursor: 'msg-multi',
+          partIndex: 99,
+        }),
+      ).rejects.toThrow('Part index 99 not found');
+    });
+
+    it('should throw when cursor is a range format', async () => {
+      await expect(
+        recallPart({
+          memory: memory as any,
+          threadId,
+          cursor: 'msg-1:msg-2',
+          partIndex: 0,
+        }),
+      ).rejects.toThrow('looks like a range');
+    });
+
+    it('should throw a helpful message for data-only messages', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-data-only',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'data-om-buffering-start',
+                  data: { cycleId: 'test-cycle', operationType: 'observation' },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:01:00Z'),
+          },
+        ],
+      });
+
+      await expect(
+        recallPart({
+          memory: memory as any,
+          threadId,
+          cursor: 'msg-data-only',
+          partIndex: 0,
+        }),
+      ).rejects.toThrow('no visible content');
+    });
+
+    it('should allow cross-thread browsing via cursor from another thread', async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'other-thread',
+          resourceId,
+          title: 'Other thread',
+          createdAt: new Date('2024-01-01T11:00:00Z'),
+          updatedAt: new Date('2024-01-01T11:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'other-msg',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'content from other thread' }] },
+            createdAt: new Date('2024-01-01T11:00:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallPart({
+        memory: memory as any,
+        threadId,
+        cursor: 'other-msg',
+        partIndex: 0,
+      });
+
+      expect(result.text).toContain('content from other thread');
+      expect(result.messageId).toBe('other-msg');
+    });
+  });
+
+  describe('attachment parts', () => {
+    let memory: Memory;
+    const threadId = 'thread-attachments';
+    const resourceId = 'resource-attachments';
+    const base64Png =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const signedUrl = `https://example.invalid/uploads/report.pdf?X-Amz-Signature=${'a1b2c3d4'.repeat(80)}`;
+
+    beforeEach(async () => {
+      memory = new Memory({
+        storage: new InMemoryStore(),
+        options: { observationalMemory: { model: 'test-model', scope: 'thread', retrieval: true } } as any,
+      });
+
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Attachment thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-attachments',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'file',
+                  data: 'https://example.invalid/original.png',
+                  mimeType: 'image/png',
+                  filename: 'original.png',
+                } as any,
+                {
+                  type: 'file',
+                  url: 'https://example.invalid/deck.pptx',
+                  mediaType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+                },
+                { type: 'file', data: `data:image/png;base64,${base64Png}`, filename: 'inline.png' } as any,
+                { type: 'file', data: base64Png, mimeType: 'image/png' } as any,
+                { type: 'file', data: 'file-abc123', mimeType: 'application/pdf', filename: 'uploaded.pdf' } as any,
+                { type: 'file', data: signedUrl, mimeType: 'application/pdf', filename: 'report.pdf' } as any,
+                { type: 'image', image: 'https://example.invalid/photo.png', mimeType: 'image/png' } as any,
+                { type: 'file', data: new URL('https://example.invalid/scan.png'), mimeType: 'image/png' } as any,
+                { type: 'file', data: `DATA:image/png;base64,${base64Png}` } as any,
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+          {
+            id: 'msg-viewed-attachment',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    state: 'result',
+                    toolCallId: 'call-view',
+                    toolName: 'recall',
+                    args: { cursor: 'msg-attachments', partIndex: 2, viewAttachment: true },
+                    result: {
+                      content: [
+                        { type: 'text', text: '[File: inline.png] image/png (inline data omitted)' },
+                        { type: 'file', data: base64Png, mimeType: 'image/png' },
+                      ],
+                    },
+                  },
+                  providerMetadata: {
+                    mastra: {
+                      modelOutput: {
+                        type: 'content',
+                        value: [
+                          { type: 'text', text: '[File: inline.png] image/png (inline data omitted)' },
+                          { type: 'media', data: base64Png, mediaType: 'image/png' },
+                        ],
+                      },
+                    },
+                  },
+                } as any,
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:01:00Z'),
+          },
+          {
+            id: 'msg-attachments-text',
+            threadId,
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'look at the attachment' }] },
+            createdAt: new Date('2024-01-01T10:05:00Z'),
+          },
+        ],
+      });
+    });
+
+    const fetchPart = (partIndex: number, charOffset?: number) =>
+      recallPart({ memory: memory as any, threadId, resourceId, cursor: 'msg-attachments', partIndex, charOffset });
+
+    it('returns the stored URL and media type for a URL-backed file part via the recall tool', async () => {
+      const recall = memory.listTools().recall!;
+      const result = await recall.execute?.(
+        { mode: 'messages', cursor: 'msg-attachments', partIndex: 0, detail: 'high' },
+        {
+          memory,
+          agent: { threadId, resourceId },
+        } as any,
+      );
+
+      expect((result as any).text).toBe('[File: original.png] image/png url: https://example.invalid/original.png');
+    });
+
+    it('reads v5-shaped file parts (url/mediaType)', async () => {
+      const result = await fetchPart(1);
+      expect(result.text).toBe(
+        '[File] application/vnd.openxmlformats-officedocument.presentationml.presentation url: https://example.invalid/deck.pptx',
+      );
+    });
+
+    it('omits inline data but keeps the media type', async () => {
+      const dataUri = await fetchPart(2);
+      expect(dataUri.text).toBe('[File: inline.png] image/png (inline data omitted)');
+
+      const rawBase64 = await fetchPart(3);
+      expect(rawBase64.text).toBe('[File] image/png (inline data omitted)');
+    });
+
+    it('returns provider file IDs', async () => {
+      const result = await fetchPart(4);
+      expect(result.text).toBe('[File: uploaded.pdf] application/pdf file id: file-abc123');
+    });
+
+    it('continues a long signed URL across charOffset chunks', async () => {
+      const chunks: string[] = [];
+      let charOffset: number | undefined;
+      do {
+        const chunk = await recallPart({
+          memory: memory as any,
+          threadId,
+          resourceId,
+          cursor: 'msg-attachments',
+          partIndex: 5,
+          charOffset,
+          maxTokens: 100,
+        });
+        chunks.push(chunk.text);
+        charOffset = chunk.nextCharOffset;
+      } while (charOffset !== undefined);
+
+      expect(chunks.length).toBeGreaterThan(1);
+      expect(chunks.join('')).toBe(`[File: report.pdf] application/pdf url: ${signedUrl}`);
+    });
+
+    it('includes references in paged recall and truncates long ones at low detail', async () => {
+      const high = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        detail: 'high',
+        maxTokens: 10_000,
+      });
+      expect(high.messages).toContain('[p0] [File: original.png] image/png url: https://example.invalid/original.png');
+      expect(high.messages).toContain(signedUrl);
+      expect(high.messages).not.toContain(base64Png);
+
+      const low = await recallThreadFromStart({ memory: memory as any, threadId, resourceId, detail: 'low' });
+      expect(low.messages).toContain('url: https://example.invalid/original.png');
+      expect(low.messages).not.toContain(signedUrl);
+      expect(low.messages).toContain('recall cursor="msg-attachments" partIndex=5 detail="high"');
+      expect(low.messages).not.toContain(base64Png);
+    });
+
+    const viewAttachment = (partIndex: number, cursor = 'msg-attachments') => {
+      const recall = memory.listTools().recall!;
+      return recall.execute?.({ mode: 'messages', cursor, partIndex, viewAttachment: true }, {
+        memory,
+        agent: { threadId, resourceId },
+      } as any) as Promise<any>;
+    };
+
+    it('returns the actual media for a data-URI attachment', async () => {
+      await expect(viewAttachment(2)).resolves.toEqual({
+        content: [
+          { type: 'text', text: '[File: inline.png] image/png (inline data omitted)' },
+          { type: 'file', data: base64Png, mimeType: 'image/png' },
+        ],
+      });
+    });
+
+    it('returns the actual media for a raw base64 attachment', async () => {
+      await expect(viewAttachment(3)).resolves.toEqual({
+        content: [
+          { type: 'text', text: '[File] image/png (inline data omitted)' },
+          { type: 'file', data: base64Png, mimeType: 'image/png' },
+        ],
+      });
+    });
+
+    it('does not send remote attachments, since AI SDK v5 providers cannot take a URL in a tool result', async () => {
+      const cases: Array<[number, string]> = [
+        [0, '[File: original.png] image/png url: https://example.invalid/original.png'],
+        [5, `[File: report.pdf] application/pdf url: ${signedUrl}`],
+        [6, '[Image] image/png url: https://example.invalid/photo.png'],
+        [7, '[File] image/png url: https://example.invalid/scan.png'],
+      ];
+
+      for (const [partIndex, description] of cases) {
+        const result = await viewAttachment(partIndex);
+        expect(result.content).toBeUndefined();
+        expect(result.messages).toBe(
+          `${description} — This attachment is stored at a remote URL, so it can't be shown inline. Use its url if you need to reference it.`,
+        );
+      }
+    });
+
+    it('explains when the attachment cannot be shown', async () => {
+      const providerFileId = await viewAttachment(4);
+      expect(providerFileId.messages).toContain('[File: uploaded.pdf] application/pdf file id: file-abc123');
+      expect(providerFileId.messages).toContain("payload is not inline data, so it can't be shown");
+      expect(providerFileId.content).toBeUndefined();
+
+      const unsupportedType = await viewAttachment(1);
+      expect(unsupportedType.messages).toBe(
+        "[File] application/vnd.openxmlformats-officedocument.presentationml.presentation url: https://example.invalid/deck.pptx — Attachments of type application/vnd.openxmlformats-officedocument.presentationml.presentation can't be shown inline. Use the attachment's url or file id if you need to reference it.",
+      );
+    });
+
+    it('explains when the target part is not an attachment or cursor/partIndex are missing', async () => {
+      const textPart = await viewAttachment(0, 'msg-attachments-text');
+      expect(textPart.messages).toContain(
+        'Part 0 of message msg-attachments-text is a text-type part, not an attachment.',
+      );
+
+      const recall = memory.listTools().recall!;
+      const missingPartIndex = (await recall.execute?.(
+        { mode: 'messages', cursor: 'msg-attachments', viewAttachment: true },
+        { memory, agent: { threadId, resourceId } } as any,
+      )) as any;
+      expect(missingPartIndex.messages).toContain('viewAttachment needs both cursor and partIndex');
+      expect(missingPartIndex.content).toBeUndefined();
+
+      const missingCursor = (await recall.execute?.({ mode: 'messages', partIndex: 2, viewAttachment: true }, {
+        memory,
+        agent: { threadId, resourceId },
+      } as any)) as any;
+      expect(missingCursor).toEqual({
+        messages:
+          'viewAttachment needs both cursor and partIndex so it knows which attachment to show. Call recall with cursor, partIndex, and viewAttachment: true.',
+      });
+    });
+
+    it('reads data URIs with an uppercase scheme', async () => {
+      const described = await fetchPart(8);
+      expect(described.text).toBe('[File] image/png (inline data omitted)');
+
+      await expect(viewAttachment(8)).resolves.toEqual({
+        content: [
+          { type: 'text', text: '[File] image/png (inline data omitted)' },
+          { type: 'file', data: base64Png, mimeType: 'image/png' },
+        ],
+      });
+    });
+
+    it('does not print inline media from a stored viewAttachment result', async () => {
+      const result = await recallPart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        cursor: 'msg-viewed-attachment',
+        partIndex: 0,
+      });
+
+      expect(result.text).toContain('[Tool Result: recall]');
+      expect(result.text).toContain('"data": "(inline data omitted)"');
+      expect(result.text).not.toContain(base64Png);
+    });
+
+    it('does not show an attachment from another thread in thread scope', async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'thread-attachments-other',
+          resourceId,
+          title: 'Other thread',
+          createdAt: new Date('2024-01-01T09:00:00Z'),
+          updatedAt: new Date('2024-01-01T09:00:00Z'),
+        },
+      });
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-other-attachment',
+            threadId: 'thread-attachments-other',
+            resourceId,
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'file', data: `data:image/png;base64,${base64Png}`, filename: 'secret.png' } as any],
+            },
+            createdAt: new Date('2024-01-01T09:00:00Z'),
+          },
+        ],
+      });
+
+      const threadScopedRecall = memory.listTools({
+        observationalMemory: { model: 'test-model', scope: 'thread', retrieval: { scope: 'thread' } },
+      } as any).recall!;
+
+      await expect(
+        threadScopedRecall.execute?.(
+          { mode: 'messages', cursor: 'msg-other-attachment', partIndex: 0, viewAttachment: true },
+          { memory, agent: { threadId, resourceId } } as any,
+        ),
+      ).rejects.toThrow('Could not resolve cursor message: msg-other-attachment');
+    });
+
+    it('does not show an attachment from another resource', async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'thread-foreign',
+          resourceId: 'resource-foreign',
+          title: 'Foreign thread',
+          createdAt: new Date('2024-01-01T09:00:00Z'),
+          updatedAt: new Date('2024-01-01T09:00:00Z'),
+        },
+      });
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-foreign-attachment',
+            threadId: 'thread-foreign',
+            resourceId: 'resource-foreign',
+            role: 'user',
+            content: {
+              format: 2,
+              parts: [{ type: 'file', data: `data:image/png;base64,${base64Png}`, filename: 'foreign.png' } as any],
+            },
+            createdAt: new Date('2024-01-01T09:00:00Z'),
+          },
+        ],
+      });
+
+      await expect(viewAttachment(0, 'msg-foreign-attachment')).rejects.toThrow(
+        'Could not resolve cursor message: msg-foreign-attachment',
+      );
+    });
+
+    it('maps a viewed attachment to text plus a native media part for the model', async () => {
+      const recall = memory.listTools().recall!;
+      const viewed = await viewAttachment(2);
+
+      expect(recall.toModelOutput!(viewed)).toEqual({
+        type: 'content',
+        value: [
+          { type: 'text', text: '[File: inline.png] image/png (inline data omitted)' },
+          { type: 'media', data: base64Png, mediaType: 'image/png' },
+        ],
+      });
+
+      // A remote attachment only gets a note, so there's nothing to map.
+      expect(recall.toModelOutput!(await viewAttachment(0))).toBeUndefined();
+
+      // Regular recall output is left alone so it keeps its default JSON tool-result shape.
+      const paged = await recall.execute?.({ mode: 'messages', cursor: 'msg-attachments', page: 1, detail: 'low' }, {
+        memory,
+        agent: { threadId, resourceId },
+      } as any);
+      expect(recall.toModelOutput!(paged)).toBeUndefined();
+    });
+  });
+
+  describe('listThreadsForResource', () => {
+    let memory: Memory;
+    const resourceId = 'resource-threads';
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+
+      await memory.saveThread({
+        thread: {
+          id: 'thread-1',
+          resourceId,
+          title: 'Planning session',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-03T10:00:00Z'),
+        },
+      });
+      await memory.saveThread({
+        thread: {
+          id: 'thread-2',
+          resourceId,
+          title: 'Coding session',
+          createdAt: new Date('2024-01-02T10:00:00Z'),
+          updatedAt: new Date('2024-01-04T10:00:00Z'),
+        },
+      });
+      await memory.saveThread({
+        thread: {
+          id: 'thread-3',
+          resourceId,
+          title: 'Review session',
+          createdAt: new Date('2024-01-03T10:00:00Z'),
+          updatedAt: new Date('2024-01-05T10:00:00Z'),
+        },
+      });
+      // Thread from a different resource — should not appear
+      await memory.saveThread({
+        thread: {
+          id: 'thread-other',
+          resourceId: 'other-resource',
+          title: 'Other user thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-06T10:00:00Z'),
+        },
+      });
+    });
+
+    it('should list threads for the current resource', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-2',
+      });
+
+      expect(result.count).toBe(3);
+      expect(result.threads).toContain('Planning session');
+      expect(result.threads).toContain('Coding session');
+      expect(result.threads).toContain('Review session');
+      expect(result.threads).not.toContain('Other user thread');
+    });
+
+    it('should mark the current thread', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-2',
+      });
+
+      expect(result.threads).toContain('← current');
+      // The current marker should appear on the Coding session line
+      const lines = result.threads.split('\n');
+      const codingLine = lines.find(l => l.includes('Coding session'));
+      expect(codingLine).toContain('← current');
+    });
+
+    it('should include thread IDs and dates', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+      });
+
+      expect(result.threads).toContain('thread-1');
+      expect(result.threads).toContain('thread-2');
+      expect(result.threads).toContain('thread-3');
+      expect(result.threads).toContain('updated:');
+      expect(result.threads).toContain('created:');
+    });
+
+    it('should paginate threads', async () => {
+      const page1 = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        limit: 2,
+        page: 0,
+      });
+
+      expect(page1.count).toBe(2);
+      expect(page1.hasMore).toBe(true);
+
+      const page2 = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        limit: 2,
+        page: 1,
+      });
+
+      expect(page2.count).toBe(1);
+      expect(page2.hasMore).toBe(false);
+    });
+
+    it('should return helpful message when no threads found', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId: 'nonexistent-resource',
+        currentThreadId: 'thread-1',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.threads).toContain('No threads found');
+    });
+
+    it('should filter threads by before date', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        before: '2024-01-02T10:00:00Z',
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.threads).toContain('Planning session');
+      expect(result.threads).not.toContain('Coding session');
+      expect(result.threads).not.toContain('Review session');
+    });
+
+    it('should filter threads by after date', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        after: '2024-01-02T00:00:00Z',
+      });
+
+      expect(result.count).toBe(2);
+      expect(result.threads).toContain('Coding session');
+      expect(result.threads).toContain('Review session');
+      expect(result.threads).not.toContain('Planning session');
+    });
+
+    it('should filter threads by before and after combined', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        before: '2024-01-03T00:00:00Z',
+        after: '2024-01-01T12:00:00Z',
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.threads).toContain('Coding session');
+      expect(result.threads).not.toContain('Planning session');
+      expect(result.threads).not.toContain('Review session');
+    });
+
+    it('should paginate date-filtered threads', async () => {
+      const result = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        after: '2024-01-01T00:00:00Z',
+        limit: 1,
+        page: 0,
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.hasMore).toBe(true);
+
+      const page2 = await listThreadsForResource({
+        memory: memory as any,
+        resourceId,
+        currentThreadId: 'thread-1',
+        after: '2024-01-01T00:00:00Z',
+        limit: 1,
+        page: 1,
+      });
+
+      expect(page2.count).toBe(1);
+      expect(page2.hasMore).toBe(true);
+    });
+  });
+
+  describe('cross-thread recallMessages', () => {
+    let memory: Memory;
+    const resourceId = 'resource-cross-thread';
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+
+      await memory.saveThread({
+        thread: {
+          id: 'current-thread',
+          resourceId,
+          title: 'Current thread',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      await memory.saveThread({
+        thread: {
+          id: 'other-thread',
+          resourceId,
+          title: 'Other thread',
+          createdAt: new Date('2024-01-02T10:00:00Z'),
+          updatedAt: new Date('2024-01-02T10:00:00Z'),
+        },
+      });
+
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'other-msg-1',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Hello from other thread' }] },
+            createdAt: new Date('2024-01-02T10:00:00Z'),
+          },
+          {
+            id: 'other-msg-2',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'assistant',
+            content: { format: 2, parts: [{ type: 'text', text: 'Response in other thread' }] },
+            createdAt: new Date('2024-01-02T10:01:00Z'),
+          },
+          {
+            id: 'other-msg-3',
+            threadId: 'other-thread',
+            resourceId,
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Follow-up in other thread' }] },
+            createdAt: new Date('2024-01-02T10:02:00Z'),
+          },
+        ],
+      });
+    });
+
+    it('should browse messages in another thread via cursor', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId: 'other-thread',
+        resourceId,
+        cursor: 'other-msg-1',
+        page: 1,
+        detail: 'low',
+      });
+
+      expect(result.count).toBeGreaterThan(0);
+      expect(result.messages).toContain('Response in other thread');
+    });
+
+    it('should page through another thread', async () => {
+      const result = await recallMessages({
+        memory: memory as any,
+        threadId: 'other-thread',
+        resourceId,
+        cursor: 'other-msg-1',
+        page: 1,
+        limit: 1,
+        detail: 'low',
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.messages).toContain('Response in other thread');
+      expect(result.hasNextPage).toBe(true);
+
+      // Page forward
+      const page2 = await recallMessages({
+        memory: memory as any,
+        threadId: 'other-thread',
+        resourceId,
+        cursor: 'other-msg-1',
+        page: 2,
+        limit: 1,
+        detail: 'low',
+      });
+
+      expect(page2.count).toBe(1);
+      expect(page2.messages).toContain('Follow-up in other thread');
+    });
+  });
+
+  describe('recallThreadFromStart', () => {
+    let memory: Memory;
+    const resourceId = 'resource-from-start';
+    const threadId = 'thread-from-start';
+
+    beforeEach(async () => {
+      memory = new Memory({ storage: new InMemoryStore() });
+
+      await memory.saveThread({
+        thread: {
+          id: threadId,
+          resourceId,
+          title: 'Thread to browse',
+          createdAt: new Date('2024-01-01T10:00:00Z'),
+          updatedAt: new Date('2024-01-01T10:00:00Z'),
+        },
+      });
+
+      const msgs: MastraDBMessage[] = [];
+      for (let i = 1; i <= 5; i++) {
+        msgs.push({
+          id: `start-msg-${i}`,
+          threadId,
+          resourceId,
+          role: i % 2 === 1 ? 'user' : 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: `Message ${i} content` }] },
+          createdAt: new Date(`2024-01-01T10:0${i}:00Z`),
+        });
+      }
+      await memory.saveMessages({ messages: msgs });
+    });
+
+    it('should read from the beginning of a thread without a cursor', async () => {
+      const result = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+      });
+
+      expect(result.count).toBe(5);
+      expect(result.messages).toContain('Message 1 content');
+      expect(result.messages).toContain('Message 5 content');
+      expect(result.page).toBe(1);
+      expect(result.hasPrevPage).toBe(false);
+      expect(result.hasNextPage).toBe(false);
+    });
+
+    it('should paginate through a thread', async () => {
+      const page1 = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        page: 1,
+        limit: 2,
+      });
+
+      expect(page1.count).toBe(2);
+      expect(page1.messages).toContain('Message 1 content');
+      expect(page1.messages).toContain('Message 2 content');
+      expect(page1.hasNextPage).toBe(true);
+      expect(page1.hasPrevPage).toBe(false);
+
+      const page2 = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        page: 2,
+        limit: 2,
+      });
+
+      expect(page2.count).toBe(2);
+      expect(page2.messages).toContain('Message 3 content');
+      expect(page2.messages).toContain('Message 4 content');
+      expect(page2.hasNextPage).toBe(true);
+      expect(page2.hasPrevPage).toBe(true);
+
+      const page3 = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        page: 3,
+        limit: 2,
+      });
+
+      expect(page3.count).toBe(1);
+      expect(page3.messages).toContain('Message 5 content');
+      expect(page3.hasNextPage).toBe(false);
+      expect(page3.hasPrevPage).toBe(true);
+    });
+
+    it('should return an explicit empty-page message for oversized pages', async () => {
+      const result = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        page: 50,
+        limit: 2,
+      });
+
+      expect(result.page).toBe(50);
+      expect(result.count).toBe(0);
+      expect(result.messages).toBe('(no messages found on page 50 for this thread)');
+      expect(result.hasNextPage).toBe(false);
+      expect(result.hasPrevPage).toBe(true);
+    });
+
+    it('should paginate from the newest messages when anchor is end', async () => {
+      const page1 = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        page: 1,
+        limit: 2,
+        anchor: 'end',
+      });
+
+      expect(page1.page).toBe(1);
+      expect(page1.count).toBe(2);
+      expect(page1.messages).toContain('Message 4 content');
+      expect(page1.messages).toContain('Message 5 content');
+      expect(page1.messages).not.toContain('Message 1 content');
+      expect(page1.hasNextPage).toBe(false);
+      expect(page1.hasPrevPage).toBe(true);
+
+      const page2 = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        page: 2,
+        limit: 2,
+        anchor: 'end',
+      });
+
+      expect(page2.page).toBe(2);
+      expect(page2.count).toBe(2);
+      expect(page2.messages).toContain('Message 2 content');
+      expect(page2.messages).toContain('Message 3 content');
+      expect(page2.messages).not.toContain('Message 5 content');
+      expect(page2.hasNextPage).toBe(true);
+      expect(page2.hasPrevPage).toBe(true);
+    });
+
+    it('should return empty message for a thread with no messages', async () => {
+      await memory.saveThread({
+        thread: {
+          id: 'empty-thread',
+          resourceId,
+          title: 'Empty thread',
+          createdAt: new Date('2024-01-02T10:00:00Z'),
+          updatedAt: new Date('2024-01-02T10:00:00Z'),
+        },
+      });
+
+      const result = await recallThreadFromStart({
+        memory: memory as any,
+        threadId: 'empty-thread',
+        resourceId,
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.messages).toContain('no messages');
+    });
+
+    it('should filter recallThreadFromStart by partType and toolName', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'start-msg-tool-filter',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [
+                { type: 'text', text: 'Thread intro' },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-start-read-call',
+                    toolName: 'readFile',
+                    state: 'call',
+                    args: { path: '/src/a.ts' },
+                  },
+                },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-start-read-result',
+                    toolName: 'readFile',
+                    state: 'result',
+                    args: { path: '/src/a.ts' },
+                    result: 'export const a = 1;',
+                  },
+                },
+                {
+                  type: 'tool-invocation',
+                  toolInvocation: {
+                    toolCallId: 'tc-start-web-result',
+                    toolName: 'web_search',
+                    state: 'result',
+                    args: { query: 'memory' },
+                    result: { results: ['memory docs'] },
+                  },
+                },
+              ],
+            },
+            createdAt: new Date('2024-01-01T10:06:00Z'),
+          },
+        ],
+      });
+
+      const byType = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        partType: 'tool-result',
+        detail: 'high',
+      });
+
+      expect(byType.messages).toContain('Tool Result: readFile');
+      expect(byType.messages).toContain('Tool Result: web_search');
+      expect(byType.messages).not.toContain('Tool Call: readFile');
+      expect(byType.messages).not.toContain('Thread intro');
+
+      const byTool = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        toolName: 'readFile',
+        detail: 'high',
+      });
+
+      expect(byTool.messages).toContain('Tool Call: readFile');
+      expect(byTool.messages).toContain('Tool Result: readFile');
+      expect(byTool.messages).not.toContain('Tool Result: web_search');
+      expect(byTool.messages).not.toContain('Thread intro');
+
+      const combined = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        toolName: 'readFile',
+        partType: 'tool-result',
+        detail: 'high',
+      });
+
+      expect(combined.messages).toContain('Tool Result: readFile');
+      expect(combined.messages).not.toContain('Tool Call: readFile');
+      expect(combined.messages).not.toContain('Tool Result: web_search');
+
+      const toolCalls = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        toolName: 'readFile',
+        partType: 'tool-call',
+        detail: 'high',
+      });
+
+      expect(toolCalls.messages).toContain('Tool Call: readFile');
+      expect(toolCalls.messages).toContain('"path": "/src/a.ts"');
+      expect(toolCalls.messages).not.toContain('Tool Result: readFile');
+    });
+
+    it('should support array-shaped tool-call and tool-result parts', async () => {
+      const mockMemory = {
+        recall: vi.fn().mockResolvedValue({
+          messages: [
+            {
+              id: 'msg-array-tool-parts',
+              threadId,
+              resourceId,
+              role: 'assistant',
+              content: [
+                { type: 'text', text: 'Array intro' },
+                {
+                  type: 'tool-call',
+                  toolCallId: 'call-array-1',
+                  toolName: 'execute_command',
+                  args: { command: 'pwd' },
+                },
+                {
+                  type: 'tool-result',
+                  toolCallId: 'call-array-1',
+                  toolName: 'execute_command',
+                  result: { stdout: '/tmp' },
+                },
+              ],
+              createdAt: new Date('2024-01-01T10:09:00Z'),
+            },
+          ],
+        }),
+        getThreadById: vi.fn().mockResolvedValue({ threadId, resourceId }),
+      };
+
+      const toolCalls = await recallThreadFromStart({
+        memory: mockMemory as any,
+        threadId,
+        resourceId,
+        partType: 'tool-call',
+        toolName: 'execute_command',
+        detail: 'high',
+      });
+
+      expect(toolCalls.messages).toContain('Tool Call: execute_command');
+      expect(toolCalls.messages).toContain('"command": "pwd"');
+      expect(toolCalls.messages).not.toContain('Array intro');
+
+      const toolResults = await recallThreadFromStart({
+        memory: mockMemory as any,
+        threadId,
+        resourceId,
+        partType: 'tool-result',
+        toolName: 'execute_command',
+        detail: 'high',
+      });
+
+      expect(toolResults.messages).toContain('Tool Result: execute_command');
+      expect(toolResults.messages).toContain('stdout');
+    });
+
+    it('should distinguish filtered-empty results from empty threads', async () => {
+      await memory.saveMessages({
+        messages: [
+          {
+            id: 'msg-filtered-empty-state',
+            threadId,
+            resourceId,
+            role: 'assistant',
+            content: {
+              format: 2,
+              parts: [{ type: 'text', text: 'Only text here' }],
+            },
+            createdAt: new Date('2024-01-01T10:10:00Z'),
+          },
+        ],
+      });
+
+      const result = await recallThreadFromStart({
+        memory: memory as any,
+        threadId,
+        resourceId,
+        partType: 'tool-call',
+      });
+
+      expect(result.messages).toBe('(no message parts matched the current filters)');
+      expect(result.count).toBeGreaterThan(0);
+    });
+  });
+
+  describe('Memory.listTools', () => {
+    it('should register recall when observational memory retrieval mode is enabled for thread scope', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'thread',
+            retrieval: true,
+          },
+        } as any,
+      });
+
+      expect(memory.listTools()).toHaveProperty('recall');
+    });
+
+    it('should register recall when retrieval mode is enabled for resource scope', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'resource',
+            retrieval: true,
+          },
+        } as any,
+      });
+
+      expect(memory.listTools()).toHaveProperty('recall');
+    });
+
+    it('should throw when retrieval has vector: true but no vector store', () => {
+      expect(
+        () =>
+          new Memory({
+            storage: new InMemoryStore(),
+            options: {
+              observationalMemory: {
+                model: 'test-model',
+                scope: 'thread',
+                retrieval: { vector: true },
+              },
+            } as any,
+          }),
+      ).toThrow('requires a vector store');
+    });
+
+    it('should throw when retrieval has vector: true but no embedder', () => {
+      expect(
+        () =>
+          new Memory({
+            storage: new InMemoryStore(),
+            vector: { id: 'test' } as any,
+            options: {
+              observationalMemory: {
+                model: 'test-model',
+                scope: 'thread',
+                retrieval: { vector: true },
+              },
+            } as any,
+          }),
+      ).toThrow('requires an embedder');
+    });
+
+    it('should not register recall when retrieval mode is disabled', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            retrieval: false,
+          },
+        } as any,
+      });
+
+      expect(memory.listTools()).not.toHaveProperty('recall');
+    });
+  });
+
+  describe('searchMessagesForResource', () => {
+    it('should allow thread-scoped mode="threads" without resourceId', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'thread' });
+      const memory = {
+        getThreadById: async ({ threadId }: { threadId: string }) => ({
+          id: threadId,
+          title: 'Current Thread',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-01'),
+          updatedAt: new Date('2024-01-02'),
+        }),
+      };
+
+      const result = await tool.execute?.({ mode: 'threads' }, { memory, agent: { threadId: 'thread-a' } } as any);
+
+      expect(result).toMatchObject({ count: 1, hasMore: false });
+      expect((result as any).threads).toContain('Current Thread');
+    });
+
+    it('should overfetch before applying thread and date filters', async () => {
+      const threads = [
+        {
+          id: 'thread-a',
+          title: 'Current Thread',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-10'),
+          updatedAt: new Date('2024-01-10'),
+        },
+        {
+          id: 'thread-b',
+          title: 'Older Thread',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-20'),
+          updatedAt: new Date('2024-01-20'),
+        },
+      ];
+
+      const searchMessages = vi.fn().mockResolvedValue({
+        results: [
+          {
+            threadId: 'thread-a',
+            groupId: 'group-a',
+            range: 'msg-1:msg-2',
+            score: 0.99,
+            text: 'Current thread hit',
+            observedAt: new Date('2024-01-10T00:00:00.000Z'),
+          },
+          {
+            threadId: 'thread-b',
+            groupId: 'group-b',
+            range: 'msg-3:msg-4',
+            score: 0.88,
+            text: 'Older thread hit',
+            observedAt: new Date('2024-01-20T00:00:00.000Z'),
+          },
+        ],
+      });
+
+      const memory = {
+        listThreads: async () => ({ threads, total: threads.length, hasMore: false, page: 0 }),
+        searchMessages,
+        getThreadById: async ({ threadId }: { threadId: string }) => threads.find(t => t.id === threadId) || null,
+      };
+
+      const result = await searchMessagesForResource({
+        memory: memory as any,
+        resourceId: 'res',
+        currentThreadId: 'thread-a',
+        query: 'older thread',
+        topK: 1,
+        after: '2024-01-15',
+      });
+
+      expect(searchMessages).toHaveBeenCalledWith({
+        query: 'older thread',
+        resourceId: 'res',
+        topK: 11,
+        filter: { observedAfter: new Date('2024-01-15T00:00:00.000Z') },
+      });
+      expect(result.count).toBe(1);
+      expect(result.results).toContain('Older Thread');
+      expect(result.results).not.toContain('Current Thread');
+    });
+
+    function makeMockMemory({
+      searchResults = [],
+      messages = [],
+      threads = [],
+    }: {
+      searchResults?: Array<{
+        threadId: string;
+        score: number;
+        groupId?: string;
+        range?: string;
+        text?: string;
+        observedAt?: Date;
+      }>;
+      messages?: MastraDBMessage[];
+      threads?: Array<{ id: string; title?: string; resourceId: string; createdAt: Date; updatedAt: Date }>;
+    }) {
+      return {
+        recall: async () => ({ messages: [] }),
+        getMemoryStore: async () => ({
+          listMessagesById: async ({ messageIds }: { messageIds: string[] }) => ({
+            messages: messages.filter(m => messageIds.includes(m.id)),
+          }),
+        }),
+        listThreads: async () => ({ threads, total: threads.length, hasMore: false, page: 0 }),
+        searchMessages: async () => ({ results: searchResults }),
+        getThreadById: async ({ threadId }: { threadId: string }) => threads.find(t => t.id === threadId) || null,
+      };
+    }
+
+    it('should return markdown-formatted observation search results with raw observation text', async () => {
+      const threads = [
+        {
+          id: 'thread-a',
+          title: 'Setup Help',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-01'),
+          updatedAt: new Date('2024-01-01'),
+        },
+        {
+          id: 'thread-b',
+          title: 'Search Docs',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-02'),
+          updatedAt: new Date('2024-01-02'),
+        },
+      ];
+
+      const memory = makeMockMemory({
+        searchResults: [
+          {
+            threadId: 'thread-a',
+            groupId: 'group-1',
+            range: 'msg-1:msg-3',
+            score: 0.95,
+            text: 'Observed setup discussion about vector search.',
+          },
+          {
+            threadId: 'thread-b',
+            groupId: 'group-2',
+            range: 'msg-4:msg-5',
+            score: 0.82,
+            text: 'Observed search documentation discussion.',
+          },
+        ],
+        threads,
+      });
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        currentThreadId: 'thread-a',
+        query: 'vector search',
+      });
+
+      expect(result.count).toBe(2);
+      expect(result.results).toContain('### Current thread memory');
+      expect(result.results).toContain('### Memory from another thread');
+      expect(result.results).toContain('This result came from the current thread.');
+      expect(result.results).toContain('This result came from another thread.');
+      expect(result.results).not.toContain('older memory generation');
+      expect(result.results).toContain('- thread: thread-a (Setup Help)');
+      expect(result.results).toContain('- thread: thread-b (Search Docs)');
+      expect(result.results).toContain('- source: raw messages from ID msg-1 through ID msg-3');
+      expect(result.results).toContain('- source: raw messages from ID msg-4 through ID msg-5');
+      expect(result.results).toContain('- observation group: group-1');
+      expect(result.results).toContain('- observation group: group-2');
+      expect(result.results).toContain('```text');
+      expect(result.results).toContain('Observed setup discussion about vector search.');
+      expect(result.results).toContain('Observed search documentation discussion.');
+    });
+
+    it('should return empty message when no results found', async () => {
+      const memory = makeMockMemory({ searchResults: [] });
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        query: 'nonexistent topic',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.results).toBe('No matching messages found.');
+    });
+
+    it('should return helpful message when searchMessages is not available', async () => {
+      const memory = {
+        recall: async () => ({ messages: [] }),
+        getMemoryStore: async () => ({ listMessagesById: async () => ({ messages: [] }) }),
+        listThreads: async () => ({ threads: [], total: 0, hasMore: false, page: 0 }),
+      };
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        query: 'test',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.results).toContain('Search is not configured');
+      expect(result.results).toContain('retrieval: { vector: true }');
+    });
+
+    it('should fall back when observation text is unavailable', async () => {
+      const memory = makeMockMemory({
+        searchResults: [{ threadId: 'thread-a', groupId: 'group-empty', range: 'msg-1:msg-2', score: 0.7, text: '' }],
+      });
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        query: 'test',
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.results).toContain('- thread: thread-a');
+      expect(result.results).toContain('_Observation text unavailable._');
+    });
+
+    it('should apply thread and date filters before the final topK slice', async () => {
+      const threads = [
+        {
+          id: 'thread-a',
+          title: 'Current Thread',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-01'),
+          updatedAt: new Date('2024-01-01'),
+        },
+        {
+          id: 'thread-b',
+          title: 'Filtered In',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-02'),
+          updatedAt: new Date('2024-01-02'),
+        },
+        {
+          id: 'thread-c',
+          title: 'Filtered Out',
+          resourceId: 'res',
+          createdAt: new Date('2024-01-03'),
+          updatedAt: new Date('2024-01-03'),
+        },
+      ];
+
+      const memory = makeMockMemory({
+        searchResults: [
+          {
+            threadId: 'thread-c',
+            groupId: 'group-1',
+            range: 'msg-1:msg-2',
+            score: 0.99,
+            text: 'out',
+            observedAt: new Date('2024-01-04T00:00:00Z'),
+          },
+          {
+            threadId: 'thread-c',
+            groupId: 'group-2',
+            range: 'msg-3:msg-4',
+            score: 0.98,
+            text: 'out',
+            observedAt: new Date('2024-01-04T00:00:00Z'),
+          },
+          {
+            threadId: 'thread-b',
+            groupId: 'group-3',
+            range: 'msg-5:msg-6',
+            score: 0.97,
+            text: 'in',
+            observedAt: new Date('2024-01-02T00:00:00Z'),
+          },
+        ],
+        threads,
+      });
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        query: 'test',
+        topK: 1,
+        before: '2024-01-03T00:00:00Z',
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.results).toContain('Filtered In');
+      expect(result.results).not.toContain('Filtered Out');
+    });
+
+    it('should cap observation text without cutting result metadata', async () => {
+      const memory = makeMockMemory({
+        searchResults: [
+          {
+            threadId: 'thread-a',
+            groupId: 'group-long',
+            range: 'msg-1:msg-99',
+            score: 0.9,
+            text: Array.from({ length: 300 }, () => 'observation').join(' '),
+          },
+        ],
+      });
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        currentThreadId: 'thread-a',
+        query: 'test',
+        maxTokens: 40,
+      });
+
+      expect(result.count).toBe(1);
+      expect(result.results).toContain('### Current thread memory');
+      expect(result.results.length).toBeLessThan(Array.from({ length: 300 }, () => 'observation').join(' ').length);
+    });
+
+    it('should return helpful message when search is not configured', async () => {
+      const memory = {
+        recall: async () => ({ messages: [] }),
+        getMemoryStore: async () => ({
+          listMessagesById: async () => ({ messages: [] }),
+        }),
+        listThreads: async () => ({ threads: [], total: 0, hasMore: false, page: 0 }),
+        // no searchMessages — simulates retrieval: true without search
+      };
+
+      const result = await searchMessagesForResource({
+        memory,
+        resourceId: 'res',
+        query: 'test',
+      });
+
+      expect(result.count).toBe(0);
+      expect(result.results).toContain('Search is not configured');
+      expect(result.results).toContain('retrieval: { vector: true }');
+    });
+  });
+
+  describe('recallTool message scoping', () => {
+    it('should default to the current thread when mode="messages" omits cursor and threadId', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const getThreadById = vi.fn().mockResolvedValue({
+        id: 'thread-a',
+        resourceId: 'res-a',
+        createdAt: new Date('2024-01-01T09:00:00Z'),
+        updatedAt: new Date('2024-01-01T10:00:00Z'),
+      });
+      const recallMock = vi.fn().mockResolvedValue({
+        messages: [
+          {
+            id: 'msg-1',
+            threadId: 'thread-a',
+            resourceId: 'res-a',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Message 1' }] },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+        ],
+      });
+
+      const result = await tool.execute?.({ mode: 'messages' }, {
+        memory: { getThreadById, recall: recallMock },
+        agent: { threadId: 'thread-a', resourceId: 'res-a' },
+      } as any);
+
+      expect(getThreadById).toHaveBeenCalledWith({ threadId: 'thread-a' });
+      expect(recallMock).toHaveBeenCalledWith(expect.objectContaining({ threadId: 'thread-a', resourceId: 'res-a' }));
+      expect((result as any)?.messages).toMatch(/^threadId wasn't passed so used default thread-a\.\n\n/);
+      expect((result as any)?.messages).toContain('Message 1');
+    });
+
+    it('should require cursor or current thread for mode="messages"', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+
+      await expect(
+        tool.execute?.({ mode: 'messages' }, { memory: {}, agent: { resourceId: 'res-a' } } as any),
+      ).rejects.toThrow('Pass a threadId (use mode="threads" to discover thread IDs) or a message ID as cursor');
+    });
+
+    it('should default to the current thread in thread scope when mode="messages" omits cursor', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'thread' });
+      const recallMock = vi.fn().mockResolvedValue({
+        messages: [
+          {
+            id: 'msg-1',
+            threadId: 'thread-a',
+            resourceId: 'res-a',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Message 1' }] },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+        ],
+      });
+
+      const result = await tool.execute?.({ mode: 'messages' }, {
+        memory: { recall: recallMock },
+        agent: { threadId: 'thread-a', resourceId: 'res-a' },
+      } as any);
+
+      expect(recallMock).toHaveBeenCalledWith(expect.objectContaining({ threadId: 'thread-a' }));
+      expect((result as any)?.messages).not.toMatch(/threadId wasn't passed/);
+      expect((result as any)?.messages).toContain('Message 1');
+    });
+
+    // Regression: with retrieval `{ vector: true, scope: 'thread' }` the tool schema omits
+    // `threadId`, so a fresh `mode="messages"` call has neither cursor nor threadId. This used
+    // to throw `Either cursor or threadId is required for mode="messages"` even with an active
+    // thread, leaving the agent no way to proceed. It must now browse the current thread.
+    it('should not throw the legacy cursor/threadId error in thread scope when a thread is active', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'thread' });
+      const recallMock = vi.fn().mockResolvedValue({
+        messages: [
+          {
+            id: 'msg-1',
+            threadId: 'thread-a',
+            resourceId: 'res-a',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Message 1' }] },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+        ],
+      });
+
+      const execute = () =>
+        tool.execute?.({ mode: 'messages' }, {
+          memory: { recall: recallMock },
+          agent: { threadId: 'thread-a', resourceId: 'res-a' },
+        } as any);
+
+      await expect(execute()).resolves.toBeDefined();
+      const result = await execute();
+      expect((result as any)?.messages).not.toContain('Either cursor or threadId is required');
+      expect(recallMock).toHaveBeenCalledWith(expect.objectContaining({ threadId: 'thread-a' }));
+    });
+
+    it('should explain missing thread context in thread scope for mode="messages"', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'thread' });
+
+      await expect(
+        tool.execute?.({ mode: 'messages' }, { memory: {}, agent: { resourceId: 'res-a' } } as any),
+      ).rejects.toThrow('no current thread could be resolved');
+    });
+
+    it('should allow cursor-only browsing in resource scope by resolving the cursor thread', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const recallMock = vi.fn().mockResolvedValue({ messages: [] });
+
+      const memory = {
+        getMemoryStore: async () => ({
+          listMessagesById: async () => ({
+            messages: [
+              {
+                id: 'msg-1',
+                threadId: 'thread-from-cursor',
+                resourceId: 'res-a',
+                role: 'user',
+                content: { format: 2, parts: [{ type: 'text', text: 'Message 1' }] },
+                createdAt: new Date('2024-01-01T10:00:00Z'),
+              },
+            ],
+          }),
+        }),
+        recall: recallMock,
+      };
+
+      const result = await tool.execute?.({ mode: 'messages', cursor: 'msg-1' }, {
+        memory,
+        agent: { resourceId: 'res-a' },
+      } as any);
+
+      expect((result as any)?.cursor).toBe('msg-1');
+      expect(recallMock).toHaveBeenCalled();
+    });
+
+    it('should resolve threadId="current" for mode="messages" in resource scope', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const getThreadById = vi.fn().mockResolvedValue({
+        id: 'thread-a',
+        resourceId: 'res-a',
+        createdAt: new Date('2024-01-01T09:00:00Z'),
+        updatedAt: new Date('2024-01-01T10:00:00Z'),
+      });
+      const recallMock = vi.fn().mockResolvedValue({ messages: [] });
+
+      await tool.execute?.(
+        { mode: 'messages', threadId: 'current' } as any,
+        {
+          memory: { getThreadById, recall: recallMock },
+          agent: { threadId: 'thread-a', resourceId: 'res-a' },
+        } as any,
+      );
+
+      expect(getThreadById).toHaveBeenCalledWith({ threadId: 'thread-a' });
+      expect(recallMock).toHaveBeenCalledWith(expect.objectContaining({ threadId: 'thread-a', resourceId: 'res-a' }));
+    });
+
+    it('should pass anchor="end" through for mode="messages" without a cursor', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const getThreadById = vi.fn().mockResolvedValue({
+        id: 'thread-a',
+        resourceId: 'res-a',
+        createdAt: new Date('2024-01-01T09:00:00Z'),
+        updatedAt: new Date('2024-01-01T10:00:00Z'),
+      });
+      const recallMock = vi.fn().mockResolvedValue({
+        messages: [
+          {
+            id: 'msg-1',
+            threadId: 'thread-a',
+            resourceId: 'res-a',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Message 1' }] },
+            createdAt: new Date('2024-01-01T10:00:00Z'),
+          },
+          {
+            id: 'msg-2',
+            threadId: 'thread-a',
+            resourceId: 'res-a',
+            role: 'assistant',
+            content: { format: 2, parts: [{ type: 'text', text: 'Message 2' }] },
+            createdAt: new Date('2024-01-01T10:01:00Z'),
+          },
+        ],
+      });
+
+      const result = await tool.execute?.(
+        { mode: 'messages', threadId: 'current', anchor: 'end', page: 1, limit: 1 } as any,
+        {
+          memory: { getThreadById, recall: recallMock },
+          agent: { threadId: 'thread-a', resourceId: 'res-a' },
+        } as any,
+      );
+
+      expect((result as any)?.messages).toContain('Message 2');
+      expect((result as any)?.page).toBe(1);
+      expect((result as any)?.hasPrevPage).toBe(true);
+      expect((result as any)?.hasNextPage).toBe(false);
+    });
+
+    it('should reject threadId="current" when there is no current thread in context', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+
+      await expect(
+        tool.execute?.(
+          { mode: 'messages', threadId: 'current' } as any,
+          { memory: {}, agent: { resourceId: 'res-a' } } as any,
+        ),
+      ).rejects.toThrow('Could not resolve current thread.');
+    });
+
+    it('should resolve threadId="current" for mode="search" in resource scope', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const searchMessages = vi.fn().mockResolvedValue({ results: [] });
+      const listThreads = vi.fn().mockResolvedValue({ threads: [], total: 0, hasMore: false, page: 0 });
+
+      await tool.execute?.(
+        { mode: 'search', query: 'test query', threadId: 'current' } as any,
+        {
+          memory: { searchMessages, listThreads },
+          agent: { threadId: 'thread-a', resourceId: 'res-a' },
+        } as any,
+      );
+
+      expect(searchMessages).toHaveBeenCalledWith(
+        expect.objectContaining({ filter: expect.objectContaining({ threadId: 'thread-a' }) }),
+      );
+    });
+
+    it('should resolve a visible cursor from resource recall when direct lookup misses', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const listThreadsMock = vi.fn().mockResolvedValue({
+        threads: [
+          {
+            id: 'thread-from-recall',
+            resourceId: 'res-a',
+            title: 'Recovered thread',
+            createdAt: new Date('2024-01-01T09:00:00Z'),
+            updatedAt: new Date('2024-01-01T10:00:00Z'),
+          },
+        ],
+        total: 1,
+        hasMore: false,
+        page: 0,
+      });
+      const recoveredMessage = {
+        id: 'visible-msg',
+        threadId: 'thread-from-recall',
+        resourceId: 'res-a',
+        role: 'assistant',
+        content: { format: 2, parts: [{ type: 'text', text: 'Recovered message' }] },
+        createdAt: new Date('2024-01-01T10:00:00Z'),
+      };
+      const recallMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          messages: [recoveredMessage],
+        })
+        .mockResolvedValueOnce({
+          messages: [recoveredMessage],
+        })
+        .mockResolvedValueOnce({
+          messages: [],
+        });
+      const memory = {
+        getMemoryStore: async () => ({
+          listMessagesById: async () => ({ messages: [] }),
+        }),
+        listThreads: listThreadsMock,
+        recall: recallMock,
+      };
+
+      const result = await tool.execute?.({ mode: 'messages', cursor: 'visible-msg' }, {
+        memory,
+        agent: { resourceId: 'res-a' },
+      } as any);
+
+      expect((result as any)?.cursor).toBe('visible-msg');
+      expect(listThreadsMock).toHaveBeenCalledWith({
+        page: 0,
+        perPage: 100,
+        orderBy: { field: 'updatedAt', direction: 'DESC' },
+        filter: { resourceId: 'res-a' },
+      });
+      expect(recallMock).toHaveBeenNthCalledWith(1, {
+        threadId: 'thread-from-recall',
+        resourceId: 'res-a',
+        page: 0,
+        perPage: false,
+      });
+      expect(recallMock).toHaveBeenNthCalledWith(2, {
+        threadId: 'thread-from-recall',
+        resourceId: 'res-a',
+        page: 0,
+        perPage: false,
+      });
+      expect(recallMock).toHaveBeenNthCalledWith(3, expect.objectContaining({ threadId: 'thread-from-recall' }));
+    });
+
+    it('should reject threadId values outside the active resource', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const memory = {
+        getThreadById: async ({ threadId }: { threadId: string }) => ({
+          id: threadId,
+          resourceId: 'other-resource',
+          createdAt: new Date('2024-01-01'),
+          updatedAt: new Date('2024-01-02'),
+        }),
+      };
+
+      await expect(
+        tool.execute?.(
+          { mode: 'messages', threadId: 'thread-b' } as any,
+          { memory, agent: { threadId: 'thread-a', resourceId: 'res-a' } } as any,
+        ),
+      ).rejects.toThrow('Thread does not belong to the active resource');
+    });
+
+    it('should resolve threadId="current" for mode="threads" in resource scope', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const getThreadById = vi.fn().mockResolvedValue({
+        id: 'thread-a',
+        resourceId: 'res-a',
+        title: 'Current Thread',
+        createdAt: new Date('2024-01-01T09:00:00Z'),
+        updatedAt: new Date('2024-01-01T10:00:00Z'),
+      });
+
+      const result = await tool.execute?.(
+        { mode: 'threads', threadId: 'current' } as any,
+        {
+          memory: { getThreadById },
+          agent: { threadId: 'thread-a', resourceId: 'res-a' },
+        } as any,
+      );
+
+      expect(getThreadById).toHaveBeenCalledWith({ threadId: 'thread-a' });
+      expect((result as any)?.count).toBe(1);
+      expect((result as any)?.threads).toContain('Current Thread');
+      expect((result as any)?.threads).toContain('← current');
+    });
+
+    it('should reject threadId="current" for mode="threads" when current thread is outside the active resource', async () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const getThreadById = vi.fn().mockResolvedValue({
+        id: 'thread-a',
+        resourceId: 'other-resource',
+        title: 'Wrong Thread',
+        createdAt: new Date('2024-01-01T09:00:00Z'),
+        updatedAt: new Date('2024-01-01T10:00:00Z'),
+      });
+
+      await expect(
+        tool.execute?.(
+          { mode: 'threads', threadId: 'current' } as any,
+          {
+            memory: { getThreadById },
+            agent: { threadId: 'thread-a', resourceId: 'res-a' },
+          } as any,
+        ),
+      ).rejects.toThrow('Thread does not belong to the active resource');
+    });
+  });
+
+  describe('Memory.listTools with retrieval config shapes', () => {
+    it('should register recall with retrieval: true (boolean)', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'thread',
+            retrieval: true, // backward compat boolean
+          },
+        } as any,
+      });
+
+      expect(memory.listTools()).toHaveProperty('recall');
+    });
+
+    it('should register recall with retrieval object config', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        vector: { id: 'test' } as any,
+        embedder: { specificationVersion: 'v3', modelId: 'test', doEmbed: async () => ({ embeddings: [] }) } as any,
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'thread',
+            retrieval: { vector: true }, // object config with vector search
+          },
+        } as any,
+      });
+
+      // recall tool should still be registered
+      expect(memory.listTools()).toHaveProperty('recall');
+    });
+  });
+
+  describe('recall search mode without a vector store (#20775)', () => {
+    const getInputJSONSchema = (tool: ReturnType<typeof recallTool>) =>
+      standardSchemaToJSONSchema(tool.inputSchema as any) as {
+        properties: Record<string, { enum?: string[]; description?: string }>;
+      };
+
+    it('omits "search" from the mode enum and descriptions when search is not enabled', () => {
+      for (const retrievalScope of ['thread', 'resource'] as const) {
+        const tool = recallTool(undefined, { retrievalScope, searchEnabled: false });
+        const schema = getInputJSONSchema(tool);
+
+        expect(schema.properties.mode.enum).toEqual(['messages', 'threads']);
+        expect(tool.description).not.toContain('mode="search"');
+        expect(schema.properties.mode.description).not.toContain('"search"');
+        expect(schema.properties).not.toHaveProperty('query');
+      }
+    });
+
+    it('keeps "search" advertised by default for direct callers', () => {
+      const tool = recallTool(undefined, { retrievalScope: 'resource' });
+      const schema = getInputJSONSchema(tool);
+
+      expect(schema.properties.mode.enum).toContain('search');
+      expect(tool.description).toContain('mode="search"');
+    });
+
+    it('rejects a stray search call with an informative validation error instead of throwing', async () => {
+      const memory = new Memory({ storage: new InMemoryStore() });
+      const tool = recallTool(undefined, { retrievalScope: 'resource', searchEnabled: false });
+
+      const result = await tool.execute?.({ mode: 'search', query: 'that diagram from last time' }, {
+        memory,
+        agent: { threadId: 'thread-1', resourceId: 'resource-1' },
+      } as any);
+
+      // Schema validation catches it: the model gets a correctable error, not
+      // the "searchMessages requires a vector store" throw.
+      expect((result as any).error).toBe(true);
+      expect((result as any).message).toContain('must be equal to one of the allowed values');
+    });
+
+    it('returns the "Search is not configured" guidance when a resumed run carries a stale search call', async () => {
+      const memory = new Memory({ storage: new InMemoryStore() });
+      const tool = recallTool(undefined, { retrievalScope: 'resource', searchEnabled: false });
+
+      // resumeData skips input validation (see Tool.execute), so without the
+      // in-execute guard this would reach Memory.searchMessages and throw.
+      const result = await tool.execute?.({ mode: 'search', query: 'that diagram from last time' }, {
+        memory,
+        resumeData: { stale: true },
+        agent: { threadId: 'thread-1', resourceId: 'resource-1' },
+      } as any);
+
+      expect(result).toMatchObject({ count: 0 });
+      expect((result as any).results).toContain('Search is not configured');
+    });
+
+    it('does not advertise search from Memory.listTools when no vector store is configured', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'thread',
+            retrieval: { scope: 'resource' },
+          },
+        } as any,
+      });
+
+      const recall = memory.listTools().recall;
+      const schema = getInputJSONSchema(recall);
+      expect(schema.properties.mode.enum).toEqual(['messages', 'threads']);
+      expect(recall.description).not.toContain('mode="search"');
+    });
+
+    it('does not advertise search when a vector store exists but retrieval search is disabled', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        vector: { id: 'test' } as any,
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'thread',
+            retrieval: true,
+          },
+        } as any,
+      });
+
+      const recall = memory.listTools().recall;
+      const schema = getInputJSONSchema(recall);
+      expect(schema.properties.mode.enum).toEqual(['messages', 'threads']);
+      expect(recall.description).not.toContain('mode="search"');
+    });
+
+    it('advertises search when retrieval search, a vector store, and an embedder are configured', () => {
+      const memory = new Memory({
+        storage: new InMemoryStore(),
+        vector: { id: 'test' } as any,
+        embedder: {
+          specificationVersion: 'v3',
+          modelId: 'test',
+          doEmbed: async () => ({ embeddings: [] }),
+        } as any,
+        options: {
+          observationalMemory: {
+            model: 'test-model',
+            scope: 'thread',
+            retrieval: { vector: true, scope: 'resource' },
+          },
+        } as any,
+      });
+
+      const recall = memory.listTools().recall;
+      const schema = getInputJSONSchema(recall);
+      expect(schema.properties.mode.enum).toEqual(['messages', 'threads', 'search', 'observations']);
+      expect(recall.description).toContain('mode="search"');
+    });
+  });
+});

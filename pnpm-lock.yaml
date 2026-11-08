@@ -20,6 +20,12 @@ importers:
       '@mastra/core':
         specifier: workspace:*
         version: link:vendor/mastra/core
+      '@mastra/libsql':
+        specifier: workspace:*
+        version: link:vendor/mastra/libsql
+      '@mastra/memory':
+        specifier: workspace:*
+        version: link:vendor/mastra/memory
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.0
         version: 1.32.0(zod@4.6.5)
@@ -659,6 +665,101 @@ importers:
       zod:
         specifier: ^4.6.7
         version: 4.6.7
+
+  vendor/mastra/libsql:
+    dependencies:
+      '@libsql/client':
+        specifier: ^0.18.0
+        version: 0.18.0
+    devDependencies:
+      '@copilotkit/aimock':
+        specifier: ^1.46.0
+        version: 1.47.0(vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@7.0.2))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)))
+      '@internal/core':
+        specifier: workspace:*
+        version: link:../internal-core
+      '@internal/types-builder':
+        specifier: workspace:*
+        version: link:../types-builder
+      '@mastra/core':
+        specifier: workspace:*
+        version: link:../core
+      '@types/node':
+        specifier: 22.19.15
+        version: 22.19.15
+      tsdown:
+        specifier: 0.23.1
+        version: 0.23.1(tsx@4.23.15)(typescript@7.0.2)
+      typescript:
+        specifier: ^7.0.2
+        version: 7.0.2
+
+  vendor/mastra/memory:
+    dependencies:
+      '@mastra/schema-compat':
+        specifier: workspace:*
+        version: link:../schema-compat
+      async-mutex:
+        specifier: ^0.5.0
+        version: 0.5.0
+      diff:
+        specifier: ^9.0.0
+        version: 9.0.0
+      json-schema:
+        specifier: ^0.4.0
+        version: 0.4.0
+      lru-cache:
+        specifier: ^11.5.3
+        version: 11.5.3
+      probe-image-size:
+        specifier: ^7.4.0
+        version: 7.5.0
+      xxhash-wasm:
+        specifier: ^1.1.0
+        version: 1.1.0
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+    devDependencies:
+      '@ai-sdk/openai-v5':
+        specifier: npm:@ai-sdk/openai@2.0.139
+        version: '@ai-sdk/openai@2.0.139(zod@4.6.7)'
+      '@copilotkit/aimock':
+        specifier: ^1.46.0
+        version: 1.47.0(vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)))
+      '@internal/ai-sdk-v4':
+        specifier: workspace:*
+        version: link:../ai-sdk-v4
+      '@internal/ai-sdk-v5':
+        specifier: workspace:*
+        version: link:../ai-sdk-v5
+      '@internal/ai-v6':
+        specifier: workspace:*
+        version: link:../ai-v6
+      '@internal/ai-v7':
+        specifier: workspace:*
+        version: link:../ai-v7
+      '@internal/types-builder':
+        specifier: workspace:*
+        version: link:../types-builder
+      '@mastra/core':
+        specifier: workspace:*
+        version: link:../core
+      '@types/json-schema':
+        specifier: ^7.0.15
+        version: 7.0.15
+      '@types/node':
+        specifier: 22.19.15
+        version: 22.19.15
+      tokenx:
+        specifier: ^1.6.0
+        version: 1.6.0
+      tsdown:
+        specifier: 0.23.1
+        version: 0.23.1(tsx@4.23.15)(typescript@6.0.3)
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
 
   vendor/mastra/schema-compat:
     dependencies:
@@ -2055,6 +2156,63 @@ packages:
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
 
+  '@libsql/client@0.18.0':
+    resolution: {integrity: sha512-zMCCo58vv7w27j7+cnt/GW+X6/Rih6cHZ86PKi0AxCMOqMfrVgG9OZ5lW2bDMJhSeOjsv2szH2nJF3A9l36UmA==}
+
+  '@libsql/core@0.18.0':
+    resolution: {integrity: sha512-N8RR2CIpcgtbKZnXs2KVpw2lJQfinUj3I56e7qRDRpK18Hty0Rr8nr00VmFb4R/DsqOanPB/TaP3+QAQLZeXMg==}
+
+  '@libsql/darwin-arm64@0.5.29':
+    resolution: {integrity: sha512-K+2RIB1OGFPYQbfay48GakLhqf3ArcbHqPFu7EZiaUcRgFcdw8RoltsMyvbj5ix2fY0HV3Q3Ioa/ByvQdaSM0A==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@libsql/darwin-x64@0.5.29':
+    resolution: {integrity: sha512-OtT+KFHsKFy1R5FVadr8FJ2Bb1mghtXTyJkxv0trocq7NuHntSki1eUbxpO5ezJesDvBlqFjnWaYYY516QNLhQ==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@libsql/hrana-client@0.10.0':
+    resolution: {integrity: sha512-OoA4EMqRAC7kn7V2P6EQqRcpZf2W+AjsNIyCizBg339Tq/aMC7sRnzs3SklderhmQWAqEzvv8A2vhxVmWpkVvw==}
+
+  '@libsql/isomorphic-ws@0.1.5':
+    resolution: {integrity: sha512-DtLWIH29onUYR00i0GlQ3UdcTRC6EP4u9w/h9LxpUZJWRMARk6dQwZ6Jkd+QdwVpuAOrdxt18v0K2uIYR3fwFg==}
+
+  '@libsql/linux-arm-gnueabihf@0.5.29':
+    resolution: {integrity: sha512-CD4n4zj7SJTHso4nf5cuMoWoMSS7asn5hHygsDuhRl8jjjCTT3yE+xdUvI4J7zsyb53VO5ISh4cwwOtf6k2UhQ==}
+    cpu: [arm]
+    os: [linux]
+
+  '@libsql/linux-arm-musleabihf@0.5.29':
+    resolution: {integrity: sha512-2Z9qBVpEJV7OeflzIR3+l5yAd4uTOLxklScYTwpZnkm2vDSGlC1PRlueLaufc4EFITkLKXK2MWBpexuNJfMVcg==}
+    cpu: [arm]
+    os: [linux]
+
+  '@libsql/linux-arm64-gnu@0.5.29':
+    resolution: {integrity: sha512-gURBqaiXIGGwFNEaUj8Ldk7Hps4STtG+31aEidCk5evMMdtsdfL3HPCpvys+ZF/tkOs2MWlRWoSq7SOuCE9k3w==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@libsql/linux-arm64-musl@0.5.29':
+    resolution: {integrity: sha512-fwgYZ0H8mUkyVqXZHF3mT/92iIh1N94Owi/f66cPVNsk9BdGKq5gVpoKO+7UxaNzuEH1roJp2QEwsCZMvBLpqg==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@libsql/linux-x64-gnu@0.5.29':
+    resolution: {integrity: sha512-y14V0vY0nmMC6G0pHeJcEarcnGU2H6cm21ZceRkacWHvQAEhAG0latQkCtoS2njFOXiYIg+JYPfAoWKbi82rkg==}
+    cpu: [x64]
+    os: [linux]
+
+  '@libsql/linux-x64-musl@0.5.29':
+    resolution: {integrity: sha512-gquqwA/39tH4pFl+J9n3SOMSymjX+6kZ3kWgY3b94nXFTwac9bnFNMffIomgvlFaC4ArVqMnOZD3nuJ3H3VO1w==}
+    cpu: [x64]
+    os: [linux]
+
+  '@libsql/win32-x64-msvc@0.5.29':
+    resolution: {integrity: sha512-4/0CvEdhi6+KjMxMaVbFM2n2Z44escBRoEYpR+gZg64DdetzGnYm8mcNLcoySaDJZNaBd6wz5DNdgRmcI4hXcg==}
+    cpu: [x64]
+    os: [win32]
+
   '@lukeed/csprng@1.1.0':
     resolution: {integrity: sha512-Z7C/xXCiGWsg0KuKsHTKJxbWhpI3Vs5GwLfOean7MGyVFGqdRgBbAjOCh6u4bbjPc/8MJ2pZmK/0DLdCbivLDA==}
     engines: {node: '>=8'}
@@ -2175,6 +2333,9 @@ packages:
   '@mswjs/interceptors@0.41.9':
     resolution: {integrity: sha512-VVPPgHyQ6ShqnrmDWuxjmUIsO9gWyOZFmuOfLd9LfBGQJwZfy0gvv9pbHSJuoFNIYC7ZDX9aoFwowjcdSC4E8w==}
     engines: {node: '>=18'}
+
+  '@neon-rs/load@0.0.4':
+    resolution: {integrity: sha512-kTPhdZyTQxB+2wpiRcFWrDcejc4JI6tkPuS7UZCG4l6Zvc5kU/gGQ/ozvHTh1XR5tS+UlfAfGuPajjzQjCiHCw==}
 
   '@noble/hashes@1.4.0':
     resolution: {integrity: sha512-V1JJ1WTRUqHHrOSh597hURcMqVKVGL/ea3kv0gSnEdsEZ0/+VyPghM1lMNGc00z7CIQorSvbKpuJkxvuHbvdbg==}
@@ -3251,6 +3412,9 @@ packages:
     resolution: {integrity: sha512-NW2cX8m1Q7KPA7a5M2ULQeZ2wR5qI5PAbw5L0UOMxdioVk9PMZ0h1TmyZEkPYrCvYjDlFICusOu1dlEKAAeXBw==}
     engines: {node: '>=0.12.0'}
 
+  async-mutex@0.5.0:
+    resolution: {integrity: sha512-1A94B18jkJ3DYq284ohPxoXbfTA5HsQ7/Mf4DEhcyLx3Bz27Rh59iScbB6EPiP+B+joue6YCxcMXSbFC1tZKwA==}
+
   async@3.2.6:
     resolution: {integrity: sha512-htCUDlxyyCLMgaM3xXg0C0LW2xqfuQ6p05pCEIsXuyQ+a1koYKTuBMzRNwmybfLgvJDMd0r1LTn4+E0Ti6C2AA==}
 
@@ -3533,6 +3697,14 @@ packages:
     resolution: {integrity: sha512-0R9ikRb668HB7QDxT1vkpuUBtqc53YyAwMwGeUFKRojY/NWKvdZ+9UYtRfGmhqNbRkTSVpMbmyhXipFFv2cb/A==}
     engines: {node: '>= 12'}
 
+  debug@3.2.7:
+    resolution: {integrity: sha512-CFjzYYAi4ThfiQvizrFQevTTXHtnCqWfe7x1AhgEscTz6ZbLbfoLRLPugTQyBth6f8ZERVUSyWHFD/7Wu4t1XQ==}
+    peerDependencies:
+      supports-color: '*'
+    peerDependenciesMeta:
+      supports-color:
+        optional: true
+
   debug@4.4.3:
     resolution: {integrity: sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==}
     engines: {node: '>=6.0'}
@@ -3576,6 +3748,10 @@ packages:
     resolution: {integrity: sha512-0je+qPKHEMohvfRTCEo3CrPG6cAzAYgmzKyxRiYSSDkS6eGJdyVJm7WaYA5ECaAD9wLB2T4EEeymA5aFVcYXCA==}
     engines: {node: '>=6'}
 
+  detect-libc@2.0.2:
+    resolution: {integrity: sha512-UX6sGumvvqSaXgdKGUsgZWqcUyIXZ/vZTrlRT/iobiKhGL0zL4d3osHj3uqllWJK+i+sixDS/3COVEOFbupFyw==}
+    engines: {node: '>=8'}
+
   detect-libc@2.1.2:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
     engines: {node: '>=8'}
@@ -3591,6 +3767,10 @@ packages:
 
   diff@8.0.4:
     resolution: {integrity: sha512-DPi0FmjiSU5EvQV0++GFDOJ9ASQUVFh5kD+OzOnYdi7n3Wpm9hWWGfB/O2blfHcMVTL5WkQXSnRiK9makhrcnw==}
+    engines: {node: '>=0.3.1'}
+
+  diff@9.0.0:
+    resolution: {integrity: sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==}
     engines: {node: '>=0.3.1'}
 
   dir-compare@4.2.0:
@@ -4076,6 +4256,10 @@ packages:
     resolution: {integrity: sha512-eKCa6bwnJhvxj14kZk5NCPc6Hb6BdsU9DZcOnmQKSnO1VKrfV0zCvtttPZUsBvjmNDn8rpcJfpwSYnHBjc95MQ==}
     engines: {node: '>=18.18.0'}
 
+  iconv-lite@0.4.24:
+    resolution: {integrity: sha512-v3MXnZAcvnywkTUEZomIActle7RXXeedOR31wwl7VlyoXO4Qi9arvSenNQWne1TcRwhCL1HwLI21bEqdpj8/rA==}
+    engines: {node: '>=0.10.0'}
+
   iconv-lite@0.7.3:
     resolution: {integrity: sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ==}
     engines: {node: '>=0.10.0'}
@@ -4199,6 +4383,9 @@ packages:
   jpeg-js@0.4.4:
     resolution: {integrity: sha512-WZzeDOEtTOBK4Mdsar0IqEU5sMr3vSV2RqkAIzUEV2BHnUfKGyswWFPFwK5EeDo93K3FohSHbLAjj0s1Wzd+dg==}
 
+  js-base64@3.9.6:
+    resolution: {integrity: sha512-LjkzbLtU6Lx6fjXMYGEACEB7rdtqZtxkBe9aS1ZpDNUyWgUivw3yBEIhQ37OVygJYRt+C+9e9fVT8PpFzH2Hww==}
+
   js-tokens@10.0.0:
     resolution: {integrity: sha512-lM/UBzQmfJRo9ABXbPWemivdCW8V2G8FHaHdypQaIy523snUjog0W71ayWXTjiR+ixeMyVHN2XcpnTd/liPg/Q==}
 
@@ -4267,6 +4454,11 @@ packages:
 
   lazy-val@1.0.5:
     resolution: {integrity: sha512-0/BnGCCfyUMkBpeDgWihanIAF9JmZhHBgUhEqzvf+adhNGLoP6TaiI5oF8oyb3I45P+PcnrqihSf01M0l0G5+Q==}
+
+  libsql@0.5.29:
+    resolution: {integrity: sha512-8lMP8iMgiBzzoNbAPQ59qdVcj6UaE/Vnm+fiwX4doX4Narook0a4GPKWBEv+CR8a1OwbfkgL18uBfBjWdF0Fzg==}
+    cpu: [x64, arm64, wasm32, arm]
+    os: [darwin, linux, win32]
 
   lightningcss-android-arm64@1.32.0:
     resolution: {integrity: sha512-YK7/ClTt4kAK0vo6w3X+Pnm0D2cf2vPHbhOXdoNti1Ga0al1P4TBZhwjATvjNwLEBCnKvjJc2jQgHXH0NEwlAg==}
@@ -4419,6 +4611,9 @@ packages:
   local-pkg@1.2.1:
     resolution: {integrity: sha512-++gUqRDEvcnN6Zhqrr+y/CkVEHhlrR96vZn3nZZPYzMcBUyBtTKzB9NadClFIsIVSsu+3i9tfk/erqy9kAmt7Q==}
     engines: {node: '>=14'}
+
+  lodash.merge@4.6.2:
+    resolution: {integrity: sha512-0KpjqXRVvrYyCsX1swR/XTK0va6VQkQM6MNo7PqW77ByjAhoARA8EfrP1N4+KlKj8YS0ZUCtRT/YUuhyYDujIQ==}
 
   lodash@4.18.1:
     resolution: {integrity: sha512-dMInicTPVE8d1e5otfwmmjlxkZoUpiVLwyeTdUsi/Caj/gfzzblBcCE5sRHV/AsjuCmxWrte2TNGSYuCeCq+0Q==}
@@ -4717,6 +4912,11 @@ packages:
     engines: {node: ^10 || ^12 || ^13.7 || ^14 || >=15.0.1}
     hasBin: true
 
+  needle@2.9.1:
+    resolution: {integrity: sha512-6R9fqJ5Zcmf+uYaFgdIHmLwNldn5HbK8L5ybn7Uz+ylX/rnOsSp1AHcvQSrCaFN+qNM1wpymHqD7mVasEOlHGQ==}
+    engines: {node: '>= 4.4.x'}
+    hasBin: true
+
   negotiator@1.1.0:
     resolution: {integrity: sha512-NMPBRMJgiQHjbd8phG3Vebdx4kZ1H121rbl5IkMqeOsahptB9BKo/d7oJ3zTXqTgagn2bWlNSXkh0QUGM31RYg==}
     engines: {node: '>=18'}
@@ -4924,6 +5124,9 @@ packages:
     resolution: {integrity: sha512-HzMy3Geq23nVALD/M2LliU+F+M+gVNsvkQWWqeBZ8HDiCgzo6YPJ/Omrmtq24EFrIsk0a3EkQGEd7bDOo+IhGA==}
     engines: {node: '>=18'}
 
+  probe-image-size@7.5.0:
+    resolution: {integrity: sha512-ietdx4XPgmnzHRZOq1/KtcnsBkL4bRsBe+Szj5Tuq1/KPqDG42OspG1IhJb7vz6Z9pSzhp0J6UPnw6hujJTWoQ==}
+
   proc-log@6.1.0:
     resolution: {integrity: sha512-iG+GYldRf2BQ0UDUAd6JQ/RwzaQy6mXmsk/IzlYyal4A4SNFw54MeH4/tLkF4I5WoWG9SQwuqWzS99jaFQHBuQ==}
     engines: {node: ^20.17.0 || >=22.9.0}
@@ -4934,6 +5137,9 @@ packages:
   progress@2.0.3:
     resolution: {integrity: sha512-7PiHtLll5LdnKIMw100I+8xJXR5gW2QwWYkT6iJva0bXitZKa/XMrSbdmg3r2Xnaidz9Qumd0VPaMrZlF9V9sA==}
     engines: {node: '>=0.4.0'}
+
+  promise-limit@2.7.0:
+    resolution: {integrity: sha512-7nJ6v5lnJsXwGprnGXga4wx6d1POjvi5Qmf1ivTRxTjH4Z/9Czja/UCMLVmB9N93GeWOU93XaFaEt6jbuoagNw==}
 
   promise-retry@2.0.1:
     resolution: {integrity: sha512-y+WKFlBR8BGXnsNlIHFGPZmyDf3DFMoLhaflAnyZgV6rG6xu+JwesTo2Q9R6XwYmtmwAFCkAk3e35jEdoeh/3g==}
@@ -6612,6 +6818,10 @@ snapshots:
 
   '@chat-adapter/catalog@4.44.0': {}
 
+  '@copilotkit/aimock@1.47.0(vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)))':
+    optionalDependencies:
+      vitest: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1))
+
   '@copilotkit/aimock@1.47.0(vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@7.0.2))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)))':
     optionalDependencies:
       vitest: 5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@7.0.2))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1))
@@ -7163,6 +7373,64 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.6.0
 
+  '@libsql/client@0.18.0':
+    dependencies:
+      '@libsql/core': 0.18.0
+      '@libsql/hrana-client': 0.10.0
+      js-base64: 3.9.6
+      libsql: 0.5.29
+      promise-limit: 2.7.0
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
+  '@libsql/core@0.18.0':
+    dependencies:
+      js-base64: 3.9.6
+
+  '@libsql/darwin-arm64@0.5.29':
+    optional: true
+
+  '@libsql/darwin-x64@0.5.29':
+    optional: true
+
+  '@libsql/hrana-client@0.10.0':
+    dependencies:
+      '@libsql/isomorphic-ws': 0.1.5
+      js-base64: 3.9.6
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
+  '@libsql/isomorphic-ws@0.1.5':
+    dependencies:
+      '@types/ws': 8.18.2
+      ws: 8.22.1
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
+  '@libsql/linux-arm-gnueabihf@0.5.29':
+    optional: true
+
+  '@libsql/linux-arm-musleabihf@0.5.29':
+    optional: true
+
+  '@libsql/linux-arm64-gnu@0.5.29':
+    optional: true
+
+  '@libsql/linux-arm64-musl@0.5.29':
+    optional: true
+
+  '@libsql/linux-x64-gnu@0.5.29':
+    optional: true
+
+  '@libsql/linux-x64-musl@0.5.29':
+    optional: true
+
+  '@libsql/win32-x64-msvc@0.5.29':
+    optional: true
+
   '@lukeed/csprng@1.1.0': {}
 
   '@lukeed/uuid@2.0.1':
@@ -7326,6 +7594,8 @@ snapshots:
       is-node-process: 1.2.0
       outvariant: 1.4.3
       strict-event-emitter: 0.5.1
+
+  '@neon-rs/load@0.0.4': {}
 
   '@noble/hashes@1.4.0': {}
 
@@ -8007,6 +8277,17 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
+  '@vitest/mocker@5.1.0(msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1))':
+    dependencies:
+      '@jridgewell/trace-mapping': 0.3.31
+      '@vitest/spy': 5.1.0
+      estree-walker: 3.0.3
+      magic-string: 1.4.5
+    optionalDependencies:
+      msw: 2.15.0(@types/node@22.19.15)(typescript@6.0.3)
+      vite: 7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)
+    optional: true
+
   '@vitest/mocker@5.1.0(msw@2.15.0(@types/node@22.19.15)(typescript@7.0.2))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1))':
     dependencies:
       '@jridgewell/trace-mapping': 0.3.31
@@ -8227,6 +8508,10 @@ snapshots:
   assertion-error@2.0.1: {}
 
   async-exit-hook@2.0.1: {}
+
+  async-mutex@0.5.0:
+    dependencies:
+      tslib: 2.8.1
 
   async@3.2.6: {}
 
@@ -8480,6 +8765,10 @@ snapshots:
 
   data-uri-to-buffer@4.0.1: {}
 
+  debug@3.2.7:
+    dependencies:
+      ms: 2.1.3
+
   debug@4.4.3:
     dependencies:
       ms: 2.1.3
@@ -8516,6 +8805,8 @@ snapshots:
 
   dequal@2.0.3: {}
 
+  detect-libc@2.0.2: {}
+
   detect-libc@2.1.2: {}
 
   detect-node@2.1.0:
@@ -8528,6 +8819,8 @@ snapshots:
   diff-match-patch@1.0.5: {}
 
   diff@8.0.4: {}
+
+  diff@9.0.0: {}
 
   dir-compare@4.2.0:
     dependencies:
@@ -9227,6 +9520,10 @@ snapshots:
 
   human-signals@8.0.1: {}
 
+  iconv-lite@0.4.24:
+    dependencies:
+      safer-buffer: 2.1.2
+
   iconv-lite@0.7.3:
     dependencies:
       safer-buffer: 2.1.2
@@ -9309,6 +9606,8 @@ snapshots:
 
   jpeg-js@0.4.4: {}
 
+  js-base64@3.9.6: {}
+
   js-tokens@10.0.0: {}
 
   js-tokens@4.0.0: {}
@@ -9375,6 +9674,21 @@ snapshots:
       json-buffer: 3.0.1
 
   lazy-val@1.0.5: {}
+
+  libsql@0.5.29:
+    dependencies:
+      '@neon-rs/load': 0.0.4
+      detect-libc: 2.0.2
+    optionalDependencies:
+      '@libsql/darwin-arm64': 0.5.29
+      '@libsql/darwin-x64': 0.5.29
+      '@libsql/linux-arm-gnueabihf': 0.5.29
+      '@libsql/linux-arm-musleabihf': 0.5.29
+      '@libsql/linux-arm64-gnu': 0.5.29
+      '@libsql/linux-arm64-musl': 0.5.29
+      '@libsql/linux-x64-gnu': 0.5.29
+      '@libsql/linux-x64-musl': 0.5.29
+      '@libsql/win32-x64-msvc': 0.5.29
 
   lightningcss-android-arm64@1.32.0:
     optional: true
@@ -9480,6 +9794,8 @@ snapshots:
       mlly: 1.8.2
       pkg-types: 2.4.0
       quansync: 0.2.11
+
+  lodash.merge@4.6.2: {}
 
   lodash@4.18.1: {}
 
@@ -9949,6 +10265,32 @@ snapshots:
 
   ms@2.1.3: {}
 
+  msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3):
+    dependencies:
+      '@inquirer/confirm': 6.3.5(@types/node@22.19.15)
+      '@mswjs/interceptors': 0.41.9
+      '@open-draft/deferred-promise': 3.0.0
+      '@types/statuses': 2.0.6
+      cookie: 1.1.1
+      graphql: 16.15.0
+      headers-polyfill: 5.0.1
+      is-node-process: 1.2.0
+      outvariant: 1.4.3
+      path-to-regexp: 6.3.0
+      picocolors: 1.1.1
+      rettime: 0.11.12
+      statuses: 2.0.2
+      strict-event-emitter: 0.5.1
+      tough-cookie: 6.1.0
+      type-fest: 5.10.0
+      until-async: 3.0.2
+      yargs: 17.7.3
+    optionalDependencies:
+      typescript: 6.0.3
+    transitivePeerDependencies:
+      - '@types/node'
+    optional: true
+
   msw@2.15.0(@types/node@22.19.15)(typescript@7.0.2):
     dependencies:
       '@inquirer/confirm': 6.3.5(@types/node@22.19.15)
@@ -10029,6 +10371,14 @@ snapshots:
   mute-stream@3.0.0: {}
 
   nanoid@3.3.19: {}
+
+  needle@2.9.1:
+    dependencies:
+      debug: 3.2.7
+      iconv-lite: 0.4.24
+      sax: 1.6.1
+    transitivePeerDependencies:
+      - supports-color
 
   negotiator@1.1.0:
     dependencies:
@@ -10216,11 +10566,20 @@ snapshots:
     dependencies:
       parse-ms: 4.0.0
 
+  probe-image-size@7.5.0:
+    dependencies:
+      lodash.merge: 4.6.2
+      needle: 2.9.1
+    transitivePeerDependencies:
+      - supports-color
+
   proc-log@6.1.0: {}
 
   process-nextick-args@2.0.1: {}
 
   progress@2.0.3: {}
+
+  promise-limit@2.7.0: {}
 
   promise-retry@2.0.1:
     dependencies:
@@ -10420,6 +10779,20 @@ snapshots:
       semver-compare: 1.0.0
       sprintf-js: 1.1.3
     optional: true
+
+  rolldown-plugin-dts@0.28.8(rolldown@1.2.16)(typescript@6.0.3):
+    dependencies:
+      dts-resolver: 3.0.0
+      get-tsconfig: 5.0.0-beta.6
+      obug: 3.0.0
+      rolldown: 1.2.16
+      yuku-ast: 0.19.0
+      yuku-codegen: 0.19.0
+      yuku-parser: 0.19.0
+    optionalDependencies:
+      typescript: 6.0.3
+    transitivePeerDependencies:
+      - oxc-resolver
 
   rolldown-plugin-dts@0.28.8(rolldown@1.2.16)(typescript@7.0.2):
     dependencies:
@@ -10759,6 +11132,32 @@ snapshots:
       '@ts-morph/common': 0.29.0
       code-block-writer: 13.0.3
 
+  tsdown@0.23.1(tsx@4.23.15)(typescript@6.0.3):
+    dependencies:
+      cac: 7.1.0
+      defu: 6.1.7
+      empathic: 2.1.0
+      hookable: 6.1.2
+      import-without-cache: 0.4.1
+      obug: 3.0.0
+      picomatch: 4.0.7
+      rolldown: 1.2.16
+      rolldown-plugin-dts: 0.28.8(rolldown@1.2.16)(typescript@6.0.3)
+      tinyexec: 1.3.1
+      tinyglobby: 0.2.17
+      tree-kill: 1.2.2
+      unconfig-core: 7.5.0
+      verkit: 0.5.0
+    optionalDependencies:
+      tsx: 4.23.15
+      typescript: 6.0.3
+    transitivePeerDependencies:
+      - '@typescript/native-preview'
+      - '@volar/typescript'
+      - '@vue/language-core'
+      - oxc-resolver
+      - vue-tsc
+
   tsdown@0.23.1(tsx@4.23.15)(typescript@7.0.2):
     dependencies:
       cac: 7.1.0
@@ -10988,6 +11387,29 @@ snapshots:
       lightningcss: 1.33.0
       tsx: 4.23.15
       yaml: 2.9.1
+
+  vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)):
+    dependencies:
+      '@types/chai': 5.2.3
+      '@vitest/mocker': 5.1.0(msw@2.15.0(@types/node@22.19.15)(typescript@6.0.3))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1))
+      chai: 6.3.0
+      es-module-lexer: 2.3.2
+      expect-type: 1.4.0
+      magic-string: 1.4.5
+      obug: 3.0.0
+      picomatch: 4.0.7
+      std-env: 4.3.0
+      tinybench: 6.2.3
+      tinyexec: 1.3.1
+      tinyglobby: 0.2.17
+      vite: 7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)
+      why-is-node-running: 3.2.1
+    optionalDependencies:
+      '@opentelemetry/api': 1.10.0
+      '@types/node': 22.19.15
+    transitivePeerDependencies:
+      - msw
+    optional: true
 
   vitest@5.1.0(@opentelemetry/api@1.10.0)(@types/node@22.19.15)(msw@2.15.0(@types/node@22.19.15)(typescript@7.0.2))(vite@7.3.6(@types/node@22.19.15)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.15)(yaml@2.9.1)):
     dependencies:
