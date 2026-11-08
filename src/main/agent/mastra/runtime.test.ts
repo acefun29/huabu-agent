@@ -15,6 +15,8 @@ import { InMemoryCredentialStore } from '@earendil-works/pi-ai'
 import { ChatModelManager } from '../../models/manager'
 import type { ChatEvent, ChatRuntimeInfo } from '../../../shared/ipc'
 import { MastraAgentRuntime, type MastraRuntimeDeps } from './runtime'
+import { mastraMemoryFor } from './memory'
+import { MEMORY_RESOURCE } from './storage'
 
 const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY
 
@@ -267,6 +269,41 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       await rt3.dispose({ nodeId: 'e2e-2' })
     },
     240_000
+  )
+
+  it(
+    'Phase 2：working memory 写入落库（真 Memory + LibSQL，thread 级）',
+    async () => {
+      const wmEvents: ChatEvent[] = []
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rtWm = new MastraAgentRuntime({
+        broadcast: (e) => wmEvents.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
+      })
+      await rtWm.create({ nodeId: 'e2e-wm' })
+      const p = await rtWm.prompt({
+        nodeId: 'e2e-wm',
+        text: '请记住：我的偏好是用中文简洁回复。请把这条偏好更新到工作记忆里，然后只回复"已记住"。',
+      })
+      expect(p.ok).toBe(true)
+      const start = Date.now()
+      while (Date.now() - start < 120_000) {
+        if (wmEvents.some((e) => e.type === 'agent_end')) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      const memory = await mastraMemoryFor(wsDir)
+      const wm = await memory.getWorkingMemory({ threadId: 'node-e2e-wm', resourceId: MEMORY_RESOURCE })
+      expect(wm).toBeTruthy()
+      expect(wm!).toContain('简洁')
+      await rtWm.dispose({ nodeId: 'e2e-wm' })
+    },
+    180_000
   )
 
   it(

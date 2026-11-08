@@ -36,6 +36,7 @@ import { aiSdkLanguageModel, createModelGateway } from './modelGateway'
 import type { ModelGateway } from './modelGateway'
 import { mastraMemoryFor } from './memory'
 import { MEMORY_RESOURCE } from './storage'
+import { TokenLimiterProcessor } from '@mastra/core/processors'
 import { toMastraTools, type AdaptedToolOutput } from './tools'
 
 export interface MastraRuntimeDeps {
@@ -209,6 +210,15 @@ export class MastraAgentRuntime implements AgentRuntime {
         // 每轮重包装：onUpdate 桥的 signal 要挂当轮 controller（abort 会话即取消工具等待）
         ...(session.piTools.length
           ? { tools: toMastraTools(session.piTools, { nodeId: session.nodeId, broadcast, signal: controller.signal }) }
+          : {}),
+        // Phase 2 上下文预算（计划 §8.2）：历史超 contextWindow 60% 时 memory-only 修剪；
+        // working memory 与当轮 system 不受影响（processor 语义保证 pin 段不丢）
+        ...(session.contextWindow
+          ? {
+              inputProcessors: [
+                new TokenLimiterProcessor({ limit: Math.floor(session.contextWindow * 0.6) }),
+              ],
+            }
           : {}),
       })
       const events = await agent.stream(text, {
