@@ -1,0 +1,10 @@
+{
+  "temperature": ["GLM-4.7"],
+  "reasoning": {
+    "GLM-4.7": [
+      {
+        "type": "toggle"
+      }
+    ]
+  }
+}

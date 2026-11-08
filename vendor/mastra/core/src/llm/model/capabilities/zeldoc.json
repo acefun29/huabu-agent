@@ -1,0 +1,13 @@
+{
+  "attachment": ["zdev"],
+  "temperature": ["zdev"],
+  "structuredOutput": ["zdev"],
+  "reasoning": {
+    "zdev": [
+      {
+        "type": "effort",
+        "values": ["low", "high", "max"]
+      }
+    ]
+  }
+}

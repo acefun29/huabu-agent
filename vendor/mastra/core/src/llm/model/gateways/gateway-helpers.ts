@@ -1,0 +1,62 @@
+import { MastraError } from '../../../error/index.js';
+import type { GatewayAuthResult, MastraModelGatewayInterface } from './base.js';
+
+export function getGatewayId(gateway: MastraModelGatewayInterface): string {
+  return gateway.getId?.() ?? gateway.id;
+}
+
+export function shouldEnableGateway(gateway: MastraModelGatewayInterface): boolean {
+  return gateway.shouldEnable?.() ?? true;
+}
+
+export function hasAuthCredentials(auth?: GatewayAuthResult): auth is GatewayAuthResult {
+  return Boolean(auth?.apiKey || auth?.bearerToken || (auth?.headers && Object.keys(auth.headers).length > 0));
+}
+
+export function serializeGatewayForSpan(
+  gateway: MastraModelGatewayInterface,
+): { id: string; name: string } & Record<string, unknown> {
+  return gateway.serializeForSpan?.() ?? { id: getGatewayId(gateway), name: gateway.name };
+}
+
+/**
+ * Find the gateway the model router would use for a model ID.
+ * Disabled gateways are skipped. A gateway ID is used as the prefix (e.g.,
+ * "netlify" for netlify gateway); gateways may also claim a model through
+ * `handlesModel`. models.dev is a provider registry and doesn't use a prefix.
+ */
+export function findGatewayForModel(
+  modelId: string,
+  allGateways: MastraModelGatewayInterface[],
+): MastraModelGatewayInterface {
+  const gateways = allGateways.filter(shouldEnableGateway);
+
+  // First, check for gateways whose ID matches the prefix (true gateways like netlify, openrouter, vercel)
+  const prefixedGateway = gateways.find(g => {
+    const id = getGatewayId(g);
+    return id !== 'models.dev' && (id === modelId || modelId.startsWith(`${id}/`));
+  });
+  if (prefixedGateway) {
+    return prefixedGateway;
+  }
+
+  // Then check gateways that explicitly claim this (possibly unprefixed) model
+  // id, e.g. a gateway that authenticates a bare `anthropic/...` id via OAuth.
+  const claimingGateway = gateways.find(g => getGatewayId(g) !== 'models.dev' && g.handlesModel?.(modelId) === true);
+  if (claimingGateway) {
+    return claimingGateway;
+  }
+
+  // Then check models.dev (provider registry without prefix)
+  const modelsDevGateway = gateways.find(g => getGatewayId(g) === 'models.dev');
+  if (modelsDevGateway) {
+    return modelsDevGateway;
+  }
+
+  throw new MastraError({
+    id: 'MODEL_ROUTER_NO_GATEWAY_FOUND',
+    category: 'USER',
+    domain: 'MODEL_ROUTER',
+    text: `No Mastra model router gateway found for model id ${modelId}`,
+  });
+}

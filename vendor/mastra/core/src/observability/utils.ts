@@ -1,0 +1,320 @@
+/**
+ * Browser-safe observability utilities.
+ *
+ * Functions that depend on AsyncLocalStorage (getCurrentSpan, executeWithContext,
+ * executeWithContextSync) are in context-storage.ts and should only be imported
+ * by server-side code.
+ */
+
+import { EntityType, SpanType } from './types';
+import type {
+  Span,
+  GetOrCreateSpanOptions,
+  AnySpan,
+  AnyExportedSpan,
+  ResumeTracingContext,
+  TracingOptions,
+  TracingProperties,
+} from './types';
+
+const entityTypeValues = new Set<EntityType>(Object.values(EntityType));
+let currentSpanResolver: (() => AnySpan | undefined) | undefined;
+
+export function setCurrentSpanResolver(resolver: (() => AnySpan | undefined) | undefined): void {
+  currentSpanResolver = resolver;
+}
+
+export function resolveCurrentSpan(): AnySpan | undefined {
+  return currentSpanResolver?.();
+}
+
+/** Generate a unique id for an observability signal (log, metric, score, feedback). */
+export function generateSignalId(): string {
+  return crypto.randomUUID();
+}
+
+/**
+ * Compute the names of tools the model can call on a single inference step,
+ * applying `activeTools` filtering when present. Used to populate the
+ * `availableTools` attribute on MODEL_INFERENCE spans so observers see the
+ * post-processor tool set, which can differ per-step from the AGENT_RUN view.
+ *
+ * `activeTools` is treated by presence, not truthiness: an explicit empty
+ * array means "no tools enabled for this step" and is honored as such.
+ * Returns `[]` (not `undefined`) when `tools` is provided but empty, so a
+ * tool-less agent still reports a definitive empty list to observers.
+ *
+ * @deprecated No longer used. `availableTools` is now derived from the tool
+ * definitions serialized for the MODEL_INFERENCE `tools` attribute, which
+ * also apply `toolChoice` and drop names that are not registered tools.
+ */
+export function getStepAvailableToolNames(
+  tools?: Record<string, unknown> | undefined,
+  activeTools?: readonly string[] | undefined,
+): string[] | undefined {
+  if (activeTools !== undefined) {
+    return [...activeTools];
+  }
+  if (tools) {
+    return Object.keys(tools);
+  }
+  return undefined;
+}
+
+// --- Lazy resolvers for executeWithContext / executeWithContextSync ---
+// The real implementations live in context-storage.ts (which imports AsyncLocalStorage).
+// context-storage.ts registers them at import time so that consumer code can call these
+// browser-safe wrappers without pulling async_hooks into shared chunks.
+
+type ExecuteWithContextFn = <T>(params: { span?: AnySpan; fn: () => Promise<T> }) => Promise<T>;
+type ExecuteWithContextSyncFn = <T>(params: { span?: AnySpan; fn: () => T }) => T;
+
+let executeWithContextImpl: ExecuteWithContextFn | undefined;
+let executeWithContextSyncImpl: ExecuteWithContextSyncFn | undefined;
+
+export function setExecuteWithContext(impl: ExecuteWithContextFn): void {
+  executeWithContextImpl = impl;
+}
+
+export function setExecuteWithContextSync(impl: ExecuteWithContextSyncFn): void {
+  executeWithContextSyncImpl = impl;
+}
+
+/**
+ * Execute an async function within a span's tracing context.
+ * Falls back to direct execution if no context-storage implementation is registered or no span exists.
+ */
+export async function executeWithContext<T>(params: { span?: AnySpan; fn: () => Promise<T> }): Promise<T> {
+  if (executeWithContextImpl) {
+    return executeWithContextImpl(params);
+  }
+  const { span, fn } = params;
+  if (span?.executeInContext) {
+    return span.executeInContext(fn);
+  }
+  return fn();
+}
+
+/**
+ * Execute a sync function within a span's tracing context.
+ * Falls back to direct execution if no context-storage implementation is registered or no span exists.
+ */
+export function executeWithContextSync<T>(params: { span?: AnySpan; fn: () => T }): T {
+  if (executeWithContextSyncImpl) {
+    return executeWithContextSyncImpl(params);
+  }
+  const { span, fn } = params;
+  if (span?.executeInContextSync) {
+    return span.executeInContextSync(fn);
+  }
+  return fn();
+}
+
+/**
+ * Resolve the spanId an observability signal should reference for a span.
+ *
+ * Signals (logs, metrics, and a suspending run's resume link) must name a span
+ * that actually reached exporters. An internal or excluded span is never
+ * stored, so referencing its raw id leaves the signal pointing at nothing:
+ * log/metric span lookups 404, and a resumed run's exported children inherit a
+ * dangling parentSpanId and land as orphans. `undefined` is a valid answer — it
+ * omits the reference rather than pointing it at a span that does not exist.
+ *
+ * `getExportedSpanId` is optional on the `Span` interface, so the typeof guard
+ * separates "this implementation predates the method" (keep the old behavior of
+ * referencing the span's own id) from "the method ran and found nothing
+ * exportable" (undefined). Without it the two collapse and custom span
+ * implementations silently lose correlation.
+ */
+export function resolveExportedSpanId(
+  span: { id?: string; getExportedSpanId?: () => string | undefined } | undefined | null,
+): string | undefined {
+  if (!span) return undefined;
+  return typeof span.getExportedSpanId === 'function' ? span.getExportedSpanId() : span.id;
+}
+
+const NO_OP_TRACE_ID = 'no-op-trace';
+
+/**
+ * The context a suspending run saves so that its resume continues it (see `resumeFrom`).
+ * Takes the run's live span, or its exported span when another process persisted it.
+ * An unsampled run saves nothing: its no-op span has no real trace for a resume to join.
+ */
+export function getResumeTracingContext(span: AnySpan | AnyExportedSpan | undefined): ResumeTracingContext | undefined {
+  if (!span) return undefined;
+  const live = 'exportSpan' in span;
+  if (live && !span.isValid) return undefined;
+  const exported = live ? span.exportSpan(span.observabilityInstance?.getConfig?.().includeInternalSpans) : span;
+  return {
+    traceId: span.traceId,
+    spanId: live ? resolveExportedSpanId(span) : span.id,
+    parentSpanId: exported?.parentSpanId,
+    resumedFromSpanId: exported && (exported.resumedFromSpanId ?? exported.id),
+    externalParentSpanId: exported?.externalParentSpanId,
+  };
+}
+
+function resumeInSavedTrace(saved: ResumeTracingContext | undefined, targetTraceId: string | undefined) {
+  if (!saved?.traceId || saved.traceId === NO_OP_TRACE_ID) return undefined;
+  if ((targetTraceId ?? saved.traceId) !== saved.traceId) return undefined;
+  return {
+    traceId: saved.traceId,
+    parentSpanId: saved.spanId,
+    resumedFromSpanId: saved.resumedFromSpanId ?? saved.spanId,
+    externalParentSpanId: saved.externalParentSpanId,
+  };
+}
+
+/**
+ * Creates or gets a child span from existing tracing context or starts a new trace.
+ * This helper consolidates the common pattern of creating spans that can either be:
+ * 1. Children of an existing span (when tracingContext.currentSpan exists)
+ * 2. New root spans (when no current span exists)
+ *
+ * @param options - Configuration object for span creation
+ * @returns The created Span or undefined if tracing is disabled
+ */
+export function getOrCreateSpan<T extends SpanType>(options: GetOrCreateSpanOptions<T>): Span<T> | undefined {
+  const { type, attributes, tracingContext, requestContext, tracingOptions, resumeFrom, resumedFromSpanId, ...rest } =
+    options;
+
+  // tracingOptions.metadata takes precedence, but a key it merely names with
+  // an `undefined` value must not erase the span's own metadata value.
+  const metadata = {
+    ...(rest.metadata ?? {}),
+    ...Object.fromEntries(Object.entries(tracingOptions?.metadata ?? {}).filter(([, value]) => value !== undefined)),
+  };
+  const resumed = resumeInSavedTrace(resumeFrom, tracingContext?.currentSpan?.traceId ?? tracingOptions?.traceId);
+
+  // If we have a current span, create a child span
+  if (tracingContext?.currentSpan) {
+    return tracingContext.currentSpan.createChildSpan({
+      type,
+      attributes,
+      ...rest,
+      metadata,
+      requestContext,
+      resumedFromSpanId: resumed?.resumedFromSpanId,
+    });
+  }
+
+  // Otherwise, try to create a new root span
+  const instance = options.mastra?.observability?.getSelectedInstance({ requestContext });
+  const rootTracingOptions = resumed ? { ...tracingOptions, traceId: resumed.traceId } : tracingOptions;
+
+  return instance?.startSpan<T>({
+    type,
+    attributes,
+    ...rest,
+    metadata,
+    requestContext,
+    tracingOptions: rootTracingOptions,
+    traceId: rootTracingOptions?.traceId,
+    // A resumed run's parent is the suspended span, a Mastra span in the trace.
+    parentSpanId: resumed ? resumed.parentSpanId : resumedFromSpanId,
+    resumedFromSpanId: resumed?.resumedFromSpanId,
+    // tracingOptions.parentSpanId is the public external-correlation channel;
+    // the id belongs to the caller's tracing system, not Mastra's own parentage.
+    externalParentSpanId: tracingOptions?.parentSpanId ?? resumed?.externalParentSpanId,
+    customSamplerOptions: {
+      requestContext,
+      metadata,
+    },
+  });
+}
+
+/**
+ * Builds `tracingOptions` that attach the next run as a child of a previous
+ * run, for example an LLM judge under the run it scores. Pass the previous
+ * run's result (or its `traceId` and `spanId`). When that run was not traced,
+ * the given options are returned unchanged.
+ */
+export function nestUnderRun(run: TracingProperties, tracingOptions?: TracingOptions): TracingOptions | undefined {
+  if (!run.traceId || !run.spanId) {
+    return tracingOptions;
+  }
+  return { ...tracingOptions, traceId: run.traceId, parentSpanId: run.spanId, nestUnderParent: true };
+}
+
+/**
+ * Returns the top-most non-internal span that would appear in exported tracing output.
+ *
+ * Public API results should use this span for trace/span correlation because internal Mastra
+ * workflow spans are omitted from external exporters.
+ */
+export function getRootExportSpan(span?: AnySpan): AnySpan | undefined {
+  if (!span?.isValid) {
+    return undefined;
+  }
+
+  let current: AnySpan | undefined = span;
+  let rootExportSpan: AnySpan | undefined = span.isInternal ? undefined : span;
+
+  while (current?.parent) {
+    current = current.parent;
+
+    if (!current.isInternal) {
+      rootExportSpan = current;
+    }
+  }
+
+  return rootExportSpan;
+}
+
+/**
+ * Resolves the best available entity type for a span-like record.
+ *
+ * Prefers an explicit `entityType` when present and valid, then falls back to the
+ * span type for common observability entities.
+ */
+export function getEntityTypeForSpan(span: {
+  entityType?: string | null;
+  spanType?: SpanType | string | null;
+}): EntityType | undefined {
+  if (span.entityType && entityTypeValues.has(span.entityType as EntityType)) {
+    return span.entityType as EntityType;
+  }
+
+  switch (span.spanType) {
+    case SpanType.AGENT_RUN:
+      return EntityType.AGENT;
+    case SpanType.RAG_INGESTION:
+      return EntityType.RAG_INGESTION;
+    case SpanType.SCORER_RUN:
+    case SpanType.SCORER_STEP:
+      return EntityType.SCORER;
+    case SpanType.WORKFLOW_RUN:
+      return EntityType.WORKFLOW_RUN;
+    case SpanType.WORKFLOW_STEP:
+      return EntityType.WORKFLOW_STEP;
+    case SpanType.TOOL_CALL:
+    case SpanType.MCP_TOOL_CALL:
+    case SpanType.PROVIDER_TOOL_CALL:
+      return EntityType.TOOL;
+    case SpanType.MCP_SERVER_REQUEST:
+      return EntityType.MCP_SERVER;
+    case SpanType.PROCESSOR_RUN:
+      return EntityType.OUTPUT_PROCESSOR;
+    case SpanType.CLASSIFIER_EVALUATION:
+      return EntityType.CLASSIFIER;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Time to first chunk in milliseconds for any span whose attributes carry
+ * `completionStartTime`, measured from that span's own start. Undefined when
+ * the span never saw a chunk.
+ */
+export function getTimeToFirstChunkMs(span: {
+  startTime: Date | string;
+  attributes?: object | undefined;
+}): number | undefined {
+  const completionStartTime = (span.attributes as { completionStartTime?: Date | string } | undefined)
+    ?.completionStartTime;
+  if (!completionStartTime) return undefined;
+  const ms = new Date(completionStartTime).getTime() - new Date(span.startTime).getTime();
+  // Clock skew between workers (durable runs) can put the first chunk before the start.
+  return Number.isNaN(ms) ? undefined : Math.max(0, ms);
+}

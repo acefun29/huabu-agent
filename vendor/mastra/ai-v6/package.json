@@ -1,0 +1,64 @@
+{
+  "name": "@internal/ai-v6",
+  "version": "0.0.95",
+  "description": "",
+  "type": "module",
+  "private": true,
+  "files": [
+    "dist"
+  ],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./*": {
+      "import": {
+        "types": "./dist/*.d.ts",
+        "default": "./dist/*.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsdown --silent --config tsdown.config.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@ai-sdk/gateway": "^3.0.226",
+    "@ai-sdk/provider": "^3.0.19",
+    "@ai-sdk/provider-utils": "^4.0.63",
+    "@internal/types-builder": "workspace:*",
+    "@microsoft/api-extractor": "^7.59.4",
+    "@types/json-schema": "^7.0.15",
+    "ai": "^6.0.320",
+    "json-schema": "^0.4.0",
+    "msw": "^2.15.0",
+    "resolve.exports": "^2.0.4",
+    "ts-morph": "^28.0.0",
+    "tsdown": "0.23.1",
+    "typescript": "^7.0.2"
+  },
+  "peerDependencies": {
+    "zod": "^3.25.76 || ^4.0.0"
+  },
+  "homepage": "https://mastra.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mastra-ai/mastra.git",
+    "directory": "packages/_ai-sdk-v4"
+  },
+  "bugs": {
+    "url": "https://github.com/mastra-ai/mastra/issues"
+  }
+}

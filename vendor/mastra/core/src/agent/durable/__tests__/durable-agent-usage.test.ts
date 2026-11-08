@@ -1,0 +1,509 @@
+/**
+ * DurableAgent Usage Tracking Tests
+ *
+ * These tests verify token usage tracking through the durable workflow,
+ * including accumulated usage across multiple steps.
+ */
+
+import type { LanguageModelV2 } from '@ai-sdk/provider-v5';
+import { MockLanguageModelV2, convertArrayToReadableStream } from '@internal/ai-sdk-v5/test';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { z } from 'zod';
+import { EventEmitterPubSub } from '../../../events/event-emitter';
+import { createTool } from '../../../tools';
+import { Agent } from '../../agent';
+import { createDurableAgent } from '../create-durable-agent';
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+function createModelWithUsage(usage: { inputTokens: number; outputTokens: number; totalTokens: number }) {
+  return new MockLanguageModelV2({
+    doStream: async () => ({
+      stream: convertArrayToReadableStream([
+        { type: 'stream-start', warnings: [] },
+        { type: 'response-metadata', id: 'id-0', modelId: 'mock-model-id', timestamp: new Date(0) },
+        { type: 'text-start', id: 'text-1' },
+        { type: 'text-delta', id: 'text-1', delta: 'Response text' },
+        { type: 'text-end', id: 'text-1' },
+        {
+          type: 'finish',
+          finishReason: 'stop',
+          usage,
+        },
+      ]),
+      rawCall: { rawPrompt: null, rawSettings: {} },
+    }),
+    doGenerate: async () => ({
+      content: [{ type: 'text', text: 'Response text' }],
+      finishReason: 'stop',
+      usage,
+      warnings: [],
+    }),
+  });
+}
+
+type PartialUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  reasoningTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
+function createToolThenReplyingModelWithUsage(firstUsage: PartialUsage, secondUsage: PartialUsage) {
+  return new MockLanguageModelV2({
+    doStream: async ({ prompt }) => {
+      const sawToolResult = JSON.stringify(prompt).includes('usage-tool-result');
+      return {
+        stream: convertArrayToReadableStream<any>(
+          sawToolResult
+            ? [
+                { type: 'stream-start', warnings: [] },
+                { type: 'response-metadata', id: 'id-2', modelId: 'mock-model-id', timestamp: new Date(0) },
+                { type: 'text-start', id: 'text-2' },
+                { type: 'text-delta', id: 'text-2', delta: 'Final response' },
+                { type: 'text-end', id: 'text-2' },
+                { type: 'finish', finishReason: 'stop', usage: secondUsage },
+              ]
+            : [
+                { type: 'stream-start', warnings: [] },
+                { type: 'response-metadata', id: 'id-1', modelId: 'mock-model-id', timestamp: new Date(0) },
+                {
+                  type: 'tool-call',
+                  toolCallType: 'function',
+                  toolCallId: 'call-1',
+                  toolName: 'usageTool',
+                  input: '{}',
+                  providerExecuted: false,
+                },
+                { type: 'finish', finishReason: 'tool-calls', usage: firstUsage },
+              ],
+        ),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+      };
+    },
+  });
+}
+
+const usageTool = createTool({
+  id: 'usageTool',
+  description: 'Returns a value so the model runs a second step.',
+  inputSchema: z.object({}),
+  execute: async () => ({ result: 'usage-tool-result' }),
+});
+
+// ============================================================================
+// Usage Tracking Tests
+// ============================================================================
+
+describe('DurableAgent usage tracking', () => {
+  let pubsub: EventEmitterPubSub;
+
+  beforeEach(() => {
+    pubsub = new EventEmitterPubSub();
+  });
+
+  afterEach(async () => {
+    await pubsub.close();
+  });
+
+  describe('basic usage tracking', () => {
+    it('should include usage data in workflow input initialization', async () => {
+      const mockModel = createModelWithUsage({
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+      });
+
+      const baseAgent = new Agent({
+        id: 'usage-test-agent',
+        name: 'Usage Test Agent',
+        instructions: 'You are a helpful assistant',
+        model: mockModel as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const result = await durableAgent.prepare('Test message');
+
+      // Workflow input should be prepared
+      expect(result.workflowInput).toBeDefined();
+      expect(result.workflowInput.runId).toBe(result.runId);
+    });
+
+    it('should track model configuration in workflow input', async () => {
+      const mockModel = createModelWithUsage({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+      });
+
+      const baseAgent = new Agent({
+        id: 'model-config-agent',
+        name: 'Model Config Agent',
+        instructions: 'Test',
+        model: mockModel as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const result = await durableAgent.prepare('Test');
+
+      expect(result.workflowInput.modelConfig).toBeDefined();
+      expect(result.workflowInput.modelConfig.provider).toBeDefined();
+      expect(result.workflowInput.modelConfig.modelId).toBeDefined();
+    });
+  });
+
+  describe('usage in stream options', () => {
+    it('should pass includeRawChunks option to workflow', async () => {
+      const mockModel = createModelWithUsage({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+      });
+
+      const baseAgent = new Agent({
+        id: 'raw-chunks-agent',
+        name: 'Raw Chunks Agent',
+        instructions: 'Test',
+        model: mockModel as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const result = await durableAgent.prepare('Test', {
+        includeRawChunks: true,
+      });
+
+      expect(result.workflowInput.options.includeRawChunks).toBe(true);
+    });
+
+    it('should pass model settings including temperature', async () => {
+      const mockModel = createModelWithUsage({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+      });
+
+      const baseAgent = new Agent({
+        id: 'temperature-agent',
+        name: 'Temperature Agent',
+        instructions: 'Test',
+        model: mockModel as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      const result = await durableAgent.prepare('Test', {
+        modelSettings: {
+          temperature: 0.7,
+        },
+      });
+
+      expect(result.workflowInput.options.modelSettings?.temperature).toBe(0.7);
+    });
+  });
+
+  describe('workflow initialization state', () => {
+    it('should expose workflow with correct id', async () => {
+      const mockModel = createModelWithUsage({
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+      });
+
+      const baseAgent = new Agent({
+        id: 'init-usage-agent',
+        name: 'Init Usage Agent',
+        instructions: 'Test',
+        model: mockModel as LanguageModelV2,
+      });
+      const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+      // Get the workflow to inspect its structure
+      const workflow = durableAgent.getWorkflow();
+      expect(workflow).toBeDefined();
+      expect(workflow.id).toBe('durable-agentic-loop');
+    });
+  });
+});
+
+// ============================================================================
+// Usage Accumulation Tests
+// ============================================================================
+
+describe('DurableAgent usage accumulation', () => {
+  let pubsub: EventEmitterPubSub;
+
+  beforeEach(() => {
+    pubsub = new EventEmitterPubSub();
+  });
+
+  afterEach(async () => {
+    await pubsub.close();
+  });
+
+  it('keeps an omitted counter unknown across a real multi-step durable run', async () => {
+    const model = createToolThenReplyingModelWithUsage(
+      { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+      { outputTokens: 5 },
+    );
+    const baseAgent = new Agent({
+      id: 'partial-usage-agent',
+      name: 'Partial Usage Agent',
+      instructions: 'Use the tool, then answer.',
+      model: model as LanguageModelV2,
+      tools: { usageTool },
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    let callbackUsage: PartialUsage | undefined;
+    const result = await durableAgent.stream('Run the tool', {
+      maxSteps: 3,
+      onFinish: ({ usage }) => {
+        callbackUsage = usage;
+      },
+    });
+
+    try {
+      for await (const _chunk of result.fullStream) {
+        // Drain the durable workflow before reading its final output.
+      }
+      const output = await result.output.getFullOutput();
+      expect(output.usage).toMatchObject({
+        inputTokens: undefined,
+        outputTokens: 25,
+        totalTokens: undefined,
+      });
+      expect(callbackUsage).toMatchObject({
+        inputTokens: undefined,
+        outputTokens: 25,
+        totalTokens: undefined,
+      });
+    } finally {
+      result.cleanup();
+    }
+  });
+
+  it('keeps usage unknown when the model errors before reporting usage', async () => {
+    const model = new MockLanguageModelV2({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'response-metadata', id: 'id-error', modelId: 'mock-model-id', timestamp: new Date(0) },
+          { type: 'text-start', id: 'text-error' },
+          { type: 'text-delta', id: 'text-error', delta: 'Partial work before failure.' },
+          { type: 'error', error: new Error('Provider failed before reporting usage') },
+        ]),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+    });
+    const baseAgent = new Agent({
+      id: 'error-usage-agent',
+      name: 'Error Usage Agent',
+      instructions: 'Test',
+      model: model as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+    const result = await durableAgent.stream('Fail before reporting usage', { maxSteps: 3 });
+
+    try {
+      const chunks: any[] = [];
+      for await (const chunk of result.fullStream) {
+        chunks.push(chunk);
+      }
+
+      const stepFinish = chunks.findLast(chunk => chunk.type === 'step-finish');
+      expect(stepFinish?.payload?.output?.usage).toMatchObject({
+        inputTokens: undefined,
+        outputTokens: undefined,
+        totalTokens: undefined,
+      });
+
+      const finish = chunks.findLast(chunk => chunk.type === 'finish');
+      expect(finish?.payload?.output?.usage).toMatchObject({
+        inputTokens: undefined,
+        outputTokens: undefined,
+        totalTokens: undefined,
+      });
+    } finally {
+      result.cleanup();
+    }
+  });
+
+  it('should handle multiple prepare calls independently', async () => {
+    const mockModel = createModelWithUsage({
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    });
+
+    const baseAgent = new Agent({
+      id: 'multi-prepare-agent',
+      name: 'Multi Prepare Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const result1 = await durableAgent.prepare('First message');
+    const result2 = await durableAgent.prepare('Second message');
+    const result3 = await durableAgent.prepare('Third message');
+
+    // Each should have unique runId
+    expect(result1.runId).not.toBe(result2.runId);
+    expect(result2.runId).not.toBe(result3.runId);
+    expect(result1.runId).not.toBe(result3.runId);
+
+    // Each should have unique messageId
+    expect(result1.messageId).not.toBe(result2.messageId);
+    expect(result2.messageId).not.toBe(result3.messageId);
+
+    // All should be in registry
+    expect(durableAgent.runRegistry.has(result1.runId)).toBe(true);
+    expect(durableAgent.runRegistry.has(result2.runId)).toBe(true);
+    expect(durableAgent.runRegistry.has(result3.runId)).toBe(true);
+  });
+});
+
+// ============================================================================
+// Model Settings Tests
+// ============================================================================
+
+describe('DurableAgent model settings', () => {
+  let pubsub: EventEmitterPubSub;
+
+  beforeEach(() => {
+    pubsub = new EventEmitterPubSub();
+  });
+
+  afterEach(async () => {
+    await pubsub.close();
+  });
+
+  it('should pass temperature setting', async () => {
+    const mockModel = createModelWithUsage({
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    });
+
+    const baseAgent = new Agent({
+      id: 'temp-setting-agent',
+      name: 'Temp Setting Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const result = await durableAgent.prepare('Test', {
+      modelSettings: { temperature: 0.5 },
+    });
+
+    expect(result.workflowInput.options.modelSettings?.temperature).toBe(0.5);
+  });
+
+  it('should handle missing model settings', async () => {
+    const mockModel = createModelWithUsage({
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    });
+
+    const baseAgent = new Agent({
+      id: 'no-settings-agent',
+      name: 'No Settings Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const result = await durableAgent.prepare('Test');
+
+    // Should not throw and modelSettings should be undefined
+    expect(result.workflowInput.options.modelSettings).toBeUndefined();
+  });
+
+  it('should serialize model config correctly', async () => {
+    const mockModel = createModelWithUsage({
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    });
+
+    const baseAgent = new Agent({
+      id: 'serialize-config-agent',
+      name: 'Serialize Config Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const result = await durableAgent.prepare('Test');
+
+    // Model config should be serializable
+    const serialized = JSON.stringify(result.workflowInput.modelConfig);
+    const deserialized = JSON.parse(serialized);
+
+    expect(deserialized.provider).toBeDefined();
+    expect(deserialized.modelId).toBeDefined();
+  });
+});
+
+// ============================================================================
+// Processor Retry Configuration Tests
+// ============================================================================
+
+describe('DurableAgent processor retry configuration', () => {
+  let pubsub: EventEmitterPubSub;
+
+  beforeEach(() => {
+    pubsub = new EventEmitterPubSub();
+  });
+
+  afterEach(async () => {
+    await pubsub.close();
+  });
+
+  it('should pass maxProcessorRetries to workflow input', async () => {
+    const mockModel = createModelWithUsage({
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    });
+
+    const baseAgent = new Agent({
+      id: 'retry-config-agent',
+      name: 'Retry Config Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const result = await durableAgent.prepare('Test', {
+      maxProcessorRetries: 3,
+    });
+
+    expect(result.workflowInput.options.maxProcessorRetries).toBe(3);
+  });
+
+  it('should default maxProcessorRetries to undefined when not specified', async () => {
+    const mockModel = createModelWithUsage({
+      inputTokens: 10,
+      outputTokens: 20,
+      totalTokens: 30,
+    });
+
+    const baseAgent = new Agent({
+      id: 'default-retry-agent',
+      name: 'Default Retry Agent',
+      instructions: 'Test',
+      model: mockModel as LanguageModelV2,
+    });
+    const durableAgent = createDurableAgent({ agent: baseAgent, pubsub });
+
+    const result = await durableAgent.prepare('Test');
+
+    expect(result.workflowInput.options.maxProcessorRetries).toBeUndefined();
+  });
+});

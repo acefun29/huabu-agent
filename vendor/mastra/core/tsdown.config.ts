@@ -1,0 +1,234 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import * as babel from '@babel/core';
+import { generateTypes } from '@internal/types-builder';
+import { defineConfig } from 'tsdown';
+
+const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, 'package.json'), 'utf-8'));
+const { default: treeshakeDecoratorsBabelPlugin } = await import(
+  new URL('./tools/treeshake-decorators.js', import.meta.url).href
+);
+
+const treeshakeDecorators = {
+  name: 'treeshake-decorators',
+  renderChunk(code: string, chunk: { fileName: string }) {
+    if (!code.includes('__decoratorStart')) {
+      return null;
+    }
+
+    return new Promise((resolve, reject) => {
+      babel.transform(
+        code,
+        {
+          babelrc: false,
+          configFile: false,
+          filename: chunk.fileName,
+          plugins: [treeshakeDecoratorsBabelPlugin],
+        },
+        (err, result) => {
+          if (err) {
+            return reject(err);
+          }
+
+          resolve({
+            code: result!.code!,
+            map: result!.map!,
+          });
+        },
+      );
+    });
+  },
+};
+
+/**
+ * Rolldown can attribute a side-effect-only import of a Node builtin to a chunk that never
+ * uses it, including the shared runtime chunk that every entry imports. That drags `module`
+ * into browser-safe entries such as `a2a/client`, and bundlers targeting the browser fail to
+ * resolve it. A bare import of a builtin has no side effects worth keeping, so drop it.
+ */
+const dropBareBuiltinImports = {
+  name: 'drop-bare-builtin-imports',
+  generateBundle(_options: unknown, bundle: Record<string, { type: string; code?: string }>) {
+    const bareBuiltinImport =
+      /^import "(?:node:)?(?:assert|async_hooks|buffer|child_process|cluster|console|constants|crypto|dgram|diagnostics_channel|dns|domain|events|fs|http|http2|https|inspector|module|net|os|path|perf_hooks|process|punycode|querystring|readline|repl|stream|string_decoder|timers|tls|trace_events|tty|url|util|v8|vm|wasi|worker_threads|zlib)(?:\/[\w/]+)?";?$/gm;
+
+    for (const chunk of Object.values(bundle)) {
+      if (chunk.type === 'chunk' && chunk.code) {
+        chunk.code = chunk.code.replace(bareBuiltinImport, '');
+      }
+    }
+  },
+};
+
+/**
+ * Entries that browser apps import directly. Everything they load statically must not touch
+ * `process` or `Buffer` (undefined in the browser), import Node built-ins or other packages besides
+ * zod, or pull in agent/provider-registry chunks. `src/storage/dashboards-browser-entry.test.ts`
+ * also loads the dashboards entry in a context without Node globals.
+ */
+const browserSafeEntries = ['storage/dashboards.js', 'storage/dashboards.cjs'];
+
+function findBrowserUnsafeImports(distDir: string, entry: string): string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  const visit = (file: string, from: string) => {
+    if (seen.has(file)) return;
+    seen.add(file);
+    const name = path.relative(distDir, file);
+    if (/(^|\/)(agent|provider-registry)[-./]/.test(name)) problems.push(`${from} imports ${name}`);
+    const code = fs.readFileSync(file, 'utf-8');
+    for (const global of ['process', 'Buffer']) {
+      if (new RegExp(`\\b${global}\\b`).test(code))
+        problems.push(`${name} (reached from ${entry}) references ${global}`);
+    }
+    const specifiers = [...code.matchAll(/(?:\bfrom\s*|\bimport\s*|\brequire\()["']([^"']+)["']/g)].map(m => m[1]!);
+    for (const specifier of specifiers) {
+      if (specifier.startsWith('.')) visit(path.resolve(path.dirname(file), specifier), name);
+      else if (specifier !== 'zod/v4') problems.push(`${name} (reached from ${entry}) imports ${specifier}`);
+    }
+  };
+  visit(path.join(distDir, entry), entry);
+  return problems;
+}
+
+export default defineConfig({
+  entry: [
+    'src/index.ts',
+    'src/base.ts',
+    'src/utils.ts',
+    '!src/action/index.ts',
+    'src/*/index.ts',
+    'src/observability/context-storage.ts',
+    'src/tools/is-vercel-tool.ts',
+    'src/workflows/constants.ts',
+    'src/storage/constants.ts',
+    'src/storage/dashboards.ts',
+    'src/workflows/builder/index.ts',
+    'src/workflows/evented/index.ts',
+    'src/loop/server.ts',
+    'src/vector/filter/index.ts',
+    'src/test-utils/llm-mock.ts',
+    'src/a2a/client.ts',
+    'src/a2a/v1.ts',
+    'src/processors/index.ts',
+    'src/zod-to-json.ts',
+    'src/utils/collect-tool-mocks.ts',
+    'src/utils/safe-stringify.ts',
+    'src/evals/scoreTraces/index.ts',
+    'src/agent/message-list/index.ts',
+    'src/agent/durable/index.ts',
+    'src/auth/ee/index.ts',
+    'src/auth/ee/fga-check.ts',
+    'src/agent-builder/ee/index.ts',
+    'src/storage/domains/agents/index.ts',
+    'src/storage/domains/mcp-clients/index.ts',
+    'src/storage/domains/mcp-servers/index.ts',
+    'src/storage/domains/prompt-blocks/index.ts',
+    'src/storage/domains/scorer-definitions/index.ts',
+    'src/storage/domains/skills/index.ts',
+    'src/storage/domains/favorites/index.ts',
+    'src/storage/domains/workspaces/index.ts',
+  ],
+  format: ['esm', 'cjs'],
+  fixedExtension: false,
+  nodeProtocol: 'strip',
+  clean: true,
+  dts: false,
+  treeshake: true,
+  inputOptions: {
+    plugins: [treeshakeDecorators, dropBareBuiltinImports],
+  },
+  define: {
+    __MASTRA_VERSION__: JSON.stringify(pkg.version),
+  },
+  sourcemap: true,
+  deps: {
+    neverBundle: ['vite', 'vitest'],
+    alwaysBundle: [
+      '@ai-sdk/openai',
+      '@internal/ai-sdk-v4',
+      '@internal/ai-sdk-v5',
+      '@internal/ai-v6',
+      '@internal/ai-v7',
+      '@internal/auth',
+      '@internal/core',
+      '@internal/deployer',
+      '@internal/voice',
+      '@sindresorhus/slugify',
+      'tokenx',
+    ],
+  },
+  onSuccess: async () => {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await generateTypes(
+      process.cwd(),
+      new Set([
+        '@ai-sdk/*',
+        'eventsource-parser',
+        '@internal/ai-sdk-v4',
+        '@internal/ai-sdk-v5',
+        '@internal/ai-v6',
+        '@internal/ai-v7',
+        '@internal/external-types',
+        '@internal/core',
+        '@internal/voice',
+        '@internal/auth',
+        '@internal/deployer',
+        '@sindresorhus/slugify',
+      ]),
+      {
+        rollupTypes: {
+          'tools/mcp-types.d.ts': ['@modelcontextprotocol/server', '@modelcontextprotocol/core'],
+        },
+      },
+    );
+
+    // Copy provider-registry.json to dist folder
+    const srcJson = path.join(process.cwd(), 'src/llm/model/provider-registry.json');
+    const distJson = path.join(process.cwd(), 'dist/provider-registry.json');
+
+    if (fs.existsSync(srcJson)) {
+      fs.copyFileSync(srcJson, distJson);
+      console.info('✓ Copied provider-registry.json to dist/');
+    }
+
+    // Copy capabilities/ directory to dist/
+    const srcCapDir = path.join(process.cwd(), 'src/llm/model/capabilities');
+    const distCapDir = path.join(process.cwd(), 'dist/capabilities');
+
+    if (fs.existsSync(srcCapDir)) {
+      if (!fs.existsSync(distCapDir)) {
+        fs.mkdirSync(distCapDir, { recursive: true });
+      }
+      for (const file of fs.readdirSync(distCapDir).filter((f: string) => f.endsWith('.json'))) {
+        fs.unlinkSync(path.join(distCapDir, file));
+      }
+      const capFiles = fs.readdirSync(srcCapDir).filter((f: string) => f.endsWith('.json'));
+      for (const file of capFiles) {
+        fs.copyFileSync(path.join(srcCapDir, file), path.join(distCapDir, file));
+      }
+      console.info(`✓ Copied ${capFiles.length} capability files to dist/capabilities/`);
+    }
+
+    // Copy provider-types.generated.d.ts to dist/llm/model/ folder
+    const srcDts = path.join(process.cwd(), 'src/llm/model/provider-types.generated.d.ts');
+    const distDtsDir = path.join(process.cwd(), 'dist/llm/model');
+    const distDts = path.join(distDtsDir, 'provider-types.generated.d.ts');
+
+    if (fs.existsSync(srcDts)) {
+      // Ensure directory exists
+      if (!fs.existsSync(distDtsDir)) {
+        fs.mkdirSync(distDtsDir, { recursive: true });
+      }
+      fs.copyFileSync(srcDts, distDts);
+      console.info('✓ Copied provider-types.generated.d.ts to dist/llm/model/');
+    }
+
+    const distDir = path.join(process.cwd(), 'dist');
+    const unsafe = browserSafeEntries.flatMap(entry => findBrowserUnsafeImports(distDir, entry));
+    if (unsafe.length > 0) {
+      throw new Error(`Browser-safe entries load Node-only code:\n${unsafe.join('\n')}`);
+    }
+    console.info(`✓ Checked browser-safe entries: ${browserSafeEntries.join(', ')}`);
+  },
+});

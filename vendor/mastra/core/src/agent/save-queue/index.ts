@@ -1,0 +1,236 @@
+import type { IMastraLogger } from '../../logger';
+import type { MemoryConfigInternal } from '../../memory';
+import type { MastraMemory } from '../../memory/memory';
+import { isRunFenceConflictError } from '../../storage/run-fencing';
+import { filterMessagesForPersistence } from '../filter-messages-for-persistence';
+import type { MastraDBMessage, MessageList } from '../message-list';
+import { noteThreadMessagesSaved } from '../thread-saves';
+
+export interface FlushMessagesOptions {
+  /**
+   * Runs inside the thread's save queue, immediately before unsaved messages
+   * are drained. A rejection skips the save, leaves the messages unsaved, and
+   * rejects the flush with that error. Unless throwOnError is enabled, storage
+   * errors are logged, except a run fence conflict, which rejects like the guard.
+   */
+  beforePersist?: () => Promise<void>;
+  /** Reject this flush on storage failure without rejecting the shared queue. */
+  throwOnError?: boolean;
+}
+
+export class SaveQueueManager {
+  private logger?: IMastraLogger;
+  private debounceMs: number;
+  private memory?: MastraMemory;
+  private onSaved?: (messages: MastraDBMessage[]) => void;
+
+  private static MAX_STALENESS_MS = 1000;
+
+  constructor({
+    logger,
+    debounceMs,
+    memory,
+    onSaved,
+  }: {
+    logger?: IMastraLogger;
+    debounceMs?: number;
+    memory?: MastraMemory;
+    /** Called with the rows memory stored after each successful save. */
+    onSaved?: (messages: MastraDBMessage[]) => void;
+  }) {
+    this.logger = logger;
+    this.debounceMs = debounceMs || 100;
+    this.memory = memory;
+    this.onSaved = onSaved;
+  }
+  private saveQueues = new Map<string, Promise<void>>();
+  private saveDebounceTimers = new Map<string, NodeJS.Timeout>();
+
+  /**
+   * Debounces save operations for a thread, ensuring that consecutive save requests
+   * are batched and only the latest is executed after a short delay.
+   * @param threadId - The ID of the thread to debounce saves for.
+   * @param messageList - The MessageList instance containing unsaved messages.
+   * @param memoryConfig - Optional memory configuration to use for saving.
+   * @returns A promise that resolves when the debounced save completes.
+   */
+  private debounceSave(threadId: string, messageList: MessageList, memoryConfig?: MemoryConfigInternal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (this.saveDebounceTimers.has(threadId)) {
+        clearTimeout(this.saveDebounceTimers.get(threadId)!);
+      }
+      this.saveDebounceTimers.set(
+        threadId,
+        setTimeout(() => {
+          this.enqueueSave(threadId, messageList, memoryConfig)
+            .then(resolve)
+            .catch(err => {
+              this.logger?.error?.('Error in debounceSave', { err, threadId });
+              reject(err);
+            })
+            .finally(() => {
+              this.saveDebounceTimers.delete(threadId);
+            });
+        }, this.debounceMs),
+      );
+    });
+  }
+
+  /**
+   * Enqueues a save operation for a thread, ensuring that saves are executed in order and
+   * only one save runs at a time per thread. If a save is already in progress for the thread,
+   * the new save is queued to run after the previous completes.
+   *
+   * @param threadId - The ID of the thread whose messages should be saved.
+   * @param messageList - The MessageList instance containing unsaved messages.
+   * @param memoryConfig - Optional memory configuration to use for saving.
+   * @param beforePersist - Optional guard; see {@link FlushMessagesOptions}.
+   */
+  private enqueueSave(
+    threadId: string,
+    messageList: MessageList,
+    memoryConfig?: MemoryConfigInternal,
+    beforePersist?: FlushMessagesOptions['beforePersist'],
+    throwOnError = false,
+  ) {
+    const prev = this.saveQueues.get(threadId) || Promise.resolve();
+    let saveFailed = false;
+    let saveError: unknown;
+    const next = prev
+      .then(async () => {
+        if (beforePersist) {
+          try {
+            await beforePersist();
+          } catch (err) {
+            saveFailed = true;
+            saveError = err;
+            return;
+          }
+        }
+        await this.persistUnsavedMessages(threadId, messageList, memoryConfig);
+      })
+      .catch(err => {
+        // Strict callers need storage failures too; the queue itself must still resolve.
+        if (throwOnError || (beforePersist && isRunFenceConflictError(err))) {
+          saveFailed = true;
+          saveError = err;
+          return;
+        }
+        this.logger?.error?.('Error in enqueueSave', { err, threadId });
+      })
+      .then(() => {
+        if (this.saveQueues.get(threadId) === next) {
+          this.saveQueues.delete(threadId);
+        }
+      });
+    this.saveQueues.set(threadId, next);
+    // The queue chain itself never rejects, so later saves aren't poisoned;
+    // only this caller sees the guard or strict save rejection.
+    if (!beforePersist && !throwOnError) return next;
+    return next.then(() => {
+      if (saveFailed) throw saveError;
+    });
+  }
+
+  /**
+   * Clears any pending debounced save for a thread, preventing the scheduled save
+   * from executing if it hasn't already fired.
+   *
+   * @param threadId - The ID of the thread whose debounced save should be cleared.
+   */
+  clearDebounce(threadId: string) {
+    if (this.saveDebounceTimers.has(threadId)) {
+      clearTimeout(this.saveDebounceTimers.get(threadId)!);
+      this.saveDebounceTimers.delete(threadId);
+    }
+  }
+
+  /**
+   * Persists any unsaved messages from the MessageList to memory storage.
+   * Drains the list of unsaved messages and writes them using the memory backend.
+   * @param messageList - The MessageList instance for the current thread.
+   * @param memoryConfig - The memory configuration for saving.
+   */
+  private async persistUnsavedMessages(
+    threadId: string,
+    messageList: MessageList,
+    memoryConfig?: MemoryConfigInternal,
+  ) {
+    const drained = messageList.drainUnsavedMessagesForSave();
+    const newMessages = filterMessagesForPersistence(drained.messages);
+    if (newMessages.length > 0 && this.memory) {
+      const savedAt = Date.now();
+      let saved: Awaited<ReturnType<MastraMemory['saveMessages']>>;
+      try {
+        saved = await this.memory.saveMessages({
+          messages: newMessages,
+          memoryConfig,
+        });
+      } catch (error) {
+        // Nothing else writes drained messages, so a later save must retry them.
+        drained.restore();
+        throw error;
+      }
+      if (saved?.messages?.length) {
+        // Bookkeeping only: a failure here must not turn a successful save into an error.
+        try {
+          this.onSaved?.(saved.messages);
+        } catch (error) {
+          this.logger?.warn?.('onSaved callback failed', { error });
+        }
+      }
+      noteThreadMessagesSaved({ threadId, resourceId: newMessages.find(m => m.resourceId)?.resourceId, savedAt });
+    }
+  }
+
+  /**
+   * Batches a save of unsaved messages for a thread, using debouncing to batch rapid updates.
+   * If the oldest unsaved message is stale (older than MAX_STALENESS_MS), the save is performed immediately.
+   * Otherwise, the save is delayed to batch multiple updates and reduce redundant writes.
+   *
+   * @param messageList - The MessageList instance containing unsaved messages.
+   * @param threadId - The ID of the thread whose messages are being saved.
+   * @param memoryConfig - Optional memory configuration for saving.
+   */
+  async batchMessages(messageList: MessageList, threadId?: string, memoryConfig?: MemoryConfigInternal) {
+    if (!threadId) return;
+    const earliest = messageList.getEarliestUnsavedMessageTimestamp();
+    const now = Date.now();
+
+    if (earliest && now - earliest > SaveQueueManager.MAX_STALENESS_MS) {
+      return this.flushMessages(messageList, threadId, memoryConfig);
+    }
+    return this.debounceSave(threadId, messageList, memoryConfig);
+  }
+
+  /**
+   * Forces an immediate save of unsaved messages for a thread, bypassing any debounce delay.
+   * This is used when a flush to persistent storage is required (e.g., on shutdown or critical transitions).
+   *
+   * @param messageList - The MessageList instance containing unsaved messages.
+   * @param threadId - The ID of the thread whose messages are being saved.
+   * @param memoryConfig - Optional memory configuration for saving.
+   * @param options - Optional {@link FlushMessagesOptions}.
+   */
+  async flushMessages(
+    messageList: MessageList,
+    threadId?: string,
+    memoryConfig?: MemoryConfigInternal,
+    options?: FlushMessagesOptions,
+  ) {
+    if (!threadId) return;
+    this.clearDebounce(threadId);
+    return this.enqueueSave(threadId, messageList, memoryConfig, options?.beforePersist, options?.throwOnError);
+  }
+
+  /**
+   * Cancels any debounced save for a thread and waits for saves already in flight to finish,
+   * so a caller can change stored messages without a queued save landing afterwards.
+   *
+   * @param threadId - The ID of the thread whose pending saves should settle.
+   */
+  async flushPending(threadId: string) {
+    this.clearDebounce(threadId);
+    await this.saveQueues.get(threadId);
+  }
+}

@@ -1,0 +1,892 @@
+import type { WritableStream } from 'node:stream/web';
+import type {
+  Tool,
+  ToolV5,
+  FlexibleSchema,
+  ToolCallOptions,
+  ToolExecutionOptions,
+  Schema,
+} from '@internal/external-types';
+import type { MastraPrimitives, MastraUnion } from '../action';
+export type { MastraPrimitives, MastraUnion };
+import type { MastraDBMessage } from '../agent/message-list';
+import type { ActorSignal } from '../auth/ee';
+import type { BackgroundTaskAdoptionContext, ToolBackgroundConfig } from '../background-tasks';
+import type { MastraBrowser } from '../browser/browser';
+import type { Mastra } from '../mastra';
+import type { ObservabilityContext } from '../observability';
+import type { RequestContext } from '../request-context';
+import type { PublicSchema } from '../schema';
+import type { SuspendOptions, OutputWriter } from '../workflows';
+import type { Workspace } from '../workspace/workspace';
+import type { ElicitRequest, ElicitResult, ServerContext } from './mcp-types';
+import type { ToolStream } from './stream';
+import type { ValidationError } from './validation';
+
+export type VercelTool = Tool;
+export type VercelToolV5 = ToolV5;
+
+export type ToolInvocationOptions = ToolExecutionOptions | ToolCallOptions;
+
+/**
+ * Context passed to a global `requireToolApproval` function, evaluated per tool call.
+ */
+export type ToolApprovalContext = {
+  /** Name of the tool being called. */
+  toolName: string;
+  /** Arguments the model is passing to the tool. */
+  args: Record<string, unknown>;
+  /** Plain object view of the request context, when available. */
+  requestContext?: Record<string, unknown>;
+  /** Active workspace, when the run is bound to one. */
+  workspace?: Workspace;
+};
+
+/**
+ * Function form of the global `requireToolApproval` option. Evaluated per tool call;
+ * return `true` to require approval for that call, `false` to allow it. Enables
+ * conditional, per-call approval policies (e.g. regex matching on `toolName`).
+ */
+export type RequireToolApprovalFn = (ctx: ToolApprovalContext) => boolean | Promise<boolean>;
+
+/**
+ * Global tool approval setting. `true` requires approval for every tool call,
+ * `false`/omitted requires none, and a function decides per call.
+ */
+export type RequireToolApproval = boolean | RequireToolApprovalFn;
+
+/**
+ * Context passed to a per-tool `needsApprovalFn` alongside the parsed tool input.
+ * This is the same context surfaced to a tool-level `requireApproval` function.
+ */
+export type NeedsApprovalContext = {
+  /** Plain object view of the request context, when available. */
+  requestContext?: Record<string, unknown>;
+  /** Active workspace, when the run is bound to one. */
+  workspace?: Workspace;
+};
+
+/**
+ * Per-tool approval predicate attached to a tool instance.
+ *
+ * This is the runtime-resolved form of a tool's `requireApproval` function (or of an
+ * MCP server-level `requireToolApproval` function wrapped by the MCP client). It is
+ * evaluated per tool call with the parsed input and the available context; return
+ * `true` to require approval for that call, `false` to allow it.
+ *
+ * It is attached to the tool instance by {@link CoreToolBuilder} / the MCP client and
+ * read by the agent runtime. Prefer the public `requireApproval` option on
+ * `createTool` over setting this directly.
+ */
+export type NeedsApprovalFn = (input: any, ctx?: NeedsApprovalContext) => boolean | Promise<boolean>;
+
+/**
+ * Context passed to a tool's `beforeApproval` hook alongside the parsed tool input.
+ */
+export type BeforeApprovalContext = NeedsApprovalContext & {
+  /** ID of the tool call awaiting approval. */
+  toolCallId: string;
+  /** Name the model used to call the tool. */
+  toolName: string;
+};
+
+/**
+ * Per-tool hook that runs after the call is known to require approval but before the
+ * run suspends for it. Return `{ proceed: false, output }` to reject the call: the run
+ * does not pause, the tool does not execute, and `output` is returned to the model as
+ * the tool result. Return nothing to continue to the approval gate. `input` is validated
+ * against the tool's `inputSchema`; calls whose input fails validation skip the hook.
+ */
+export type BeforeApprovalFn<TInput = any, TOutput = unknown> = (
+  input: TInput,
+  ctx: BeforeApprovalContext,
+) => void | ToolBeforeHookResult<TOutput> | Promise<void | ToolBeforeHookResult<TOutput>>;
+
+/**
+ * Trusted runtime values the agent runtime passes to a built tool's `beforeApproval`
+ * wrapper so it can run the same authorization check as `execute`. Not exposed to user hooks.
+ * @internal
+ */
+export type BeforeApprovalRuntime = {
+  requestContext?: RequestContext;
+  actor?: ActorSignal;
+};
+
+export interface ToolHookContext<
+  TInput = unknown,
+  TContext = unknown,
+  TMetadata extends Record<string, unknown> = Record<string, unknown>,
+> {
+  /** The name exposed to the model for this tool call. */
+  toolName: string;
+  /** Input passed to the tool. */
+  input: TInput;
+  /** Execution context passed to the tool. */
+  context: TContext;
+  /** Optional adapter-specific metadata. */
+  metadata?: TMetadata;
+}
+
+export interface ToolBeforeHookResult<TOutput = unknown> {
+  /** Set to false to skip the tool execution and return `output` instead. */
+  proceed: false;
+  output: TOutput;
+}
+
+export interface ToolAfterHookContext<
+  TInput = unknown,
+  TOutput = unknown,
+  TContext = unknown,
+  TMetadata extends Record<string, unknown> = Record<string, unknown>,
+> extends ToolHookContext<TInput, TContext, TMetadata> {
+  /** Tool output when execution completed. Undefined when execution failed before producing output. */
+  output?: TOutput;
+  /** Error thrown by the tool, if execution failed. */
+  error?: unknown;
+}
+
+export interface ToolHooks<
+  TInput = unknown,
+  TOutput = unknown,
+  TContext = unknown,
+  TMetadata extends Record<string, unknown> = Record<string, unknown>,
+> {
+  beforeToolCall?: (
+    context: ToolHookContext<TInput, TContext, TMetadata>,
+  ) => void | ToolBeforeHookResult<TOutput> | Promise<void | ToolBeforeHookResult<TOutput>>;
+  afterToolCall?: (context: ToolAfterHookContext<TInput, TOutput, TContext, TMetadata>) => void | Promise<void>;
+}
+
+export type ToolPayloadTransformTarget = 'display' | 'transcript';
+
+export type ToolPayloadTransformPhase =
+  | 'input-delta'
+  | 'input-available'
+  | 'output-available'
+  | 'error'
+  | 'approval'
+  | 'suspend'
+  | 'resume';
+
+export type ToolPayloadTransformContext<TInput = unknown, TOutput = unknown, TError = unknown> = {
+  target: ToolPayloadTransformTarget;
+  phase: ToolPayloadTransformPhase;
+  toolName: string;
+  toolCallId: string;
+  input?: TInput;
+  inputTextDelta?: string;
+  output?: TOutput;
+  error?: TError;
+  suspendPayload?: unknown;
+  resumeData?: unknown;
+  providerMetadata?: Record<string, unknown>;
+  context?: Record<string, unknown>;
+};
+
+export type ToolPayloadTransformResult = unknown;
+
+export type ToolPayloadTransformFunction<TInput = unknown, TOutput = unknown, TError = unknown> = (
+  context: ToolPayloadTransformContext<TInput, TOutput, TError>,
+) => ToolPayloadTransformResult | Promise<ToolPayloadTransformResult>;
+
+export type ToolPayloadTransformTargetConfig<TInput = unknown, TOutput = unknown, TError = unknown> = {
+  input?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+  inputDelta?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+  output?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+  error?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+  approval?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+  suspend?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+  resume?: ToolPayloadTransformFunction<TInput, TOutput, TError>;
+};
+
+export type ToolPayloadTransform<TInput = unknown, TOutput = unknown, TError = unknown> = Partial<
+  Record<ToolPayloadTransformTarget, ToolPayloadTransformTargetConfig<TInput, TOutput, TError>>
+>;
+
+export type ToolPayloadTransformPolicy = {
+  transformToolPayload?: ToolPayloadTransformFunction;
+  targets?: ToolPayloadTransformTarget[];
+};
+
+/**
+ * Observability helpers available on the tool execution context.
+ * Wraps child span creation and structured log emission in a
+ * null-safe API that callers never need to check — when no tracing
+ * context is active, `span` runs the function directly and `log` is
+ * a no-op.
+ */
+export interface ToolObserve {
+  span<T>(name: string, fn: () => Promise<T> | T, attributes?: Record<string, unknown>): Promise<T>;
+  log(level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', message: string, data?: Record<string, unknown>): void;
+}
+
+/**
+ * A no-op ToolObserve implementation. `span` runs the function
+ * directly; `log` does nothing. Used as the default when no
+ * collector/tracing context is active, so user code never needs to
+ * null-check `observe`.
+ */
+export const noopObserve: ToolObserve = {
+  async span<T>(_name: string, fn: () => Promise<T> | T): Promise<T> {
+    return fn();
+  },
+  log(): void {},
+};
+
+/**
+ * MCP-specific context properties available during tool execution in MCP environments.
+ */
+// Agent tool execution context - properties specific when tools are executed by agents
+export interface AgentToolExecutionContext<TSuspend, TResume> {
+  // Always present when called from agent context
+  agentId: string;
+  toolCallId: string;
+  messages: any[];
+  /**
+   * Reads the current in-memory conversation, including remembered messages and this run's responses.
+   * Reflects message-list removals, but not transient provider-prompt transforms. Treat messages as read-only.
+   * Not available outside a supported agent loop.
+   */
+  getMessages?: () => readonly MastraDBMessage[];
+  suspend: (suspendPayload: TSuspend, suspendOptions?: SuspendOptions) => Promise<void>;
+
+  // Optional - memory identifiers
+  threadId?: string;
+  resourceId?: string;
+
+  // Optional - only present if tool was previously suspended
+  resumeData?: TResume;
+  /** Framework-resolved delegated run ID recovered from persisted suspension state. */
+  suspendedToolRunId?: string;
+  // Optional - the payload this tool suspended with, present on resume
+  suspendPayload?: TSuspend;
+
+  // Optional - original WritableStream passed from AI SDK (without Mastra metadata wrapping)
+  writableStream?: WritableStream<any>;
+
+  /**
+   * Flushes the parent stream's pending messages to persistent storage.
+   * See `MastraToolInvocationOptions.flushMessages` for details.
+   */
+  flushMessages?: () => Promise<void>;
+
+  /**
+   * True when the tool is running as a dispatched background task rather than
+   * inline in the agent loop. The parent model has already received a
+   * placeholder result by the time the tool executes.
+   */
+  isBackgroundTask?: boolean;
+}
+
+// Workflow tool execution context - properties specific when tools are executed in workflows
+export interface WorkflowToolExecutionContext<TSuspend, TResume> {
+  // Always present when called from workflow context
+  runId: string;
+  workflowId: string;
+  state: any;
+  setState: (state: any) => void;
+  suspend: (suspendPayload: TSuspend, suspendOptions?: SuspendOptions) => Promise<void>;
+  // Optional - only present if workflow step was previously suspended
+  resumeData?: TResume;
+  /** Framework-resolved delegated run ID recovered from persisted suspension state. */
+  suspendedToolRunId?: string;
+  // Optional - the payload this step suspended with, present on resume
+  suspendPayload?: TSuspend;
+}
+
+/** Log levels for MCP `notifications/message`, ordered per RFC 5424. */
+export type MCPLoggingLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error' | 'critical' | 'alert' | 'emergency';
+
+/** Protocol context the MCP server hands to a tool as `context.mcp.extra`. */
+export type MCPServerContext = ServerContext & {
+  /** Aborts when the client cancels the request or disconnects. */
+  signal: ServerContext['mcpReq']['signal'];
+  requestId: ServerContext['mcpReq']['id'];
+  authInfo?: NonNullable<ServerContext['http']>['authInfo'];
+  /**
+   * Raw notification sender.
+   * @deprecated Use `context.mcp.log` / `context.mcp.progress`. A 2026-07-28 server throws when this is called.
+   * Removed in the next core major.
+   */
+  sendNotification: ServerContext['mcpReq']['notify'];
+  /**
+   * Raw server-to-client request sender.
+   * @deprecated 2026-07-28 removed server-initiated requests; a 2026-07-28 server throws when this is called.
+   * Removed in the next core major.
+   */
+  sendRequest: ServerContext['mcpReq']['send'];
+  /** Request metadata: trace headers, the log-level opt-in and the progress token. */
+  _meta?: ServerContext['mcpReq']['_meta'];
+};
+
+/**
+ * MCP tool execution context - properties specific when tools are executed via a Model Context Protocol server.
+ *
+ * `@mastra/mcp` 1.x and 2.x servers both provide it. `extra` (minus the deprecated senders), `log` and `progress`
+ * behave the same on either; the deprecated members throw on a 2026-07-28 server with a message pointing at the
+ * replacement.
+ */
+export interface MCPToolExecutionContext {
+  /** MCP protocol context passed by the server */
+  extra: MCPServerContext;
+  /**
+   * Elicitation handler for interactive user input during tool execution.
+   * @deprecated 2026-07-28 removed server-initiated elicitation: call `context.suspend(payload)` and read
+   * `context.resumeData` instead. A 2026-07-28 server throws when this is called. Removed in the next core major.
+   */
+  elicitation: {
+    sendRequest: (request: ElicitRequest['params']) => Promise<ElicitResult>;
+  };
+  /**
+   * Sends a `notifications/message` log notification to the calling client.
+   * Messages below the client's minimum level are dropped: 1.x reads it from `logging/setLevel`,
+   * 2026-07-28 from the request's `_meta`.
+   */
+  log?: (level: MCPLoggingLevel, message: string, data?: Record<string, unknown>) => Promise<void>;
+  /**
+   * Sends a `notifications/progress` notification to the calling client.
+   * No-op if the caller did not request progress tracking (no progressToken in `_meta`).
+   */
+  progress?: (params: { progress: number; total?: number; message?: string }) => Promise<void>;
+  /** Set by 2026-07-28 servers. Absent on `@mastra/mcp` 1.x. */
+  protocolVersion?: '2026-07-28';
+}
+
+/**
+ * Extended version of ToolInvocationOptions that includes Mastra-specific properties
+ * for suspend/resume functionality, stream writing, and tracing context.
+ *
+ * This is used by CoreTool/InternalCoreTool for AI SDK compatibility (AI SDK expects this signature).
+ * Mastra v1.0 tools (ToolAction) use ToolExecutionContext instead.
+ *
+ * CoreToolBuilder acts as the adapter layer:
+ * - Receives: AI SDK calls with MastraToolInvocationOptions
+ * - Converts to: ToolExecutionContext for Mastra tool execution
+ * - Returns: Results back to AI SDK
+ */
+export type MastraToolInvocationOptions = ToolInvocationOptions &
+  Partial<ObservabilityContext> & {
+    suspend?: (suspendPayload: any, suspendOptions?: SuspendOptions) => Promise<any>;
+    resumeData?: any;
+    /** Framework-resolved delegated run ID recovered from persisted suspension state. */
+    suspendedToolRunId?: string;
+    /** The payload the tool previously suspended with, when resuming. */
+    suspendPayload?: any;
+    outputWriter?: OutputWriter;
+    /**
+     * Optional MCP-specific context passed when tool is executed in MCP server.
+     * This is populated by the MCP server and passed through to the tool's execution context.
+     */
+    mcp?: MCPToolExecutionContext;
+    /**
+     * Skip the TOOL_CALL span for this execution. Set by the MCP server, which
+     * already wraps the call in an MCP_SERVER_REQUEST span. Nested agent and
+     * workflow runs still attach to `tracingContext.currentSpan`.
+     */
+    skipToolSpan?: boolean;
+    /**
+     * Workspace for tool execution. When provided at execution time, this overrides
+     * any workspace configured at tool build time. Allows dynamic workspace selection
+     * per-step via prepareStep.
+     */
+    workspace?: Workspace;
+    /**
+     * Request context for tool execution. When provided at execution time, this overrides
+     * any requestContext configured at tool build time. Allows workflow steps to forward
+     * their requestContext (e.g., authenticated API clients, feature flags) to tools.
+     */
+    requestContext?: RequestContext;
+    /** Trusted server-side signal for this tool FGA check. */
+    actor?: ActorSignal;
+    /**
+     * Flushes the parent stream's pending messages to persistent storage.
+     *
+     * The agent stream batches message saves through a `SaveQueueManager`
+     * (100ms debounce). Tools that read the thread's persisted history
+     * mid-stream (e.g. cloning the thread, exporting it, handing off to a
+     * sibling agent) must call this first, otherwise the store will be
+     * missing the latest user / assistant messages.
+     *
+     * Populated automatically by the agent tool-call step. No-op when the
+     * stream is not memory-backed.
+     */
+    flushMessages?: () => Promise<void>;
+    /** Live conversation reader supplied by the agent loop. Never serialized in workflow state. */
+    getMessages?: AgentToolExecutionContext<unknown, unknown>['getMessages'];
+    /** Observability helper to expose on the final tool execution context. */
+    observe?: ToolObserve;
+    /** Set by the agent tool-call step when the tool runs as a background task. */
+    isBackgroundTask?: boolean;
+    /** Process-local lifecycle bridge for an operation adopted by the background task. */
+    background?: BackgroundTaskAdoptionContext;
+  };
+
+/**
+ * The type of tool registered with the MCP server.
+ * This is used to categorize tools in the MCP Server playground.
+ * If not specified, it defaults to a regular tool.
+ */
+export type MCPToolType = 'agent' | 'workflow';
+
+/**
+ * Metadata identifying a tool as originating from an MCP server.
+ * Set automatically by the MCP client when creating tools.
+ * Used by CoreToolBuilder to create MCP_TOOL_CALL spans instead of TOOL_CALL spans.
+ */
+export interface McpMetadata {
+  serverName: string;
+  serverVersion?: string;
+  /** Instructions advertised by the MCP server during initialize. */
+  serverInstructions?: string;
+  /** Whether the agent should append these instructions to its system prompt. Defaults to false (opt-in). */
+  forwardInstructions?: boolean;
+  /** Maximum number of characters to forward into the agent system prompt. */
+  instructionsMaxLength?: number;
+}
+
+/**
+ * MCP Tool Annotations for describing tool behavior and UI presentation.
+ * These annotations are part of the MCP protocol and are used by clients
+ * like OpenAI Apps SDK to control tool card display and permission hints.
+ *
+ * @see https://spec.modelcontextprotocol.io/specification/2025-03-26/server/tools/#tool-annotations
+ */
+export interface ToolAnnotations {
+  /**
+   * A human-readable title for the tool.
+   * Used for display purposes in UI components.
+   */
+  title?: string;
+  /**
+   * If true, the tool does not modify its environment.
+   * This hint indicates the tool only reads data and has no side effects.
+   * @default false
+   */
+  readOnlyHint?: boolean;
+  /**
+   * If true, the tool may perform destructive updates to its environment.
+   * If false, the tool performs only additive updates.
+   * This hint helps clients determine if confirmation should be required.
+   * @default true
+   */
+  destructiveHint?: boolean;
+  /**
+   * If true, calling the tool repeatedly with the same arguments
+   * will have no additional effect on its environment.
+   * This hint indicates idempotent behavior.
+   * @default false
+   */
+  idempotentHint?: boolean;
+  /**
+   * If true, this tool may interact with an "open world" of external
+   * entities (e.g., web search, external APIs).
+   * If false, the tool's domain is closed and fully defined.
+   * @default true
+   */
+  openWorldHint?: boolean;
+}
+
+// MCP-specific properties for tools
+export interface MCPToolProperties {
+  /**
+   * The type of tool registered with the MCP server.
+   * This is used to categorize tools in the MCP Server playground.
+   * If not specified, it defaults to a regular tool.
+   */
+  toolType?: MCPToolType;
+  /**
+   * MCP tool annotations for describing tool behavior and UI presentation.
+   * These are exposed via MCP protocol and used by clients like OpenAI Apps SDK.
+   * @see https://spec.modelcontextprotocol.io/specification/2025-03-26/server/tools/#tool-annotations
+   */
+  annotations?: ToolAnnotations;
+  /**
+   * Arbitrary metadata that will be passed through to MCP clients.
+   * This field allows custom metadata to be attached to tools for
+   * client-specific functionality.
+   */
+  _meta?: Record<string, unknown>;
+}
+
+/**
+ * CoreTool is the AI SDK-compatible tool format used when passing tools to the AI SDK.
+ * This matches the AI SDK's Tool interface.
+ *
+ * CoreToolBuilder converts Mastra tools (ToolAction) to this format and handles the
+ * signature transformation from Mastra's (inputData, context) to AI SDK format (params, options).
+ *
+ * Key differences from ToolAction:
+ * - Uses 'parameters' instead of 'inputSchema' (AI SDK naming)
+ * - Execute signature: (params, options: MastraToolInvocationOptions) (AI SDK format)
+ * - Supports FlexibleSchema | Schema for broader AI SDK compatibility
+ */
+export type CoreTool = {
+  title?: string;
+  description?: string;
+  parameters: FlexibleSchema<any> | Schema;
+  outputSchema?: FlexibleSchema<any> | Schema;
+  execute?: (params: any, options: MastraToolInvocationOptions) => Promise<any>;
+  /**
+   * Enables strict tool input generation for providers that support it.
+   */
+  strict?: boolean;
+  /**
+   * Provider-specific options passed to the model when this tool is used.
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
+  /**
+   * Optional MCP-specific properties.
+   * Only populated when the tool is being used in an MCP context.
+   */
+  mcp?: MCPToolProperties;
+  /**
+   * Optional function to transform tool output before returning to the model.
+   * Receives the raw tool output and returns a transformed representation.
+   * Passed through from the original tool definition.
+   */
+  toModelOutput?: (output: unknown) => unknown;
+  transform?: ToolPayloadTransform;
+  /**
+   * Examples of valid tool inputs. Each example contains an `input` object
+   * showing what valid arguments look like.
+   * Passed through to the AI SDK which forwards them to model providers
+   * that support input examples (e.g., Anthropic's `input_examples` beta feature).
+   */
+  inputExamples?: Array<{ input: Record<string, unknown> }>;
+  onInputStart?: (options: ToolCallOptions) => void | PromiseLike<void>;
+  onInputDelta?: (options: { inputTextDelta: string } & ToolCallOptions) => void | PromiseLike<void>;
+  onInputAvailable?: (options: { input: any } & ToolCallOptions) => void | PromiseLike<void>;
+  onOutput?: (
+    options: { output: any; toolName: string } & Omit<ToolCallOptions, 'messages'>,
+  ) => void | PromiseLike<void>;
+  /** Background task configuration for this tool. */
+  background?: ToolBackgroundConfig;
+} & (
+  | {
+      type?: 'function' | undefined;
+      id?: string;
+    }
+  | {
+      type: 'provider-defined';
+      id: `${string}.${string}`;
+      args: Record<string, unknown>;
+    }
+);
+
+/**
+ * InternalCoreTool is identical to CoreTool but with stricter typing.
+ * Used internally where we know the schema has already been converted to AI SDK Schema format.
+ *
+ * The only difference: parameters must be Schema (not FlexibleSchema | Schema)
+ */
+export type InternalCoreTool = {
+  title?: string;
+  description?: string;
+  parameters: Schema;
+  outputSchema?: Schema;
+  execute?: (params: any, options: MastraToolInvocationOptions) => Promise<any>;
+  /**
+   * Enables strict tool input generation for providers that support it.
+   */
+  strict?: boolean;
+  /**
+   * Provider-specific options passed to the model when this tool is used.
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
+  /**
+   * Optional MCP-specific properties.
+   * Only populated when the tool is being used in an MCP context.
+   */
+  mcp?: MCPToolProperties;
+  /**
+   * Optional function to transform tool output before returning to the model.
+   * Receives the raw tool output and returns a transformed representation.
+   * Passed through from the original tool definition.
+   */
+  toModelOutput?: (output: unknown) => unknown;
+  transform?: ToolPayloadTransform;
+  /**
+   * Examples of valid tool inputs. Each example contains an `input` object
+   * showing what valid arguments look like.
+   * Passed through to the AI SDK which forwards them to model providers
+   * that support input examples (e.g., Anthropic's `input_examples` beta feature).
+   */
+  inputExamples?: Array<{ input: Record<string, unknown> }>;
+  onInputStart?: (options: ToolCallOptions) => void | PromiseLike<void>;
+  onInputDelta?: (options: { inputTextDelta: string } & ToolCallOptions) => void | PromiseLike<void>;
+  onInputAvailable?: (options: { input: any } & ToolCallOptions) => void | PromiseLike<void>;
+  onOutput?: (
+    options: { output: any; toolName: string } & Omit<ToolCallOptions, 'messages'>,
+  ) => void | PromiseLike<void>;
+  /** Background task configuration for this tool. */
+  background?: ToolBackgroundConfig;
+} & (
+  | {
+      type?: 'function' | undefined;
+      id?: string;
+    }
+  | {
+      type: 'provider-defined';
+      id: `${string}.${string}`;
+      args: Record<string, unknown>;
+    }
+);
+
+// Unified tool execution context that works for all scenarios
+export interface ToolExecutionContext<
+  TSuspend = unknown,
+  TResume = unknown,
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> extends Partial<ObservabilityContext> {
+  // ============ Common properties (available in all contexts) ============
+  mastra?: MastraUnion;
+  requestContext?: RequestContext<TRequestContext>;
+  abortSignal?: AbortSignal;
+  /** Trusted server-side signal forwarded for nested FGA checks. */
+  actor?: ActorSignal;
+
+  /**
+   * Workspace available for tool execution. When provided, tools can access:
+   * - workspace.filesystem - for file operations (read, write, list, etc.)
+   * - workspace.sandbox - for command execution
+   *
+   * This allows tools to work with the agent's configured workspace.
+   */
+  workspace?: Workspace;
+
+  /**
+   * Browser available for tool execution. When provided, tools can access
+   * browser capabilities for web automation, screenshots, and data extraction.
+   *
+   * The browser is lazily initialized - it will be launched on first use.
+   */
+  browser?: MastraBrowser;
+
+  // Writer is created by Mastra for ALL contexts (agent, workflow, direct execution)
+  // Wraps chunks with metadata (toolCallId, toolName, runId) before passing to underlying stream
+  writer?: ToolStream;
+
+  // ============ Context-specific nested properties ============
+
+  // Agent-specific properties
+  agent?: AgentToolExecutionContext<TSuspend, TResume>;
+
+  // Workflow-specific properties
+  workflow?: WorkflowToolExecutionContext<TSuspend, TResume>;
+
+  // MCP (Model Context Protocol) specific context
+  mcp?: MCPToolExecutionContext;
+
+  /**
+   * Process-local lifecycle bridge exposed only during native background
+   * execution. Acknowledgement-returning tools can adopt their existing
+   * operation so the native task remains running until it settles.
+   */
+  background?: BackgroundTaskAdoptionContext;
+
+  // ============ Suspend/resume for direct and MCP 2.x execution ============
+  // Agents and workflows nest these under `agent` / `workflow` until the next core major.
+
+  /** Suspends the tool with a payload validated against `suspendSchema`. On an MCP 2.x server this ends the request as `input_required`. */
+  suspend?: (suspendPayload: TSuspend, suspendOptions?: SuspendOptions) => Promise<void>;
+  /** The answer to the last suspension, validated against `resumeSchema`. Present only when resuming. */
+  resumeData?: TResume;
+  /** The payload the tool last suspended with. Present only when resuming. */
+  suspendPayload?: TSuspend;
+
+  /**
+   * Observability helpers for recording child spans and structured logs
+   * from inside a tool's execute function. Always provided to the tool's
+   * `execute` callback (callers of `tool.execute()` may omit it) — when no
+   * tracing context is active, `span` runs the function directly and
+   * `log` is a no-op. No null-checking needed.
+   *
+   * ```ts
+   * execute: async ({ userId }, { observe }) => {
+   *   observe.log('info', 'fetching user', { userId })
+   *   return observe.span('fetch user', () => fetch(`/api/users/${userId}`))
+   * }
+   * ```
+   */
+  observe: ToolObserve;
+}
+
+/**
+ * Context accepted when calling `tool.execute(input, context)` directly. `observe`
+ * is optional here because the tool runtime fills it in (a no-op implementation
+ * when no tracing span is active); the tool's own `execute` callback always
+ * receives it.
+ */
+export type ToolExecuteCallContext<TContext> = Omit<TContext, 'observe'> & {
+  observe?: ToolObserve;
+};
+
+/**
+ * Context received by a tool's `execute` callback. The runtime always provides
+ * `requestContext` (an empty one is created if the caller passed none), so it
+ * is non-optional here — like `observe`. No null-checking needed.
+ */
+export type ToolExecuteContext<TContext, TRequestContext extends Record<string, any> | unknown = unknown> = Omit<
+  TContext,
+  'requestContext'
+> & {
+  requestContext: RequestContext<TRequestContext>;
+};
+
+/** The `execute` callback signature used by `createTool` and `new Tool(...)`. */
+export type ToolExecuteFunction<
+  TSchemaIn,
+  TSchemaOut,
+  TContext,
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> = (
+  inputData: TSchemaIn,
+  context: ToolExecuteContext<TContext, TRequestContext>,
+) => Promise<TSchemaOut | ValidationError | void>;
+
+export interface ToolAction<
+  TSchemaIn,
+  TSchemaOut,
+  TSuspend = unknown,
+  TResume = unknown,
+  TContext extends ToolExecutionContext<TSuspend, TResume, any> = ToolExecutionContext<TSuspend, TResume>,
+  TId extends string = string,
+  TRequestContext extends Record<string, any> | unknown = unknown,
+> {
+  id: TId;
+  /** Display name for UIs and MCP clients. Never sent to the model. */
+  title?: string;
+  description: string;
+  inputSchema?: PublicSchema<TSchemaIn>;
+  outputSchema?: PublicSchema<TSchemaOut>;
+  suspendSchema?: PublicSchema<TSuspend>;
+  resumeSchema?: PublicSchema<TResume>;
+  /**
+   * Optional schema for validating request context values.
+   * When provided, the request context will be validated against this schema before tool execution.
+   * If validation fails, a validation error is returned instead of executing the tool.
+   */
+  requestContextSchema?: PublicSchema<TRequestContext, any>;
+  /**
+   * Optional MCP-specific properties.
+   * Only populated when the tool is being used in an MCP context.
+   */
+  mcp?: MCPToolProperties;
+  /**
+   * Optional function to transform tool output before returning to the model.
+   * Receives the raw tool output and returns a transformed representation.
+   * Passed through from the original tool definition.
+   */
+  toModelOutput?: (output: TSchemaOut) => unknown;
+  /**
+   * Optional target-aware transform for tool payloads that leave runtime.
+   *
+   * Runtime execution still receives raw inputs and outputs. These transforms
+   * are used by display and transcript serializers to avoid exposing internal
+   * payload fields.
+   */
+  transform?: ToolPayloadTransform<TSchemaIn, TSchemaOut>;
+  // Execute signature with unified context type
+  // First parameter: raw input data (validated against inputSchema)
+  // Second parameter: unified execution context with all metadata
+  // Returns: The expected output, a validation error, or void when the tool
+  // suspends via `context.agent?.suspend?.(...)` / `context.workflow?.suspend?.(...)`.
+  // When `suspend` has been called, the tool runtime skips output validation
+  // (see `Tool.execute` in tool.ts), so returning `undefined` after `suspend`
+  // is the supported idiom (e.g. `return await suspend(...)`).
+  // Note: When no outputSchema is provided, returns any to allow property access
+  // Note: For outputSchema, we use the input type because Zod transforms are applied during validation
+  // Note: { error?: never } enables inline type narrowing with 'error' in result checks
+  execute?: (inputData: TSchemaIn, context: TContext) => Promise<TSchemaOut | ValidationError | void>;
+  /**
+   * Display-only tool: stream the call to the client, return `{ acknowledged: true }`
+   * from the server, and continue the model loop without waiting for a browser result.
+   * Cannot be combined with `execute`.
+   */
+  renderOnly?: boolean;
+  mastra?: Mastra;
+  /**
+   * Whether the tool requires explicit user approval before execution.
+   * Pass `true` to always require approval, or a function evaluated per-call
+   * with the tool input (and optional request context/workspace) to require
+   * approval conditionally.
+   */
+  requireApproval?:
+    | boolean
+    | ((
+        input: TSchemaIn,
+        ctx?: { requestContext?: Record<string, unknown>; workspace?: Workspace },
+      ) => boolean | Promise<boolean>);
+  /**
+   * Runs before the approval gate for calls that require approval. Use it to validate a
+   * call (e.g. check that referenced records exist) so invalid calls are never shown to a
+   * human. Return `{ proceed: false, output }` to reject: the run does not suspend, the
+   * tool does not execute, and `output` is returned to the model as the tool result.
+   * Not run on resume, so keep validating inside `execute` if state can change while paused.
+   * If the hook throws, the error is logged and the call continues to the approval gate.
+   */
+  beforeApproval?: BeforeApprovalFn<TSchemaIn>;
+  /**
+   * Enables strict tool input generation for providers that support it.
+   * When enabled, supported providers will attempt to generate arguments
+   * that exactly match the tool schema.
+   */
+  strict?: boolean;
+  /**
+   * How a result that fails `outputSchema` validation is handled.
+   * - `'strict'` (default): the result is replaced with a validation error object, so the
+   *   model is told the call failed.
+   * - `'warn'`: the failure is logged and the tool's actual result is returned unchanged.
+   *   Use this for tools whose side effects have already happened when the result is
+   *   produced (an order was placed, a message was sent), so the model does not retry them.
+   */
+  outputValidation?: 'strict' | 'warn';
+  /**
+   * Provider-specific options passed to the model when this tool is used.
+   * Keys are provider names (e.g., 'anthropic', 'openai'), values are provider-specific configs.
+   * @example
+   * ```typescript
+   * providerOptions: {
+   *   anthropic: {
+   *     cacheControl: { type: 'ephemeral' }
+   *   }
+   * }
+   * ```
+   */
+  providerOptions?: Record<string, Record<string, unknown>>;
+  /**
+   * Metadata identifying this tool as originating from an MCP server.
+   * Set automatically by the MCP client when creating tools.
+   * Used by CoreToolBuilder to create MCP_TOOL_CALL spans instead of TOOL_CALL spans.
+   */
+  mcpMetadata?: McpMetadata;
+  /**
+   * Examples of valid tool inputs. Each example contains an `input` object
+   * showing what valid arguments look like.
+   * Passed through to the AI SDK which forwards them to model providers
+   * that support input examples (e.g., Anthropic's `input_examples` beta feature).
+   */
+  inputExamples?: Array<{ input: Record<string, unknown> }>;
+  onInputStart?: (options: ToolCallOptions) => void | PromiseLike<void>;
+  onInputDelta?: (
+    options: {
+      inputTextDelta: string;
+    } & ToolCallOptions,
+  ) => void | PromiseLike<void>;
+  onInputAvailable?: (
+    options: {
+      input: TSchemaIn;
+    } & ToolCallOptions,
+  ) => void | PromiseLike<void>;
+  onOutput?: (
+    options: {
+      output: TSchemaOut;
+      toolName: string;
+    } & Omit<ToolCallOptions, 'messages'>,
+  ) => void | PromiseLike<void>;
+  /**
+   * Background task configuration for this tool.
+   * When enabled, the tool can be executed in the background while the agent conversation continues.
+   */
+  background?: ToolBackgroundConfig;
+}

@@ -1,0 +1,574 @@
+import { injectJsonInstructionIntoMessages as injectJsonInstructionIntoMessagesV3 } from '@ai-sdk/provider-utils-v6';
+import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
+import { APICallError } from '@internal/ai-sdk-v5';
+import type { IdGenerator, ToolChoice, ToolSet } from '@internal/ai-sdk-v5';
+import { prepareJsonSchemaForOpenAIStrictMode } from '@mastra/schema-compat';
+import type { StructuredOutputOptions } from '../../../agent/types';
+import { validateModelTimeoutSettings } from '../../../llm/model/model-settings';
+import type { ModelMethodType } from '../../../llm/model/model.loop.types';
+import { modelSupportsStructuredOutput, modelSupportsTemperature } from '../../../llm/model/provider-registry';
+import { ModelRouterLanguageModel } from '../../../llm/model/router';
+import type { MastraLanguageModel, SharedProviderOptions } from '../../../llm/model/shared.types';
+import {
+  createTimeoutAbortSignal,
+  guardStreamUntilMatch,
+  guardStreamWithAbort,
+  isMastraTimeoutError,
+  raceAgainstAbort,
+} from '../../../loop/timeout';
+import type { LoopOptions } from '../../../loop/types';
+import { DEFAULT_MAX_RETRY_AFTER_MS, getRetryAfterMs, waitDelay } from '../../../utils/retry-after';
+import { getResponseFormat } from '../../base/schema';
+import type { LanguageModelV2StreamResult, OnResult } from '../../types';
+import { attachModelStreamTransport, readModelStreamTransport } from '../../types';
+import { prepareToolsAndToolChoice } from './compat';
+import type { ModelSpecVersion } from './compat';
+import { AISDKV5InputStream } from './input';
+
+type JsonPromptInjection = StructuredOutputOptions<unknown>['jsonPromptInjection'];
+type ResolvedJsonPromptInjection = Exclude<JsonPromptInjection, 'auto'>;
+
+/**
+ * p-retry's own defaults, pinned explicitly so the delay it schedules between
+ * model-call attempts can be computed when honoring a provider `Retry-After`.
+ */
+const RETRY_MIN_TIMEOUT_MS = 1_000;
+const RETRY_BACKOFF_FACTOR = 2;
+
+const CONTENT_CHUNK_TYPES = new Set([
+  'text-delta',
+  'reasoning-delta',
+  'tool-call',
+  'tool-call-delta',
+  'tool-input-delta',
+  'tool-result',
+  'object',
+  'object-result',
+  'file',
+  'source',
+]);
+
+function isContentChunk(chunk: unknown): boolean {
+  return (
+    typeof chunk === 'object' && chunk !== null && CONTENT_CHUNK_TYPES.has((chunk as { type?: string }).type ?? '')
+  );
+}
+
+/**
+ * Whether a failed model call will be retried. Used by both `onFailedAttempt` and
+ * `shouldRetry` so a terminal error never waits out a provider delay it will not use.
+ */
+function isRetryableModelError(error: unknown): boolean {
+  // A step budget covers the whole attempt, so burning what is left of it on retries
+  // against the same model would only delay the fallback to the next one.
+  if (isMastraTimeoutError(error)) {
+    return false;
+  }
+  if (APICallError.isInstance(error)) {
+    return error.isRetryable;
+  }
+  return true;
+}
+
+/**
+ * Whether a JSON schema has an object with free-form keys (e.g. `z.record()`), which OpenAI
+ * strict mode cannot express: it requires every object to list fixed keys with
+ * `additionalProperties: false`.
+ */
+export function hasFreeFormObject(schema: unknown): boolean {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return false;
+  const node = schema as Record<string, unknown>;
+  const additional = node.additionalProperties;
+  if (additional === true || (additional && typeof additional === 'object')) return true;
+  if (node.patternProperties || node.propertyNames) return true;
+
+  // Only descend into keywords that hold subschemas. Data keywords (`default`, `const`,
+  // `enum`, `examples`) and property names are not schemas and must not trigger a match.
+  const subschemas: unknown[] = [];
+  for (const key of ['properties', '$defs', 'definitions'] as const) {
+    const map = node[key];
+    if (map && typeof map === 'object' && !Array.isArray(map)) subschemas.push(...Object.values(map));
+  }
+  for (const key of ['anyOf', 'oneOf', 'allOf'] as const) {
+    const list = node[key];
+    if (Array.isArray(list)) subschemas.push(...list);
+  }
+  const items = node.items;
+  if (Array.isArray(items)) subschemas.push(...items);
+  else if (items) subschemas.push(items);
+  if (Array.isArray(node.prefixItems)) subschemas.push(...node.prefixItems);
+  return subschemas.some(hasFreeFormObject);
+}
+
+function readStrictJsonSchemaOption(options: unknown): boolean | undefined {
+  if (!options || typeof options !== 'object') return undefined;
+  const strictJsonSchema = (options as { strictJsonSchema?: unknown }).strictJsonSchema;
+  return typeof strictJsonSchema === 'boolean' ? strictJsonSchema : undefined;
+}
+
+/**
+ * Whether the model sends structured output as an OpenAI strict json_schema, which
+ * requires the schema to be prepared (all properties required, no unsupported keywords).
+ *
+ * OpenAI providers are detected by provider id. Other provider instances (for example
+ * `@ai-sdk/openai-compatible` models created with `supportsStructuredOutputs: true`) are
+ * detected by capability, honoring a `strictJsonSchema` override in their provider options.
+ * Model-router models always advertise structured output support, so they keep deciding by
+ * provider id.
+ */
+// Native @ai-sdk/openai ids are 'openai.chat', 'openai.responses', ...; 'openai-compatible.*' reads its own provider options.
+const isNativeOpenAIProvider = (provider: string) => /^openai(\.|$)/.test(provider);
+
+export function usesOpenAIStrictJsonSchema(
+  model: Pick<MastraLanguageModel, 'provider'> & { supportsStructuredOutputs?: unknown },
+  providerOptions?: SharedProviderOptions,
+): boolean {
+  if (isNativeOpenAIProvider(model.provider)) return true;
+  if (model instanceof ModelRouterLanguageModel || model.supportsStructuredOutputs !== true) return false;
+
+  const providerKey = model.provider.split('.')[0]!;
+  const camelCaseProviderKey = providerKey
+    .split(/[-_]/)
+    .map((part, i) => (i === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join('');
+  const options = providerOptions as Record<string, unknown> | undefined;
+  // Highest precedence first, matching @ai-sdk/openai-compatible (the only version that sends `strict`).
+  for (const key of new Set([camelCaseProviderKey, providerKey, 'openaiCompatible', 'openai-compatible'])) {
+    const strictJsonSchema = readStrictJsonSchemaOption(options?.[key]);
+    if (strictJsonSchema !== undefined) return strictJsonSchema;
+  }
+
+  // @ai-sdk/openai-compatible sends strict json_schema by default.
+  return true;
+}
+
+export function resolveJsonPromptInjection(
+  value: JsonPromptInjection,
+  capability: boolean | undefined,
+): ResolvedJsonPromptInjection {
+  if (value !== 'auto') return value;
+  return capability === true ? undefined : 'inline';
+}
+
+/**
+ * Whether a step sends a native structured-output schema (`responseFormat`) to the model.
+ * Tools are dropped under `toolChoice: 'none'` only in this case (#14459); when the schema is
+ * injected into the prompt instead, tools are kept so providers retain tool history (#25908).
+ */
+export function sendsNativeResponseFormat(
+  structuredOutput: { schema?: unknown; model?: unknown; jsonPromptInjection?: JsonPromptInjection } | undefined,
+  model: { provider: string; modelId: string },
+): boolean {
+  if (!structuredOutput?.schema || structuredOutput.model) return false;
+  const { jsonPromptInjection } = structuredOutput;
+  const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
+  return !resolveJsonPromptInjection(
+    jsonPromptInjection,
+    jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
+  );
+}
+
+type InjectJsonInstructionArgs = Parameters<typeof injectJsonInstructionIntoMessagesV3>[0];
+
+/**
+ * Typed V2 wrapper for the `@ai-sdk/provider-utils-v6` helper, which only reads and rewrites the
+ * leading system message's string content — a shape shared by V2 and V3 prompts.
+ */
+function injectJsonInstructionIntoMessages(
+  args: Omit<InjectJsonInstructionArgs, 'messages'> & { messages: LanguageModelV2Prompt },
+): LanguageModelV2Prompt {
+  return injectJsonInstructionIntoMessagesV3({
+    ...args,
+    messages: args.messages as unknown as InjectJsonInstructionArgs['messages'],
+  }) as unknown as LanguageModelV2Prompt;
+}
+
+/**
+ * Caller-supplied `structuredOutput.instructions` replace the generated schema dump only when
+ * they carry actual text. Empty / whitespace-only values fall back to the generated instruction.
+ */
+function hasCompactInstructions(instructions: string | undefined): instructions is string {
+  return typeof instructions === 'string' && instructions.trim().length > 0;
+}
+
+function buildJsonInstruction(schema: unknown, instructions?: string) {
+  if (hasCompactInstructions(instructions)) {
+    return instructions;
+  }
+  return `Return your response as JSON matching this schema:\n\n${JSON.stringify(schema)}\n\nReturn only valid JSON. Do not include markdown or explanatory text.`;
+}
+
+function injectJsonInstructionIntoLatestUserMessage({
+  messages,
+  schema,
+  instructions,
+}: {
+  messages: LanguageModelV2Prompt;
+  schema: unknown;
+  instructions?: string;
+}): LanguageModelV2Prompt {
+  const instruction = buildJsonInstruction(schema, instructions);
+  const prompt = messages.map(message => ({
+    ...message,
+    content: Array.isArray(message.content) ? [...message.content] : message.content,
+  })) as LanguageModelV2Prompt;
+
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    const message = prompt[i];
+    if (message?.role !== 'user') {
+      continue;
+    }
+
+    message.content = Array.isArray(message.content)
+      ? [...message.content, { type: 'text', text: instruction }]
+      : [
+          { type: 'text', text: String(message.content ?? '') },
+          { type: 'text', text: instruction },
+        ];
+    return prompt;
+  }
+
+  return [...prompt, { role: 'user', content: [{ type: 'text', text: instruction }] }] as LanguageModelV2Prompt;
+}
+
+function omit<T extends object, K extends keyof T>(obj: T, keys: K[]): Omit<T, K> {
+  const newObj = { ...obj };
+  for (const key of keys) {
+    delete newObj[key];
+  }
+  return newObj;
+}
+
+type ExecutionProps<OUTPUT = undefined> = {
+  runId: string;
+  model: MastraLanguageModel;
+  providerOptions?: SharedProviderOptions;
+  inputMessages: LanguageModelV2Prompt;
+  tools?: ToolSet;
+  toolChoice?: ToolChoice<ToolSet>;
+  activeTools?: string[];
+  options?: {
+    abortSignal?: AbortSignal;
+  };
+  includeRawChunks?: boolean;
+  modelSettings?: LoopOptions['modelSettings'];
+  onResult: OnResult;
+  structuredOutput?: StructuredOutputOptions<OUTPUT>;
+  /**
+  Additional HTTP headers to be sent with the request.
+  Only applicable for HTTP-based providers.
+  */
+  headers?: Record<string, string | undefined>;
+  shouldThrowError?: boolean;
+  methodType: ModelMethodType;
+  generateId?: IdGenerator;
+  /**
+   * Called when a provider request fails, before it is retried. A run that lost its thread lease while the
+   * request was out stops here, so the failed request is its last.
+   */
+  onRequestFailed?: () => void;
+  /**
+   * Called when a failed request is about to be sent again, after the retry delay. A run that lost its thread
+   * lease during that delay has already stopped, so this is only reached by a run that still holds it.
+   */
+  onRequestRetry?: () => void;
+};
+
+export function execute<OUTPUT = undefined>({
+  runId,
+  model,
+  providerOptions,
+  inputMessages,
+  tools,
+  toolChoice,
+  activeTools,
+  options,
+  onResult,
+  includeRawChunks,
+  modelSettings,
+  structuredOutput,
+  headers,
+  shouldThrowError,
+  methodType,
+  generateId,
+  onRequestFailed,
+  onRequestRetry,
+}: ExecutionProps<OUTPUT>) {
+  const v5 = new AISDKV5InputStream({
+    component: 'LLM',
+    name: model.modelId,
+    generateId,
+  });
+
+  // Determine target version based on model's specificationVersion
+  // V3 (AI SDK v6) and V4 (AI SDK v7) models need 'provider' type, V2 models need 'provider-defined'
+  const targetVersion: ModelSpecVersion =
+    model.specificationVersion === 'v4' ? 'v4' : model.specificationVersion === 'v3' ? 'v3' : 'v2';
+
+  const structuredOutputMode = structuredOutput?.schema
+    ? structuredOutput?.model
+      ? 'processor'
+      : 'direct'
+    : undefined;
+
+  const toolsAndToolChoice = prepareToolsAndToolChoice({
+    tools,
+    toolChoice,
+    activeTools,
+    targetVersion,
+    stripToolsWhenNone: sendsNativeResponseFormat(structuredOutput, model),
+  });
+
+  const responseFormat = structuredOutput?.schema
+    ? getResponseFormat(structuredOutput?.schema, {
+        model: {
+          provider: model.provider,
+          modelId: model.modelId,
+          supportsStructuredOutputs: true,
+        },
+      })
+    : undefined;
+
+  let prompt = inputMessages;
+  const jsonPromptInjection = structuredOutput?.jsonPromptInjection;
+  const modelRoute = `${model.provider.split('.')[0]}/${model.modelId}`;
+  const resolvedJsonPromptInjection = resolveJsonPromptInjection(
+    jsonPromptInjection,
+    jsonPromptInjection === 'auto' ? modelSupportsStructuredOutput(modelRoute) : undefined,
+  );
+  const injectionMode = resolvedJsonPromptInjection === true ? 'system' : resolvedJsonPromptInjection;
+
+  // For direct mode (no model provided for structuring agent), inject JSON schema instruction if opting out of native response format with jsonPromptInjection
+  if (structuredOutputMode === 'direct' && responseFormat?.type === 'json' && injectionMode) {
+    const compactInstructions = hasCompactInstructions(structuredOutput?.instructions)
+      ? structuredOutput.instructions
+      : undefined;
+    prompt =
+      injectionMode === 'inline'
+        ? injectJsonInstructionIntoLatestUserMessage({
+            messages: inputMessages,
+            schema: responseFormat.schema,
+            instructions: compactInstructions,
+          })
+        : injectJsonInstructionIntoMessages({
+            messages: inputMessages,
+            // Compact instructions replace the schema dump entirely. Passing them in the
+            // `schemaSuffix` slot (with no schema) suppresses the AI SDK's default generic
+            // suffix, which would otherwise be appended when `schema` is nullish.
+            ...(compactInstructions
+              ? { schema: undefined, schemaPrefix: undefined, schemaSuffix: compactInstructions }
+              : { schema: responseFormat.schema }),
+          });
+  }
+
+  // For processor mode without agent reuse, inject a custom prompt to inform the main agent
+  // about the structured output schema that the structuring agent will use.
+  // An explicit `jsonPromptInjection: false` opts out of this hint.
+  if (
+    structuredOutputMode === 'processor' &&
+    responseFormat?.type === 'json' &&
+    responseFormat?.schema &&
+    !structuredOutput?.useAgent &&
+    jsonPromptInjection !== false
+  ) {
+    prompt = injectJsonInstructionIntoMessages({
+      messages: inputMessages,
+      schema: responseFormat.schema,
+      schemaPrefix: `Your response will be processed by another agent to extract structured data. Please ensure your response contains comprehensive information for all the following fields that will be extracted:\n`,
+      schemaSuffix: `\n\nYou don't need to format your response as JSON unless the user asks you to. Just ensure your natural language response includes relevant information for each field in the schema above.`,
+    });
+  }
+
+  /**
+   * Enable OpenAI's strict JSON schema mode to ensure schema compliance.
+   * Without this, OpenAI may omit required fields or violate type constraints.
+   * @see https://platform.openai.com/docs/guides/structured-outputs#structured-outputs-vs-json-mode
+   * @see https://ai-sdk.dev/docs/ai-sdk-core/generating-structured-data#accessing-reasoning
+   */
+  // Strict json_schema (OpenAI, and OpenAI-compatible providers with native structured output)
+  // requires all properties to be required, additionalProperties: false, and no unsupported keywords.
+  const isOpenAIProvider = isNativeOpenAIProvider(model.provider);
+  // OpenAI rejects free-form objects in strict mode, so send those schemas non-strict instead of
+  // rewriting them into objects that can hold no keys. Mastra still validates the result against the schema.
+  const sendNonStrict =
+    isOpenAIProvider &&
+    providerOptions?.openai?.strictJsonSchema !== true &&
+    hasFreeFormObject(responseFormat?.type === 'json' ? responseFormat.schema : undefined);
+  const isStrictJsonSchemaMode =
+    responseFormat?.type === 'json' &&
+    !injectionMode &&
+    !sendNonStrict &&
+    usesOpenAIStrictJsonSchema(model, providerOptions);
+
+  if (isStrictJsonSchemaMode && responseFormat?.schema) {
+    responseFormat.schema = prepareJsonSchemaForOpenAIStrictMode(responseFormat.schema);
+  }
+
+  // Only OpenAI providers read `providerOptions.openai`; OpenAI-compatible providers send strict by default
+  // and read their own provider key.
+  const providerOptionsToUse: SharedProviderOptions | undefined =
+    (isStrictJsonSchemaMode || sendNonStrict) && isOpenAIProvider
+      ? {
+          ...(providerOptions ?? {}),
+          openai: {
+            strictJsonSchema: isStrictJsonSchemaMode,
+            ...(providerOptions?.openai ?? {}),
+          },
+        }
+      : providerOptions;
+
+  const stream = v5.initialize({
+    runId,
+    onResult,
+    createStream: async () => {
+      try {
+        const timeout = validateModelTimeoutSettings(modelSettings?.timeout);
+        let filteredModelSettings = omit(modelSettings || {}, ['maxRetries', 'headers', 'timeout']);
+
+        // Capability-gated stripping of sampling params for models that reject them
+        // (e.g. Claude Sonnet 5, reasoning models). The model router applies this for
+        // router-id models, but provider instances passed directly (e.g. @ai-sdk/anthropic,
+        // @ai-sdk/amazon-bedrock) never enter the router, so strip here on the shared path
+        // too. Only drop on an explicit `false`; leave `true`/`undefined` untouched.
+        if (modelSupportsTemperature(modelRoute) === false) {
+          filteredModelSettings = omit(filteredModelSettings, ['temperature', 'topP', 'topK']);
+        }
+
+        // Bound this single model call by modelSettings.timeout.stepMs, composed with
+        // whatever signal the run already carries. The budget stays armed until the
+        // returned stream ends, so a provider that stalls mid-stream is caught too.
+        const { signal: abortSignal, cleanup: cleanupStepTimeout } = createTimeoutAbortSignal({
+          parentSignal: options?.abortSignal,
+          timeoutMs: timeout?.stepMs,
+          timeoutType: 'step',
+        });
+        let callAbortSignal = abortSignal;
+        let cleanupFirstChunkTimeout = () => {};
+
+        const pRetry = await import('p-retry');
+        const retryResult = await pRetry
+          .default(
+            async attemptNumber => {
+              if (attemptNumber > 1) {
+                onRequestRetry?.();
+                abortSignal?.throwIfAborted();
+              }
+              const firstChunkTimeout = createTimeoutAbortSignal({
+                parentSignal: abortSignal,
+                timeoutMs: methodType === 'stream' ? timeout?.firstChunkMs : undefined,
+                timeoutType: 'firstChunk',
+              });
+              callAbortSignal = firstChunkTimeout.signal;
+              cleanupFirstChunkTimeout = firstChunkTimeout.cleanup;
+
+              try {
+                const fn = (methodType === 'stream' ? model.doStream : model.doGenerate).bind(model);
+
+                // Cast needed: V2 and V3 call options are structurally compatible but typed differently
+                // (e.g., tool types differ: V2 uses 'provider-defined', V3 uses 'provider')
+                // Raced rather than merely signalled: a provider that ignores `abortSignal`
+                // would otherwise hang straight past its budget.
+                const streamResult = await raceAgainstAbort(
+                  (fn as Function)({
+                    ...toolsAndToolChoice,
+                    prompt,
+                    providerOptions: providerOptionsToUse,
+                    abortSignal: callAbortSignal,
+                    includeRawChunks,
+                    responseFormat: structuredOutputMode === 'direct' && !injectionMode ? responseFormat : undefined,
+                    ...filteredModelSettings,
+                    headers,
+                  }),
+                  callAbortSignal,
+                );
+
+                // We have to cast this because doStream is missing the warnings property in its return type even though it exists
+                return streamResult as unknown as LanguageModelV2StreamResult;
+              } catch (error) {
+                cleanupFirstChunkTimeout();
+                onRequestFailed?.();
+                abortSignal?.throwIfAborted();
+                throw error;
+              }
+            },
+            {
+              retries: modelSettings?.maxRetries ?? 2,
+              signal: abortSignal,
+              // Pinned to p-retry's own defaults so the backoff it schedules stays
+              // unchanged while remaining computable in onFailedAttempt below.
+              minTimeout: RETRY_MIN_TIMEOUT_MS,
+              factor: RETRY_BACKOFF_FACTOR,
+              async onFailedAttempt(context) {
+                // Runs before shouldRetry, so bail on anything that will not be retried:
+                // a terminal error must not wait out a provider delay it will never use.
+                if (context.retriesLeft <= 0 || !isRetryableModelError(context.error)) return;
+
+                const retryAfterMs = getRetryAfterMs(context.error);
+                if (retryAfterMs === undefined) return;
+
+                // p-retry applies its own exponential delay after this hook resolves, so
+                // wait only the remainder. Total wait lands on
+                // max(backoff, min(Retry-After, cap)), the same rule
+                // StreamErrorRetryProcessor applies, keeping a hostile or very large
+                // Retry-After from wedging the run.
+                const boundedRetryAfterMs = Math.min(retryAfterMs, DEFAULT_MAX_RETRY_AFTER_MS);
+                const scheduledBackoffMs = RETRY_MIN_TIMEOUT_MS * RETRY_BACKOFF_FACTOR ** (context.attemptNumber - 1);
+                await waitDelay(boundedRetryAfterMs - scheduledBackoffMs, abortSignal);
+              },
+              shouldRetry(context) {
+                return isRetryableModelError(context.error);
+              },
+            },
+          )
+          .catch(error => {
+            cleanupFirstChunkTimeout();
+            cleanupStepTimeout();
+            throw error;
+          });
+
+        if (!retryResult?.stream) {
+          cleanupFirstChunkTimeout();
+          cleanupStepTimeout();
+          return retryResult;
+        }
+
+        const firstChunkGuardedStream = guardStreamUntilMatch(
+          retryResult.stream,
+          callAbortSignal,
+          isContentChunk,
+          cleanupFirstChunkTimeout,
+        );
+        const guardedResult = {
+          ...retryResult,
+          stream: guardStreamWithAbort(firstChunkGuardedStream, abortSignal, cleanupStepTimeout),
+        } as unknown as LanguageModelV2StreamResult;
+        // The router attaches its stream transport as a non-enumerable symbol,
+        // which object spread drops. Re-attach it so transport handles survive
+        // the step-timeout wrapper.
+        attachModelStreamTransport(guardedResult, readModelStreamTransport(retryResult));
+        return guardedResult;
+      } catch (error) {
+        if (shouldThrowError) {
+          throw error;
+        }
+
+        return {
+          stream: new ReadableStream({
+            start: async controller => {
+              controller.enqueue({
+                type: 'error',
+                error,
+              });
+              controller.close();
+            },
+          }),
+          warnings: [],
+          request: {},
+          rawResponse: {},
+        };
+      }
+    },
+  });
+
+  return stream;
+}

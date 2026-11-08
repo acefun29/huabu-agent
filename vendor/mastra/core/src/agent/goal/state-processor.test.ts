@@ -1,0 +1,338 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { Mastra } from '../../mastra';
+import { RequestContext } from '../../request-context';
+import type { GoalObjectiveRecord } from '../../storage/domains/thread-state/base';
+import { InMemoryStore } from '../../storage/mock';
+
+import { beginGoalActivity, stopGoalActivity } from './activity';
+import { cacheGoalObjective } from './activity-cache';
+import { GOAL_REQUEST_CONTEXT_KEY, GOAL_STATE_TYPE } from './objective';
+import { GoalStateProcessor } from './state-processor';
+
+const THREAD_ID = 'thread-1';
+
+function objective(overrides: Partial<GoalObjectiveRecord> = {}): GoalObjectiveRecord {
+  return {
+    objective: 'Ship the feature',
+    status: 'active',
+    runsUsed: 0,
+    maxRuns: 5,
+    startedAt: 0,
+    updatedAt: 0,
+    ...overrides,
+  };
+}
+
+async function createProcessor(stored?: GoalObjectiveRecord) {
+  const storage = new InMemoryStore();
+  const mastra = new Mastra({ storage, logger: false });
+  const store = await storage.getStore('threadState');
+  if (stored) await store!.setState({ threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: stored });
+  const processor = new GoalStateProcessor();
+  processor.__registerMastra(mastra as any);
+  return { mastra, processor, storage, store: store! };
+}
+
+function snapshotSignal(record: GoalObjectiveRecord) {
+  return { metadata: { value: { objective: record } } } as any;
+}
+
+function createArgs(options: {
+  carried?: GoalObjectiveRecord | null;
+  lastSnapshot?: GoalObjectiveRecord;
+  hasSnapshot?: boolean;
+  requestContext?: RequestContext;
+}) {
+  const requestContext = options.requestContext ?? new RequestContext();
+  if (options.carried !== undefined) {
+    requestContext.set(GOAL_REQUEST_CONTEXT_KEY, options.carried === null ? undefined : options.carried);
+  }
+  return {
+    threadId: THREAD_ID,
+    resourceId: 'resource-1',
+    messages: [],
+    requestContext,
+    contextWindow: { hasSnapshot: options.hasSnapshot ?? true },
+    lastSnapshot: options.lastSnapshot ? snapshotSignal(options.lastSnapshot) : undefined,
+    activeStateSignals: [],
+    deltasSinceSnapshot: [],
+  } as any;
+}
+
+describe('GoalStateProcessor', () => {
+  it('emits a snapshot for an active objective (no base in window)', async () => {
+    const { processor } = await createProcessor(objective());
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: false }));
+
+    expect(result).toBeTruthy();
+    expect(result!.mode).toBe('snapshot');
+    expect(result!.tagName).toBe('current-objective');
+    expect(result!.contents).toContain('Ship the feature');
+    expect(result!.attributes).toMatchObject({ status: 'active' });
+  });
+
+  it('emits nothing when unchanged and the base is still in window', async () => {
+    const { processor } = await createProcessor(objective());
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), hasSnapshot: true }));
+    expect(result).toBeUndefined();
+  });
+
+  it('re-emits when the objective changes', async () => {
+    const { processor } = await createProcessor(objective({ objective: 'Ship the hyperdrive' }));
+    const result = await processor.computeStateSignal(
+      createArgs({ lastSnapshot: objective({ objective: 'Ship the feature' }), hasSnapshot: true }),
+    );
+    expect(result).toBeTruthy();
+    expect(result!.contents).toContain('Ship the hyperdrive');
+  });
+
+  // Regression: `runsUsed` advances on every judge pass. Keying the projection
+  // on it made the key differ from the previous one on every step, so an
+  // unchanged objective was appended to the window again each attempt.
+  it('emits nothing when only progress changed', async () => {
+    const { processor } = await createProcessor(objective({ runsUsed: 2 }));
+    const result = await processor.computeStateSignal(
+      createArgs({ lastSnapshot: objective({ runsUsed: 0 }), hasSnapshot: true }),
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it('re-snapshots when the base was dropped from the window', async () => {
+    const { processor } = await createProcessor(objective());
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), hasSnapshot: false }));
+    expect(result).toBeTruthy();
+    expect(result!.mode).toBe('snapshot');
+  });
+
+  it('emits nothing for a non-active objective', async () => {
+    const { processor } = await createProcessor(objective({ status: 'done' }));
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: false }));
+    expect(result).toBeUndefined();
+  });
+
+  it('prefers the within-turn objective carried on the request context', async () => {
+    const { processor } = await createProcessor(objective({ objective: 'stored' }));
+    const result = await processor.computeStateSignal(
+      createArgs({ carried: objective({ objective: 'carried' }), hasSnapshot: false }),
+    );
+    expect(result!.contents).toContain('carried');
+  });
+
+  it('emits nothing when the objective was cleared this turn', async () => {
+    const { processor } = await createProcessor(objective());
+    const result = await processor.computeStateSignal(createArgs({ carried: null, hasSnapshot: false }));
+    expect(result).toBeUndefined();
+  });
+
+  it('retracts a stale snapshot when the objective is no longer active but a base is in window', async () => {
+    const { processor } = await createProcessor(objective({ status: 'done' }));
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), hasSnapshot: true }));
+
+    expect(result).toBeTruthy();
+    expect(result!.mode).toBe('snapshot');
+    expect(result!.tagName).toBe('current-objective');
+    expect(result!.contents).not.toContain('Ship the feature');
+    expect(result!.attributes).toMatchObject({ status: 'none' });
+    expect((result!.metadata as any).value.objective).toBeUndefined();
+  });
+
+  it('retracts a stale snapshot when the objective was cleared this turn but a base is in window', async () => {
+    const { processor } = await createProcessor(objective());
+    const result = await processor.computeStateSignal(
+      createArgs({ carried: null, lastSnapshot: objective(), hasSnapshot: true }),
+    );
+
+    expect(result).toBeTruthy();
+    expect(result!.attributes).toMatchObject({ status: 'none' });
+  });
+
+  it('does not re-emit the retraction once the base snapshot is already empty', async () => {
+    const { processor } = await createProcessor(objective({ status: 'done' }));
+    // No prior objective in the last snapshot (already retracted) — nothing to do.
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: true }));
+    expect(result).toBeUndefined();
+  });
+
+  it('reuses the objective resolved by activity tracking', async () => {
+    const { mastra, processor, store } = await createProcessor(objective());
+    const requestContext = new RequestContext();
+    const getState = vi.spyOn(store, 'getState');
+
+    await beginGoalActivity({
+      mastra,
+      agentId: 'goal-agent',
+      threadId: THREAD_ID,
+      runId: 'cached-objective-run',
+      requestContext,
+    });
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: false, requestContext }));
+
+    expect(result?.contents).toContain('Ship the feature');
+    expect(getState).toHaveBeenCalledTimes(1);
+
+    await processor.computeStateSignal(createArgs({ hasSnapshot: false, requestContext }));
+    expect(getState).toHaveBeenCalledTimes(2);
+    await stopGoalActivity({ agentId: 'goal-agent', runId: 'cached-objective-run' });
+  });
+
+  it('prefers a within-turn objective write over the activity cache', async () => {
+    const { mastra, processor } = await createProcessor(objective({ objective: 'Stored objective' }));
+    const requestContext = new RequestContext();
+
+    await beginGoalActivity({
+      mastra,
+      agentId: 'goal-agent',
+      threadId: THREAD_ID,
+      runId: 'cached-stale-run',
+      requestContext,
+    });
+    requestContext.set(GOAL_REQUEST_CONTEXT_KEY, objective({ objective: 'New within-turn objective' }));
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: false, requestContext }));
+
+    expect(result?.contents).toContain('New within-turn objective');
+    expect(result?.contents).not.toContain('Stored objective');
+    await stopGoalActivity({ agentId: 'goal-agent', runId: 'cached-stale-run' });
+  });
+
+  // Regression: the objective cache is populated at run start, before an
+  // asynchronous `setObjective` has landed in the store. A cached miss must not
+  // shadow the store — otherwise an objective the store reports as active is
+  // projected as `status: none` and the model reports the goal as cancelled.
+  it('falls through a cached missing objective to the store', async () => {
+    const { processor } = await createProcessor(objective({ objective: 'Stored active objective' }));
+    const requestContext = new RequestContext();
+    cacheGoalObjective(requestContext, THREAD_ID, undefined);
+
+    // A prior objective snapshot is in the window, so a shadowed store read
+    // retracts it with `status: none` — what the model reads as "goal cancelled".
+    // The prior snapshot carries a different objective so that a correct read
+    // must emit a fresh projection rather than dedupe against an identical one.
+    const result = await processor.computeStateSignal(
+      createArgs({ lastSnapshot: objective({ objective: 'Superseded objective' }), requestContext }),
+    );
+
+    // Pin the projected objective, not merely the absence of the retraction:
+    // emitting nothing at all would also satisfy `status !== 'none'`.
+    expect(result?.attributes?.status).toBe('active');
+    expect(result?.contents).toContain('Stored active objective');
+  });
+
+  // Inverted deliberately: this previously asserted a single store read, i.e. that
+  // a cached miss is authoritative. A miss is no longer memoized, because the
+  // objective can be written after the run-start read — see the fall-through test
+  // above. The cache-hit dedup this protected is covered by the test below.
+  it('re-reads storage when the run-start objective read missed', async () => {
+    const { mastra, processor, store } = await createProcessor();
+    const requestContext = new RequestContext();
+    const getState = vi.spyOn(store, 'getState');
+
+    await beginGoalActivity({
+      mastra,
+      agentId: 'goal-agent',
+      threadId: THREAD_ID,
+      runId: 'cached-empty-run',
+      requestContext,
+    });
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: false, requestContext }));
+
+    expect(result).toBeUndefined();
+    expect(getState).toHaveBeenCalledTimes(2);
+  });
+
+  // Guards the deduplication the cache exists for: a hit is still read once.
+  it('reuses a cached objective without reading storage again', async () => {
+    const { mastra, processor, store } = await createProcessor(objective());
+    const requestContext = new RequestContext();
+    const getState = vi.spyOn(store, 'getState');
+
+    await beginGoalActivity({
+      mastra,
+      agentId: 'goal-agent',
+      threadId: THREAD_ID,
+      runId: 'cached-hit-run',
+      requestContext,
+    });
+    const result = await processor.computeStateSignal(createArgs({ hasSnapshot: false, requestContext }));
+
+    expect(result?.contents).toContain('Ship the feature');
+    expect(getState).toHaveBeenCalledTimes(1);
+    await stopGoalActivity({ agentId: 'goal-agent', runId: 'cached-hit-run' });
+  });
+
+  // A cached record is read at run start, before a restart may have landed in
+  // the store. A non-active cached record must not shadow a store that reports
+  // the objective as active — the same shadowing class as a cached miss.
+  it('does not retract when a cached non-active record is stale', async () => {
+    const { processor } = await createProcessor(objective());
+    const requestContext = new RequestContext();
+    cacheGoalObjective(requestContext, THREAD_ID, objective({ status: 'paused' }));
+
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), requestContext }));
+
+    // The store reports the objective active and unchanged: no retraction, no
+    // re-projection.
+    expect(result).toBeUndefined();
+  });
+
+  it('retracts when the store agrees with a cached non-active record', async () => {
+    const { processor } = await createProcessor(objective({ status: 'paused' }));
+    const requestContext = new RequestContext();
+    cacheGoalObjective(requestContext, THREAD_ID, objective({ status: 'paused' }));
+
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), requestContext }));
+
+    expect(result?.attributes).toMatchObject({ status: 'none' });
+  });
+
+  it('trusts a cached non-active record when no store resolves', async () => {
+    const { processor } = await createProcessor(objective({ status: 'paused' }));
+    (processor as any).mastra = undefined;
+    const requestContext = new RequestContext();
+    cacheGoalObjective(requestContext, THREAD_ID, objective({ status: 'paused' }));
+
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), requestContext }));
+
+    expect(result?.attributes).toMatchObject({ status: 'none' });
+  });
+
+  // Regression: a processor that never received a Mastra instance (e.g. one
+  // contributed by a signal provider while `inputProcessors` is configured as a
+  // function) resolves no store. An unreadable store is not an absent goal:
+  // projecting `status: none` tells the model the goal was cancelled and it
+  // abandons the run.
+  it('keeps the last projection when no store resolves', async () => {
+    const { processor } = await createProcessor(objective({ objective: 'Active objective in window' }));
+    // Drop the Mastra instance the processor resolves the store through.
+    (processor as any).mastra = undefined;
+
+    const result = await processor.computeStateSignal(
+      createArgs({ lastSnapshot: objective({ objective: 'Active objective in window' }), hasSnapshot: true }),
+    );
+
+    expect(result).toBeUndefined();
+  });
+
+  it('still retracts when the store resolves and reports no objective', async () => {
+    const { processor } = await createProcessor();
+    const result = await processor.computeStateSignal(createArgs({ lastSnapshot: objective(), hasSnapshot: true }));
+
+    expect(result?.attributes).toMatchObject({ status: 'none' });
+  });
+
+  it('resolves storage for a second instance registered under the same processor id', async () => {
+    const storage = new InMemoryStore();
+    const mastra = new Mastra({ storage, logger: false });
+    const store = await storage.getStore('threadState');
+    await store!.setState({ threadId: THREAD_ID, type: GOAL_STATE_TYPE, value: objective() });
+    const first = new GoalStateProcessor();
+    const second = new GoalStateProcessor();
+    mastra.addProcessor(first);
+    mastra.addProcessor(second);
+
+    const result = await second.computeStateSignal(createArgs({ hasSnapshot: false }));
+
+    expect(result?.mode).toBe('snapshot');
+    expect(result?.contents).toContain('Ship the feature');
+  });
+});

@@ -1,0 +1,2683 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { EventEmitterPubSub } from '../events/event-emitter';
+import { Mastra } from '../mastra';
+import { MockStore } from '../storage';
+import { createBackgroundTask } from './create';
+import { BackgroundTaskManager } from './manager';
+import type { BackgroundTaskManagerConfig, TaskContext } from './types';
+import { slimProgressChunk } from './workflow';
+
+/** Create a per-task context with the given execute function */
+function ctx(executeFn: (args: any, opts?: any) => Promise<any>): TaskContext {
+  return { executor: { execute: executeFn } };
+}
+
+const testStorage = new MockStore();
+
+/** Wait for async microtasks/timers to settle */
+const tick = (ms = 50) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Spin up a private Mastra + bg-task manager scoped to a single test. Tests
+ * that need a different manager config than the shared `manager` from
+ * `beforeEach` must use this — reusing the shared `mastra` causes the bg-task
+ * workflow registration on Mastra to bind to the *first* manager that called
+ * `init()`. Subsequent managers registering against the same Mastra see
+ * `__hasInternalWorkflow(...) === true` and skip re-registration, so their
+ * dispatches actually run through the first manager's workflow and fail to
+ * find the executor in `taskContexts`.
+ */
+async function makeLocalManager(config: BackgroundTaskManagerConfig) {
+  const localMastra = new Mastra({ logger: false, storage: testStorage });
+  await localMastra.startWorkers();
+  const isolatedPubsub = new EventEmitterPubSub();
+  const mgr = new BackgroundTaskManager(config);
+  mgr.__registerMastra(localMastra);
+  await mgr.init(isolatedPubsub);
+  return {
+    mgr,
+    localMastra,
+    isolatedPubsub,
+    cleanup: async () => {
+      await mgr.shutdown();
+      await isolatedPubsub.close();
+      await localMastra.stopWorkers();
+    },
+  };
+}
+
+describe('BackgroundTaskManager', () => {
+  let pubsub: EventEmitterPubSub;
+  let manager: BackgroundTaskManager;
+  let mastra: Mastra;
+
+  beforeEach(async () => {
+    // Fresh Mastra per test so the workflow engine's per-Mastra processor +
+    // internal-workflow registry stays clean between tests.
+    mastra = new Mastra({
+      logger: false,
+      storage: testStorage,
+    });
+    await mastra.startWorkers();
+    pubsub = new EventEmitterPubSub();
+    manager = new BackgroundTaskManager({
+      globalConcurrency: 3,
+      perAgentConcurrency: 2,
+      defaultTimeoutMs: 5000,
+      enabled: true,
+    });
+    manager.__registerMastra(mastra);
+    await manager.init(pubsub);
+  });
+
+  afterEach(async () => {
+    await manager.shutdown();
+    await pubsub.close();
+    await mastra.stopWorkers();
+    const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+    await backgroundTasksStore?.dangerouslyClearAll();
+  });
+
+  describe('shared-storage ownership', () => {
+    it('releases resume reservations on publish failure and tolerates worker-start failure', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const execute = vi.fn(async (_args, opts) => {
+        if (!opts.resumeData) return opts.suspend({ waiting: true });
+        return opts.resumeData;
+      });
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'suspend', args: {}, agentId: 'parent', runId: 'suspend' },
+          ctx(execute),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('suspended'));
+        vi.spyOn(local.isolatedPubsub, 'publish').mockRejectedValueOnce(new Error('resume publish failed'));
+        await expect(local.mgr.resume(task.id, { ok: true })).rejects.toThrow('resume publish failed');
+        expect((await local.mgr.getTask(task.id))?.status).toBe('suspended');
+        const { task: next } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'next', args: {}, agentId: 'parent', runId: 'next' },
+          ctx(async () => 'next'),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(next.id))?.status).toBe('completed'));
+        vi.spyOn(local.localMastra, '__ensureExecutionWorkersStarted').mockRejectedValueOnce(
+          new Error('startup failed'),
+        );
+        await local.mgr.resume(task.id, { ok: true });
+        await vi.waitFor(async () =>
+          expect(await local.mgr.getTask(task.id)).toMatchObject({ status: 'completed', result: { ok: true } }),
+        );
+        expect(execute).toHaveBeenCalledTimes(2);
+      } finally {
+        await local.cleanup();
+      }
+    });
+
+    it('leaves another live manager’s running and queued invocation contexts untouched', async () => {
+      const config = { enabled: true, globalConcurrency: 1, perAgentConcurrency: 1, recoverStaleTasksOnStart: false };
+      const origin = await makeLocalManager(config);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const first = vi.fn(async () => {
+        await gate;
+        return 'request-A';
+      });
+      const second = vi.fn(async () => 'request-B');
+      let remote: Awaited<ReturnType<typeof makeLocalManager>> | undefined;
+      try {
+        const { task: running } = await origin.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'a', args: {}, agentId: 'parent', runId: 'a' },
+          ctx(first),
+        );
+        await vi.waitFor(async () => expect((await origin.mgr.getTask(running.id))?.status).toBe('running'));
+        const { task: queued } = await origin.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'b', args: {}, agentId: 'parent', runId: 'b' },
+          ctx(second),
+        );
+        remote = await makeLocalManager(config);
+        const remoteExecute = vi.fn(async () => 'remote');
+        const { task: remoteTask } = await remote.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'c', args: {}, agentId: 'parent', runId: 'c' },
+          ctx(remoteExecute),
+        );
+        await vi.waitFor(async () => expect((await remote!.mgr.getTask(remoteTask.id))?.status).toBe('completed'));
+        expect((await origin.mgr.getTask(running.id))?.status).toBe('running');
+        expect((await origin.mgr.getTask(queued.id))?.status).toBe('pending');
+        expect(second).not.toHaveBeenCalled();
+        release();
+        await vi.waitFor(async () => {
+          expect(await origin.mgr.getTask(running.id)).toMatchObject({ status: 'completed', result: 'request-A' });
+          expect(await origin.mgr.getTask(queued.id)).toMatchObject({ status: 'completed', result: 'request-B' });
+        });
+        expect(first).toHaveBeenCalledTimes(1);
+        expect(second).toHaveBeenCalledTimes(1);
+        expect(remoteExecute).toHaveBeenCalledTimes(1);
+      } finally {
+        release();
+        await origin.cleanup();
+        await remote?.cleanup();
+      }
+    });
+
+    it('preserves a claimed invocation when publication reports failure after delivery', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      let started!: () => void;
+      const executing = new Promise<void>(resolve => {
+        started = resolve;
+      });
+      const publish = local.isolatedPubsub.publish.bind(local.isolatedPubsub);
+      vi.spyOn(local.isolatedPubsub, 'publish').mockImplementationOnce(async (...args) => {
+        await publish(...args);
+        await executing;
+        throw new Error('acknowledgement lost');
+      });
+      try {
+        await expect(
+          local.mgr.enqueue(
+            { toolName: 'agent-helper', toolCallId: 'claimed', args: {}, agentId: 'parent', runId: 'claimed' },
+            ctx(async () => {
+              started();
+              await gate;
+              return 'claimed';
+            }),
+          ),
+        ).rejects.toThrow('acknowledgement lost');
+        const { task: queued } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'queued', args: {}, agentId: 'parent', runId: 'queued' },
+          ctx(async () => 'queued'),
+        );
+        expect((await local.mgr.getTask(queued.id))?.status).toBe('pending');
+        release();
+        await vi.waitFor(async () => {
+          expect((await local.mgr.listTasks({ runId: 'claimed' })).tasks[0]).toMatchObject({
+            status: 'completed',
+            result: 'claimed',
+          });
+          expect(await local.mgr.getTask(queued.id)).toMatchObject({ status: 'completed', result: 'queued' });
+        });
+      } finally {
+        release();
+        await local.cleanup();
+      }
+    });
+
+    it('cleans up an invocation when dispatch publication rejects and allows the next enqueue', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        recoverStaleTasksOnStart: false,
+      });
+      const execute = vi.fn(async () => 'next');
+      const deregister = vi.spyOn(local.mgr, 'deregisterTaskContext');
+      const publish = vi.spyOn(local.isolatedPubsub, 'publish').mockRejectedValueOnce(new Error('publish failed'));
+      try {
+        await expect(
+          local.mgr.enqueue(
+            { toolName: 'agent-helper', toolCallId: 'failed', args: {}, agentId: 'parent', runId: 'failed' },
+            ctx(execute),
+          ),
+        ).rejects.toThrow('publish failed');
+        const { tasks } = await local.mgr.listTasks({ runId: 'failed' });
+        expect(tasks).toHaveLength(1);
+        expect(tasks[0]?.status).toBe('failed');
+        expect(deregister).toHaveBeenCalledWith(tasks[0]!.id);
+        const { task } = await local.mgr.enqueue(
+          { toolName: 'agent-helper', toolCallId: 'next', args: {}, agentId: 'parent', runId: 'next' },
+          ctx(execute),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('completed'));
+        expect(execute).toHaveBeenCalledTimes(1);
+      } finally {
+        publish.mockRestore();
+        await local.cleanup();
+      }
+    });
+  });
+
+  describe('enqueue and execute', () => {
+    it('enqueues a task, executes it, and completes', async () => {
+      const executeFn = vi.fn().mockResolvedValue({ data: 'hello' });
+
+      const { task } = await manager.enqueue(
+        { toolName: 'my-tool', toolCallId: 'call-1', args: { query: 'test' }, agentId: 'agent-1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      const completed = await manager.getTask(task.id);
+      expect(completed?.status).toBe('completed');
+      expect(completed?.result).toEqual({ data: 'hello' });
+      expect(executeFn).toHaveBeenCalledWith(
+        { query: 'test' },
+        expect.objectContaining({ abortSignal: expect.any(AbortSignal) }),
+      );
+    });
+
+    it('passes args correctly to the tool', async () => {
+      const executeFn = vi.fn().mockResolvedValue('ok');
+
+      await manager.enqueue(
+        {
+          toolName: 'my-tool',
+          toolCallId: 'call-1',
+          args: { foo: 'bar', num: 42 },
+          agentId: 'agent-1',
+          runId: 'run-1',
+        },
+        ctx(executeFn),
+      );
+
+      await tick();
+      expect(executeFn).toHaveBeenCalledWith({ foo: 'bar', num: 42 }, expect.anything());
+    });
+
+    it('sets failed status when tool throws', async () => {
+      const executeFn = vi.fn().mockRejectedValue(new Error('Tool broke'));
+
+      const { task } = await manager.enqueue(
+        { toolName: 'failing-tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      const failed = await manager.getTask(task.id);
+      expect(failed?.status).toBe('failed');
+      expect(failed?.error?.message).toBe('Tool broke');
+    });
+
+    it('fails with message when no executor is registered', async () => {
+      const { task } = await manager.enqueue({
+        toolName: 'my-tool',
+        toolCallId: 'call-1',
+        args: {},
+        agentId: 'agent-1',
+        runId: 'run-1',
+      });
+
+      await tick();
+
+      const result = await manager.getTask(task.id);
+      expect(result?.status).toBe('failed');
+      expect(result?.error?.message).toContain('No executor');
+    });
+  });
+
+  describe('createBackgroundTask handle', () => {
+    it('returns a handle that can dispatch and wait', async () => {
+      const executeFn = vi.fn().mockResolvedValue('from-handle');
+
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'tool',
+        toolCallId: 'call-1',
+        args: {},
+        agentId: 'a1',
+        runId: 'run-1',
+        context: ctx(executeFn),
+      });
+
+      const { task } = await bgTask.dispatch();
+      expect(task.status).toBe('pending');
+
+      const completed = await bgTask.waitForCompletion({ timeoutMs: 2000 });
+      expect(completed.status).toBe('completed');
+      expect(completed.result).toBe('from-handle');
+    });
+
+    it('adopts the exact persisted terminal task for a replayed invocation', async () => {
+      const executeFn = vi.fn().mockResolvedValue('persisted-result');
+      const identity = {
+        toolName: 'tool',
+        toolCallId: 'call-terminal',
+        agentId: 'a1',
+        runId: 'run-terminal',
+      };
+      const original = createBackgroundTask(manager, {
+        ...identity,
+        args: {},
+        context: ctx(executeFn),
+      });
+      const { task } = await original.dispatch();
+      await expect(original.waitForCompletion({ timeoutMs: 2000 })).resolves.toMatchObject({
+        id: task.id,
+        status: 'completed',
+        result: 'persisted-result',
+      });
+
+      const replay = createBackgroundTask(manager, {
+        ...identity,
+        args: {},
+        context: ctx(vi.fn()),
+      });
+      const terminalTask = await replay.checkIfExisting(identity);
+
+      expect(terminalTask).toMatchObject({ id: task.id, status: 'completed', result: 'persisted-result' });
+      await expect(replay.waitForCompletion()).resolves.toMatchObject({ id: task.id, status: 'completed' });
+      expect(executeFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('re-dispatches an adopted pending task without creating a duplicate', async () => {
+      const identity = {
+        toolName: 'tool',
+        toolCallId: 'call-pending',
+        agentId: 'a1',
+        runId: 'run-pending',
+      };
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      await backgroundTasksStore!.createTask({
+        id: 'pending-replay',
+        status: 'pending',
+        ...identity,
+        args: {},
+        retryCount: 0,
+        maxRetries: 1,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+      });
+      const executeFn = vi.fn().mockResolvedValue('recovered-result');
+      const replay = createBackgroundTask(manager, {
+        ...identity,
+        args: {},
+        context: ctx(executeFn),
+      });
+
+      await expect(replay.checkIfExisting(identity)).resolves.toMatchObject({
+        id: 'pending-replay',
+        status: 'pending',
+      });
+      await expect(replay.restart()).resolves.toMatchObject({ id: 'pending-replay', status: 'pending' });
+      await expect(replay.waitForCompletion({ timeoutMs: 2000 })).resolves.toMatchObject({
+        id: 'pending-replay',
+        status: 'completed',
+        result: 'recovered-result',
+      });
+      await expect(manager.listTasks(identity)).resolves.toMatchObject({ total: 1 });
+      expect(executeFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails closed when multiple tasks match one replayed invocation', async () => {
+      const identity = {
+        toolName: 'tool',
+        toolCallId: 'call-ambiguous',
+        agentId: 'a1',
+        runId: 'run-ambiguous',
+      };
+
+      for (const result of ['first', 'second']) {
+        const handle = createBackgroundTask(manager, {
+          ...identity,
+          args: {},
+          context: ctx(vi.fn().mockResolvedValue(result)),
+        });
+        await handle.dispatch();
+        await expect(handle.waitForCompletion({ timeoutMs: 2000 })).resolves.toMatchObject({
+          status: 'completed',
+          result,
+        });
+      }
+
+      const replay = createBackgroundTask(manager, {
+        ...identity,
+        args: {},
+        context: ctx(vi.fn()),
+      });
+
+      await expect(replay.checkIfExisting(identity)).rejects.toThrow(
+        'Multiple background tasks found for run "run-ambiguous" and tool call "call-ambiguous"',
+      );
+    });
+
+    it('can cancel via handle', async () => {
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'tool',
+        toolCallId: 'call-1',
+        args: {},
+        agentId: 'a1',
+        runId: 'run-1',
+        context: ctx(executeFn),
+      });
+
+      await bgTask.dispatch();
+      await tick();
+
+      await bgTask.cancel();
+      await tick();
+
+      expect((await manager.getTask(bgTask.task.id))?.status).toBe('cancelled');
+    });
+
+    it('stops waiting when the caller aborts', async () => {
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'tool',
+        toolCallId: 'call-1',
+        args: {},
+        agentId: 'a1',
+        runId: 'run-1',
+        context: ctx(vi.fn(() => new Promise(() => {}))),
+      });
+      const abortController = new AbortController();
+
+      await bgTask.dispatch();
+      const waiting = bgTask.waitForCompletion({ abortSignal: abortController.signal });
+      abortController.abort(new Error('request aborted'));
+
+      await expect(waiting).rejects.toThrow('request aborted');
+      await bgTask.cancel();
+    });
+
+    it('throws if cancel/wait called before dispatch', async () => {
+      const bgTask = createBackgroundTask(manager, {
+        toolName: 'tool',
+        toolCallId: 'call-1',
+        args: {},
+        agentId: 'a1',
+        runId: 'run-1',
+        context: ctx(vi.fn().mockResolvedValue('ok')),
+      });
+
+      await expect(bgTask.cancel()).rejects.toThrow('not been dispatched');
+      await expect(bgTask.waitForCompletion()).rejects.toThrow('not been dispatched');
+    });
+  });
+
+  describe('concurrency', () => {
+    it('enforces global concurrency limit', async () => {
+      const resolvers: Array<() => void> = [];
+      const executeFn = vi.fn().mockImplementation(
+        () =>
+          new Promise<string>(resolve => {
+            resolvers.push(() => resolve('done'));
+          }),
+      );
+
+      // Enqueue 4 tasks across 2 agents (global limit=3, per-agent=2)
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c2', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c3', args: {}, agentId: 'a2', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c4', args: {}, agentId: 'a2', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      const { tasks: running } = await manager.listTasks({ status: 'running' });
+      const { tasks: pending } = await manager.listTasks({ status: 'pending' });
+      expect(running.length).toBe(3);
+      expect(pending.length).toBe(1);
+
+      // Complete one task — the pending one should be dispatched
+      resolvers[0]!();
+      await tick();
+
+      const { tasks: runningAfter } = await manager.listTasks({ status: 'running' });
+      const { tasks: pendingAfter } = await manager.listTasks({ status: 'pending' });
+      const { tasks: completedAfter } = await manager.listTasks({ status: 'completed' });
+      expect(completedAfter.length).toBe(1);
+      expect(runningAfter.length).toBe(3);
+      expect(pendingAfter.length).toBe(0);
+
+      resolvers.forEach(r => r());
+    });
+
+    it('enforces per-agent concurrency limit', async () => {
+      const resolvers: Array<() => void> = [];
+      const executeFn = vi.fn().mockImplementation(
+        () =>
+          new Promise<string>(resolve => {
+            resolvers.push(() => resolve('done'));
+          }),
+      );
+
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c1', args: {}, agentId: 'agent-x', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c2', args: {}, agentId: 'agent-x', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'c3', args: {}, agentId: 'agent-x', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      const { tasks: running } = await manager.listTasks({ status: 'running', agentId: 'agent-x' });
+      const { tasks: pending } = await manager.listTasks({ status: 'pending', agentId: 'agent-x' });
+      expect(running.length).toBe(2);
+      expect(pending.length).toBe(1);
+
+      resolvers.forEach(r => r());
+    });
+
+    it('does not let abandoned shared running rows block process-affine tasks', async () => {
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      for (let i = 0; i < 3; i++) {
+        await backgroundTasksStore!.createTask({
+          id: `abandoned-${i}`,
+          status: 'running',
+          toolName: 'remote-tool',
+          toolCallId: `remote-call-${i}`,
+          args: {},
+          agentId: 'remote-agent',
+          runId: `remote-run-${i}`,
+          retryCount: 0,
+          maxRetries: 0,
+          timeoutMs: 5000,
+          createdAt: new Date(),
+          startedAt: new Date(),
+        });
+      }
+
+      const executeFn = vi.fn().mockResolvedValue('local-result');
+      const { task } = await manager.enqueue(
+        { toolName: 'local-tool', toolCallId: 'local-call', args: {}, agentId: 'local-agent', runId: 'local-run' },
+        ctx(executeFn),
+      );
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('completed');
+      expect(executeFn).toHaveBeenCalledOnce();
+    });
+
+    it('continues to apply persisted concurrency limits to portable tasks', async () => {
+      const backgroundTasksStore = await testStorage.getStore('backgroundTasks');
+      for (let i = 0; i < 3; i++) {
+        await backgroundTasksStore!.createTask({
+          id: `portable-blocker-${i}`,
+          status: 'running',
+          toolName: 'remote-tool',
+          toolCallId: `remote-call-${i}`,
+          args: {},
+          agentId: 'remote-agent',
+          runId: `remote-run-${i}`,
+          retryCount: 0,
+          maxRetries: 0,
+          timeoutMs: 5000,
+          createdAt: new Date(),
+          startedAt: new Date(),
+        });
+      }
+
+      const { task } = await manager.enqueue({
+        toolName: 'portable-tool',
+        toolCallId: 'portable-call',
+        args: {},
+        agentId: 'portable-agent',
+        runId: 'portable-run',
+      });
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('pending');
+    });
+
+    it('backpressure reject throws on limit', async () => {
+      const { mgr: rejectManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        backpressure: 'reject',
+      });
+
+      let resolver!: () => void;
+      const executeFn = vi.fn().mockImplementation(
+        () =>
+          new Promise<string>(resolve => {
+            resolver = () => resolve('done');
+          }),
+      );
+
+      await rejectManager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      await expect(
+        rejectManager.enqueue(
+          { toolName: 'tool', toolCallId: 'c2', args: {}, agentId: 'a', runId: 'run-1' },
+          ctx(executeFn),
+        ),
+      ).rejects.toThrow('Concurrency limit reached');
+
+      resolver();
+      await cleanup();
+    });
+
+    it('backpressure fallback-sync returns signal', async () => {
+      const { mgr: syncManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        backpressure: 'fallback-sync',
+      });
+
+      let resolver!: () => void;
+      const executeFn = vi.fn().mockImplementation(
+        () =>
+          new Promise<string>(resolve => {
+            resolver = () => resolve('done');
+          }),
+      );
+
+      await syncManager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      const result = await syncManager.enqueue(
+        { toolName: 'tool', toolCallId: 'c2', args: {}, agentId: 'a', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      expect(result.fallbackToSync).toBe(true);
+
+      resolver();
+      await cleanup();
+    });
+  });
+
+  describe('timeout', () => {
+    it('aborts tool execution on timeout', async () => {
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => {
+              reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+            });
+          }),
+      );
+
+      const { task } = await manager.enqueue(
+        { toolName: 'slow-tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', timeoutMs: 100, runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await new Promise(resolve => setTimeout(resolve, 300));
+
+      const result = await manager.getTask(task.id);
+      expect(result?.status).toBe('timed_out');
+      expect(result?.error?.message).toContain('timed out');
+    });
+  });
+
+  describe('retry', () => {
+    it('retries a failed task up to maxRetries', async () => {
+      let callCount = 0;
+      const executeFn = vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount < 3) throw new Error('Transient error');
+        return 'success';
+      });
+
+      const { mgr: retryManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        defaultRetries: { retryDelayMs: 0 },
+      });
+
+      const { task } = await retryManager.enqueue(
+        { toolName: 'flaky-tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', maxRetries: 3, runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick(200);
+
+      const result = await retryManager.getTask(task.id);
+      expect(result?.status).toBe('completed');
+      expect(result?.result).toBe('success');
+      expect(executeFn).toHaveBeenCalledTimes(3);
+
+      await cleanup();
+    });
+
+    it('fails after exhausting retries', async () => {
+      const executeFn = vi.fn().mockRejectedValue(new Error('Always fails'));
+
+      const { mgr: retryManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        defaultRetries: { retryDelayMs: 0 },
+      });
+
+      const { task } = await retryManager.enqueue(
+        { toolName: 'bad-tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', maxRetries: 2, runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick(200);
+
+      const result = await retryManager.getTask(task.id);
+      expect(result?.status).toBe('failed');
+      expect(executeFn).toHaveBeenCalledTimes(3); // initial + 2 retries
+
+      await cleanup();
+    });
+
+    it('fails immediately without retrying on FGADeniedError', async () => {
+      const denial = new Error('access denied');
+      denial.name = 'FGADeniedError';
+      const executeFn = vi.fn().mockRejectedValue(denial);
+
+      const { mgr: retryManager, cleanup } = await makeLocalManager({
+        enabled: true,
+        defaultRetries: { retryDelayMs: 0 },
+      });
+
+      const { task } = await retryManager.enqueue(
+        { toolName: 'secure-tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', maxRetries: 3, runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await retryManager.waitForNextTask([task.id], { timeoutMs: 5000 });
+
+      const result = await retryManager.getTask(task.id);
+      expect(result?.status).toBe('failed');
+      expect(result?.error?.message).toBe('access denied');
+      expect(executeFn).toHaveBeenCalledTimes(1); // no retries for authorization denials
+
+      await cleanup();
+    });
+  });
+
+  describe('cancel', () => {
+    it('cancels a pending task', async () => {
+      const resolvers: Array<() => void> = [];
+      const executeFn = vi.fn().mockImplementation(
+        () =>
+          new Promise<string>(resolve => {
+            resolvers.push(() => resolve('done'));
+          }),
+      );
+
+      // Fill per-agent concurrency (limit=2)
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c2', args: {}, agentId: 'a', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      // This one should be pending
+      const { task } = await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c3', args: {}, agentId: 'a', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('pending');
+
+      await manager.cancel(task.id);
+      expect((await manager.getTask(task.id))?.status).toBe('cancelled');
+
+      resolvers.forEach(r => r());
+    });
+
+    it('cancels a running task by aborting execution', async () => {
+      let capturedSignal!: AbortSignal;
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            capturedSignal = opts.abortSignal;
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      const { task } = await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('running');
+
+      await manager.cancel(task.id);
+      await tick();
+
+      expect((await manager.getTask(task.id))?.status).toBe('cancelled');
+      expect(capturedSignal.aborted).toBe(true);
+    });
+
+    it('is a no-op for completed tasks', async () => {
+      const executeFn = vi.fn().mockResolvedValue('done');
+
+      const { task } = await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'call-1', args: {}, agentId: 'agent-1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+      expect((await manager.getTask(task.id))?.status).toBe('completed');
+
+      await manager.cancel(task.id);
+      expect((await manager.getTask(task.id))?.status).toBe('completed');
+    });
+  });
+
+  describe('listTasks', () => {
+    it('filters by status', async () => {
+      const executeFn = vi.fn().mockResolvedValue('done');
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      expect((await manager.listTasks({ status: 'completed' })).tasks.length).toBe(1);
+      expect((await manager.listTasks({ status: 'pending' })).tasks.length).toBe(0);
+    });
+
+    it('filters by agentId', async () => {
+      const executeFn = vi.fn().mockResolvedValue('done');
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c2', args: {}, agentId: 'a2', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      const { tasks: a1Tasks } = await manager.listTasks({ agentId: 'a1' });
+      expect(a1Tasks.length).toBe(1);
+      expect(a1Tasks[0]!.agentId).toBe('a1');
+    });
+
+    it('supports page and perPage', async () => {
+      const executeFn = vi.fn().mockResolvedValue('done');
+
+      for (let i = 0; i < 5; i++) {
+        await manager.enqueue(
+          { toolName: 'tool', toolCallId: `c${i}`, args: {}, agentId: 'a1', runId: 'run-1' },
+          ctx(executeFn),
+        );
+      }
+      await tick();
+
+      const { tasks: page0, total } = await manager.listTasks({ page: 0, perPage: 2 });
+      expect(page0.length).toBe(2);
+      expect(total).toBe(5);
+
+      const { tasks: page1 } = await manager.listTasks({ page: 1, perPage: 2 });
+      expect(page1.length).toBe(2);
+
+      const { tasks: page2 } = await manager.listTasks({ page: 2, perPage: 2 });
+      expect(page2.length).toBe(1);
+    });
+  });
+
+  describe('callbacks', () => {
+    it('invokes onTaskComplete callback', async () => {
+      const onComplete = vi.fn();
+      const { mgr, cleanup } = await makeLocalManager({ enabled: true, onTaskComplete: onComplete });
+
+      const executeFn = vi.fn().mockResolvedValue('result');
+      await mgr.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      expect(onComplete).toHaveBeenCalledTimes(1);
+      expect(onComplete.mock.calls[0]![0].status).toBe('completed');
+
+      await cleanup();
+    });
+
+    it('invokes onTaskFailed callback', async () => {
+      const onFailed = vi.fn();
+      const { mgr, cleanup } = await makeLocalManager({ enabled: true, onTaskFailed: onFailed });
+
+      const executeFn = vi.fn().mockRejectedValue(new Error('oops'));
+      await mgr.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      expect(onFailed).toHaveBeenCalledTimes(1);
+      expect(onFailed.mock.calls[0]![0].status).toBe('failed');
+
+      await cleanup();
+    });
+
+    it('invokes onTaskCancelled callback', async () => {
+      const onCancelled = vi.fn();
+      const { mgr, cleanup } = await makeLocalManager({ enabled: true, onTaskCancelled: onCancelled });
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      try {
+        const { task } = await mgr.enqueue(
+          { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+          ctx(executeFn),
+        );
+        await tick();
+
+        await mgr.cancel(task.id);
+        await tick();
+
+        expect(onCancelled).toHaveBeenCalledTimes(1);
+        expect(onCancelled.mock.calls[0]![0].status).toBe('cancelled');
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('continues cancellation when onTaskCancelled rejects', async () => {
+      const callbackError = new Error('callback failed');
+      const onCancelled = vi.fn().mockRejectedValue(callbackError);
+      const { mgr, cleanup, localMastra } = await makeLocalManager({ enabled: true, onTaskCancelled: onCancelled });
+      const warn = vi.spyOn(localMastra.getLogger(), 'warn');
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      try {
+        const { task } = await mgr.enqueue(
+          { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+          ctx(executeFn),
+        );
+        await tick();
+
+        await expect(mgr.cancel(task.id)).resolves.toBeUndefined();
+        await tick();
+
+        expect(onCancelled).toHaveBeenCalledOnce();
+        expect(warn).toHaveBeenCalledWith(
+          `background-task cancellation callback failed for ${task.id}:`,
+          callbackError,
+        );
+        expect(mgr.taskContexts.has(task.id)).toBe(false);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('invokes per-task onComplete callback', async () => {
+      const onComplete = vi.fn();
+      const executeFn = vi.fn().mockResolvedValue('ok');
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        { executor: { execute: executeFn }, onComplete },
+      );
+      await tick();
+
+      expect(onComplete).toHaveBeenCalledTimes(1);
+      expect(onComplete.mock.calls[0]![0].status).toBe('completed');
+    });
+
+    it('invokes per-task onChunk callback', async () => {
+      const onChunk = vi.fn();
+      const executeFn = vi.fn().mockResolvedValue('chunk-result');
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        { executor: { execute: executeFn }, onChunk },
+      );
+      await tick();
+
+      expect(onChunk).toHaveBeenCalledTimes(1);
+      expect(onChunk.mock.calls[0]![0].type).toBe('background-task-completed');
+      expect(onChunk.mock.calls[0]![0].payload.result).toBe('chunk-result');
+    });
+  });
+
+  describe('cleanup', () => {
+    it('deletes old completed tasks', async () => {
+      const { mgr, cleanup } = await makeLocalManager({
+        enabled: true,
+        cleanup: { completedTtlMs: 100, failedTtlMs: 200 },
+      });
+
+      const executeFn = vi.fn().mockResolvedValue('ok');
+      await mgr.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      const { tasks: before } = await mgr.listTasks({});
+      expect(before.length).toBe(1);
+
+      await new Promise(resolve => setTimeout(resolve, 150));
+      await mgr.cleanup();
+
+      const { tasks: after } = await mgr.listTasks({});
+      expect(after.length).toBe(0);
+
+      await cleanup();
+    });
+
+    it('keeps recent completed tasks', async () => {
+      const { mgr, cleanup } = await makeLocalManager({
+        enabled: true,
+        cleanup: { completedTtlMs: 60_000 },
+      });
+
+      const executeFn = vi.fn().mockResolvedValue('ok');
+      await mgr.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      await mgr.cleanup();
+
+      const { tasks: afterTasks } = await mgr.listTasks({});
+      expect(afterTasks.length).toBe(1);
+
+      await cleanup();
+    });
+
+    it('deletes old failed tasks with separate TTL', async () => {
+      const { mgr, cleanup } = await makeLocalManager({
+        enabled: true,
+        cleanup: { completedTtlMs: 50, failedTtlMs: 100 },
+      });
+
+      const executeFn = vi.fn().mockRejectedValue(new Error('fail'));
+      await mgr.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      expect((await mgr.listTasks({})).total).toBe(1);
+
+      await new Promise(resolve => setTimeout(resolve, 150));
+      await mgr.cleanup();
+
+      expect((await mgr.listTasks({})).total).toBe(0);
+
+      await cleanup();
+    });
+  });
+
+  describe('suspend/resume', () => {
+    it('suspends mid-execution and persists status + suspendPayload', async () => {
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        await opts.suspend({ awaiting: 'human-approval' });
+        // Code after suspend runs but its return value is discarded.
+        return 'should-be-ignored';
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'csusp1', args: { ask: 'go?' }, agentId: 'a1', runId: 'r1' },
+        ctx(executeFn),
+      );
+
+      await tick(200);
+
+      const suspended = await manager.getTask(task.id);
+      expect(suspended?.status).toBe('suspended');
+      expect(suspended?.suspendPayload).toEqual({ awaiting: 'human-approval' });
+      expect(suspended?.result).toBeUndefined();
+      expect(executeFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('emits a background-task-suspended chunk on the manager stream', async () => {
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        await opts.suspend({ ask: 'pause' });
+      });
+
+      const chunks: any[] = [];
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const consumer = (async () => {
+        for await (const chunk of stream as any) chunks.push(chunk);
+      })();
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'csusp2', args: {}, agentId: 'a1', runId: 'r2' },
+        ctx(executeFn),
+      );
+
+      await tick(200);
+      abortController.abort();
+      await consumer;
+
+      const suspendedChunk = chunks.find(c => c.type === 'background-task-suspended');
+      expect(suspendedChunk).toBeDefined();
+      expect(suspendedChunk.payload.taskId).toBe(task.id);
+      expect(suspendedChunk.payload.suspendPayload).toEqual({ ask: 'pause' });
+    });
+
+    it('resumes a suspended task with resumeData and the suspended tool run id', async () => {
+      const executeFn = vi.fn(async (args, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend(
+            { awaiting: 'approval', suspendedToolRunId: 'delegated-run-id' },
+            { runId: 'delegated-run-id' },
+          );
+          return undefined;
+        }
+        return {
+          approvedBy: (opts.resumeData as { user: string }).user,
+          suspendedToolRunId: args.suspendedToolRunId,
+        };
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cres1', args: {}, agentId: 'a1', runId: 'r3' },
+        ctx(executeFn),
+      );
+      await tick(200);
+      expect((await manager.getTask(task.id))?.status).toBe('suspended');
+      expect(executeFn.mock.calls[0]?.[0]).not.toHaveProperty('suspendedToolRunId');
+
+      await manager.resume(task.id, { user: 'alice' });
+      await tick(200);
+
+      const completed = await manager.getTask(task.id);
+      expect(completed?.status).toBe('completed');
+      expect(completed?.result).toEqual({ approvedBy: 'alice', suspendedToolRunId: 'delegated-run-id' });
+      expect(completed?.suspendPayload).toBeUndefined();
+      expect(executeFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('refuses a resume fenced on a suspension the task has moved past', async () => {
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ awaiting: 'approval' });
+          return undefined;
+        }
+        return { approved: true };
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cfence1', args: {}, agentId: 'a1', runId: 'r-fence' },
+        ctx(executeFn),
+      );
+      await tick(200);
+      const suspended = await manager.getTask(task.id);
+      expect(suspended?.status).toBe('suspended');
+
+      const stale = new Date(suspended!.suspendedAt!.getTime() - 1000);
+      await expect(manager.resume(task.id, { approved: true }, { suspendedAt: stale })).rejects.toThrow(
+        /suspension has changed/,
+      );
+      await tick(200);
+      expect((await manager.getTask(task.id))?.status).toBe('suspended');
+      expect(executeFn).toHaveBeenCalledTimes(1);
+
+      await manager.resume(task.id, { approved: true }, { suspendedAt: suspended!.suspendedAt! });
+      await tick(200);
+      expect((await manager.getTask(task.id))?.status).toBe('completed');
+    });
+
+    it('drops a model-authored suspendedToolRunId so the framework-persisted id wins on resume', async () => {
+      // A queued model payload cannot establish delegated identity. The arbitrary
+      // ID must be dropped from the fresh call and replaced by the framework ID
+      // recovered from the task's suspension snapshot on resume (#23811).
+      const executeFn = vi.fn(async (args, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend(
+            { awaiting: 'approval', suspendedToolRunId: 'delegated-run-id' },
+            { runId: 'delegated-run-id' },
+          );
+          return undefined;
+        }
+        return {
+          approvedBy: (opts.resumeData as { user: string }).user,
+          suspendedToolRunId: args.suspendedToolRunId,
+          contextSuspendedToolRunId: opts.suspendedToolRunId,
+        };
+      });
+
+      const { task } = await manager.enqueue(
+        {
+          toolName: 't',
+          toolCallId: 'cres-unverified',
+          args: { suspendedToolRunId: 'model-authored-run-id' },
+          agentId: 'a1',
+          runId: 'r3s',
+        },
+        ctx(executeFn),
+      );
+      await tick(200);
+      expect((await manager.getTask(task.id))?.status).toBe('suspended');
+      expect(executeFn.mock.calls[0]?.[0]).not.toHaveProperty('suspendedToolRunId');
+
+      await manager.resume(task.id, { user: 'alice' });
+      await tick(200);
+
+      const completed = await manager.getTask(task.id);
+      expect(completed?.status).toBe('completed');
+      expect(completed?.result).toEqual({
+        approvedBy: 'alice',
+        suspendedToolRunId: 'delegated-run-id',
+        contextSuspendedToolRunId: 'delegated-run-id',
+      });
+      expect(executeFn.mock.calls[1]?.[0]).toMatchObject({ suspendedToolRunId: 'delegated-run-id' });
+      expect(executeFn.mock.calls[1]?.[1]).toMatchObject({ suspendedToolRunId: 'delegated-run-id' });
+      expect(executeFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('resumes an agent-as-tool delegation whose runId is only in suspendOptions', async () => {
+      // Mirrors the real agent-as-tool suspend: the nested sub-agent runId is
+      // passed via `suspendOptions.runId` (with `isAgentSuspend: true`) and is
+      // absent from the suspend payload. The resume path must still restore it
+      // into `args.suspendedToolRunId`.
+      const executeFn = vi.fn(async (args, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ awaiting: 'approval' }, { runId: 'delegated-run-id', isAgentSuspend: true });
+          return undefined;
+        }
+        return {
+          approvedBy: (opts.resumeData as { user: string }).user,
+          suspendedToolRunId: args.suspendedToolRunId,
+        };
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cres-agent', args: {}, agentId: 'a1', runId: 'r4' },
+        ctx(executeFn),
+      );
+      await tick(200);
+
+      const suspended = await manager.getTask(task.id);
+      expect(suspended?.status).toBe('suspended');
+      // The user-facing suspend payload must stay clean — no runId leaked in.
+      expect(suspended?.suspendPayload).toEqual({ awaiting: 'approval' });
+      expect(executeFn.mock.calls[0]?.[0]).not.toHaveProperty('suspendedToolRunId');
+
+      await manager.resume(task.id, { user: 'alice' });
+      await tick(200);
+
+      const completed = await manager.getTask(task.id);
+      expect(completed?.status).toBe('completed');
+      expect(completed?.result).toEqual({ approvedBy: 'alice', suspendedToolRunId: 'delegated-run-id' });
+      expect(executeFn.mock.calls[1]?.[0]).toMatchObject({ suspendedToolRunId: 'delegated-run-id' });
+      expect(executeFn).toHaveBeenCalledTimes(2);
+    });
+
+    it('emits background-task-resumed on the stream when resumed', async () => {
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        if (!opts.resumeData) {
+          await opts.suspend({ awaiting: 'go' });
+          return undefined;
+        }
+        return 'ok';
+      });
+
+      const chunks: any[] = [];
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const consumer = (async () => {
+        for await (const chunk of stream as any) chunks.push(chunk);
+      })();
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cres2', args: {}, agentId: 'a1', runId: 'r4' },
+        ctx(executeFn),
+      );
+      await tick(200);
+      await manager.resume(task.id, { go: true });
+      await tick(200);
+      abortController.abort();
+      await consumer;
+
+      expect(chunks.some(c => c.type === 'background-task-suspended' && c.payload.taskId === task.id)).toBe(true);
+      expect(chunks.some(c => c.type === 'background-task-resumed' && c.payload.taskId === task.id)).toBe(true);
+      expect(chunks.some(c => c.type === 'background-task-completed' && c.payload.taskId === task.id)).toBe(true);
+    });
+
+    it('cancels a suspended task and publishes task.cancelled', async () => {
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        await opts.suspend({});
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'ccsusp', args: {}, agentId: 'a1', runId: 'r5' },
+        ctx(executeFn),
+      );
+      await tick(200);
+      expect((await manager.getTask(task.id))?.status).toBe('suspended');
+
+      await manager.cancel(task.id);
+      await tick(50);
+
+      const cancelled = await manager.getTask(task.id);
+      expect(cancelled?.status).toBe('cancelled');
+    });
+
+    it('throws when resuming a task that is not suspended', async () => {
+      const executeFn = vi.fn().mockResolvedValue('done');
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cnotsusp', args: {}, agentId: 'a1', runId: 'r6' },
+        ctx(executeFn),
+      );
+      await tick(150);
+      await expect(manager.resume(task.id)).rejects.toThrow(/Cannot resume task in status 'completed'/);
+    });
+
+    it('preserves retry counter across suspend/resume', async () => {
+      let calls = 0;
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        calls++;
+        if (calls === 1) {
+          // First attempt: throw to record a retry.
+          throw new Error('first-attempt-fails');
+        }
+        if (calls === 2) {
+          // Second attempt (retry): suspend.
+          await opts.suspend({ at: 'attempt-2' });
+          return undefined;
+        }
+        // Resume: complete.
+        return { resumeData: opts.resumeData };
+      });
+
+      const { task } = await manager.enqueue(
+        { toolName: 't', toolCallId: 'cretry', args: {}, agentId: 'a1', runId: 'r7', maxRetries: 3 },
+        ctx(executeFn),
+      );
+      await tick(300);
+
+      const suspended = await manager.getTask(task.id);
+      expect(suspended?.status).toBe('suspended');
+      // After the first failed attempt, retryCount was bumped to 1; suspending
+      // mid-attempt-2 leaves it at 1 (not bumped — only failures bump).
+      expect(suspended?.retryCount).toBe(1);
+
+      await manager.resume(task.id, { ok: true });
+      await tick(300);
+
+      const completed = await manager.getTask(task.id);
+      expect(completed?.status).toBe('completed');
+      expect(completed?.result).toEqual({ resumeData: { ok: true } });
+      // Resume re-entered the step at attempt = task.retryCount = 1, did NOT
+      // re-run the failed attempt 0. Total executor calls: 1 (failed) +
+      // 1 (suspended) + 1 (resumed) = 3, not 4.
+      expect(calls).toBe(3);
+    });
+  });
+
+  describe('recovery on startup', () => {
+    it('leaves running tasks untouched when startup recovery is disabled', async () => {
+      const seedStorage = new MockStore();
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      const startedAt = new Date(Date.now() - 60_000);
+      await bgStore!.createTask({
+        id: 'live-elsewhere',
+        status: 'running',
+        toolName: 't',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+        startedAt,
+      });
+
+      const local = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true, recoverStaleTasksOnStart: false },
+      });
+      await local.startWorkers();
+
+      try {
+        await tick(150);
+        await expect(local.backgroundTaskManager!.getTask('live-elsewhere')).resolves.toMatchObject({
+          status: 'running',
+          startedAt,
+        });
+      } finally {
+        await local.backgroundTaskManager?.shutdown();
+        await local.stopWorkers();
+      }
+    });
+
+    it('recovers stale running tasks with retries available', async () => {
+      // Pre-seed storage with a task in 'running' status as if a previous
+      // process crashed mid-execution. A fresh manager.init() should flip
+      // it to pending and re-dispatch via the workflow.
+      const seedStorage = new MockStore();
+      const local = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true },
+      });
+
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      await bgStore!.createTask({
+        id: 'stale-1',
+        status: 'running',
+        toolName: 't',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 1,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+        startedAt: new Date(Date.now() - 60_000),
+      });
+
+      // Register the context BEFORE init's recoverStaleTasks fires. The
+      // backgroundTaskManager is set synchronously by Mastra's constructor;
+      // init() is fire-and-forget after.
+      local.backgroundTaskManager!.registerTaskContext(
+        'stale-1',
+        ctx(async () => 'recovered'),
+      );
+      await local.startWorkers();
+
+      try {
+        const mgr = local.backgroundTaskManager!;
+
+        // Recovery is async during init — give it time to flip + re-dispatch.
+        await tick(200);
+
+        const completed = await mgr.getTask('stale-1');
+        expect(completed?.status).toBe('completed');
+        expect(completed?.result).toBe('recovered');
+      } finally {
+        await local.backgroundTaskManager?.shutdown();
+        await local.stopWorkers();
+      }
+    });
+
+    it('re-dispatches stale pending tasks on init', async () => {
+      const seedStorage = new MockStore();
+      const local = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true },
+      });
+
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      await bgStore!.createTask({
+        id: 'pending-1',
+        status: 'pending',
+        toolName: 't',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 0,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+      });
+
+      local.backgroundTaskManager!.registerTaskContext(
+        'pending-1',
+        ctx(async () => 'late-pickup'),
+      );
+      await local.startWorkers();
+
+      try {
+        const mgr = local.backgroundTaskManager!;
+
+        await tick(200);
+
+        const completed = await mgr.getTask('pending-1');
+        expect(completed?.status).toBe('completed');
+        expect(completed?.result).toBe('late-pickup');
+      } finally {
+        await local.backgroundTaskManager?.shutdown();
+        await local.stopWorkers();
+      }
+    });
+
+    it('leaves suspended tasks alone on init recovery', async () => {
+      // First mastra: enqueue a task that suspends.
+      const seedStorage = new MockStore();
+      const m1 = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true },
+      });
+      await m1.startWorkers();
+      await tick();
+      const mgr1 = m1.backgroundTaskManager!;
+      const executeFn = vi.fn(async (_args, opts: any) => {
+        await opts.suspend({ checkpoint: 1 });
+      });
+      const { task } = await mgr1.enqueue(
+        { toolName: 't', toolCallId: 'crec', args: {}, agentId: 'a1', runId: 'r8' },
+        ctx(executeFn),
+      );
+      await tick(200);
+      expect((await mgr1.getTask(task.id))?.status).toBe('suspended');
+      await mgr1.shutdown();
+      await m1.stopWorkers();
+
+      // Second mastra over the same storage — recovery should NOT touch
+      // the suspended row.
+      const m2 = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true },
+      });
+      await m2.startWorkers();
+      await tick(150);
+      try {
+        const mgr2 = m2.backgroundTaskManager!;
+        const stillSuspended = await mgr2.getTask(task.id);
+        expect(stillSuspended?.status).toBe('suspended');
+        expect(stillSuspended?.suspendPayload).toEqual({ checkpoint: 1 });
+      } finally {
+        await m2.backgroundTaskManager?.shutdown();
+        await m2.stopWorkers();
+      }
+    });
+
+    it('does not reclaim a running task whose lease is still valid', async () => {
+      // The previous process is still alive and renewing its lease, so its
+      // ownership is durable and startup recovery must leave the task alone.
+      const seedStorage = new MockStore();
+      const local = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true },
+      });
+
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      await bgStore!.createTask({
+        id: 'leased-elsewhere',
+        status: 'running',
+        toolName: 't',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 1,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+        startedAt: new Date(Date.now() - 60_000),
+        ownerId: 'other-worker',
+        leaseExpiresAt: new Date(Date.now() + 60_000),
+      });
+      // This process can run the task if it is (wrongly) reclaimed.
+      local.backgroundTaskManager!.registerTaskContext(
+        'leased-elsewhere',
+        ctx(async () => 'stolen'),
+      );
+      await local.startWorkers();
+
+      try {
+        await tick(200);
+
+        const task = await local.backgroundTaskManager!.getTask('leased-elsewhere');
+        expect(task).toMatchObject({ status: 'running', ownerId: 'other-worker' });
+      } finally {
+        await local.backgroundTaskManager?.shutdown();
+        await local.stopWorkers();
+      }
+    });
+
+    it('reclaims a running task once its lease has expired', async () => {
+      const seedStorage = new MockStore();
+      const local = new Mastra({
+        logger: false,
+        storage: seedStorage,
+        backgroundTasks: { enabled: true },
+      });
+
+      const bgStore = await seedStorage.getStore('backgroundTasks');
+      await bgStore!.createTask({
+        id: 'expired-lease',
+        status: 'running',
+        toolName: 't',
+        toolCallId: 'c',
+        args: {},
+        agentId: 'a',
+        runId: 'r',
+        retryCount: 0,
+        maxRetries: 1,
+        timeoutMs: 5000,
+        createdAt: new Date(),
+        startedAt: new Date(Date.now() - 60_000),
+        ownerId: 'dead-worker',
+        leaseExpiresAt: new Date(Date.now() - 1_000),
+      });
+      local.backgroundTaskManager!.registerTaskContext(
+        'expired-lease',
+        ctx(async () => 'reclaimed'),
+      );
+      await local.startWorkers();
+
+      try {
+        const mgr = local.backgroundTaskManager!;
+
+        await tick(200);
+
+        const task = await mgr.getTask('expired-lease');
+        expect(task).toMatchObject({ status: 'completed', result: 'reclaimed' });
+        // Terminal writes release the lease so the row carries no stale owner.
+        expect(task!.ownerId).toBeUndefined();
+        expect(task!.leaseExpiresAt).toBeUndefined();
+      } finally {
+        await local.backgroundTaskManager?.shutdown();
+        await local.stopWorkers();
+      }
+    });
+
+    it('stamps an execution lease on dispatch and clears it when the task finishes', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        leaseDurationMs: 60_000,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 't', toolCallId: 'lease', args: {}, agentId: 'a1', runId: 'r-lease' },
+          ctx(async () => {
+            await gate;
+            return 'leased';
+          }),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('running'));
+
+        const running = await local.mgr.getTask(task.id);
+        expect(running!.ownerId).toBe(local.mgr.ownerId);
+        expect(running!.leaseExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 30_000);
+
+        release();
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('completed'));
+
+        const completed = await local.mgr.getTask(task.id);
+        expect(completed!.ownerId).toBeUndefined();
+        expect(completed!.leaseExpiresAt).toBeUndefined();
+      } finally {
+        release();
+        await local.cleanup();
+      }
+    });
+
+    it('keeps renewing the lease of a task it is still running', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        leaseDurationMs: 3_000,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 't', toolCallId: 'heartbeat', args: {}, agentId: 'a1', runId: 'r-heartbeat' },
+          ctx(async () => {
+            await gate;
+            return 'ok';
+          }),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('running'));
+        const initialExpiry = (await local.mgr.getTask(task.id))!.leaseExpiresAt!.getTime();
+
+        // The heartbeat renews every leaseDurationMs / 3 (1s with a 3s lease).
+        await vi.waitFor(
+          async () => {
+            const renewed = (await local.mgr.getTask(task.id))!.leaseExpiresAt!.getTime();
+            expect(renewed).toBeGreaterThan(initialExpiry);
+          },
+          { timeout: 5_000, interval: 100 },
+        );
+      } finally {
+        release();
+        await local.cleanup();
+      }
+    });
+
+    it('does not let a superseded owner commit results', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        leaseDurationMs: 60_000,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      const onChunk = vi.fn();
+      const onResult = vi.fn();
+      const onComplete = vi.fn();
+      const published: string[] = [];
+      const onPublished = (event: { type: string }) => {
+        published.push(event.type);
+      };
+      await local.isolatedPubsub.subscribe('background-tasks-result', onPublished);
+
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 't', toolCallId: 'superseded', args: {}, agentId: 'a1', runId: 'r-superseded' },
+          {
+            executor: {
+              execute: async () => {
+                await gate;
+                return 'late result';
+              },
+            },
+            onChunk,
+            onResult,
+            onComplete,
+          },
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('running'));
+
+        // Another worker takes the task over, as it would once this owner's
+        // lease lapsed, and becomes the recorded owner.
+        const bgStore = await testStorage.getStore('backgroundTasks');
+        await bgStore!.updateTask(task.id, {
+          ownerId: 'other-worker',
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+        });
+
+        release();
+        // Give the original owner's workflow time to try — and fail — to
+        // commit its result.
+        await tick(300);
+
+        const afterTakeover = await local.mgr.getTask(task.id);
+        expect(afterTakeover).toMatchObject({ status: 'running', ownerId: 'other-worker' });
+        expect(afterTakeover!.result).toBeUndefined();
+
+        // Losing ownership must not leak the stale result to local observers:
+        // no completion hook fires and no `task.completed` event is published.
+        // The observer is proven live by the `task.running` event from the
+        // original claim, so the negative assertion is not vacuous.
+        expect(published).toContain('task.running');
+        expect(onChunk).not.toHaveBeenCalled();
+        expect(onResult).not.toHaveBeenCalled();
+        expect(onComplete).not.toHaveBeenCalled();
+        expect(published).not.toContain('task.completed');
+      } finally {
+        release();
+        await local.isolatedPubsub.unsubscribe('background-tasks-result', onPublished);
+        await local.cleanup();
+      }
+    });
+
+    it('aborts a superseded run once its lease renewal is rejected', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        leaseDurationMs: 3_000,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      let executorSignal: AbortSignal | undefined;
+
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 't', toolCallId: 'superseded-abort', args: {}, agentId: 'a1', runId: 'r-superseded-abort' },
+          ctx(async (_args: unknown, opts: { abortSignal?: AbortSignal }) => {
+            executorSignal = opts.abortSignal;
+            await gate;
+            return 'late result';
+          }),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('running'));
+        await vi.waitFor(() => expect(executorSignal).toBeDefined());
+        expect(executorSignal!.aborted).toBe(false);
+
+        // Another worker takes the task over, as it would once this owner's
+        // lease lapsed, and becomes the recorded owner.
+        const bgStore = await testStorage.getStore('backgroundTasks');
+        await bgStore!.updateTask(task.id, {
+          ownerId: 'other-worker',
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+        });
+
+        // The heartbeat (1s with a 3s lease) is now fenced out by the owner, so
+        // the local run is aborted instead of executing alongside the new owner.
+        await vi.waitFor(() => expect(executorSignal!.aborted).toBe(true), { timeout: 5_000, interval: 50 });
+      } finally {
+        release();
+        await local.cleanup();
+      }
+    });
+
+    it('does not abort when a rejected renewal finds the task no longer running', async () => {
+      const local = await makeLocalManager({
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        leaseDurationMs: 3_000,
+        recoverStaleTasksOnStart: false,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      let executorSignal: AbortSignal | undefined;
+
+      try {
+        const { task } = await local.mgr.enqueue(
+          { toolName: 't', toolCallId: 'settled-renewal', args: {}, agentId: 'a1', runId: 'r-settled-renewal' },
+          ctx(async (_args: unknown, opts: { abortSignal?: AbortSignal }) => {
+            executorSignal = opts.abortSignal;
+            await gate;
+            return 'ok';
+          }),
+        );
+        await vi.waitFor(async () => expect((await local.mgr.getTask(task.id))?.status).toBe('running'));
+        await vi.waitFor(() => expect(executorSignal).toBeDefined());
+
+        // The task leaves `running` under another owner — it suspended rather
+        // than being taken over — so renewal is rejected but nothing is aborted.
+        const bgStore = await testStorage.getStore('backgroundTasks');
+        await bgStore!.updateTask(task.id, {
+          status: 'suspended',
+          ownerId: 'other-worker',
+          leaseExpiresAt: new Date(Date.now() + 60_000),
+        });
+
+        // Wait past the 1s heartbeat so the rejected renewal has definitely run.
+        await tick(2_200);
+
+        expect(executorSignal!.aborted).toBe(false);
+      } finally {
+        release();
+        await local.cleanup();
+      }
+    });
+
+    it.each([
+      ['rejects when aborted', true],
+      ['ignores the abort and returns', false],
+    ])('aborts a run cancelled from another manager on shared storage (executor %s)', async (_label, rejectOnAbort) => {
+      const config = {
+        enabled: true,
+        globalConcurrency: 1,
+        perAgentConcurrency: 1,
+        leaseDurationMs: 3_000,
+        recoverStaleTasksOnStart: false,
+      };
+      const onTaskComplete = vi.fn();
+      const onTaskFailed = vi.fn();
+      // Separate Mastra + pubsub per manager: B's `task.cancel` event cannot
+      // reach A, as with two processes on the default in-process pubsub.
+      const workerA = await makeLocalManager({ ...config, onTaskComplete, onTaskFailed });
+      const workerB = await makeLocalManager(config);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => {
+        release = resolve;
+      });
+      let executorSignal: AbortSignal | undefined;
+      let executorReturned = false;
+      const onChunk = vi.fn();
+      const onResult = vi.fn();
+      const onComplete = vi.fn();
+      const onFailed = vi.fn();
+      const published: string[] = [];
+      const onPublished = (event: { type: string }) => {
+        published.push(event.type);
+      };
+      await workerA.isolatedPubsub.subscribe('background-tasks-result', onPublished);
+
+      try {
+        const { task } = await workerA.mgr.enqueue(
+          { toolName: 't', toolCallId: 'remote-cancel', args: {}, agentId: 'a1', runId: 'r-remote-cancel' },
+          {
+            executor: {
+              execute: async (_args: unknown, opts: { abortSignal?: AbortSignal }) => {
+                executorSignal = opts.abortSignal;
+                if (rejectOnAbort) {
+                  await new Promise((_resolve, reject) => {
+                    opts.abortSignal!.addEventListener('abort', () => reject(opts.abortSignal!.reason));
+                  });
+                }
+                await gate;
+                executorReturned = true;
+                return 'late result';
+              },
+            },
+            onChunk,
+            onResult,
+            onComplete,
+            onFailed,
+          },
+        );
+        await vi.waitFor(async () => expect((await workerA.mgr.getTask(task.id))?.status).toBe('running'));
+        await vi.waitFor(() => expect(executorSignal).toBeDefined());
+        expect(executorSignal!.aborted).toBe(false);
+
+        await workerB.mgr.cancel(task.id);
+        const cancelled = await workerB.mgr.getTask(task.id);
+        expect(cancelled!.status).toBe('cancelled');
+        expect(cancelled!.ownerId).toBeUndefined();
+        expect(cancelled!.completedAt).toBeInstanceOf(Date);
+
+        // A's next heartbeat (1s with a 3s lease) is rejected and finds the
+        // row cancelled, so the local run is aborted as a cancellation.
+        await vi.waitFor(() => expect(executorSignal!.aborted).toBe(true), { timeout: 5_000, interval: 50 });
+        expect((executorSignal!.reason as Error).message).toBe('Task cancelled');
+
+        release();
+        if (!rejectOnAbort) await vi.waitFor(() => expect(executorReturned).toBe(true));
+        // Let A's workflow settle the attempt.
+        await tick(300);
+
+        const after = await workerA.mgr.getTask(task.id);
+        expect(after!.status).toBe('cancelled');
+        expect(after!.result).toBeUndefined();
+        expect(after!.error).toBeUndefined();
+        expect(after!.completedAt!.getTime()).toBe(cancelled!.completedAt!.getTime());
+
+        // The observer is live (it saw the claim), so these negatives are real.
+        expect(published).toContain('task.running');
+        expect(published).not.toContain('task.completed');
+        expect(published).not.toContain('task.failed');
+        expect(onChunk).not.toHaveBeenCalled();
+        expect(onResult).not.toHaveBeenCalled();
+        expect(onComplete).not.toHaveBeenCalled();
+        expect(onFailed).not.toHaveBeenCalled();
+        expect(onTaskComplete).not.toHaveBeenCalled();
+        expect(onTaskFailed).not.toHaveBeenCalled();
+      } finally {
+        release();
+        await workerA.isolatedPubsub.unsubscribe('background-tasks-result', onPublished);
+        await workerA.cleanup();
+        await workerB.cleanup();
+      }
+    });
+  });
+
+  describe('stream', () => {
+    it('emits dispatch event with running status then completed event', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      const executeFn = vi.fn().mockResolvedValue('streamed-result');
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      // First event: dispatch (running)
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      expect(first.value).toMatchObject({
+        type: 'background-task-running',
+        payload: { toolName: 'tool', agentId: 'a1' },
+      });
+
+      // Second event: completed
+      const second = await reader.read();
+      expect(second.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'tool', result: 'streamed-result' },
+      });
+
+      abortController.abort();
+    });
+
+    it('emits failed events with failed status', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      const executeFn = vi.fn().mockRejectedValue(new Error('boom'));
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      // Skip dispatch event
+      await reader.read();
+
+      const { value } = await reader.read();
+      expect(value).toMatchObject({
+        type: 'background-task-failed',
+        payload: { toolName: 'tool', error: expect.objectContaining({ message: 'boom' }) },
+      });
+
+      abortController.abort();
+    });
+
+    it('emits every progress output chunk by default', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      const chunk = (output: string) => ({
+        type: 'tool-output',
+        runId: 'run-1',
+        from: 'AGENT',
+        payload: { output, toolCallId: 'c1', toolName: 'tool' },
+      });
+
+      const executeFn = vi.fn().mockImplementation(async (_args: any, opts: { onProgress?: (chunk: any) => void }) => {
+        await opts.onProgress?.(chunk('first'));
+        await opts.onProgress?.(chunk('second'));
+        await opts.onProgress?.(chunk('third'));
+        return 'done';
+      });
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      await reader.read(); // running
+
+      const firstOutput = await reader.read();
+      expect(firstOutput.value).toMatchObject({
+        type: 'background-task-output',
+        payload: { payload: { payload: { output: 'first' } } },
+      });
+
+      const secondOutput = await reader.read();
+      expect(secondOutput.value).toMatchObject({
+        type: 'background-task-output',
+        payload: { payload: { payload: { output: 'second' } } },
+      });
+
+      const thirdOutput = await reader.read();
+      expect(thirdOutput.value).toMatchObject({
+        type: 'background-task-output',
+        payload: { payload: { payload: { output: 'third' } } },
+      });
+
+      const completed = await reader.read();
+      expect(completed.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { result: 'done' },
+      });
+
+      abortController.abort();
+    });
+
+    it('drops nested output past the wrapper depth limit instead of publishing it unslimmed', () => {
+      const leaf = {
+        type: 'step-start',
+        from: 'AGENT',
+        payload: { messageId: 'm', request: { body: 'x'.repeat(100_000) } },
+      };
+      let chunk: unknown = leaf;
+      for (let i = 0; i < 30; i++) chunk = { type: 'tool-output', payload: { output: chunk } };
+      expect(JSON.stringify(slimProgressChunk(chunk)).length).toBeLessThan(5_000);
+    });
+
+    it('publishes data a tool writes itself unchanged, even when it looks like an agent chunk', () => {
+      const userData = {
+        type: 'finish',
+        payload: { messages: { all: ['keep'] }, output: { steps: ['keep'] }, metadata: { request: { body: 'keep' } } },
+      };
+      const chunk = {
+        type: 'tool-output',
+        from: 'USER',
+        runId: 'r1',
+        payload: { output: userData, toolCallId: 'c1', toolName: 'tool' },
+      };
+      expect(slimProgressChunk(chunk)).toBe(chunk);
+      const wrapped = { type: 'workflow-step-output', from: 'WORKFLOW', payload: { output: chunk } };
+      expect(slimProgressChunk(wrapped)).toBe(wrapped);
+    });
+
+    it('publishes nested agent step/finish chunks without request snapshots or repeated args', async () => {
+      const published: any[] = [];
+      const originalPublish = pubsub.publish.bind(pubsub);
+      vi.spyOn(pubsub, 'publish').mockImplementation(async (topic, event) => {
+        if ((event as any).type === 'task.output') published.push(event);
+        return originalPublish(topic, event);
+      });
+
+      const bigFile = 'x'.repeat(100_000);
+      const wrap = (inner: unknown) => ({
+        type: 'workflow-step-output',
+        runId: 'wf-1',
+        from: 'WORKFLOW',
+        payload: { output: inner },
+      });
+      const executeFn = vi.fn().mockImplementation(async (_args: any, opts: { onProgress?: (chunk: any) => void }) => {
+        await opts.onProgress?.(
+          wrap({
+            type: 'step-start',
+            from: 'AGENT',
+            payload: { messageId: 'm1', request: { body: bigFile }, inputMessages: [bigFile] },
+          }),
+        );
+        await opts.onProgress?.(
+          wrap({
+            type: 'step-finish',
+            from: 'AGENT',
+            payload: {
+              messageId: 'm1',
+              stepResult: { reason: 'stop' },
+              output: { text: 'hi', usage: { totalTokens: 3 }, steps: [bigFile] },
+              metadata: { request: { body: bigFile }, modelId: 'gpt-5' },
+              messages: { all: [bigFile], user: [], nonUser: [] },
+            },
+          }),
+        );
+        await opts.onProgress?.(
+          wrap({
+            type: 'finish',
+            from: 'AGENT',
+            payload: {
+              stepResult: { reason: 'stop' },
+              output: { usage: { totalTokens: 3 }, steps: [bigFile] },
+              metadata: { request: { body: bigFile } },
+              messages: { all: [bigFile], user: [], nonUser: [] },
+              response: { id: 'resp-1', modelId: 'gpt-5' },
+            },
+          }),
+        );
+        await opts.onProgress?.(wrap({ type: 'workflow-step-progress', payload: { id: 'step', completedCount: 1 } }));
+        return 'done';
+      });
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: { file: bigFile }, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await vi.waitFor(() => expect(published).toHaveLength(4));
+
+      for (const event of published) {
+        expect(event.data.args).toBeUndefined();
+        expect(JSON.stringify(event).length).toBeLessThan(2_000);
+      }
+      const [start, stepFinish, finish, progress] = published.map(e => e.data.chunk.payload.output);
+      expect(start).toEqual({ type: 'step-start', from: 'AGENT', payload: { messageId: 'm1' } });
+      expect(stepFinish.payload).toEqual({
+        messageId: 'm1',
+        stepResult: { reason: 'stop' },
+        output: { text: 'hi', usage: { totalTokens: 3 } },
+        metadata: { modelId: 'gpt-5' },
+      });
+      expect(finish.payload).toEqual({
+        stepResult: { reason: 'stop' },
+        output: { usage: { totalTokens: 3 } },
+        metadata: {},
+        response: { id: 'resp-1', modelId: 'gpt-5' },
+      });
+      expect(progress).toEqual({ type: 'workflow-step-progress', payload: { id: 'step', completedCount: 1 } });
+    });
+
+    it('throttles progress output chunks while still emitting completion', async () => {
+      const { mgr, cleanup } = await makeLocalManager({ enabled: true, progressThrottleMs: 100 });
+
+      const abortController = new AbortController();
+      const stream = mgr.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+      let now = 1_000;
+      const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => now);
+
+      const chunk = (output: string) => ({
+        type: 'tool-output',
+        runId: 'run-1',
+        from: 'AGENT',
+        payload: { output, toolCallId: 'c1', toolName: 'tool' },
+      });
+
+      const executeFn = vi.fn().mockImplementation(async (_args: any, opts: { onProgress?: (chunk: any) => void }) => {
+        await opts.onProgress?.(chunk('first'));
+        now += 50;
+        await opts.onProgress?.(chunk('dropped'));
+        now += 100;
+        await opts.onProgress?.(chunk('third'));
+        return 'done';
+      });
+
+      try {
+        await mgr.enqueue(
+          { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+          ctx(executeFn),
+        );
+
+        await tick();
+
+        await reader.read(); // running
+
+        const firstOutput = await reader.read();
+        expect(firstOutput.value).toMatchObject({
+          type: 'background-task-output',
+          payload: { payload: { payload: { output: 'first' } } },
+        });
+
+        const thirdOutput = await reader.read();
+        expect(thirdOutput.value).toMatchObject({
+          type: 'background-task-output',
+          payload: { payload: { payload: { output: 'third' } } },
+        });
+
+        const completed = await reader.read();
+        expect(completed.value).toMatchObject({
+          type: 'background-task-completed',
+          payload: { result: 'done' },
+        });
+      } finally {
+        dateNow.mockRestore();
+        abortController.abort();
+        await cleanup();
+      }
+    });
+
+    it('emits cancel event with cancelled status', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      // Use a tool that blocks so we can cancel while running
+      const executeFn = vi.fn().mockImplementation(
+        (_args: any, opts: { abortSignal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            opts.abortSignal.addEventListener('abort', () => reject(new Error('Task cancelled')));
+          }),
+      );
+
+      const { task } = await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+
+      await tick();
+
+      // Skip dispatch event
+      await reader.read();
+
+      // Cancel the task
+      await manager.cancel(task.id);
+      await tick();
+
+      const { value } = await reader.read();
+      expect(value).toMatchObject({
+        type: 'background-task-cancelled',
+        payload: { toolName: 'tool', taskId: task.id },
+      });
+
+      abortController.abort();
+    });
+
+    it('filters by agentId across all event types', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ agentId: 'a2', abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      // Enqueue for a1 — should NOT appear on the stream filtered to a2
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(vi.fn().mockResolvedValue('for-a1')),
+      );
+      // Enqueue for a2 — should appear
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c2', args: {}, agentId: 'a2', runId: 'run-2' },
+        ctx(vi.fn().mockResolvedValue('for-a2')),
+      );
+
+      await tick();
+
+      // First event for a2: dispatch
+      const first = await reader.read();
+      expect(first.value).toMatchObject({
+        type: 'background-task-running',
+        payload: { toolName: 'tool', agentId: 'a2' },
+      });
+
+      // Second event for a2: completed
+      const second = await reader.read();
+      expect(second.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'tool', agentId: 'a2', result: 'for-a2' },
+      });
+
+      abortController.abort();
+    });
+
+    it('filters by runId', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ runId: 'run-target', abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-other' },
+        ctx(vi.fn().mockResolvedValue('other')),
+      );
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c2', args: {}, agentId: 'a1', runId: 'run-target' },
+        ctx(vi.fn().mockResolvedValue('target')),
+      );
+
+      await tick();
+
+      // dispatch for run-target
+      const first = await reader.read();
+      expect(first.value).toMatchObject({
+        type: 'background-task-running',
+        payload: { toolName: 'tool', runId: 'run-target' },
+      });
+
+      // completed for run-target
+      const second = await reader.read();
+      expect(second.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'tool', runId: 'run-target', result: 'target' },
+      });
+
+      abortController.abort();
+    });
+
+    it('snapshot only includes running tasks, not already-completed ones', async () => {
+      // Enqueue a blocking task (will be running) and a fast task (will be completed)
+      let resolver!: (val: string) => void;
+      await manager.enqueue(
+        { toolName: 'slow', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(
+          vi.fn().mockImplementation(
+            () =>
+              new Promise<string>(r => {
+                resolver = r;
+              }),
+          ),
+        ),
+      );
+      await manager.enqueue(
+        { toolName: 'fast', toolCallId: 'c2', args: {}, agentId: 'a1', runId: 'run-2' },
+        ctx(vi.fn().mockResolvedValue('done')),
+      );
+      await tick();
+
+      // Open stream — snapshot should only include the running task, not the completed one
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      const snapshot = await reader.read();
+      expect(snapshot.value).toMatchObject({
+        type: 'background-task-running',
+        payload: { toolName: 'slow' },
+      });
+
+      // Complete the running task — live event should come through
+      resolver('late-result');
+      await tick();
+
+      const live = await reader.read();
+      expect(live.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'slow', result: 'late-result' },
+      });
+
+      abortController.abort();
+    });
+
+    it('emits snapshot of running tasks then live completion', async () => {
+      // Enqueue a task that blocks
+      let resolver!: (val: string) => void;
+      const executeFn = vi.fn().mockImplementation(
+        () =>
+          new Promise<string>(resolve => {
+            resolver = resolve;
+          }),
+      );
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(executeFn),
+      );
+      await tick();
+
+      // Open stream while task is running — snapshot should show running status
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      const snapshot = await reader.read();
+      expect(snapshot.value).toMatchObject({
+        type: 'background-task-running',
+        payload: { toolName: 'tool' },
+      });
+
+      // Complete the task — should get live completion event
+      resolver('late-result');
+      await tick();
+
+      const live = await reader.read();
+      expect(live.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'tool', result: 'late-result' },
+      });
+
+      abortController.abort();
+    });
+
+    it('can subscribe to live events without importing existing running tasks', async () => {
+      let resolver!: (val: string) => void;
+      await manager.enqueue(
+        { toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' },
+        ctx(
+          vi.fn().mockImplementation(
+            () =>
+              new Promise<string>(resolve => {
+                resolver = resolve;
+              }),
+          ),
+        ),
+      );
+      await tick();
+
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal, includeExisting: false });
+      const reader = stream.getReader();
+
+      resolver('late-result');
+      await tick();
+
+      const live = await reader.read();
+      expect(live.value).toMatchObject({
+        type: 'background-task-completed',
+        payload: { toolName: 'tool', result: 'late-result' },
+      });
+
+      abortController.abort();
+    });
+
+    describe('resource scoping', () => {
+      const enqueueFor = (resourceId: string | undefined, toolCallId: string, result: string) =>
+        manager.enqueue(
+          {
+            toolName: 'tool',
+            toolCallId,
+            args: { secret: `${toolCallId}-args` },
+            agentId: 'a1',
+            runId: `run-${toolCallId}`,
+            threadId: `thread-${toolCallId}`,
+            resourceId,
+          },
+          ctx(vi.fn().mockResolvedValue(result)),
+        );
+
+      const collect = async (stream: ReadableStream<Record<string, unknown>>, abort: AbortController) => {
+        await tick();
+        abort.abort();
+        const events: any[] = [];
+        const reader = stream.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          events.push(value);
+        }
+        return events;
+      };
+
+      it('does not deliver resource-scoped task events to an unscoped subscriber', async () => {
+        const abortController = new AbortController();
+        const stream = manager.stream({ agentId: 'a1', abortSignal: abortController.signal });
+
+        await enqueueFor('victim', 'victim-call', 'SECRET');
+        await enqueueFor(undefined, 'shared-call', 'shared');
+
+        const events = await collect(stream, abortController);
+        expect(events.map(e => e.payload.toolCallId)).not.toContain('victim-call');
+        expect(JSON.stringify(events)).not.toContain('SECRET');
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: 'background-task-completed',
+            payload: expect.objectContaining({ toolCallId: 'shared-call', result: 'shared' }),
+          }),
+        );
+      });
+
+      it('delivers only the subscribed resource across threads', async () => {
+        const abortController = new AbortController();
+        const stream = manager.stream({ agentId: 'a1', resourceId: 'user-1', abortSignal: abortController.signal });
+
+        await enqueueFor('user-1', 'own-call', 'mine');
+        await enqueueFor('user-2', 'other-call', 'theirs');
+        await enqueueFor(undefined, 'unscoped-call', 'unscoped');
+
+        const events = await collect(stream, abortController);
+        expect(new Set(events.map(e => e.payload.toolCallId))).toEqual(new Set(['own-call']));
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: 'background-task-completed',
+            payload: expect.objectContaining({ result: 'mine' }),
+          }),
+        );
+      });
+
+      it('treats an empty-string resource id as a resource, not as unscoped', async () => {
+        const unscopedAbort = new AbortController();
+        const unscoped = manager.stream({ agentId: 'a1', abortSignal: unscopedAbort.signal });
+        const emptyAbort = new AbortController();
+        const empty = manager.stream({ agentId: 'a1', resourceId: '', abortSignal: emptyAbort.signal });
+
+        await enqueueFor('', 'empty-call', 'EMPTY');
+        await enqueueFor('user-1', 'user-call', 'USER');
+
+        const unscopedEvents = await collect(unscoped, unscopedAbort);
+        expect(unscopedEvents.map(e => e.payload.toolCallId)).not.toContain('empty-call');
+
+        const emptyEvents = await collect(empty, emptyAbort);
+        expect(new Set(emptyEvents.map(e => e.payload.toolCallId))).toEqual(new Set(['empty-call']));
+      });
+
+      it('delivers every resource when allResources is set', async () => {
+        const abortController = new AbortController();
+        const stream = manager.stream({ allResources: true, abortSignal: abortController.signal });
+
+        await enqueueFor('user-1', 'one-call', 'r1');
+        await enqueueFor('user-2', 'two-call', 'r2');
+
+        const events = await collect(stream, abortController);
+        expect(new Set(events.map(e => e.payload.toolCallId))).toEqual(new Set(['one-call', 'two-call']));
+      });
+
+      it('excludes other resources from the existing-task snapshot', async () => {
+        const blocking = () => ctx(vi.fn().mockImplementation(() => new Promise(() => {})));
+        await manager.enqueue(
+          { toolName: 'tool', toolCallId: 'victim-call', args: {}, agentId: 'a1', runId: 'r1', resourceId: 'victim' },
+          blocking(),
+        );
+        await manager.enqueue(
+          { toolName: 'tool', toolCallId: 'shared-call', args: {}, agentId: 'a1', runId: 'r2' },
+          blocking(),
+        );
+        await tick();
+
+        const unscopedAbort = new AbortController();
+        const unscoped = await collect(manager.stream({ abortSignal: unscopedAbort.signal }), unscopedAbort);
+        expect(unscoped.map(e => e.payload.toolCallId)).toEqual(['shared-call']);
+
+        const victimTask = (await manager.listTasks({ resourceId: 'victim' })).tasks[0]!;
+        const byIdAbort = new AbortController();
+        const byId = await collect(manager.stream({ taskId: victimTask.id, abortSignal: byIdAbort.signal }), byIdAbort);
+        expect(byId).toEqual([]);
+
+        const allAbort = new AbortController();
+        const all = await collect(manager.stream({ allResources: true, abortSignal: allAbort.signal }), allAbort);
+        expect(new Set(all.map(e => e.payload.toolCallId))).toEqual(new Set(['victim-call', 'shared-call']));
+      });
+    });
+
+    it('closes when abortSignal fires', async () => {
+      const abortController = new AbortController();
+      const stream = manager.stream({ abortSignal: abortController.signal });
+      const reader = stream.getReader();
+
+      abortController.abort();
+
+      const { done } = await reader.read();
+      expect(done).toBe(true);
+    });
+  });
+
+  describe('shutdown', () => {
+    it('rejects new enqueues after shutdown', async () => {
+      await manager.shutdown();
+
+      await expect(
+        manager.enqueue({ toolName: 'tool', toolCallId: 'c1', args: {}, agentId: 'a1', runId: 'run-1' }),
+      ).rejects.toThrow('shutting down');
+    });
+  });
+});

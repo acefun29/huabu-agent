@@ -1,0 +1,278 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createScorer } from '../../evals';
+import { runScorer } from '../../evals/hooks';
+import { Mastra } from '../../mastra';
+import { MockMemory } from '../../memory/mock';
+import { Agent } from '../agent';
+import { getDummyResponseModel } from './mock-model';
+
+vi.mock('../../evals/hooks', () => ({
+  runScorer: vi.fn(),
+}));
+
+function scorersTests(version: 'v1' | 'v2' | 'v3' | 'v4') {
+  const dummyModel = getDummyResponseModel(version);
+
+  // Non-legacy generate()/stream() coverage lives in loop/test-utils/aimock/scenarios/scorers-live.scenario.test.ts.
+  if (version === 'v1') {
+    describe('scorer output data', () => {
+      it(`v1 - should return scoring data from generate when returnScorerData is true`, async () => {
+        const agent = new Agent({
+          id: 'scorer-test',
+          name: 'Scorer Agent',
+          instructions: 'You are an agent that can score things',
+          model: dummyModel,
+        });
+
+        const result = await agent.generateLegacy('Make it green', {
+          returnScorerData: true,
+        });
+
+        expect(result.scoringData).toBeDefined();
+        expect(result.scoringData.input).toMatchObject({
+          inputMessages: expect.any(Array),
+          rememberedMessages: expect.any(Array),
+          systemMessages: expect.any(Array),
+          taggedSystemMessages: expect.any(Object),
+        });
+        expect(result.scoringData.output).toBeInstanceOf(Array);
+      });
+
+      it(`v1 - should not return scoring data from generate when returnScorerData is false`, async () => {
+        const agent = new Agent({
+          id: 'scorer-test',
+          name: 'Scorer Agent',
+          instructions: 'You are an agent that can score things',
+          model: dummyModel,
+        });
+
+        const result = await agent.generateLegacy('Make it green', {
+          returnScorerData: false,
+        });
+
+        expect(result.scoringData).toBeUndefined();
+      });
+
+      it(`v1 - should not return scoring data from generate when returnScorerData is not specified`, async () => {
+        const agent = new Agent({
+          id: 'scorer-test',
+          name: 'Scorer Agent',
+          instructions: 'You are an agent that can score things',
+          model: dummyModel,
+        });
+
+        const result = await agent.generateLegacy('Make it green');
+
+        expect(result.scoringData).toBeUndefined();
+      });
+    });
+  }
+
+  describe('scorer override functionality', () => {
+    let agent: Agent;
+    let mastra: Mastra;
+    let scorerTest: any;
+    let scorer1: any;
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+      scorerTest = createScorer({
+        id: 'scorer-test',
+        name: 'scorerTest',
+        description: 'Test Scorer',
+      }).generateScore(() => 0.95);
+
+      scorer1 = createScorer({
+        id: 'scorer-1',
+        name: 'scorer1',
+        description: 'Test Scorer 1',
+      }).generateScore(() => 0.95);
+
+      agent = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a test agent.',
+        model: dummyModel,
+        scorers: {
+          scorerTest: {
+            scorer: scorerTest,
+          },
+        },
+      });
+
+      mastra = new Mastra({
+        agents: { agent },
+        logger: false,
+        scorers: { scorer1 },
+      });
+    });
+
+    if (version === 'v1') {
+      it(`v1 - should call scorerTest when no override is provided`, async () => {
+        await agent.generateLegacy('Hello world');
+
+        expect(runScorer).toHaveBeenCalledWith(
+          expect.objectContaining({
+            scorerId: 'scorer-test',
+            scorerObject: expect.objectContaining({
+              scorer: scorerTest,
+            }),
+          }),
+        );
+      });
+
+      it(`v1 - should use override scorers when provided in generate options`, async () => {
+        await agent.generateLegacy('Hello world', {
+          scorers: {
+            scorer1: { scorer: mastra.getScorer('scorer1') },
+          },
+        });
+
+        expect(runScorer).toHaveBeenCalledWith(
+          expect.objectContaining({
+            scorerId: 'scorer-1',
+            scorerObject: expect.objectContaining({
+              scorer: expect.any(Object),
+            }),
+          }),
+        );
+
+        expect(runScorer).not.toHaveBeenCalledWith(
+          expect.objectContaining({
+            scorerId: 'scorer-test',
+            scorerObject: expect.objectContaining({
+              scorer: scorerTest,
+            }),
+          }),
+        );
+
+        expect(runScorer).toHaveBeenCalledTimes(1);
+      });
+
+      it(`v1 - should call scorers when provided in stream options`, async () => {
+        const result = await agent.streamLegacy('Hello world', {
+          scorers: {
+            scorer1: { scorer: mastra.getScorer('scorer1') },
+          },
+        });
+        await result.consumeStream();
+
+        expect(runScorer).toHaveBeenCalledWith(
+          expect.objectContaining({
+            scorerId: 'scorer-1',
+            scorerObject: expect.objectContaining({
+              scorer: expect.any(Object),
+            }),
+          }),
+        );
+      });
+
+      it(`v1 - can use scorer name for scorer config for generate`, async () => {
+        await agent.generateLegacy('Hello world', {
+          scorers: {
+            scorer1: { scorer: scorer1.name },
+          },
+        });
+
+        expect(runScorer).toHaveBeenCalledWith(
+          expect.objectContaining({
+            scorerId: 'scorer-1',
+            scorerObject: expect.objectContaining({
+              scorer: scorer1,
+            }),
+          }),
+        );
+      });
+    }
+
+    it(`${version} - should call runScorer with correct parameters`, async () => {
+      if (version === 'v1') {
+        await agent.generateLegacy('Hello world', {
+          scorers: {
+            scorer1: { scorer: scorer1.name },
+          },
+        });
+      } else {
+        await agent.generate('Hello world', {
+          scorers: {
+            scorer1: { scorer: scorer1.name },
+          },
+        });
+      }
+
+      // Verify the exact call parameters
+      expect(runScorer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scorerId: 'scorer-1',
+          scorerObject: expect.objectContaining({
+            scorer: scorer1,
+          }),
+          runId: expect.any(String),
+          input: expect.any(Object),
+          output: expect.any(Object),
+          requestContext: expect.any(Object),
+          entity: expect.objectContaining({
+            id: 'test-agent',
+            name: 'Test Agent',
+          }),
+          source: 'LIVE',
+          entityType: 'AGENT',
+          structuredOutput: false,
+          threadId: undefined,
+          resourceId: undefined,
+          tracingContext: expect.any(Object),
+        }),
+      );
+    });
+
+    it(`${version} - should forward threadId and resourceId to runScorer when memory options are provided`, async () => {
+      const mockMemory = new MockMemory();
+      const agentWithMemory = new Agent({
+        id: 'test-agent',
+        name: 'Test Agent',
+        instructions: 'You are a test agent.',
+        model: dummyModel,
+        memory: mockMemory,
+      });
+
+      const mastraWithMemory = new Mastra({
+        agents: { agentWithMemory },
+        logger: false,
+        scorers: { scorer1 },
+      });
+
+      if (version === 'v1') {
+        await agentWithMemory.generateLegacy('Hello world', {
+          threadId: 'thread-123',
+          resourceId: 'resource-456',
+          scorers: {
+            scorer1: { scorer: mastraWithMemory.getScorer('scorer1') },
+          },
+        });
+      } else {
+        await agentWithMemory.generate('Hello world', {
+          memory: {
+            thread: 'thread-123',
+            resource: 'resource-456',
+          },
+          scorers: {
+            scorer1: { scorer: mastraWithMemory.getScorer('scorer1') },
+          },
+        });
+      }
+
+      expect(runScorer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scorerId: 'scorer-1',
+          threadId: 'thread-123',
+          resourceId: 'resource-456',
+        }),
+      );
+    });
+  });
+}
+
+scorersTests('v1');
+scorersTests('v2');
+scorersTests('v3');
+scorersTests('v4');

@@ -1,0 +1,1369 @@
+import type { LanguageModelV2Prompt } from '@ai-sdk/provider-v5';
+import { APICallError } from '@internal/ai-sdk-v5';
+
+import type { MastraDBMessage, MastraMessagePart, MastraToolInvocationPart, MessageList } from '../agent/message-list';
+import { getResponseProviderItemIdFromPart } from '../agent/message-list';
+import {
+  RESPONSE_ITEM_ID_PROVIDERS,
+  RESPONSE_RESULT_ITEM_ID_KEY,
+} from '../agent/message-list/utils/response-item-metadata';
+import type {
+  Processor,
+  ProcessAPIErrorArgs,
+  ProcessAPIErrorResult,
+  ProcessLLMRequestArgs,
+  ProcessLLMRequestResult,
+} from './index';
+
+// ---------------------------------------------------------------------------
+// Compat-rule infrastructure
+// ---------------------------------------------------------------------------
+
+/**
+ * A single compatibility rule that resolves a known provider history
+ * incompatibility. Rules can resolve issues either:
+ *
+ * - **Reactively** via {@link CompatRule.fix}: when an API call fails with an
+ *   error matching one of {@link CompatRule.errorPatterns}, the fix mutates
+ *   the persisted message list and the request is retried. Suitable for
+ *   incompatibilities that, once fixed, stay fixed across future turns
+ *   (e.g. tool-call ID format).
+ *
+ * - **Preemptively** via {@link CompatRule.applyToPrompt}: runs in
+ *   `processLLMRequest` after `MessageList → LanguageModelV2Prompt` conversion
+ *   and before the prompt is sent to the provider. Mutations affect only the
+ *   outbound prompt; nothing is persisted to the message list. Suitable for
+ *   incompatibilities that would otherwise re-trigger on every turn (e.g.
+ *   fields the model adds to its own response that the same provider rejects
+ *   on subsequent input).
+ *
+ * A rule may implement either hook, both, or — rarely — neither (e.g. a
+ * placeholder for future error-pattern matching).
+ */
+export interface CompatRule {
+  /** Human-readable identifier for logging/debugging. */
+  name: string;
+  /** Regexes matched against the error message and response body. */
+  errorPatterns?: RegExp[];
+  /** Mutate persisted messages to resolve the incompatibility. Return `true` if changes were made. */
+  fix?: (messages: MastraDBMessage[]) => boolean;
+  /**
+   * Rewrite the outbound LLM request preemptively. Receives the resolved model
+   * so rules can scope themselves to specific providers, and — when the caller
+   * has it — the message list the prompt was built from, for provenance the
+   * converted prompt no longer carries. Return a new prompt to forward, or
+   * `undefined` to leave the prompt unchanged.
+   */
+  applyToPrompt?: (args: {
+    prompt: LanguageModelV2Prompt;
+    model: unknown;
+    /** Provider id of the API the prompt is sent to (see `ProcessLLMRequestArgs.apiProviderId`). */
+    apiProviderId?: string;
+    messageList?: MessageList;
+  }) => LanguageModelV2Prompt | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function getErrorCandidates(error: APICallError | Error): string[] {
+  const candidates = [error.message];
+
+  if (APICallError.isInstance(error) && typeof error.responseBody === 'string') {
+    candidates.push(error.responseBody);
+  }
+
+  return candidates.filter(Boolean);
+}
+
+function matchesRule(error: unknown, rule: CompatRule): boolean {
+  if (!rule.errorPatterns?.length) return false;
+  const matches = (text: string) => rule.errorPatterns!.some(p => p.test(text));
+
+  if (APICallError.isInstance(error)) {
+    return getErrorCandidates(error).some(matches);
+  }
+
+  if (error instanceof Error) {
+    return getErrorCandidates(error).some(matches);
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Built-in rule: Anthropic tool-call ID format
+// ---------------------------------------------------------------------------
+
+const VALID_TOOL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+function sanitizeToolId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function buildToolIdMap(messages: MastraDBMessage[]): Map<string, string> {
+  const idMap = new Map<string, string>();
+
+  for (const msg of messages) {
+    if (!msg.content?.parts) continue;
+    for (const part of msg.content.parts) {
+      if (part.type === 'tool-invocation') {
+        const id = part.toolInvocation.toolCallId;
+        if (id && !VALID_TOOL_ID_PATTERN.test(id) && !idMap.has(id)) {
+          idMap.set(id, sanitizeToolId(id));
+        }
+      }
+    }
+
+    if (msg.content.toolInvocations) {
+      for (const inv of msg.content.toolInvocations) {
+        const id = inv.toolCallId;
+        if (id && !VALID_TOOL_ID_PATTERN.test(id) && !idMap.has(id)) {
+          idMap.set(id, sanitizeToolId(id));
+        }
+      }
+    }
+  }
+
+  return idMap;
+}
+
+function rewriteToolIds(messages: MastraDBMessage[], idMap: Map<string, string>): void {
+  for (const msg of messages) {
+    if (msg.content?.parts) {
+      for (let i = 0; i < msg.content.parts.length; i++) {
+        const part = msg.content.parts[i] as MastraMessagePart;
+        if (part.type === 'tool-invocation') {
+          const oldId = part.toolInvocation.toolCallId;
+          const newId = idMap.get(oldId);
+          if (newId) {
+            (part as MastraToolInvocationPart).toolInvocation = {
+              ...part.toolInvocation,
+              toolCallId: newId,
+            };
+          }
+        }
+      }
+    }
+
+    if (msg.content?.toolInvocations) {
+      for (const inv of msg.content.toolInvocations) {
+        const newId = idMap.get(inv.toolCallId);
+        if (newId) {
+          inv.toolCallId = newId;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Rewrites invalid tool-call IDs in the outbound prompt, keeping call↔result
+ * pairing intact. Nothing is persisted — the prompt is rebuilt, and the
+ * original ids stay in the message list.
+ *
+ * Replacements are assigned per call, in encounter order, and never collide
+ * with an id the prompt already carries: a sanitized id that is already
+ * claimed — by another original id or by a valid id elsewhere in the prompt —
+ * gets `_2`, `_3`, … appended until it is unique. Anthropic rejects duplicate
+ * `tool_use.id` values, so uniqueness is what keeps call/result pairing
+ * resolvable. Two calls that share one invalid original id still receive
+ * distinct replacements; the nth result carrying that id pairs with the nth
+ * call, which is the only resolvable reading of an already-degenerate prompt.
+ */
+function rewritePromptToolIds(prompt: LanguageModelV2Prompt): LanguageModelV2Prompt | undefined {
+  const replacements = new Map<string, string[]>();
+  const claimed = new Set<string>();
+
+  // Every id the prompt carries is unavailable as a replacement target.
+  for (const message of prompt) {
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === 'tool-call') claimed.add(part.toolCallId);
+      }
+      continue;
+    }
+    if (message.role === 'tool') {
+      for (const part of message.content) claimed.add(part.toolCallId);
+    }
+  }
+
+  // Assign a replacement to every call with an invalid id, per occurrence.
+  let assigned = 0;
+  for (const message of prompt) {
+    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== 'tool-call') continue;
+      const id = part.toolCallId;
+      if (VALID_TOOL_ID_PATTERN.test(id)) continue;
+
+      const sanitized = sanitizeToolId(id);
+      let candidate = sanitized;
+      for (let suffix = 2; claimed.has(candidate); suffix++) {
+        candidate = `${sanitized}_${suffix}`;
+      }
+      claimed.add(candidate);
+      const queue = replacements.get(id);
+      if (queue) queue.push(candidate);
+      else replacements.set(id, [candidate]);
+      assigned++;
+    }
+  }
+
+  if (assigned === 0) return undefined;
+
+  // Calls and results interleave in the prompt, so each side tracks its own
+  // occurrence index: the nth result carrying an id pairs with the nth call.
+  const callIndex = new Map<string, number>();
+  const resultIndex = new Map<string, number>();
+  const takeAt = (index: Map<string, number>, id: string): string | undefined => {
+    const queue = replacements.get(id);
+    if (!queue) return undefined;
+    const i = index.get(id) ?? 0;
+    index.set(id, i + 1);
+    return i < queue.length ? queue[i] : undefined;
+  };
+  const takeCall = (id: string) => takeAt(callIndex, id);
+  const takeResult = (id: string) => takeAt(resultIndex, id);
+
+  const rewritten: LanguageModelV2Prompt = prompt.map(message => {
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      let changed = false;
+      const content = message.content.map(part => {
+        if (part.type !== 'tool-call') return part;
+        const replacement = takeCall(part.toolCallId);
+        if (!replacement) return part;
+        changed = true;
+        return { ...part, toolCallId: replacement };
+      });
+      return changed ? { ...message, content } : message;
+    }
+
+    if (message.role === 'tool') {
+      let changed = false;
+      const content = message.content.map(part => {
+        const replacement = takeResult(part.toolCallId);
+        if (!replacement) return part;
+        changed = true;
+        return { ...part, toolCallId: replacement };
+      });
+      return changed ? { ...message, content } : message;
+    }
+
+    return message;
+  });
+
+  return rewritten;
+}
+
+/**
+ * Anthropic enforces `^[a-zA-Z0-9_-]+$` on tool_use.id values.
+ * Tool-call IDs from other providers (e.g. containing `.`, `:`) will be
+ * rejected. This rule rewrites offending characters to `_` in the outbound
+ * prompt, so the rejection never happens and persisted history keeps its
+ * original IDs.
+ */
+export const anthropicToolIdFormat: CompatRule = {
+  name: 'anthropic-tool-id-format',
+  /**
+   * Matches Anthropic's tool_use.id rejection. The preemptive
+   * `applyToPrompt` hook repairs the outbound prompt first, so this pattern
+   * only fires when that hook cannot see the request: Anthropic served
+   * through a provider `isMaybeAnthropic` does not recognize (for example
+   * Vertex- or Bedrock-hosted Claude), or compat configured outside the
+   * agent's prompt path.
+   */
+  errorPatterns: [/tool_use\.id:.*should match pattern/i, /tool_call_id.*invalid/i],
+  /**
+   * Rewrites invalid tool-call ids in place after a provider rejection.
+   * This is the fallback repair for Anthropic served through a provider the
+   * preemptive `applyToPrompt` check does not recognize (for example Vertex-
+   * or Bedrock-hosted Claude), and the only repair available once an API
+   * call has already been rejected.
+   */
+  fix(messages) {
+    const idMap = buildToolIdMap(messages);
+    if (idMap.size === 0) return false;
+    rewriteToolIds(messages, idMap);
+    return true;
+  },
+  applyToPrompt({ prompt, model }) {
+    if (!isMaybeAnthropic(model)) return undefined;
+    return rewritePromptToolIds(prompt);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Built-in rule: Cerebras `reasoning_content` strip
+// ---------------------------------------------------------------------------
+
+/**
+ * Detects whether a model is (or might be) routed through Cerebras.
+ *
+ * Cerebras's API rejects assistant messages carrying `reasoning_content`
+ * (the field `@ai-sdk/openai-compatible@>=1.0.32` adds when serializing
+ * reasoning parts). A flexible matcher is used here because the model arg
+ * passed to processors may be a resolved language model, an unresolved
+ * model id string, a dynamic function, or a fallback array.
+ */
+function matchesProviderPrefix(model: unknown, providerPrefix: string): boolean {
+  if (model == null) return false;
+  if (typeof model === 'function') return false;
+
+  if (Array.isArray(model)) {
+    return model.some(m => matchesProviderPrefix((m as { model?: unknown }).model ?? m, providerPrefix));
+  }
+
+  const gatewayPattern = new RegExp(`^${providerPrefix}[/:]`, 'i');
+  const providerPattern = new RegExp(`^${providerPrefix}($|[.\\-])`, 'i');
+
+  if (typeof model === 'string') {
+    // Common forms: 'provider/...' (mastra gateway prefix), 'provider:...' (some routers)
+    return gatewayPattern.test(model);
+  }
+
+  if (typeof model === 'object') {
+    const { provider, modelId } = model as { provider?: unknown; modelId?: unknown };
+    if (typeof provider === 'string' && providerPattern.test(provider)) return true;
+    if (typeof modelId === 'string') return gatewayPattern.test(modelId);
+  }
+
+  return false;
+}
+
+/**
+ * Extract the exact provider id from a resolved model — the same value
+ * `buildResponseModelMetadata` stamps onto each persisted assistant turn.
+ * Returns `undefined` for unresolved string ids and dynamic functions, where
+ * no reliable provider identity exists.
+ */
+function getModelProviderId(model: unknown): string | undefined {
+  if (model == null || typeof model === 'function' || typeof model === 'string') return undefined;
+
+  if (Array.isArray(model)) {
+    for (const entry of model) {
+      const provider = getModelProviderId((entry as { model?: unknown }).model ?? entry);
+      if (provider) return provider;
+    }
+    return undefined;
+  }
+
+  if (typeof model === 'object') {
+    const provider = (model as { provider?: unknown }).provider;
+    return typeof provider === 'string' && provider.length > 0 ? provider : undefined;
+  }
+
+  return undefined;
+}
+
+export function isMaybeCerebras(
+  model:
+    | string
+    | { provider?: string; modelId?: string }
+    | ((...args: any[]) => any)
+    | { model: any; enabled?: boolean }[]
+    | unknown,
+): boolean {
+  return matchesProviderPrefix(model, 'cerebras');
+}
+
+export function isMaybeAnthropic(
+  model:
+    | string
+    | { provider?: string; modelId?: string }
+    | ((...args: any[]) => any)
+    | { model: any; enabled?: boolean }[]
+    | unknown,
+): boolean {
+  return matchesProviderPrefix(model, 'anthropic');
+}
+
+type ProviderFamily = 'anthropic' | 'openai' | 'google';
+
+function getModelProviderFamily(model: unknown): ProviderFamily | undefined {
+  if (matchesProviderPrefix(model, 'anthropic')) return 'anthropic';
+  if (matchesProviderPrefix(model, 'openai') || matchesProviderPrefix(model, 'azure')) return 'openai';
+  if (matchesProviderPrefix(model, 'google') || matchesProviderPrefix(model, 'vertex')) return 'google';
+  return undefined;
+}
+
+function getPartProviderFamily(part: { providerOptions?: unknown }): ProviderFamily | undefined {
+  if (!part.providerOptions || typeof part.providerOptions !== 'object') return undefined;
+  const providers = Object.keys(part.providerOptions);
+  if (providers.some(provider => provider === 'anthropic')) return 'anthropic';
+  if (providers.some(provider => provider === 'openai' || provider === 'azure')) return 'openai';
+  if (providers.some(provider => provider === 'google' || provider === 'vertex')) return 'google';
+  return undefined;
+}
+
+/**
+ * Provider-executed tools are provider-owned continuation state. A foreign
+ * provider cannot resolve their IDs, so remove the call and paired result from
+ * the outbound prompt while leaving persisted history untouched.
+ */
+export const stripForeignProviderExecutedTools: CompatRule = {
+  name: 'strip-foreign-provider-executed-tools',
+  applyToPrompt({ prompt, model }) {
+    const destinationProvider = getModelProviderFamily(model);
+    if (!destinationProvider) return undefined;
+
+    const foreignToolCallIds = new Set<string>();
+    for (const message of prompt) {
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) continue;
+      for (const part of message.content) {
+        if (part.type !== 'tool-call' || !part.providerExecuted) continue;
+        const sourceProvider = getPartProviderFamily(part);
+        if (sourceProvider && sourceProvider !== destinationProvider) {
+          foreignToolCallIds.add(part.toolCallId);
+        }
+      }
+    }
+
+    if (foreignToolCallIds.size === 0) return undefined;
+
+    const rewritten: LanguageModelV2Prompt = [];
+    for (const message of prompt) {
+      if (message.role === 'assistant') {
+        const content = message.content.filter(
+          part =>
+            (part.type !== 'tool-call' && part.type !== 'tool-result') || !foreignToolCallIds.has(part.toolCallId),
+        );
+        if (content.length > 0) rewritten.push({ ...message, content });
+        continue;
+      }
+
+      if (message.role === 'tool') {
+        const content = message.content.filter(part => !foreignToolCallIds.has(part.toolCallId));
+        if (content.length > 0) rewritten.push({ ...message, content });
+        continue;
+      }
+
+      rewritten.push(message);
+    }
+    return rewritten;
+  },
+};
+
+const CLAUDE_VERSION_PATTERN = /claude-(?:(?:opus|sonnet|haiku)-)?(\d+)(?:[.-](\d+))?/i;
+
+function supportsAssistantPrefill(modelId: string): boolean | undefined {
+  const match = CLAUDE_VERSION_PATTERN.exec(modelId);
+  if (!match) return undefined;
+
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? 0);
+  return major < 4 || (major === 4 && minor < 6);
+}
+
+const GEMINI_VERSION_PATTERN = /gemini-(\d+)/i;
+
+function supportsTrailingModelTurn(modelId: string): boolean | undefined {
+  const match = GEMINI_VERSION_PATTERN.exec(modelId);
+  if (!match) return undefined;
+
+  return Number(match[1]) < 3;
+}
+
+/**
+ * Detects Anthropic models that removed assistant-message prefill support.
+ * Claude 4.6 and later reject assistant-prefill requests, while earlier
+ * models retain support. Unknown Anthropic model versions are matched
+ * conservatively so a new model cannot silently bypass compatibility guards.
+ */
+export function isMaybeAnthropicWithoutAssistantPrefill(model: unknown): boolean {
+  if (typeof model === 'function') return true;
+
+  if (Array.isArray(model)) {
+    return model.some(entry => isMaybeAnthropicWithoutAssistantPrefill((entry as { model?: unknown }).model ?? entry));
+  }
+
+  if (!isMaybeAnthropic(model)) return false;
+
+  const modelId =
+    typeof model === 'string'
+      ? model
+      : model && typeof model === 'object' && typeof (model as { modelId?: unknown }).modelId === 'string'
+        ? (model as { modelId: string }).modelId
+        : undefined;
+
+  if (!modelId) return true;
+  return supportsAssistantPrefill(modelId) !== true;
+}
+
+/**
+ * Detects Google models that reject a request ending on a model turn.
+ *
+ * Gemini 3 and later return 400 "Requests ending with a model turn are not
+ * supported"; Gemini 2.x accepted the same prompt, including under native
+ * structured output. Unknown Google model versions are matched conservatively
+ * so a new model cannot silently bypass compatibility guards.
+ *
+ * @see https://github.com/mastra-ai/mastra/issues/23320
+ */
+export function isMaybeGoogleWithoutTrailingModelTurn(model: unknown): boolean {
+  if (typeof model === 'function') return true;
+
+  if (Array.isArray(model)) {
+    return model.some(entry => isMaybeGoogleWithoutTrailingModelTurn((entry as { model?: unknown }).model ?? entry));
+  }
+
+  if (getModelProviderFamily(model) !== 'google') return false;
+
+  const modelId =
+    typeof model === 'string'
+      ? model
+      : model && typeof model === 'object' && typeof (model as { modelId?: unknown }).modelId === 'string'
+        ? (model as { modelId: string }).modelId
+        : undefined;
+
+  if (!modelId) return true;
+  return supportsTrailingModelTurn(modelId) !== true;
+}
+
+export function isMaybeAzure(
+  model:
+    | string
+    | { provider?: string; modelId?: string }
+    | ((...args: any[]) => any)
+    | { model: any; enabled?: boolean }[]
+    | unknown,
+): boolean {
+  if (Array.isArray(model)) {
+    return model.some(entry => isMaybeAzure((entry as { model?: unknown }).model ?? entry));
+  }
+
+  if (model && typeof model === 'object') {
+    const { provider, modelId } = model as { provider?: unknown; modelId?: unknown };
+    if (typeof provider === 'string' && /^(?:azure|azure-openai)(?:\.[a-z0-9_-]+)?$/i.test(provider)) {
+      return true;
+    }
+
+    return (
+      typeof modelId === 'string' &&
+      (matchesProviderPrefix(modelId, 'azure') || matchesProviderPrefix(modelId, 'azure-openai'))
+    );
+  }
+
+  return matchesProviderPrefix(model, 'azure') || matchesProviderPrefix(model, 'azure-openai');
+}
+
+/**
+ * Detects providers that reject a conversation whose first non-system turn is
+ * the assistant's: Amazon Bedrock ("A conversation must start with a user
+ * message") and Google/Vertex Gemini. OpenAI, Anthropic, Groq, Mistral,
+ * DeepSeek and Cerebras accept that shape, so they are left alone.
+ *
+ * @see https://github.com/mastra-ai/mastra/issues/5465
+ * @see https://github.com/mastra-ai/mastra/issues/8053
+ */
+export function isMaybeRequiringUserFirstTurn(model: unknown): boolean {
+  return (
+    getModelProviderFamily(model) === 'google' ||
+    matchesProviderPrefix(model, 'amazon') ||
+    matchesProviderPrefix(model, 'amazon-bedrock') ||
+    matchesProviderPrefix(model, 'bedrock')
+  );
+}
+
+/**
+ * Inserts a minimal user turn ahead of a leading assistant turn for providers
+ * that require conversations to start with the user (see
+ * {@link isMaybeRequiringUserFirstTurn}). History windows commonly start on an
+ * assistant turn — agents that greet first, or `lastMessages` cutting into a
+ * thread — and those providers reject the whole request otherwise.
+ */
+export const ensureUserFirstTurn = {
+  name: 'ensure-user-first-turn',
+  applyToPrompt({
+    prompt,
+    model,
+  }: {
+    prompt: LanguageModelV2Prompt;
+    model: unknown;
+  }): LanguageModelV2Prompt | undefined {
+    if (!isMaybeRequiringUserFirstTurn(model)) return undefined;
+
+    const firstTurnIndex = prompt.findIndex(message => message.role !== 'system');
+    if (firstTurnIndex === -1 || prompt[firstTurnIndex]!.role !== 'assistant') return undefined;
+
+    return [
+      ...prompt.slice(0, firstTurnIndex),
+      { role: 'user', content: [{ type: 'text', text: '.' }] },
+      ...prompt.slice(firstTurnIndex),
+    ];
+  },
+} satisfies CompatRule;
+
+/**
+ * Returns the index of the trailing assistant message whose thinking blocks
+ * Anthropic verifies byte-for-byte: the last message when it is an assistant
+ * message, or the assistant message that only has tool messages after it (an
+ * active tool-use continuation). Returns `-1` when no such message exists —
+ * e.g. when the prompt ends with a fresh user turn, in which case Anthropic
+ * ignores thinking blocks on earlier assistant messages.
+ */
+function getProtectedAssistantIndex(prompt: LanguageModelV2Prompt): number {
+  for (let i = prompt.length - 1; i >= 0; i--) {
+    const role = prompt[i]!.role;
+    if (role === 'assistant') return i;
+    if (role !== 'tool') return -1;
+  }
+  return -1;
+}
+
+/**
+ * Returns a copy of the prompt with selected `reasoning` parts stripped from
+ * assistant messages, dropping any assistant message left with no content.
+ * Returns `undefined` if no changes were necessary.
+ *
+ * `skipIndex` excludes one message from stripping — used to protect the
+ * trailing assistant message of an active tool-use continuation, which
+ * Anthropic requires to be replayed unmodified ("`thinking` or
+ * `redacted_thinking` blocks in the latest assistant message cannot be
+ * modified").
+ */
+function stripReasoningFromPrompt(
+  prompt: LanguageModelV2Prompt,
+  shouldStrip: (
+    part: Extract<
+      Extract<LanguageModelV2Prompt[number], { role: 'assistant' }>['content'][number],
+      { type: 'reasoning' }
+    >,
+  ) => boolean = () => true,
+  skipIndex = -1,
+): LanguageModelV2Prompt | undefined {
+  let mutated = false;
+  const next: LanguageModelV2Prompt = [];
+  for (let index = 0; index < prompt.length; index++) {
+    const message = prompt[index]!;
+    if (
+      index === skipIndex ||
+      message.role !== 'assistant' ||
+      typeof message.content === 'string' ||
+      !Array.isArray(message.content)
+    ) {
+      next.push(message);
+      continue;
+    }
+    const filtered = message.content.filter(part => part.type !== 'reasoning' || !shouldStrip(part as any));
+    if (filtered.length === message.content.length) {
+      next.push(message);
+      continue;
+    }
+    mutated = true;
+    // A reasoning-only turn is emptied by the strip. Processors run after
+    // conversion, so the empty-content filter in MessageList no longer
+    // applies — Anthropic rejects empty assistant content, so drop the
+    // message itself (same idiom as anthropicStripForeignSignedReasoning).
+    if (filtered.length === 0) continue;
+    next.push({ ...message, content: filtered });
+  }
+  return mutated ? next : undefined;
+}
+
+function isAnthropicReasoningPart(part: { providerOptions?: unknown; providerMetadata?: unknown }): boolean {
+  const providerOptions = part.providerOptions;
+  if (providerOptions && typeof providerOptions === 'object' && 'anthropic' in providerOptions) return true;
+
+  const providerMetadata = part.providerMetadata;
+  if (providerMetadata && typeof providerMetadata === 'object' && 'anthropic' in providerMetadata) return true;
+
+  return false;
+}
+
+function getProtectedAnthropicAssistantIndex(prompt: LanguageModelV2Prompt): number {
+  const index = getProtectedAssistantIndex(prompt);
+  if (index === -1) return -1;
+
+  const message = prompt[index]!;
+  if (message.role !== 'assistant' || !Array.isArray(message.content)) return -1;
+
+  return message.content.some(part => part.type === 'reasoning' && isAnthropicReasoningPart(part)) ? index : -1;
+}
+
+function getProviderMetadataForProvider(metadata: unknown, provider: string): Record<string, unknown> | undefined {
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const value = (metadata as Record<string, unknown>)[provider];
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+}
+
+function isEmptySignedReasoning(part: MastraDBMessage['content']['parts'][number]): boolean {
+  if (part.type !== 'reasoning') return false;
+  const signature = getProviderMetadataForProvider(part.providerMetadata, 'anthropic')?.signature;
+  if (typeof signature !== 'string' || signature.length === 0) return false;
+  const hasText =
+    (typeof part.reasoning === 'string' && part.reasoning.length > 0) ||
+    (part.details ?? []).some(detail => detail.type === 'text' && detail.text.length > 0);
+  return !hasText;
+}
+
+/**
+ * Cerebras's API rejects assistant messages carrying a `reasoning_content`
+ * field with HTTP 400 (`property '...reasoning_content' is unsupported`).
+ *
+ * Starting in `@ai-sdk/openai-compatible@1.0.32` (https://github.com/vercel/ai/pull/12049),
+ * which `@ai-sdk/cerebras` depends on, reasoning parts on assistant messages
+ * are unconditionally serialized as `reasoning_content` on outbound requests.
+ * That breaks multi-turn tool calls with reasoning enabled (e.g.
+ * `cerebras/zai-glm-4.7`) on the second-or-later assistant turn.
+ *
+ * This rule preemptively strips `reasoning` parts from assistant messages
+ * in the outbound prompt when the resolved model is Cerebras. The strip
+ * runs in `processLLMRequest` so it affects only what is sent to Cerebras —
+ * the persisted message list (memory, UI, observability) keeps the full
+ * reasoning trace, and other providers (e.g. Z.ai's coding-plan endpoint,
+ * which *requires* `reasoning_content` echoed back for its preserved-thinking
+ * feature) are unaffected because the rule is provider-scoped.
+ *
+ * It can't be reactive (`processAPIError`) because the model emits a fresh
+ * reasoning part on every turn — a reactive rule would cause one
+ * failed-and-retried request per turn.
+ *
+ * Once https://github.com/vercel/ai/pull/11278 lands a per-provider
+ * `sendReasoning` opt-out, this rule can be replaced with `sendReasoning: false`
+ * on the cerebras provider config.
+ */
+export const cerebrasStripReasoningContent: CompatRule = {
+  name: 'cerebras-strip-reasoning-content',
+  applyToPrompt({ prompt, model }) {
+    if (!isMaybeCerebras(model)) return undefined;
+    return stripReasoningFromPrompt(prompt);
+  },
+};
+
+/**
+ * Legacy records could contain Anthropic signed thinking metadata with an
+ * empty reasoning text. Anthropic signs the exact thinking text, so replaying
+ * that mismatched pair is rejected with the "thinking blocks cannot be
+ * modified" 400.
+ *
+ * Reactive, because an empty text with a signature is not by itself a sign of
+ * corruption: Claude 5.x returns exactly that for every thinking block when
+ * `display` is left at its default (`omitted`). Stripping those up front would
+ * change the prompt prefix on every step and break prompt caching, so the
+ * blocks are only dropped, from earlier assistant messages, once Anthropic has
+ * actually rejected the history.
+ *
+ * @see https://github.com/mastra-ai/mastra/issues/28309
+ */
+export const anthropicStripEmptySignedReasoningContent: CompatRule = {
+  name: 'anthropic-strip-empty-signed-reasoning-content',
+  errorPatterns: [/thinking`? or `?redacted_thinking`? blocks in the latest assistant message cannot be modified/i],
+  fix(messages) {
+    let mutated = false;
+    // The trailing assistant message of an active tool continuation is the one
+    // Anthropic requires unmodified, so it is never touched.
+    const protectedIndex = messages.at(-1)?.role === 'assistant' ? messages.length - 1 : -1;
+
+    messages.forEach((message, index) => {
+      const parts = message.content?.parts;
+      if (message.role !== 'assistant' || index === protectedIndex || !parts?.length) return;
+
+      const kept = parts.filter(part => !isEmptySignedReasoning(part));
+      if (kept.length === parts.length) return;
+      parts.splice(0, parts.length, ...kept);
+      mutated = true;
+    });
+
+    return mutated;
+  },
+};
+
+/**
+ * Anthropic accepts its own thinking/reasoning history, but rejects reasoning
+ * parts emitted by other providers. Strip only foreign reasoning parts at the
+ * Anthropic provider boundary so persisted history remains intact and native
+ * Anthropic thinking can still round-trip.
+ */
+export const anthropicStripForeignReasoningContent: CompatRule = {
+  name: 'anthropic-strip-foreign-reasoning-content',
+  applyToPrompt({ prompt, model }) {
+    if (!isMaybeAnthropic(model)) return undefined;
+    return stripReasoningFromPrompt(
+      prompt,
+      part => !isAnthropicReasoningPart(part),
+      getProtectedAnthropicAssistantIndex(prompt),
+    );
+  },
+};
+
+/**
+ * Replays of signed `thinking`/`redacted_thinking` blocks to a provider other
+ * than the one that signed them are rejected — Anthropic returns
+ * `Invalid \`signature\` in \`thinking\` block`.
+ *
+ * Several providers are served through `@ai-sdk/anthropic` and therefore write
+ * their reasoning metadata under the same `anthropic` key — Kimi For Coding
+ * talks to `api.kimi.com` over the Anthropic wire format — so a signature's
+ * `anthropic` key alone cannot tell which provider signed it. The durable
+ * provenance is the `provider` each assistant turn was stamped with by
+ * `buildResponseModelMetadata`, which only the persisted message list carries.
+ *
+ * Reasoning parts whose signature came from a turn stamped with a provider
+ * different from the current target are dropped from the outbound prompt, so
+ * the rejection never happens. Unstamped history is left untouched — turns
+ * persisted before their provider had a distinct identity stay ambiguous and
+ * are forwarded as-is. Turns emptied of all content by the drop are removed
+ * from the prompt (Anthropic rejects empty assistant content).
+ */
+export const anthropicStripForeignSignedReasoning: CompatRule = {
+  name: 'anthropic-strip-foreign-signed-reasoning',
+  applyToPrompt({ prompt, model, messageList }) {
+    if (!messageList) return undefined;
+    const targetProvider = getModelProviderId(model);
+    if (!targetProvider) return undefined;
+
+    // Collect the signatures of every signed reasoning block whose origin
+    // turn was stamped with a provider different from this request's target.
+    const foreign = new Map<string, string>(); // signature -> origin provider
+    for (const dbMessage of messageList.get.all.db()) {
+      if (dbMessage.role !== 'assistant') continue;
+      if (dbMessage.content?.format !== 2) continue;
+      const origin = dbMessage.content.metadata?.provider;
+      if (typeof origin !== 'string' || origin === targetProvider) continue;
+      for (const part of dbMessage.content.parts ?? []) {
+        if (part.type !== 'reasoning') continue;
+        const anthropic = part.providerMetadata?.anthropic as
+          | { signature?: unknown; redactedData?: unknown }
+          | undefined;
+        for (const value of [anthropic?.signature, anthropic?.redactedData]) {
+          if (typeof value === 'string' && value && !foreign.has(value)) foreign.set(value, origin);
+        }
+      }
+    }
+    if (foreign.size === 0) return undefined;
+
+    let dropped = 0;
+    const next: LanguageModelV2Prompt = [];
+    for (const message of prompt) {
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) {
+        next.push(message);
+        continue;
+      }
+      const content = message.content.filter(part => {
+        if (part.type !== 'reasoning') return true;
+        const anthropic = part.providerOptions?.anthropic as
+          | { signature?: unknown; redactedData?: unknown }
+          | undefined;
+        const signature = anthropic?.signature ?? anthropic?.redactedData;
+        if (typeof signature === 'string' && foreign.has(signature)) {
+          dropped++;
+          return false;
+        }
+        return true;
+      });
+      if (content.length === message.content.length) {
+        next.push(message);
+        continue;
+      }
+      // A turn that held only foreign signed thinking is emptied by the drop.
+      // Processors run after conversion, so the empty-content filter in
+      // MessageList no longer applies — Anthropic rejects empty assistant
+      // content, so drop the message itself (same idiom as
+      // stripForeignProviderExecutedTools).
+      if (content.length > 0) next.push({ ...message, content });
+    }
+
+    return dropped > 0 ? next : undefined;
+  },
+};
+
+const SYSTEM_REMINDER_OPEN_TAG = /<system-reminder(?=\s|\/?>)([^>]*)>/g;
+const SYSTEM_REMINDER_CLOSE_TAG = /<\/system-reminder>/g;
+
+function rewriteSystemReminderTags(text: string): string {
+  return text
+    .replace(SYSTEM_REMINDER_OPEN_TAG, '<memory-context$1>')
+    .replace(SYSTEM_REMINDER_CLOSE_TAG, '</memory-context>');
+}
+
+/**
+ * Azure OpenAI's content moderation can classify `<system-reminder>` wrappers
+ * in user messages as prompt injection. Rename the wrapper at the provider
+ * boundary while leaving persisted history and other providers unchanged.
+ */
+export const azureSystemReminderTransform: CompatRule = {
+  name: 'azure-system-reminder-transform',
+  applyToPrompt({ prompt, model }) {
+    if (!isMaybeAzure(model)) return undefined;
+
+    let mutated = false;
+    const next: LanguageModelV2Prompt = prompt.map(message => {
+      if (message.role === 'system') {
+        const content = rewriteSystemReminderTags(message.content);
+        if (content === message.content) return message;
+        mutated = true;
+        return { ...message, content };
+      }
+
+      if (message.role !== 'user') return message;
+
+      let messageMutated = false;
+      const content = message.content.map(part => {
+        if (part.type !== 'text') return part;
+        const text = rewriteSystemReminderTags(part.text);
+        if (text === part.text) return part;
+        mutated = true;
+        messageMutated = true;
+        return { ...part, text };
+      });
+
+      return messageMutated ? { ...message, content } : message;
+    });
+
+    return mutated ? next : undefined;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Built-in rule: orphaned Responses message itemId (OpenAI / Azure)
+// ---------------------------------------------------------------------------
+
+function hasReasoningPart(message: MastraDBMessage): boolean {
+  return (message.content?.parts ?? []).some(p => p.type === 'reasoning');
+}
+
+/**
+ * True when `message` looks like the leading half of a turn that storage split across two
+ * assistant rows: it carries a reasoning item and has not yet produced text of its own. A
+ * following text row is then covered by that reasoning item.
+ *
+ * Deliberately not "has any reasoning part" — a previous row that already paired its own
+ * reasoning with its own text says nothing about the row after it, and treating it as cover
+ * would leave a genuine orphan unrepaired. The retry would then hit the same 400, and
+ * `processAPIError` stops after its second pass, turning a recoverable turn into a hard failure.
+ */
+function isUnpairedReasoningRow(message: MastraDBMessage): boolean {
+  const parts = message.content?.parts ?? [];
+  return parts.some(p => p.type === 'reasoning') && !parts.some(p => p.type === 'text');
+}
+
+/**
+ * Strips `itemId` and its result-side partner from every Responses namespace a
+ * part carries, in both metadata containers, leaving every other field (cache
+ * counts, reasoning-token counts, logprobs) intact. Mirrors the narrow
+ * destructure in `client-sdks/ai-sdk/src/helpers.ts` (PR #23323).
+ *
+ * {@link RESPONSE_RESULT_ITEM_ID_KEY} has to go with it: a merged tool part
+ * keeps the result half of the pair under that key, and
+ * `splitResponsesToolItemReferences` turns it back into an `itemId` on the
+ * tool-result part during conversion. Dropping only `itemId` would leave a
+ * live reference into the very response that was rejected.
+ *
+ * Both `providerMetadata` and `providerOptions` are cleared because
+ * {@link getResponseProviderItemIdFromPart} reads an id from either, so
+ * leaving one behind would report a part as still item-bearing — and would
+ * leave the unsatisfiable reference in the prompt, which is the whole failure.
+ *
+ * Returns true when it removed an id.
+ */
+function stripResponseItemIds(part: MastraMessagePart): boolean {
+  const containers = [
+    (part as { providerMetadata?: Record<string, unknown> }).providerMetadata,
+    (part as { providerOptions?: Record<string, unknown> }).providerOptions,
+  ];
+
+  let stripped = false;
+  for (const container of containers) {
+    if (!container) continue;
+    for (const provider of RESPONSE_ITEM_ID_PROVIDERS) {
+      const namespace = container[provider] as Record<string, unknown> | undefined;
+      if (!namespace) continue;
+      if (!('itemId' in namespace) && !(RESPONSE_RESULT_ITEM_ID_KEY in namespace)) continue;
+      const { itemId: _itemId, [RESPONSE_RESULT_ITEM_ID_KEY]: _resultItemId, ...rest } = namespace;
+      container[provider] = rest;
+      stripped = true;
+    }
+  }
+  return stripped;
+}
+
+/**
+ * OpenAI's Responses API replays a persisted assistant message by reference
+ * (`item_reference`) when the message carries an `itemId` (`msg_…`). If that
+ * message has no accompanying `reasoning` item, the request is rejected with a
+ * non-retryable 400:
+ *
+ * ```
+ * Item 'msg_…' of type 'message' was provided without its required 'reasoning' item: 'rs_…'
+ * ```
+ *
+ * Because the offending message is already persisted, that 400 repeats on every
+ * subsequent turn, and the thread stops working. This rule is a recovery
+ * seatbelt for histories that are *already* corrupted: dropping the `itemId`
+ * makes the message replay by value instead of by reference, which OpenAI
+ * accepts. The content the user sees is unchanged.
+ *
+ * The repair is in-memory for the current turn: a message sourced from storage
+ * is not re-drained, so a later turn on the same thread spends one rejected
+ * request before recovering again. Same property as `anthropicToolIdFormat`.
+ *
+ * Reactive by design — it fires only after OpenAI has actually rejected the
+ * request, so a legitimately reasoning-free message (e.g.
+ * `reasoning.effort: 'none'`, or a non-reasoning model) is untouched on any
+ * thread that has not already hit this 400. Once it has, see the collateral
+ * note below.
+ *
+ * Deliberately narrow:
+ * - Matches only the `of type 'message'` phrasing. The sibling `function_call`
+ *   (`fc_…`) variant is a different failure, addressed by PR #19408. Matching
+ *   narrowly is not the same as repairing narrowly, though: once a message is
+ *   established as an orphan, every item reference it carries is unsatisfiable
+ *   for the same reason, so the repair covers all of them. A message whose
+ *   `msg_…` id was dropped while its `fc_…` id stayed would simply fail on the
+ *   next item in the list, spending the one available retry to arrive at the
+ *   same error.
+ * - Strips only the item-reference keys (`itemId` and its result-side partner
+ *   `resultItemId`); all other fields in the namespace survive.
+ * - Reads and strips through the shared Responses helpers, so the `azure`
+ *   namespace is covered on the same footing as `openai` — the repo treats
+ *   them as one Responses family, and Azure raises this same 400.
+ * - Skips a message whose reasoning lives on the immediately preceding
+ *   assistant row, when that row has reasoning and no text of its own. Stored
+ *   history can split one turn across adjacent assistant rows (adjacent rows
+ *   are merged when streamed, but not when loaded from storage), and in that
+ *   case the reasoning item *is* present in the prompt — stripping the id
+ *   there would fix nothing and would discard a valid reference. A preceding
+ *   row that already paired its own reasoning with its own text is not cover
+ *   and does not suppress the repair.
+ *
+ * Not covered by that guard, deliberately: the `assistant[reasoning, tool-call]
+ * → tool[result] → assistant[text]` shape, where the preceding entry is a tool
+ * message. If OpenAI rejected the text item there, its reference is genuinely
+ * unsatisfiable and stripping is the right repair.
+ *
+ * The rule repairs every orphan-shaped message in the history rather than only
+ * the id named in the error, because `fix` does not receive the error and the
+ * error names only the first item OpenAI tripped over. Healing that one id
+ * would trade a permanent failure for N sequential ones, and there is a single
+ * retry available, not N.
+ *
+ * The cost of that breadth: in a thread that mixes a reasoning model with a
+ * non-reasoning Responses model, the non-reasoning turns are also orphan-shaped
+ * (an `itemId`, no reasoning) but are perfectly valid, and they lose their item
+ * references too. Ordinary text and tool parts still replay correctly — by
+ * value instead of by reference — so for them the effect is a lost item
+ * reference, not a failure.
+ *
+ * One part type pays more than a reference. A hosted `tool_search` call cannot
+ * be replayed by value at all, so `isUnreplayableHostedToolSearchPart`
+ * (`output-converter.ts`) drops it from the prompt once its ids are gone. On a
+ * genuinely orphaned message that is the right outcome — the ids pointed into
+ * the rejected response. On a swept-along valid message it costs the model that
+ * search result, and it would have to search again. That is accepted: the
+ * asymmetry is still deliberate, because under-stripping ends the turn outright
+ * while over-stripping costs a reference, or at worst one hosted search.
+ *
+ * Known limitation: the guard reasons about message *shape*, because the
+ * required `rs_…` id named in the error is not available to `fix`. A turn whose
+ * reasoning row belongs to a different turn could in principle be skipped
+ * when it should have been repaired. That case degrades to today's behavior — the turn
+ * fails as it already does — so the guard can cost a recovery, never cause a
+ * new failure.
+ *
+ * This is a seatbelt, not the cure: the path that produces these orphans is
+ * fixed separately in the processor-retry rollback (#22291).
+ */
+export const openaiOrphanItemId: CompatRule = {
+  name: 'openai-orphan-item-id',
+  errorPatterns: [/Item '[^']*' of type 'message' was provided without its required 'reasoning' item/i],
+  fix(messages) {
+    let mutated = false;
+
+    messages.forEach((message, index) => {
+      if (message.role !== 'assistant') return;
+
+      const parts = message.content?.parts;
+      if (!parts?.length) return;
+      if (hasReasoningPart(message)) return;
+
+      // Split-history guard: the reasoning item for this turn may sit on the
+      // preceding assistant row, in which case the reference is satisfiable.
+      const previous = messages[index - 1];
+      if (previous?.role === 'assistant' && isUnpairedReasoningRow(previous)) return;
+
+      for (const part of parts) {
+        if (!getResponseProviderItemIdFromPart(part)) continue;
+        mutated = stripResponseItemIds(part) || mutated;
+      }
+    });
+
+    return mutated;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Built-in rule: Anthropic orphaned thinking step (reactive)
+// ---------------------------------------------------------------------------
+
+/**
+ * Removes steps that hold nothing but reasoning when more assistant content
+ * follows them. The step's other parts were lost (older `@mastra/memory`
+ * releases stripped an `updateWorkingMemory` call and kept its thinking), so
+ * `@ai-sdk/anthropic` merges the leftover signed thinking into the next
+ * assistant step — a shape Anthropic rejects on every later turn.
+ *
+ * Reactive (matches Anthropic's "cannot be modified" 400); a recovery seatbelt
+ * for history saved before the strip was fixed.
+ *
+ * @see https://github.com/mastra-ai/mastra/issues/22798
+ */
+export const anthropicOrphanedThinkingStep: CompatRule = {
+  name: 'anthropic-orphaned-thinking-step',
+  errorPatterns: [/thinking`? or `?redacted_thinking`? blocks in the latest assistant message cannot be modified/i],
+  fix(messages) {
+    let mutated = false;
+
+    messages.forEach((message, index) => {
+      const parts = message.content?.parts;
+      if (message.role !== 'assistant' || !parts?.length) return;
+
+      const followedByAssistant = messages[index + 1]?.role === 'assistant';
+      // A step starts at a `step-start` part, or where a tool part is followed by a
+      // non-tool part (the boundary prompt conversion uses when markers are missing).
+      const steps: (typeof parts)[] = [];
+      parts.forEach((part, i) => {
+        const previous = parts[i - 1];
+        const startsStep =
+          part.type === 'step-start' || (previous?.type === 'tool-invocation' && part.type !== 'tool-invocation');
+        if (startsStep || steps.length === 0) steps.push([]);
+        steps[steps.length - 1]!.push(part);
+      });
+
+      const kept = steps.filter((step, i) => {
+        const content = step.filter(
+          part => part.type !== 'step-start' && !(part.type === 'text' && !part.text?.trim()),
+        );
+        const reasoningOnly = content.length > 0 && content.every(part => part.type === 'reasoning');
+        return !reasoningOnly || (i === steps.length - 1 && !followedByAssistant);
+      });
+
+      if (kept.length === steps.length) return;
+      parts.splice(0, parts.length, ...kept.flat());
+      mutated = true;
+    });
+
+    return mutated;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Built-in rule: single leading system message for Chat Completions
+// ---------------------------------------------------------------------------
+
+/**
+ * Merges the leading system messages of a Chat Completions request into one.
+ *
+ * Whether a server accepts several system messages depends on the host's chat template, not the
+ * model or provider: the same Qwen3.5 weights are accepted by some hosts and rejected with
+ * `System message must be at the beginning` by others. One leading system message is valid
+ * everywhere.
+ *
+ * Applies when the API provider id ends in `.chat` (`openai.chat`, `groq.chat`, `<name>.chat`
+ * from `createOpenAICompatible`, ...). Native APIs with a dedicated system field (`anthropic`,
+ * `google.generative-ai`, `bedrock`) and Responses APIs never do. Prompts are left unchanged when
+ * any merged message other than the last carries `providerOptions` (e.g. a cache breakpoint),
+ * since merging would drop it.
+ *
+ * @see https://github.com/mastra-ai/mastra/issues/25435
+ */
+export const chatCompletionsSingleSystemMessage: CompatRule = {
+  name: 'chat-completions-single-system-message',
+  applyToPrompt({ prompt, model, apiProviderId }) {
+    if (!(apiProviderId ?? getModelProviderId(model))?.endsWith('.chat')) return undefined;
+
+    let leading = 0;
+    while (leading < prompt.length && prompt[leading]!.role === 'system') leading++;
+    if (leading < 2) return undefined;
+
+    const leadingMessages = prompt.slice(0, leading) as Extract<LanguageModelV2Prompt[number], { role: 'system' }>[];
+    if (leadingMessages.slice(0, -1).some(m => m.providerOptions)) return undefined;
+
+    const content = leadingMessages
+      .map(m => m.content)
+      .filter(text => text.length > 0)
+      .join('\n\n');
+    const { providerOptions } = leadingMessages[leading - 1]!;
+    return [{ role: 'system', content, ...(providerOptions ? { providerOptions } : {}) }, ...prompt.slice(leading)];
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Built-in rule: tool calls without input
+// ---------------------------------------------------------------------------
+
+/**
+ * Sends an assistant tool call that has no input (`undefined` or `null`) as `{}`.
+ *
+ * A call whose arguments could not be parsed is stored as an `output-error` tool part with no
+ * `args`. Replayed as-is, providers reject every later request on the thread (Anthropic:
+ * `tool_use.input: Field required`; OpenAI-compatible: `function.arguments must be defined`).
+ * The error result stays paired with the call; only the call's input is filled in. An empty string
+ * is a real stored input, not a missing one, and is left as it is.
+ *
+ * Applies to every provider, runs in `processLLMRequest` so the stored message keeps its shape.
+ */
+export const toolCallEmptyInput: CompatRule = {
+  name: 'tool-call-empty-input',
+  applyToPrompt({ prompt }) {
+    const isEmpty = (part: { type: string; input?: unknown }) =>
+      part.type === 'tool-call' && (part.input === undefined || part.input === null);
+    if (!prompt.some(m => m.role === 'assistant' && Array.isArray(m.content) && m.content.some(isEmpty))) {
+      return undefined;
+    }
+
+    return prompt.map(message =>
+      message.role === 'assistant' && Array.isArray(message.content)
+        ? { ...message, content: message.content.map(part => (isEmpty(part) ? { ...part, input: {} } : part)) }
+        : message,
+    ) as LanguageModelV2Prompt;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Default rule set
+// ---------------------------------------------------------------------------
+
+/**
+ * All built-in compat rules. Extend by passing additional rules to the
+ * `ProviderHistoryCompat` constructor.
+ */
+export const DEFAULT_COMPAT_RULES: CompatRule[] = [
+  stripForeignProviderExecutedTools,
+  anthropicToolIdFormat,
+  cerebrasStripReasoningContent,
+  // Both reactive Anthropic rules match the same "cannot be modified" 400 and `processAPIError` stops
+  // at the first rule that changes history. The orphaned-step repair goes first: it only removes a
+  // step that is provably broken, whereas the empty-signed strip also removes blocks that may be
+  // valid (Claude 5.x), so it must only run when no orphaned step explains the 400.
+  anthropicOrphanedThinkingStep,
+  anthropicStripEmptySignedReasoningContent,
+  anthropicStripForeignReasoningContent,
+  anthropicStripForeignSignedReasoning,
+  azureSystemReminderTransform,
+  openaiOrphanItemId,
+  chatCompletionsSingleSystemMessage,
+  toolCallEmptyInput,
+  // Last, so it sees the prompt after other rules have dropped emptied turns.
+  ensureUserFirstTurn,
+];
+
+// ---------------------------------------------------------------------------
+// Processor
+// ---------------------------------------------------------------------------
+
+/**
+ * Handles provider-specific history incompatibilities by applying a registry
+ * of {@link CompatRule}s. Rules can rewrite the outbound prompt preemptively
+ * via `processLLMRequest`, or react to non-retryable API rejections via
+ * `processAPIError`.
+ *
+ * Built-in rules:
+ * - **anthropic-tool-id-format** — rewrites tool-call IDs that contain
+ *   characters outside `[a-zA-Z0-9_-]` (e.g. `.` or `:` from other
+ *   providers). Preemptive; runs in `processLLMRequest` so the persisted
+ *   message list keeps its original IDs. Both the call and its paired result
+ *   are rewritten together, and a sanitized ID that would collide with an ID
+ *   already in the prompt gets a `_2`/`_3`… suffix. The reactive fallback
+ *   (matching a 400 response body and retrying with sanitized IDs) covers
+ *   providers the preemptive check doesn't recognize, such as Vertex-hosted
+ *   Claude.
+ * - **cerebras-strip-reasoning-content** — strips `reasoning` parts from
+ *   assistant messages in the outbound prompt when the resolved model is
+ *   Cerebras, to avoid the `@ai-sdk/openai-compatible@>=1.0.32` regression
+ *   that serializes them as `reasoning_content` (a field Cerebras's API
+ *   rejects). Preemptive; runs in `processLLMRequest` so the persisted
+ *   message list keeps the reasoning trace.
+ * - **anthropic-strip-empty-signed-reasoning-content** — strips legacy
+ *   Anthropic signed reasoning blocks whose text was lost before replay.
+ *   Reactive (matches the "thinking blocks cannot be modified" 400), because
+ *   Claude 5.x returns empty-text signed blocks as normal output and they must
+ *   be replayed untouched to keep the prompt cache.
+ * - **anthropic-strip-foreign-reasoning-content** — strips non-Anthropic
+ *   `reasoning` parts from assistant messages in the outbound prompt when the
+ *   resolved model is Anthropic. Anthropic-native reasoning parts are kept.
+ * - **anthropic-strip-foreign-signed-reasoning** — drops signed thinking
+ *   blocks from the outbound prompt when their origin turn was stamped with a
+ *   provider different from the current target (preemptive). Turns emptied of
+ *   all content by the drop are removed from the prompt. Unstamped history is
+ *   left untouched.
+ * - **openai-orphan-item-id** — drops the Responses `itemId` (`openai` and
+ *   `azure` namespaces alike) from every item-bearing part of an assistant
+ *   message that carries one but has no `reasoning` part, so it replays by
+ *   value instead of as an unsatisfiable `item_reference`. Reactive (matches
+ *   the specific `of type 'message' … without its required 'reasoning' item`
+ *   400); a recovery seatbelt for already-corrupted history.
+ * - **anthropic-orphaned-thinking-step** — drops steps left with only signed
+ *   reasoning when more assistant content follows them, so Anthropic doesn't
+ *   see that thinking merged into the next step. Reactive (matches the
+ *   "thinking blocks ... cannot be modified" 400); a recovery seatbelt for
+ *   already-corrupted history.
+ * - **chat-completions-single-system-message** — merges the leading system
+ *   messages into one for Chat Completions providers (API provider id ending
+ *   in `.chat`), whose hosted chat templates often reject a second system
+ *   message. Skipped when an earlier one carries its own `providerOptions`.
+ *   Preemptive.
+ * - **tool-call-empty-input** — sends an assistant tool call whose input is
+ *   `undefined` or `null` as `{}`, keeping its paired result, so a stored
+ *   call with unparseable arguments can't make every later request fail.
+ *   Preemptive; the stored message keeps its shape.
+ * - **ensure-user-first-turn** — inserts a `.` user turn ahead of a leading
+ *   assistant turn for Amazon Bedrock and Google/Vertex, which reject
+ *   assistant-first conversations. Preemptive; the turn is never persisted.
+ *
+ * To add custom rules, pass them to the constructor:
+ * ```ts
+ * new ProviderHistoryCompat({
+ *   additionalRules: [myCustomRule],
+ * })
+ * ```
+ */
+export class ProviderHistoryCompat implements Processor<'provider-history-compat'> {
+  readonly id = 'provider-history-compat' as const;
+  readonly name = 'Provider History Compat';
+
+  private rules: CompatRule[];
+
+  constructor(opts?: { additionalRules?: CompatRule[] }) {
+    this.rules = [...DEFAULT_COMPAT_RULES, ...(opts?.additionalRules ?? [])];
+  }
+
+  processLLMRequest({ prompt, model, apiProviderId, messageList }: ProcessLLMRequestArgs): ProcessLLMRequestResult {
+    let current = prompt;
+    let mutated = false;
+    for (const rule of this.rules) {
+      if (!rule.applyToPrompt) continue;
+      const next = rule.applyToPrompt({ prompt: current, model, apiProviderId, messageList });
+      if (next) {
+        current = next;
+        mutated = true;
+      }
+    }
+    return mutated ? { prompt: current } : undefined;
+  }
+
+  async processAPIError({
+    error,
+    messageList,
+    retryCount,
+  }: ProcessAPIErrorArgs): Promise<ProcessAPIErrorResult | void> {
+    // Two passes, not one: a legacy history can need two repairs that raise the same error (an
+    // orphaned thinking step and an empty signed block), and only the first rule that changes
+    // history runs per pass. A pass retries only when a rule actually changed something, so
+    // the second pass is a no-op once nothing is left to repair.
+    if (retryCount > 1) return;
+
+    const messages = messageList.get.all.db();
+
+    for (const rule of this.rules) {
+      if (!rule.fix) continue;
+      if (matchesRule(error, rule)) {
+        const changed = rule.fix(messages);
+        if (changed) {
+          return { retry: true };
+        }
+      }
+    }
+  }
+}

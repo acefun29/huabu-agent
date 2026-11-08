@@ -1,0 +1,23 @@
+export * from './model';
+export type { ModelTimeoutSettings, MastraModelSettings, ModelConfigModelSettings } from './model-settings';
+export { ModelRouterLanguageModel } from './router';
+export {
+  type ModelRouterModelId,
+  type Provider,
+  type ModelForProvider,
+  type AttachmentCapabilities,
+  type ModelReasoningOption,
+  getModelReasoningOptions,
+  modelSupportsAttachments,
+  modelSupportsStructuredOutput,
+  modelSupportsTemperature,
+} from './provider-registry.js';
+export { resolveModelConfig, isOpenAICompatibleObjectConfig } from './resolve-model';
+export { resolveModelAuth, type ResolveModelAuthArgs } from './model-auth-resolver';
+export type { GatewayAuthRequest, GatewayAuthResult } from './gateways/base';
+export {
+  ModelRouterEmbeddingModel,
+  type EmbeddingModelId,
+  EMBEDDING_MODELS,
+  type EmbeddingModelInfo,
+} from './embedding-router';

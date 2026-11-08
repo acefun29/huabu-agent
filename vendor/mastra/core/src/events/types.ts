@@ -1,0 +1,134 @@
+export type Event = {
+  type: string;
+  id: string;
+  // TODO: we'll want to type this better
+  data: any;
+  runId: string;
+  createdAt: Date;
+  /** Epoch ms at which the event's payload was produced, when it differs from publish time. */
+  producedAt?: number;
+  /**
+   * Claim generation of the durable run execution that published the event.
+   * Consumers drop events from a generation older than one they have already
+   * seen: a newer execution has taken the run over.
+   */
+  generation?: number;
+  /**
+   * Position of this event in its topic's log.
+   *
+   * Allocated when the event is appended to the shared cache (see
+   * `MastraServerCache.listPushIndexed`), so a subscriber can resume from an
+   * index and, on seeing a higher one, read the gap back from the log. Absent
+   * when the event could not be cached — such events are delivered live-only
+   * and cannot be resumed by offset.
+   */
+  index?: number;
+  /**
+   * How many times this message has been delivered (including this attempt).
+   * Starts at 1 for the first delivery. Incremented on each nack/redelivery.
+   * Not all PubSub backends support this — defaults to 1 if unknown.
+   */
+  deliveryAttempt?: number;
+};
+
+/**
+ * Per-subscription batching policy.
+ *
+ * Opt-in: when omitted, subscribers receive events one at a time as today.
+ * When provided, callbacks are invoked in temporally grouped runs — the
+ * callback signature does not change; a batch of N events becomes N
+ * consecutive callback invocations in publish order.
+ */
+export interface SubscribeBatchOptions {
+  /** Maximum events held before forcing a flush. */
+  maxSize?: number;
+  /**
+   * Maximum wall time (ms) the oldest event may sit in the buffer.
+   * Timer starts when the buffer transitions empty → non-empty.
+   */
+  maxWaitMs?: number;
+  /**
+   * Minimum wall time (ms) between consecutive batch deliveries.
+   * Even when `maxSize`/`maxWaitMs` would fire, the buffer holds until
+   * this interval has elapsed since the last delivery.
+   */
+  minIntervalMs?: number;
+  /**
+   * If true for an event, the buffer flushes immediately on publish
+   * (subject to `minIntervalMs`). Per-event escape hatch.
+   */
+  isImmediate?: (event: Event) => boolean;
+  /**
+   * Applied to the batch before delivery. Use to drop superseded events.
+   *
+   * Contract: must return a subset of its input events by **reference
+   * identity**. To drop an event, omit it. Do NOT return freshly-constructed
+   * `Event` objects (even with matching `id`) — the batching layer routes
+   * ack/nack to the original transport handle by reference, and a
+   * manufactured event has no such handle. If a coalesce returns any
+   * event that wasn't in the input array by reference, the whole batch
+   * is treated as a contract violation and discarded (every original
+   * event is acked as dropped). If you need merged event payloads,
+   * build them in the subscriber callback after delivery.
+   *
+   * Ordering of kept events must be preserved.
+   */
+  coalesce?: (events: Event[]) => Event[];
+  /**
+   * Maximum events the buffer may hold before overflow handling kicks in.
+   * Defaults to 256. Events flagged immediate are never dropped on overflow.
+   */
+  maxBufferSize?: number;
+  /**
+   * Overflow strategy. Defaults to 'coalesce-or-drop-oldest', which runs
+   * `coalesce` first (if provided) and then drops oldest if still over budget.
+   */
+  overflow?: 'drop-oldest' | 'drop-newest' | 'coalesce-or-drop-oldest';
+}
+
+export interface SubscribeOptions {
+  /**
+   * When set, subscribers with the same group compete for messages.
+   * Each message is delivered to exactly one subscriber in the group.
+   * When not set, behaves as fan-out (all subscribers get every message).
+   */
+  group?: string;
+  /**
+   * Where a newly created subscription should begin reading.
+   * Defaults to 'earliest'. Existing consumer groups keep their checkpoint.
+   */
+  startFrom?: 'earliest' | 'latest';
+  /**
+   * Opt-in batching policy. When omitted, behavior is unchanged.
+   */
+  batch?: SubscribeBatchOptions;
+}
+
+/**
+ * Callback signature for PubSub subscribers.
+ *
+ * @param event - The delivered event
+ * @param ack - Acknowledge successful processing. Message is removed from the queue.
+ * @param nack - Negative acknowledge. Message is requeued for redelivery after a delay.
+ *               Not calling either ack or nack leaves the message in-flight until the
+ *               backend's ack deadline expires (typically 10s for GCP).
+ *
+ * Subscribers on persistent backends must call `ack` for every delivered event —
+ * including events they filter out — otherwise the message stays in the backend's
+ * pending set for the lifetime of the subscription and the topic grows unbounded.
+ *
+ * A returned promise is honored by backends that support redelivery: a rejection
+ * is treated as a `nack`. The promise is not awaited before the next delivery, so
+ * subscribers that need ordering must serialize internally.
+ */
+export type EventCallback = (
+  event: Event,
+  ack?: () => Promise<void>,
+  nack?: () => Promise<void>,
+  /**
+   * Renews the delivery's lease/visibility so the broker does not redeliver
+   * the event while its handler is still running. Omitted by backends that
+   * cannot extend a delivery.
+   */
+  extend?: () => Promise<void>,
+) => void | Promise<void>;

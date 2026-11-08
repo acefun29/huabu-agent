@@ -1,0 +1,1472 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { z } from 'zod/v4';
+import { Mastra } from '../mastra';
+import { MastraCompositeStore } from '../storage/base';
+import { applyNotificationRoutingRequirement } from './routing';
+import { InMemoryNotificationsStorage, NotificationsStorage } from './storage';
+import type { UpdateNotificationInput } from './types';
+import {
+  buildNotificationDispatchSchedule,
+  createNotificationDispatchWorkflow,
+  NOTIFICATION_DISPATCH_SCHEDULE_ROW_ID,
+  parseNotificationDispatchNow,
+} from './workflow';
+import {
+  createNotificationInboxTool,
+  createNotificationSignal,
+  createNotificationSummarySignal,
+  dispatchDueNotifications,
+  MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+  resolveNotificationDeliveryDecision,
+  summarizeNotifications,
+} from '.';
+
+describe('notification inbox', () => {
+  it('stores thread-scoped notifications and filters inbox queries', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({
+      id: 'n1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed on main',
+      resourceId: 'resource-1',
+      agentId: 'agent-1',
+    });
+    await storage.createNotification({
+      id: 'n2',
+      threadId: 'thread-2',
+      source: 'github',
+      kind: 'issue',
+      summary: 'Issue opened',
+    });
+
+    await expect(storage.listNotifications({ threadId: 'thread-1', status: 'pending' })).resolves.toMatchObject([
+      { id: 'n1', threadId: 'thread-1', source: 'github', priority: 'high', status: 'pending' },
+    ]);
+    await expect(storage.listNotifications({ threadId: 'thread-1', resourceId: 'missing' })).resolves.toEqual([]);
+  });
+
+  it('stores same notification id independently across threads', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({
+      id: 'shared',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci',
+      summary: 'Thread 1',
+    });
+    await storage.createNotification({
+      id: 'shared',
+      threadId: 'thread-2',
+      source: 'github',
+      kind: 'ci',
+      summary: 'Thread 2',
+    });
+
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'shared' })).resolves.toMatchObject({
+      threadId: 'thread-1',
+      summary: 'Thread 1',
+    });
+    await expect(storage.getNotification({ threadId: 'thread-2', id: 'shared' })).resolves.toMatchObject({
+      threadId: 'thread-2',
+      summary: 'Thread 2',
+    });
+  });
+
+  it('deep-clones notification payload, attributes, and metadata at storage boundaries', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const payload = { nested: { count: 1 } };
+    const attributes = { nested: { label: 'first' } } as any;
+    const metadata = { nested: { version: 1 } };
+    const created = await storage.createNotification({
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci',
+      summary: 'CI failed',
+      payload,
+      attributes,
+      metadata,
+    });
+
+    payload.nested.count = 2;
+    attributes.nested.label = 'mutated';
+    metadata.nested.version = 2;
+    (created.payload as any).nested.count = 3;
+    (created.attributes as any).nested.label = 'returned';
+    (created.metadata as any).nested.version = 3;
+
+    await expect(storage.getNotification({ threadId: 'thread-1', id: created.id })).resolves.toMatchObject({
+      payload: { nested: { count: 1 } },
+      attributes: { nested: { label: 'first' } },
+      metadata: { nested: { version: 1 } },
+    });
+  });
+
+  it('coalesces duplicate pending notifications by dedupe or coalesce key', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const first = await storage.createNotification({
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      summary: 'CI failed: 1 test',
+      dedupeKey: 'main-ci',
+    });
+    const second = await storage.createNotification({
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      summary: 'CI failed: 3 tests',
+      dedupeKey: 'main-ci',
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.summary).toBe('CI failed: 3 tests');
+    expect(second.coalescedCount).toBe(2);
+    await expect(storage.listNotifications({ threadId: 'thread-1' })).resolves.toHaveLength(1);
+  });
+
+  it('does not coalesce notifications with different kinds', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      summary: 'CI failed',
+      dedupeKey: 'shared-key',
+    });
+    await storage.createNotification({
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'issue',
+      summary: 'Issue opened',
+      dedupeKey: 'shared-key',
+    });
+
+    await expect(storage.listNotifications({ threadId: 'thread-1' })).resolves.toHaveLength(2);
+  });
+
+  it('updates the status of many notifications in one call, scoped to the thread', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (const id of ['a', 'b', 'c']) {
+      await storage.createNotification({ id, threadId: 'thread-1', source: 'email', kind: 'dm', summary: id });
+    }
+    await storage.createNotification({ id: 'a', threadId: 'thread-2', source: 'email', kind: 'dm', summary: 'other' });
+
+    const updated = await storage.updateNotificationsStatus({
+      threadId: 'thread-1',
+      ids: ['a', 'b', 'missing', 'a'],
+      status: 'seen',
+    });
+    expect(updated.map(notification => notification.id).sort()).toEqual(['a', 'b']);
+    expect(updated.every(notification => notification.status === 'seen' && notification.seenAt)).toBe(true);
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'c' })).resolves.toMatchObject({
+      status: 'pending',
+    });
+    await expect(storage.getNotification({ threadId: 'thread-2', id: 'a' })).resolves.toMatchObject({
+      status: 'pending',
+    });
+    await expect(storage.updateNotificationsStatus({ threadId: 'thread-1', ids: [], status: 'seen' })).resolves.toEqual(
+      [],
+    );
+  });
+
+  it('falls back to per-record updates for adapters without a native bulk status write', async () => {
+    class LegacyStorage extends InMemoryNotificationsStorage {
+      override updateNotificationsStatus = NotificationsStorage.prototype.updateNotificationsStatus;
+    }
+    const storage = new LegacyStorage();
+    await storage.createNotification({ id: 'a', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'a' });
+    await storage.createNotification({ id: 'b', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'b' });
+    const single = vi.spyOn(storage, 'updateNotification');
+
+    const updated = await storage.updateNotificationsStatus({
+      threadId: 'thread-1',
+      ids: ['a', 'missing', 'b', 'a'],
+      status: 'dismissed',
+    });
+    expect(single).toHaveBeenCalledTimes(3);
+    expect(updated.map(notification => notification.id)).toEqual(['a', 'b']);
+    expect(updated.every(notification => notification.status === 'dismissed')).toBe(true);
+  });
+
+  it('fallback bulk update bounds how many per-record writes are in flight at once', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    class LegacyStorage extends InMemoryNotificationsStorage {
+      override updateNotificationsStatus = NotificationsStorage.prototype.updateNotificationsStatus;
+      override async updateNotification(input: UpdateNotificationInput) {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise(resolve => setTimeout(resolve, 1));
+        try {
+          return await super.updateNotification(input);
+        } finally {
+          inFlight--;
+        }
+      }
+    }
+    const storage = new LegacyStorage();
+    const ids = Array.from({ length: 100 }, (_, index) => `n-${index}`);
+    for (const id of ids) {
+      await storage.createNotification({ id, threadId: 'thread-1', source: 'email', kind: 'dm', summary: id });
+    }
+
+    const updated = await storage.updateNotificationsStatus({ threadId: 'thread-1', ids, status: 'seen' });
+
+    expect(updated).toHaveLength(100);
+    expect(maxInFlight).toBeLessThanOrEqual(20);
+    expect(maxInFlight).toBeGreaterThan(1);
+  });
+
+  it('creates individual and summary notification signals', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const github = await storage.createNotification({
+      id: 'n1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed on main: 3 tests',
+    });
+    const slack = await storage.createNotification({
+      id: 'n2',
+      threadId: 'thread-1',
+      source: 'slack',
+      kind: 'mention',
+      priority: 'medium',
+      summary: 'Jane mentioned you',
+    });
+
+    expect(createNotificationSignal(github)).toMatchObject({
+      type: 'notification',
+      tagName: 'notification',
+      contents: 'CI failed on main: 3 tests',
+      attributes: { source: 'github', type: 'ci-status', kind: 'ci-status', priority: 'high', status: 'pending' },
+      metadata: {
+        notification: {
+          signal: 'notification',
+          recordId: 'n1',
+          source: 'github',
+          kind: 'ci-status',
+          priority: 'high',
+          status: 'pending',
+        },
+      },
+    });
+
+    await storage.updateNotification({ threadId: 'thread-1', id: slack.id, status: 'seen' });
+    const seenSlack = await storage.getNotification({ threadId: 'thread-1', id: slack.id });
+    const summarySignal = createNotificationSummarySignal(summarizeNotifications([github, seenSlack!]));
+    expect(summarySignal).toMatchObject({
+      type: 'notification',
+      tagName: 'notification-summary',
+      attributes: { pending: 1, priority: 'high' },
+      metadata: {
+        notification: {
+          signal: 'summary',
+          pending: 1,
+          groups: [{ source: 'github', count: 1 }],
+          byPriority: { high: 1 },
+          notificationIds: ['n1'],
+          priority: 'high',
+        },
+      },
+    });
+    expect(summarySignal.metadata?.notificationSummary).toMatchObject({
+      pending: 1,
+      notificationIds: ['n1'],
+      bySource: { github: 1 },
+    });
+  });
+
+  it('uses one inbox tool to list, read, search, and update notifications', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({
+      id: 'n1',
+      threadId: 'thread-1',
+      source: 'email',
+      kind: 'direct-message',
+      summary: 'Jane sent a launch update',
+      payload: { body: 'Launch moved to Friday' },
+      metadata: { internal: 'bookkeeping' },
+      resourceId: 'resource-1',
+      agentId: 'agent-1',
+    });
+    await storage.createNotification({
+      id: 'n2',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'pull-request-activity',
+      summary: 'CI is still running',
+      resourceId: 'resource-1',
+      agentId: 'agent-1',
+    });
+    const sendSignal = vi.fn(signal => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      signal,
+      persisted: Promise.resolve(),
+    }));
+    const tool = createNotificationInboxTool({ storage });
+
+    // Listing views the notifications: returned records are marked seen and internal
+    // metadata/payload bookkeeping is stripped from the agent-facing projection.
+    const listResult = (await tool.execute?.({ action: 'list' }, { agent: { threadId: 'thread-1' } } as any)) as {
+      notifications: Record<string, unknown>[];
+      hasMore: boolean;
+    };
+    expect(listResult.hasMore).toBe(false);
+    expect(listResult.notifications).toHaveLength(2);
+    const listed = Object.fromEntries(listResult.notifications.map(notification => [notification.id, notification]));
+    expect(listed.n1).toMatchObject({ id: 'n1', status: 'seen', summary: 'Jane sent a launch update' });
+    expect(listed.n2).toMatchObject({ id: 'n2', status: 'seen' });
+    expect('payload' in listed.n1!).toBe(false);
+    expect('metadata' in listed.n1!).toBe(false);
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n2' })).resolves.toMatchObject({
+      status: 'seen',
+    });
+
+    // Search still finds viewed records and marks fresh matches seen too.
+    await expect(
+      tool.execute?.({ action: 'search', query: 'launch' }, { agent: { threadId: 'thread-1' } } as any),
+    ).resolves.toMatchObject({ notifications: [{ id: 'n1' }], hasMore: false });
+
+    // The pending backlog is drained because viewing marked everything seen.
+    await expect(
+      tool.execute?.({ action: 'search', query: 'CI', status: 'pending' }, { agent: { threadId: 'thread-1' } } as any),
+    ).resolves.toMatchObject({ notifications: [] });
+
+    // Reading a not-yet-viewed notification still delivers it through the agent.
+    await storage.createNotification({
+      id: 'n3',
+      threadId: 'thread-1',
+      source: 'email',
+      kind: 'direct-message',
+      summary: 'Fresh pending update',
+      resourceId: 'resource-1',
+      agentId: 'agent-1',
+    });
+    await expect(
+      tool.execute?.({ action: 'read', id: 'n3' }, {
+        agent: { agentId: 'agent-1', threadId: 'thread-1', resourceId: 'resource-1' },
+        mastra: { getAgentById: vi.fn(async () => ({ sendSignal })) },
+      } as any),
+    ).resolves.toMatchObject({
+      message: '1 notification will now be delivered.',
+      delivered: 1,
+    });
+    expect(sendSignal).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'notification', tagName: 'notification', contents: 'Fresh pending update' }),
+      { resourceId: 'resource-1', threadId: 'thread-1' },
+    );
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n3' })).resolves.toMatchObject({
+      status: 'seen',
+    });
+    await expect(
+      tool.execute?.({ action: 'archive', id: 'n1' }, { agent: { threadId: 'thread-1' } } as any),
+    ).resolves.toMatchObject({
+      notification: { id: 'n1', status: 'archived' },
+    });
+  });
+
+  it('bounds list results, drains unread pages without repeating them, and reports hasMore', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    for (let index = 0; index < 25; index += 1) {
+      await storage.createNotification({
+        id: `n${index}`,
+        threadId: 'thread-1',
+        source: 'github',
+        kind: 'pull-request-activity',
+        summary: `Notification ${index}`,
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)),
+      });
+    }
+    const tool = createNotificationInboxTool({ storage });
+    const context = { agent: { threadId: 'thread-1' } } as any;
+    type Page = { notifications: { id: string; status: string }[]; hasMore: boolean; markedSeen: number };
+
+    // Listing defaults to unread notifications and marks the returned page seen, so repeated
+    // lists page through the backlog even though marking seen bumps the updatedAt sort key.
+    const firstPage = (await tool.execute?.({ action: 'list' }, context)) as Page;
+    expect(firstPage.notifications).toHaveLength(20);
+    expect(firstPage.hasMore).toBe(true);
+    expect(firstPage.markedSeen).toBe(20);
+
+    const secondPage = (await tool.execute?.({ action: 'list' }, context)) as Page;
+    expect(secondPage.notifications).toHaveLength(5);
+    expect(secondPage.hasMore).toBe(false);
+    expect(secondPage.markedSeen).toBe(5);
+    const firstIds = new Set(firstPage.notifications.map(notification => notification.id));
+    expect(secondPage.notifications.some(notification => firstIds.has(notification.id))).toBe(false);
+
+    const drained = (await tool.execute?.({ action: 'list' }, context)) as Page;
+    expect(drained.notifications).toHaveLength(0);
+    expect(drained.markedSeen).toBe(0);
+
+    // An explicit status lists already-viewed records; explicit limit is honored.
+    const seenPage = (await tool.execute?.({ action: 'list', status: 'seen', limit: 3 }, context)) as Page;
+    expect(seenPage.notifications).toHaveLength(3);
+    expect(seenPage.hasMore).toBe(true);
+    expect(seenPage.markedSeen).toBe(0);
+
+    const allSeen = (await tool.execute?.({ action: 'list', status: 'seen', limit: 25 }, context)) as Page;
+    expect(allSeen.notifications).toHaveLength(25);
+    expect(allSeen.hasMore).toBe(false);
+  });
+
+  it('surfaces a notification that ran out of delivery attempts once, then marks it seen', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({ id: 'ok', threadId: 'thread-1', source: 'ci', kind: 'run', summary: 'ok' });
+    await storage.createNotification({ id: 'gave-up', threadId: 'thread-1', source: 'ci', kind: 'run', summary: 'x' });
+    await storage.updateNotification({
+      threadId: 'thread-1',
+      id: 'gave-up',
+      status: 'failed',
+      deliveryAttempts: MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+      lastDeliveryError: 'no model configured',
+    });
+    const tool = createNotificationInboxTool({ storage });
+    const context = { agent: { threadId: 'thread-1' } } as any;
+    type Page = {
+      notifications: { id: string; status: string; lastDeliveryError?: string }[];
+      markedSeen: number;
+    };
+
+    const first = (await tool.execute?.({ action: 'list' }, context)) as Page;
+    const byId = Object.fromEntries(first.notifications.map(notification => [notification.id, notification]));
+    expect(byId['gave-up']).toMatchObject({ status: 'failed', lastDeliveryError: 'no model configured' });
+    expect(byId.ok).toMatchObject({ status: 'seen' });
+    expect(first.markedSeen).toBe(2);
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'gave-up' })).resolves.toMatchObject({
+      status: 'seen',
+      deliveryAttempts: MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+      lastDeliveryError: 'no model configured',
+    });
+
+    // Shown once: the next default list does not repeat it.
+    const second = (await tool.execute?.({ action: 'list' }, context)) as Page;
+    expect(second.notifications).toHaveLength(0);
+    expect(second.markedSeen).toBe(0);
+  });
+
+  it('marks the viewed page seen with a single bulk status write', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({ id: 'a', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'a' });
+    await storage.createNotification({ id: 'b', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'b' });
+    await storage.createNotification({ id: 'c', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'c' });
+    await storage.updateNotification({ threadId: 'thread-1', id: 'c', status: 'archived' });
+    const bulk = vi.spyOn(storage, 'updateNotificationsStatus');
+    const single = vi.spyOn(storage, 'updateNotification');
+    const tool = createNotificationInboxTool({ storage });
+
+    const page = (await tool.execute?.({ action: 'search', query: 'dm' }, {
+      agent: { threadId: 'thread-1' },
+    } as any)) as {
+      notifications: { id: string; status: string }[];
+      markedSeen: number;
+    };
+    expect(page.markedSeen).toBe(2);
+    expect(bulk).toHaveBeenCalledTimes(1);
+    expect(bulk).toHaveBeenCalledWith({
+      threadId: 'thread-1',
+      ids: expect.arrayContaining(['a', 'b']),
+      status: 'seen',
+    });
+    expect(bulk.mock.calls[0]![0].ids).toHaveLength(2);
+    expect(single).not.toHaveBeenCalled();
+    const byId = Object.fromEntries(page.notifications.map(notification => [notification.id, notification.status]));
+    expect(byId).toEqual({ a: 'seen', b: 'seen', c: 'archived' });
+  });
+
+  it('returns the page with stored statuses when the bulk seen write fails', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    await storage.createNotification({ id: 'ok', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'ok' });
+    await storage.createNotification({ id: 'bad', threadId: 'thread-1', source: 'email', kind: 'dm', summary: 'bad' });
+    vi.spyOn(storage, 'updateNotificationsStatus').mockRejectedValue(new Error('write failed'));
+    const tool = createNotificationInboxTool({ storage });
+
+    const page = (await tool.execute?.({ action: 'list' }, { agent: { threadId: 'thread-1' } } as any)) as {
+      notifications: { id: string; status: string }[];
+      markedSeen: number;
+    };
+    expect(page.notifications).toHaveLength(2);
+    expect(page.markedSeen).toBe(0);
+    // The returned status reflects what storage actually holds for each record.
+    expect(page.notifications.every(notification => notification.status === 'pending')).toBe(true);
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'bad' })).resolves.toMatchObject({
+      status: 'pending',
+    });
+  });
+
+  it('rejects search without a query and id-scoped actions without an id at the schema level', () => {
+    const tool = createNotificationInboxTool({ storage: new InMemoryNotificationsStorage() });
+    const schema = tool.inputSchema as z.ZodType;
+    expect(schema.safeParse({ action: 'search' }).success).toBe(false);
+    expect(schema.safeParse({ action: 'search', query: '  ' }).success).toBe(false);
+    expect(schema.safeParse({ action: 'search', query: 'launch' }).success).toBe(true);
+    expect(schema.safeParse({ action: 'list' }).success).toBe(true);
+    for (const action of ['markSeen', 'dismiss', 'archive']) {
+      expect(schema.safeParse({ action }).success).toBe(false);
+      expect(schema.safeParse({ action, id: '' }).success).toBe(false);
+      expect(schema.safeParse({ action, id: '   ' }).success).toBe(false);
+      expect(schema.safeParse({ action, id: 'n1' }).success).toBe(true);
+    }
+    // read supports both a single id and a bulk unread read.
+    expect(schema.safeParse({ action: 'read' }).success).toBe(true);
+  });
+
+  it('resolves priority-aware default delivery decisions', async () => {
+    const now = new Date('2026-05-30T12:00:00Z');
+    const baseRecord = {
+      id: 'n1',
+      threadId: 'thread-1',
+      source: 'mastracode',
+      kind: 'manual',
+      status: 'pending',
+      summary: 'Test notification',
+      createdAt: now,
+      updatedAt: now,
+    } as const;
+
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'active',
+        record: { ...baseRecord, priority: 'urgent' },
+      }),
+    ).resolves.toMatchObject({ action: 'deliver', reason: 'urgent' });
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'active',
+        record: { ...baseRecord, priority: 'high' },
+      }),
+    ).resolves.toMatchObject({
+      action: 'summarize',
+      summaryAt: now,
+      deliverAt: now,
+      reason: 'active-high-summary-then-full',
+    });
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'idle',
+        record: { ...baseRecord, priority: 'high' },
+      }),
+    ).resolves.toMatchObject({ action: 'deliver', reason: 'idle-high' });
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'active',
+        record: { ...baseRecord, priority: 'medium' },
+      }),
+    ).resolves.toMatchObject({ action: 'summarize', summaryAt: now, reason: 'active-batch-summary' });
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'idle',
+        record: { ...baseRecord, priority: 'medium' },
+      }),
+    ).resolves.toMatchObject({ action: 'deliver', reason: 'idle-medium' });
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'active',
+        record: { ...baseRecord, priority: 'low' },
+      }),
+    ).resolves.toMatchObject({ action: 'summarize', summaryAt: now, reason: 'active-batch-summary' });
+    await expect(
+      resolveNotificationDeliveryDecision({
+        now,
+        threadState: 'idle',
+        record: { ...baseRecord, priority: 'low' },
+      }),
+    ).resolves.toMatchObject({ action: 'summarize', summaryAt: now, reason: 'idle-low-summary' });
+  });
+
+  it('does not resolve inherited Object.prototype members as source decisions', async () => {
+    const now = new Date('2026-05-30T12:00:00Z');
+    const baseRecord = {
+      id: 'n1',
+      threadId: 'thread-1',
+      source: 'mastracode',
+      kind: 'manual',
+      status: 'pending',
+      summary: 'Test notification',
+      priority: 'low',
+      createdAt: now,
+      updatedAt: now,
+    } as const;
+
+    for (const source of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+      await expect(
+        resolveNotificationDeliveryDecision({
+          now,
+          threadState: 'active',
+          config: { sources: {}, default: 'discard' },
+          record: { ...baseRecord, source },
+        }),
+      ).resolves.toEqual({ action: 'discard' });
+    }
+  });
+
+  it('lists due notifications across threads and ignores future or terminal records', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    await storage.createNotification({
+      id: 'future',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      summary: 'Future notification',
+      deliverAt: new Date('2026-05-30T12:05:00Z'),
+    });
+    await storage.createNotification({
+      id: 'due-later',
+      threadId: 'thread-2',
+      source: 'slack',
+      kind: 'mention',
+      summary: 'Due second',
+      deliverAt: new Date('2026-05-30T11:59:00Z'),
+    });
+    await storage.createNotification({
+      id: 'due-first',
+      threadId: 'thread-3',
+      source: 'email',
+      kind: 'direct-message',
+      summary: 'Due first',
+      deliverAt: new Date('2026-05-30T11:58:00Z'),
+    });
+    await storage.updateNotification({ id: 'due-first', threadId: 'thread-3', status: 'delivered' });
+    await storage.createNotification({
+      id: 'summary-due',
+      threadId: 'thread-4',
+      source: 'linear',
+      kind: 'issue',
+      summary: 'Summary due',
+      summaryAt: new Date('2026-05-30T11:57:00Z'),
+    });
+
+    await expect(storage.listDueNotifications({ now })).resolves.toMatchObject([
+      { id: 'summary-due' },
+      { id: 'due-later' },
+    ]);
+  });
+
+  it('dispatches due individual notifications and marks them delivered', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sent: any[] = [];
+    const sendSignal = vi.fn((signal, target) => {
+      sent.push({ signal, target });
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }), signal };
+    });
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.failed).toEqual([]);
+    expect(result.delivered).toMatchObject([
+      { id: 'n1', status: 'delivered', deliveredSignalId: result.signals[0]?.id },
+    ]);
+    expect(sent).toMatchObject([
+      {
+        signal: {
+          type: 'notification',
+          tagName: 'notification',
+          contents: 'CI failed',
+          attributes: { status: 'delivered' },
+        },
+        target: { resourceId: 'resource-1', threadId: 'thread-1' },
+      },
+    ]);
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: result.signals[0]?.id,
+    });
+  });
+
+  it('starts a deferred delivery with the scopes it was sent with, queueing it when the active run holds others', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sent: any[] = [];
+    const queued: any[] = [];
+    const sendSignal = vi.fn((signal, target) => {
+      sent.push(target);
+      return {
+        accepted: Promise.resolve({ action: 'blocked', reason: 'scope-mismatch', runId: 'run-r1' }),
+        signal,
+      };
+    });
+    const queueSignal = vi.fn((signal, target) => {
+      queued.push(target);
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-r2' }), signal };
+    });
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal, queueSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+      metadata: applyNotificationRoutingRequirement(undefined, { scopes: ['request:r2'] }),
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.failed).toEqual([]);
+    expect(result.delivered).toMatchObject([{ id: 'n1', status: 'delivered' }]);
+    expect(sent).toEqual([{ resourceId: 'resource-1', threadId: 'thread-1', scopes: ['request:r2'] }]);
+    expect(queued).toEqual(sent);
+    expect(result.signals[0]?.metadata).not.toHaveProperty('__mastraNotificationRouting');
+  });
+
+  it('resolves stream options for deferred deliveries so a woken idle thread has a request context', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sent: any[] = [];
+    const sendSignal = vi.fn((signal, target) => {
+      sent.push({ signal, target });
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }), signal };
+    });
+    const streamOptions = { memory: { thread: 'thread-1', resource: 'resource-1' }, maxSteps: 1000 };
+    const resolveNotificationDeliveryDecision = vi.fn(async () => ({ action: 'deliver' as const, streamOptions }));
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.failed).toEqual([]);
+    expect(resolveNotificationDeliveryDecision).toHaveBeenCalledWith({
+      record: expect.objectContaining({ id: 'n1', resourceId: 'resource-1', threadId: 'thread-1' }),
+      threadState: 'idle',
+      now,
+    });
+    expect(sent[0]?.target).toEqual({
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      ifIdle: { streamOptions },
+    });
+  });
+
+  it('resolves stream options for deferred summary deliveries with non-low priorities', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sent: any[] = [];
+    const sendSignal = vi.fn((signal, target) => {
+      sent.push({ signal, target });
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }), signal };
+    });
+    const streamOptions = { maxSteps: 1000 };
+    const resolveNotificationDeliveryDecision = vi.fn(async () => ({ action: 'summarize' as const, streamOptions }));
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'mention',
+      priority: 'high',
+      summary: 'mention summary',
+      summaryAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.failed).toEqual([]);
+    expect(sent[0]?.target).toEqual({
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      ifIdle: { streamOptions },
+    });
+  });
+
+  it('fails the delivery attempt, without a bare wake, when the delivery policy throws at dispatch time', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sent: any[] = [];
+    const sendSignal = vi.fn((signal, target) => {
+      sent.push({ signal, target });
+      return { accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }), signal };
+    });
+    const resolveNotificationDeliveryDecision = vi.fn(async () => {
+      throw new Error('resolver exploded');
+    });
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(sent).toEqual([]);
+    expect(result.failed).toEqual([expect.objectContaining({ error: 'resolver exploded' })]);
+    const [record] = await storage.listNotifications({ threadId: 'thread-1' });
+    expect(record).toMatchObject({ status: 'pending', deliveryAttempts: 1, lastDeliveryError: 'resolver exploded' });
+  });
+
+  it('leaves notifications the delivery policy holds pending for another dispatcher, without counting an attempt', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn();
+    const resolveNotificationDeliveryDecision = vi.fn(async () => ({ action: 'deliver' as const, hold: true }));
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    const base = { agentId: 'agent-1', resourceId: 'resource-1', threadId: 'thread-1', source: 'github' } as const;
+    await storage.createNotification({
+      ...base,
+      id: 'full',
+      kind: 'ci',
+      priority: 'high',
+      summary: 'CI',
+      deliverAt: now,
+    });
+    await storage.createNotification({
+      ...base,
+      id: 'sum',
+      kind: 'pr',
+      priority: 'medium',
+      summary: 'PR',
+      summaryAt: now,
+    });
+    await storage.createNotification({
+      ...base,
+      threadId: 'thread-2',
+      id: 'low',
+      kind: 'pr',
+      priority: 'low',
+      summary: 'PR',
+      summaryAt: now,
+    });
+
+    for (let tick = 0; tick < 6; tick++) {
+      const result = await dispatchDueNotifications({ mastra, storage, now });
+      expect(result).toEqual({ delivered: [], failed: [], signals: [] });
+    }
+
+    expect(sendSignal).not.toHaveBeenCalled();
+    for (const [threadId, id] of [
+      ['thread-1', 'full'],
+      ['thread-1', 'sum'],
+      ['thread-2', 'low'],
+    ] as const) {
+      const record = await storage.getNotification({ threadId, id });
+      expect(record).toMatchObject({ status: 'pending' });
+      expect(record?.deliveryAttempts ?? 0).toBe(0);
+      expect(record?.lastDeliveryError).toBeUndefined();
+    }
+    expect((await storage.listDueNotifications({ now })).map(record => record.id).sort()).toEqual([
+      'full',
+      'low',
+      'sum',
+    ]);
+  });
+
+  it('delivers past however many records the delivery policy holds ahead, and limits only the records it acts on', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      persisted: Promise.resolve(),
+      signal,
+    }));
+    // Another process's dispatcher delivers 'held-thread', so this one holds it.
+    const resolveNotificationDeliveryDecision = vi.fn(async ({ record }: { record: { threadId: string } }) => ({
+      action: 'deliver' as const,
+      hold: record.threadId === 'held-thread',
+    }));
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    const base = { agentId: 'agent-1', resourceId: 'resource-1', source: 'github', kind: 'ci', summary: 'CI' } as const;
+    for (let index = 0; index < 120; index++) {
+      await storage.createNotification({
+        ...base,
+        id: `held-${index}`,
+        threadId: 'held-thread',
+        priority: 'high',
+        deliverAt: new Date(now.getTime() - 60_000),
+      });
+    }
+    for (const id of ['mine-1', 'mine-2', 'mine-3']) {
+      await storage.createNotification({ ...base, id, threadId: `${id}-thread`, priority: 'high', deliverAt: now });
+    }
+
+    const first = await dispatchDueNotifications({ mastra, storage, now, limit: 2 });
+    expect(first.delivered.map(record => record.id).sort()).toEqual(['mine-1', 'mine-2']);
+    const second = await dispatchDueNotifications({ mastra, storage, now });
+    expect(second.delivered.map(record => record.id)).toEqual(['mine-3']);
+
+    expect(sendSignal).toHaveBeenCalledTimes(3);
+    const held = await storage.listNotifications({ threadId: 'held-thread' });
+    expect(held).toHaveLength(120);
+    expect(held.every(record => record.status === 'pending' && (record.deliveryAttempts ?? 0) === 0)).toBe(true);
+  });
+
+  it('delivers a record that shares its id with a held record on another thread', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      persisted: Promise.resolve(),
+      signal,
+    }));
+    const resolveNotificationDeliveryDecision = vi.fn(async ({ record }: { record: { threadId: string } }) => ({
+      action: 'deliver' as const,
+      hold: record.threadId === 'held-thread',
+    }));
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    const base = { agentId: 'agent-1', resourceId: 'resource-1', source: 'github', kind: 'ci', summary: 'CI' } as const;
+    // Callers choose notification ids, which are unique per thread only: a full page of held records, one of them 'ci-run'.
+    for (let index = 0; index < 100; index++) {
+      await storage.createNotification({
+        ...base,
+        id: index === 0 ? 'ci-run' : `held-${index}`,
+        threadId: 'held-thread',
+        priority: 'high',
+        deliverAt: new Date(now.getTime() - 60_000),
+      });
+    }
+    await storage.createNotification({
+      ...base,
+      id: 'ci-run',
+      threadId: 'live-thread',
+      priority: 'high',
+      deliverAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.delivered.map(record => [record.threadId, record.id])).toEqual([['live-thread', 'ci-run']]);
+    expect((await storage.getNotification({ threadId: 'held-thread', id: 'ci-run' }))?.status).toBe('pending');
+  });
+
+  it("dispatches only one resource's notifications when asked to", async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      persisted: Promise.resolve(),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    for (const resourceId of ['mine', 'theirs']) {
+      await storage.createNotification({
+        id: resourceId,
+        agentId: 'agent-1',
+        resourceId,
+        threadId: `${resourceId}-thread`,
+        source: 'github',
+        kind: 'ci',
+        priority: 'high',
+        summary: 'CI',
+        deliverAt: now,
+      });
+    }
+
+    const result = await dispatchDueNotifications({ mastra, storage, now, resourceId: 'mine' });
+
+    expect(result.delivered.map(record => record.id)).toEqual(['mine']);
+    expect(sendSignal).toHaveBeenCalledTimes(1);
+    expect((await storage.getNotification({ threadId: 'theirs-thread', id: 'theirs' }))?.status).toBe('pending');
+  });
+
+  it('records delivery failure when a notification signal is rejected', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.reject(new Error('signal routing failed: no model configured')),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.delivered).toEqual([]);
+    expect(result.signals).toEqual([]);
+    expect(result.failed).toMatchObject([
+      { record: { id: 'n1' }, error: 'signal routing failed: no model configured' },
+    ]);
+    const stored = await storage.getNotification({ threadId: 'thread-1', id: 'n1' });
+    expect(stored).toMatchObject({
+      status: 'pending',
+      deliveryAttempts: 1,
+      lastDeliveryError: 'signal routing failed: no model configured',
+    });
+    expect(stored?.deliveredSignalId).toBeUndefined();
+  });
+
+  it('marks a notification failed once delivery attempts are exhausted', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.reject(new Error('No model selected. Use /models to select a model first.')),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+
+    for (let attempt = 1; attempt < MAX_NOTIFICATION_DELIVERY_ATTEMPTS; attempt++) {
+      await dispatchDueNotifications({ mastra, storage, now });
+      await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+        status: 'pending',
+        deliveryAttempts: attempt,
+      });
+    }
+
+    await dispatchDueNotifications({ mastra, storage, now });
+
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'failed',
+      deliveryAttempts: MAX_NOTIFICATION_DELIVERY_ATTEMPTS,
+      lastDeliveryError: 'No model selected. Use /models to select a model first.',
+    });
+    await expect(storage.listDueNotifications({ now })).resolves.toEqual([]);
+
+    await dispatchDueNotifications({ mastra, storage, now });
+    expect(sendSignal).toHaveBeenCalledTimes(MAX_NOTIFICATION_DELIVERY_ATTEMPTS);
+  });
+
+  it.each([
+    { label: 'at the cap', attempts: MAX_NOTIFICATION_DELIVERY_ATTEMPTS },
+    { label: 'far past the cap', attempts: 288 },
+  ])('terminalizes a record $label without inflating its attempt count', async ({ attempts }) => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.reject(new Error('No model selected. Use /models to select a model first.')),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+    await storage.updateNotification({ id: 'n1', threadId: 'thread-1', deliveryAttempts: attempts });
+
+    await dispatchDueNotifications({ mastra, storage, now });
+
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'failed',
+      deliveryAttempts: attempts,
+    });
+    await expect(storage.listDueNotifications({ now })).resolves.toEqual([]);
+    // A record carried over from before the cap existed gets one final
+    // attempt, in case the failure it accumulated has since been resolved.
+    expect(sendSignal).toHaveBeenCalledTimes(1);
+
+    await dispatchDueNotifications({ mastra, storage, now });
+    expect(sendSignal).toHaveBeenCalledTimes(1);
+  });
+
+  it('groups due summary notifications by agent, resource, and thread', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    for (const id of ['n1', 'n2']) {
+      await storage.createNotification({
+        id,
+        agentId: 'agent-1',
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+        source: id === 'n1' ? 'github' : 'slack',
+        kind: 'mention',
+        summary: `${id} summary`,
+        summaryAt: now,
+      });
+    }
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.failed).toEqual([]);
+    expect(result.delivered).toMatchObject([
+      { id: 'n1', status: 'pending', summarySignalId: result.signals[0]?.id },
+      { id: 'n2', status: 'pending', summarySignalId: result.signals[0]?.id },
+    ]);
+    expect(result.signals).toHaveLength(1);
+    expect(result.signals[0]).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+    expect(sendSignal).toHaveBeenCalledTimes(1);
+    expect(sendSignal).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'notification', tagName: 'notification-summary' }),
+      {
+        resourceId: 'resource-1',
+        threadId: 'thread-1',
+      },
+    );
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'pending',
+      summaryAt: undefined,
+      summarySignalId: result.signals[0]?.id,
+    });
+  });
+
+  it('keeps the persist behavior for all-low-priority summaries and passes only the policy request context', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const resolveNotificationDeliveryDecision = vi.fn(async () => ({
+      action: 'summarize' as const,
+      streamOptions: { requestContext: { user: 'thread-owner' }, maxSteps: 3 },
+    }));
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'persist' }),
+      signal,
+    }));
+    const mastra = {
+      getAgentById: vi.fn(async () => ({ sendSignal, resolveNotificationDeliveryDecision })),
+    } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'mention',
+      priority: 'low',
+      summary: 'low summary',
+      summaryAt: now,
+    });
+
+    await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(sendSignal).toHaveBeenCalledWith(expect.objectContaining({ tagName: 'notification-summary' }), {
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      // Writing the summary resolves the agent's memory as the thread's owner; nothing else
+      // from the policy applies, because no run starts.
+      ifIdle: { behavior: 'persist', streamOptions: { requestContext: { user: 'thread-owner' } } },
+    });
+  });
+
+  it('records summary delivery failure when a notification summary signal is rejected', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.reject(new Error('signal routing failed: no model configured')),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'medium',
+      summary: 'CI failed',
+      summaryAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.delivered).toEqual([]);
+    expect(result.signals).toEqual([]);
+    expect(result.failed).toMatchObject([
+      { record: { id: 'n1' }, error: 'signal routing failed: no model configured' },
+    ]);
+    const stored = await storage.getNotification({ threadId: 'thread-1', id: 'n1' });
+    expect(stored).toMatchObject({
+      status: 'pending',
+      summaryAt: now,
+      deliveryAttempts: 1,
+      lastDeliveryError: 'signal routing failed: no model configured',
+    });
+    expect(stored?.summarySignalId).toBeUndefined();
+  });
+
+  it('summarizes high-priority active notifications before full idle delivery', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      signal,
+    }));
+    const getPubSub = vi.fn();
+    const mastra = { getAgentById: vi.fn(async () => ({ id: 'agent-1', getPubSub, sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'High priority update',
+      summaryAt: now,
+      deliverAt: now,
+    });
+
+    const summaryResult = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(summaryResult.failed).toEqual([]);
+    expect(summaryResult.signals).toHaveLength(1);
+    expect(summaryResult.signals[0]).toMatchObject({ type: 'notification', tagName: 'notification-summary' });
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'pending',
+      summaryAt: undefined,
+      deliverAt: now,
+      summarySignalId: summaryResult.signals[0]?.id,
+    });
+
+    sendSignal.mockClear();
+    const deliveryResult = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(deliveryResult.failed).toEqual([]);
+    expect(deliveryResult.signals[0]).toMatchObject({
+      type: 'notification',
+      tagName: 'notification',
+      contents: 'High priority update',
+    });
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'delivered',
+      deliveredSignalId: deliveryResult.signals[0]?.id,
+    });
+  });
+
+  it('skips high-priority full delivery after it has already been read', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'deliver', runId: 'run-1' }),
+      signal,
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ id: 'agent-1', sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'high',
+      summary: 'High priority update',
+      deliverAt: now,
+    });
+    await storage.updateNotification({ threadId: 'thread-1', id: 'n1', summarySignalId: 'summary-1' });
+    await storage.updateNotification({ threadId: 'thread-1', id: 'n1', status: 'seen' });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.delivered).toEqual([]);
+    expect(result.signals).toEqual([]);
+    expect(sendSignal).not.toHaveBeenCalled();
+  });
+
+  it('persists low-priority summary dispatch without waking idle loops', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const sendSignal = vi.fn((signal, _target) => ({
+      accepted: Promise.resolve({ action: 'persist' }),
+      signal,
+      persisted: Promise.resolve(),
+    }));
+    const mastra = { getAgentById: vi.fn(async () => ({ sendSignal })) } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      priority: 'low',
+      summary: 'Low priority update',
+      summaryAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.failed).toEqual([]);
+    expect(sendSignal).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'notification', tagName: 'notification-summary' }),
+      { resourceId: 'resource-1', threadId: 'thread-1', ifIdle: { behavior: 'persist' } },
+    );
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'pending',
+      summaryAt: undefined,
+      summarySignalId: result.signals[0]?.id,
+    });
+  });
+
+  it('keeps failed deliveries pending with attempt metadata', async () => {
+    const storage = new InMemoryNotificationsStorage();
+    const now = new Date('2026-05-30T12:00:00Z');
+    const mastra = {
+      getAgentById: vi.fn(async () => ({
+        sendSignal: vi.fn(() => {
+          throw new Error('agent offline');
+        }),
+      })),
+    } as any;
+    await storage.createNotification({
+      id: 'n1',
+      agentId: 'agent-1',
+      resourceId: 'resource-1',
+      threadId: 'thread-1',
+      source: 'github',
+      kind: 'ci-status',
+      summary: 'CI failed',
+      deliverAt: now,
+    });
+
+    const result = await dispatchDueNotifications({ mastra, storage, now });
+
+    expect(result.delivered).toEqual([]);
+    expect(result.failed).toMatchObject([{ record: { id: 'n1' }, error: 'agent offline' }]);
+    await expect(storage.getNotification({ threadId: 'thread-1', id: 'n1' })).resolves.toMatchObject({
+      status: 'pending',
+      deliveryAttempts: 1,
+      lastDeliveryError: 'agent offline',
+    });
+  });
+
+  it('registers notification dispatch workflow by default', async () => {
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({
+      id: 'notification-workflow-registration-storage',
+      domains: { notifications },
+    });
+    const mastra = new Mastra({
+      storage,
+      logger: false,
+    });
+
+    try {
+      const workflow = (mastra as any).getWorkflow('__mastra_notification_dispatcher');
+      expect(workflow.id).toBe('__mastra_notification_dispatcher');
+      expect(mastra.listWorkflows()).not.toHaveProperty('__mastra_notification_dispatcher');
+      // The dispatcher must not declare a schedule — its schedule row is
+      // created lazily on the first deferred notification so idle apps never
+      // start the scheduler (see #18864).
+      expect(workflow.getScheduleConfigs()).toEqual([]);
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
+  it('allows notification dispatch workflow registration to be disabled', async () => {
+    const notifications = new InMemoryNotificationsStorage();
+    const storage = new MastraCompositeStore({
+      id: 'notification-workflow-disabled-storage',
+      domains: { notifications },
+    });
+    const mastra = new Mastra({
+      storage,
+      logger: false,
+      notifications: { dispatch: { enabled: false } },
+    });
+
+    try {
+      expect(() => (mastra as any).getWorkflow('__mastra_notification_dispatcher')).toThrow(
+        'Workflow with ID __mastra_notification_dispatcher not found',
+      );
+    } finally {
+      await mastra.stopWorkers();
+    }
+  });
+
+  it('builds the dispatcher schedule row from the dispatch config', () => {
+    const schedule = buildNotificationDispatchSchedule({ cron: '*/5 * * * *', batchSize: 25 });
+
+    expect(schedule).toMatchObject({
+      id: NOTIFICATION_DISPATCH_SCHEDULE_ROW_ID,
+      cron: '*/5 * * * *',
+      status: 'active',
+      target: {
+        type: 'workflow',
+        workflowId: '__mastra_notification_dispatcher',
+        inputData: { limit: 25 },
+      },
+      metadata: { internal: true, feature: 'notifications' },
+    });
+    expect(schedule.nextFireAt).toBeGreaterThan(Date.now());
+    // Not `wf_`-prefixed: declarative orphan-cleanup must leave it alone.
+    expect(schedule.id.startsWith('wf_')).toBe(false);
+  });
+
+  it('rejects invalid notification dispatch workflow times', () => {
+    expect(() => parseNotificationDispatchNow('not-a-date')).toThrow('Invalid notification dispatch time: not-a-date');
+  });
+
+  it('creates an unscheduled notification dispatch workflow', () => {
+    const workflow = createNotificationDispatchWorkflow({ batchSize: 25 });
+
+    expect(workflow.id).toBe('__mastra_notification_dispatcher');
+    expect((workflow as any).getScheduleConfigs()).toEqual([]);
+  });
+});

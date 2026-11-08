@@ -1,0 +1,288 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import { MastraFGAPermissions } from '../auth/ee';
+import { RequestContext } from '../request-context';
+import { InMemoryStore } from '../storage';
+
+import { MockMemory } from './mock';
+
+describe('MastraMemory FGA', () => {
+  it('includes the acting agent in thread authorization metadata', async () => {
+    const fgaProvider = {
+      require: vi.fn().mockResolvedValue(undefined),
+    };
+    const requestContext = new RequestContext();
+    const user = { id: 'user-1', organizationMembershipId: 'membership-1' };
+
+    await MockMemory.checkThreadFGA({
+      mastra: {
+        getServer: () => ({ fga: fgaProvider }),
+      } as any,
+      user,
+      threadId: 'thread-1',
+      resourceId: 'resource-1',
+      agentId: 'agent-1',
+      requestContext,
+      permission: MastraFGAPermissions.MEMORY_READ,
+    });
+
+    expect(fgaProvider.require).toHaveBeenCalledWith(user, {
+      resource: { type: 'thread', id: 'thread-1' },
+      permission: MastraFGAPermissions.MEMORY_READ,
+      context: {
+        requestContext,
+        resourceId: 'resource-1',
+        metadata: {
+          threadId: 'thread-1',
+          resourceId: 'resource-1',
+          agentId: 'agent-1',
+        },
+      },
+    });
+  });
+
+  it('bypasses thread membership resolution for a tenant-scoped trusted actor', async () => {
+    const fgaProvider = {
+      require: vi.fn().mockResolvedValue(undefined),
+    };
+    const requestContext = new RequestContext();
+    requestContext.set('organizationId', 'org-1');
+
+    await MockMemory.checkThreadFGA({
+      mastra: {
+        getServer: () => ({ fga: fgaProvider }),
+      } as any,
+      threadId: 'thread-1',
+      resourceId: 'tenant-1',
+      requestContext,
+      permission: MastraFGAPermissions.MEMORY_READ,
+      actor: { actorKind: 'system', sourceWorkflow: 'nightly-workflow' },
+    });
+
+    expect(fgaProvider.require).not.toHaveBeenCalled();
+  });
+});
+
+describe('MastraMemory config serialization', () => {
+  it('should serialize observational memory retrieval config for thread scope', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          retrieval: true,
+          observation: {
+            messageTokens: 500,
+            model: 'test-observer-model',
+          },
+          reflection: {
+            observationTokens: 1000,
+            model: 'test-reflector-model',
+          },
+        },
+      },
+    });
+
+    expect(memory.getConfig().observationalMemory).toEqual({
+      scope: 'thread',
+      activateAfterIdle: undefined,
+      temporalMarkers: undefined,
+      retrieval: true,
+      observation: {
+        messageTokens: 500,
+        model: 'test-observer-model',
+        modelSettings: undefined,
+        providerOptions: undefined,
+        maxTokensPerBatch: undefined,
+        bufferTokens: undefined,
+        bufferActivation: undefined,
+        blockAfter: undefined,
+      },
+      reflection: {
+        observationTokens: 1000,
+        model: 'test-reflector-model',
+        modelSettings: undefined,
+        providerOptions: undefined,
+        blockAfter: undefined,
+      },
+      shareTokenBudget: undefined,
+    });
+  });
+
+  it('should serialize retrieval config for resource scope without changing the requested config', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'resource',
+          retrieval: true,
+          model: 'test-model',
+        },
+      },
+    });
+
+    expect(memory.getConfig().observationalMemory).toEqual({
+      scope: 'resource',
+      activateAfterIdle: undefined,
+      temporalMarkers: undefined,
+      retrieval: true,
+      model: 'test-model',
+      shareTokenBudget: undefined,
+    });
+  });
+
+  it('should serialize retrieval config with vector: true', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          retrieval: { vector: true },
+          model: 'test-model',
+        },
+      },
+    });
+
+    const omConfig = memory.getConfig().observationalMemory;
+    expect(typeof omConfig).not.toBe('boolean');
+    if (typeof omConfig !== 'boolean' && omConfig) {
+      expect(omConfig.retrieval).toEqual({ vector: true });
+    }
+  });
+
+  it('should preserve backward compatibility with retrieval: false', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          retrieval: false,
+          model: 'test-model',
+        },
+      },
+    });
+
+    const omConfig = memory.getConfig().observationalMemory;
+    expect(typeof omConfig).not.toBe('boolean');
+    if (typeof omConfig !== 'boolean' && omConfig) {
+      expect(omConfig.retrieval).toBe(false);
+    }
+  });
+
+  it('should serialize top-level activateAfterIdle for observational memory', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          activateAfterIdle: '5m',
+          model: 'test-model',
+        },
+      },
+    });
+
+    expect(memory.getConfig().observationalMemory).toEqual({
+      scope: 'thread',
+      activateAfterIdle: '5m',
+      model: 'test-model',
+      shareTokenBudget: undefined,
+      temporalMarkers: undefined,
+      retrieval: undefined,
+    });
+  });
+
+  it('should serialize auto activateAfterIdle for observational memory', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          activateAfterIdle: 'auto',
+          model: 'test-model',
+        },
+      },
+    });
+
+    expect(memory.getConfig().observationalMemory).toEqual({
+      scope: 'thread',
+      activateAfterIdle: 'auto',
+      model: 'test-model',
+      shareTokenBudget: undefined,
+      temporalMarkers: undefined,
+      retrieval: undefined,
+    });
+  });
+
+  it('should serialize per-provider activateAfterIdle for observational memory', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          activateAfterIdle: { default: 'auto', anthropic: '1h' },
+          model: 'test-model',
+        },
+      },
+    });
+
+    const serialized = memory.getConfig().observationalMemory;
+    expect(serialized).toEqual({
+      scope: 'thread',
+      activateAfterIdle: { default: 'auto', anthropic: '1h' },
+      model: 'test-model',
+      shareTokenBudget: undefined,
+      temporalMarkers: undefined,
+      retrieval: undefined,
+    });
+    expect(JSON.parse(JSON.stringify(serialized))).toMatchObject({
+      activateAfterIdle: { default: 'auto', anthropic: '1h' },
+    });
+  });
+
+  it('should serialize temporalMarkers for observational memory', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          scope: 'thread',
+          temporalMarkers: true,
+          model: 'test-model',
+        },
+      },
+    });
+
+    expect(memory.getConfig().observationalMemory).toEqual({
+      scope: 'thread',
+      activateAfterIdle: undefined,
+      model: 'test-model',
+      shareTokenBudget: undefined,
+      temporalMarkers: true,
+      retrieval: undefined,
+    });
+  });
+
+  it('round-trips observation and reflection maxRetries and failurePolicy through getConfig()', () => {
+    const memory = new MockMemory({
+      storage: new InMemoryStore(),
+      options: {
+        observationalMemory: {
+          model: 'test-model',
+          observation: { maxRetries: 1, failurePolicy: 'continue' },
+          reflection: { maxRetries: 0, failurePolicy: 'abort' },
+        },
+      },
+    });
+
+    const omConfig = memory.getConfig().observationalMemory;
+    expect(omConfig).toMatchObject({
+      observation: { maxRetries: 1, failurePolicy: 'continue' },
+      reflection: { maxRetries: 0, failurePolicy: 'abort' },
+    });
+
+    const restored = new MockMemory({
+      storage: new InMemoryStore(),
+      options: { observationalMemory: omConfig },
+    });
+    expect(restored.getConfig().observationalMemory).toEqual(omConfig);
+  });
+});

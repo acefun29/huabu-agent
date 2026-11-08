@@ -1,0 +1,174 @@
+import { convertArrayToReadableStream, MockLanguageModelV2 } from '@internal/ai-sdk-v5/test';
+import { describe, it, expect, vi } from 'vitest';
+import { Agent } from '../../agent';
+import { Mastra } from '../../mastra';
+import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from '../../request-context';
+import { InMemoryStore } from '../../storage';
+import { createScorer } from '../base';
+import { runEvals } from '.';
+
+describe('runEvals - Score Persistence', () => {
+  // The scorer passed to runEvals must persist even without Mastra registration. (#27603)
+  it.each([false, true])('saves scores when scorer is registered on Mastra: %s', async registerScorer => {
+    // Create a simple agent
+    const dummyModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        content: [{ type: 'text', text: 'Test response' }],
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: 'Test' },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 } },
+        ]),
+      }),
+    });
+
+    const agent = new Agent({
+      id: 'testAgent',
+      name: 'Test Agent',
+      instructions: 'Test instructions',
+      model: dummyModel,
+    });
+
+    // Create a scorer
+    const scorer = createScorer({
+      id: 'testScorer',
+      description: 'Test scorer for bug demonstration',
+      name: 'testScorer',
+    }).generateScore(() => {
+      // Simple scorer that always returns 0.85
+      return 0.85;
+    });
+
+    // Use a real in-memory store rather than a partial mock: the agent loop
+    // runs on the evented workflow engine, which needs a functioning
+    // `workflows` store to coordinate step execution. A scores-only mock would
+    // leave the loop unable to complete and the run would hang.
+    const storage = new InMemoryStore();
+
+    const mastra = new Mastra({
+      agents: { testAgent: agent },
+      ...(registerScorer ? { scorers: { testScorer: scorer } } : {}),
+      logger: false,
+      storage,
+    });
+
+    // Track saveScore calls by spying on the real scores store the eval
+    // pipeline writes to, while still delegating to the real implementation.
+    const saveScoreCalls: any[] = [];
+    const scoresStore = (await mastra.getStorage()!.getStore('scores'))!;
+    const realSaveScore = scoresStore.saveScore.bind(scoresStore);
+    vi.spyOn(scoresStore, 'saveScore').mockImplementation(async (payload: any) => {
+      saveScoreCalls.push(payload);
+      return realSaveScore(payload);
+    });
+
+    // Run the evaluation
+    const result = await runEvals({
+      data: [
+        { input: 'Test input 1', groundTruth: 'Expected output 1' },
+        { input: 'Test input 2', groundTruth: 'Expected output 2' },
+      ],
+      scorers: [scorer],
+      target: agent,
+    });
+
+    // Verify the scores were calculated correctly
+    expect(result.scores.testScorer).toBe(0.85);
+    expect(result.summary.totalItems).toBe(2);
+
+    expect(saveScoreCalls).toHaveLength(2);
+    const saved = await scoresStore.listScoresByScorerId({ scorerId: scorer.id, pagination: { page: 0, perPage: 10 } });
+    expect(saved.scores).toHaveLength(2);
+    expect(saved.scores.map(row => row.score)).toEqual([0.85, 0.85]);
+
+    // Verify first score includes groundTruth in additionalContext
+    expect(saveScoreCalls[0]).toMatchObject({
+      scorerId: 'testScorer',
+      score: 0.85,
+      source: 'TEST',
+      entityId: 'testAgent',
+      entityType: 'AGENT',
+      additionalContext: {
+        groundTruth: 'Expected output 1',
+      },
+    });
+
+    // Verify second score includes its groundTruth
+    expect(saveScoreCalls[1]).toMatchObject({
+      scorerId: 'testScorer',
+      score: 0.85,
+      source: 'TEST',
+      entityId: 'testAgent',
+      entityType: 'AGENT',
+      additionalContext: {
+        groundTruth: 'Expected output 2',
+      },
+    });
+  });
+
+  it('persists a JSON-safe requestContext without the auth token', async () => {
+    const model = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        content: [{ type: 'text', text: 'ok' }],
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: 'ok' },
+          { type: 'text-end', id: 'text-1' },
+          { type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+        ]),
+      }),
+    });
+    const agent = new Agent({ id: 'ctxAgent', name: 'Ctx Agent', instructions: 'x', model });
+    const scorer = createScorer({ id: 'ctxScorer', description: 'x', name: 'ctxScorer' }).generateScore(() => 1);
+    const mastra = new Mastra({
+      agents: { ctxAgent: agent },
+      scorers: { ctxScorer: scorer },
+      logger: false,
+      storage: new InMemoryStore(),
+    });
+
+    const saveScoreCalls: any[] = [];
+    const scoresStore = (await mastra.getStorage()!.getStore('scores'))!;
+    const realSaveScore = scoresStore.saveScore.bind(scoresStore);
+    vi.spyOn(scoresStore, 'saveScore').mockImplementation(async (payload: any) => {
+      saveScoreCalls.push(payload);
+      return realSaveScore(payload);
+    });
+
+    const requestContext = new RequestContext<any>([
+      ['userId', 'u1'],
+      [MASTRA_AUTH_TOKEN_KEY, 'super-secret-token'],
+      ['fn', () => 1],
+      ['nested', { a: { b: 'x' } }],
+    ]);
+
+    await runEvals({
+      data: [{ input: 'hi', requestContext }],
+      scorers: [scorer],
+      target: agent,
+    });
+
+    expect(saveScoreCalls).toHaveLength(1);
+    expect(saveScoreCalls[0].requestContext).toEqual({ userId: 'u1', 'nested.a.b': 'x' });
+    expect(JSON.stringify(saveScoreCalls[0])).not.toContain('super-secret-token');
+  });
+});

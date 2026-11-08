@@ -1,0 +1,421 @@
+import { describe, it, expect } from 'vitest';
+import type { MastraMessagePart } from '../agent/message-list/state/types';
+import {
+  extractWorkingMemoryTags,
+  extractWorkingMemoryContent,
+  removeWorkingMemoryTags,
+  removeWorkingMemoryToolInvocationParts,
+  removeWorkingMemoryToolInvocations,
+  removeSystemReminderTags,
+} from './working-memory-utils';
+
+describe('Working Memory Utils - ReDoS Prevention', () => {
+  // The vulnerable regex pattern that was replaced
+  const vulnerableRegex = /<working_memory>([^]*?)<\/working_memory>/g;
+
+  describe('extractWorkingMemoryTags', () => {
+    it('should extract simple working memory tags', () => {
+      const result = extractWorkingMemoryTags('<working_memory>hello world</working_memory>');
+      expect(result).toEqual(['<working_memory>hello world</working_memory>']);
+    });
+
+    it('should extract multiple working memory tags', () => {
+      const result = extractWorkingMemoryTags(
+        '<working_memory>first</working_memory> text <working_memory>second</working_memory>',
+      );
+      expect(result).toEqual(['<working_memory>first</working_memory>', '<working_memory>second</working_memory>']);
+    });
+
+    it('should handle multiline content', () => {
+      const result = extractWorkingMemoryTags('<working_memory>line1\nline2\nline3</working_memory>');
+      expect(result).toEqual(['<working_memory>line1\nline2\nline3</working_memory>']);
+    });
+
+    it('should return null when no tags found', () => {
+      expect(extractWorkingMemoryTags('no tags here')).toBeNull();
+    });
+
+    it('should return null when only opening tag exists', () => {
+      expect(extractWorkingMemoryTags('<working_memory>unclosed')).toBeNull();
+    });
+
+    it('should handle nested angle brackets', () => {
+      const result = extractWorkingMemoryTags('<working_memory>has <nested> tags</working_memory>');
+      expect(result).toEqual(['<working_memory>has <nested> tags</working_memory>']);
+    });
+
+    it('should match regex behavior for normal inputs', () => {
+      const testCases = [
+        '<working_memory>hello world</working_memory>',
+        'prefix <working_memory>content</working_memory> suffix',
+        '<working_memory></working_memory>',
+        '<working_memory>multi\nline</working_memory>',
+      ];
+
+      for (const input of testCases) {
+        const regexResult = input.match(vulnerableRegex);
+        const helperResult = extractWorkingMemoryTags(input);
+        expect(helperResult).toEqual(regexResult);
+      }
+    });
+  });
+
+  describe('extractWorkingMemoryContent', () => {
+    it('should extract content without tags', () => {
+      expect(extractWorkingMemoryContent('<working_memory>hello world</working_memory>')).toBe('hello world');
+    });
+
+    it('should return first match content only', () => {
+      expect(
+        extractWorkingMemoryContent('<working_memory>first</working_memory> <working_memory>second</working_memory>'),
+      ).toBe('first');
+    });
+
+    it('should handle multiline content', () => {
+      expect(extractWorkingMemoryContent('<working_memory>line1\nline2</working_memory>')).toBe('line1\nline2');
+    });
+
+    it('should return null when no tags found', () => {
+      expect(extractWorkingMemoryContent('no tags here')).toBeNull();
+    });
+
+    it('should return null when only opening tag exists', () => {
+      expect(extractWorkingMemoryContent('<working_memory>unclosed')).toBeNull();
+    });
+
+    it('should handle empty content', () => {
+      expect(extractWorkingMemoryContent('<working_memory></working_memory>')).toBe('');
+    });
+
+    it('should extract content with prefix text', () => {
+      expect(extractWorkingMemoryContent('prefix <working_memory>content</working_memory>')).toBe('content');
+    });
+  });
+
+  describe('removeWorkingMemoryTags', () => {
+    it('should remove working memory tags', () => {
+      expect(removeWorkingMemoryTags('<working_memory>secret</working_memory>')).toBe('');
+    });
+
+    it('should remove tags and preserve surrounding text', () => {
+      expect(removeWorkingMemoryTags('Hello <working_memory>secret</working_memory> world')).toBe('Hello  world');
+    });
+
+    it('should remove multiple tags', () => {
+      expect(
+        removeWorkingMemoryTags('<working_memory>a</working_memory> middle <working_memory>b</working_memory>'),
+      ).toBe(' middle ');
+    });
+
+    it('should handle text with no tags', () => {
+      expect(removeWorkingMemoryTags('no tags here')).toBe('no tags here');
+    });
+
+    it('should handle unclosed tags by preserving them', () => {
+      expect(removeWorkingMemoryTags('before <working_memory>unclosed')).toBe('before <working_memory>unclosed');
+    });
+
+    it('should match regex behavior for normal inputs', () => {
+      const testCases = [
+        '<working_memory>hello</working_memory>',
+        'prefix <working_memory>content</working_memory> suffix',
+        'Hello <working_memory>secret</working_memory> world',
+        '<working_memory>a</working_memory><working_memory>b</working_memory>',
+      ];
+
+      for (const input of testCases) {
+        const regexResult = input.replace(vulnerableRegex, '');
+        const helperResult = removeWorkingMemoryTags(input);
+        expect(helperResult).toBe(regexResult);
+      }
+    });
+  });
+
+  describe('Performance comparison (ReDoS prevention)', () => {
+    // Generate pathological input that causes O(n²) behavior with regex
+    function createPathologicalInput(n: number): string {
+      return '<working_memory>' + '<working_memory>a'.repeat(n);
+    }
+
+    it('should handle pathological input without performance degradation', () => {
+      // This input would cause the regex to take ~60ms at n=5000
+      // and grows quadratically. The helper should stay under 1ms.
+      const input = createPathologicalInput(5000);
+
+      const start = performance.now();
+      const result = extractWorkingMemoryTags(input);
+      const elapsed = performance.now() - start;
+
+      // Helper should complete in under 5ms even for large inputs
+      expect(elapsed).toBeLessThan(5);
+      // Should return null since there's no closing tag
+      expect(result).toBeNull();
+    });
+
+    it('should demonstrate regex has quadratic complexity on pathological input', () => {
+      // Use large enough inputs that timer/JIT noise does not hide the growth pattern.
+      const times: { n: number; ms: number }[] = [];
+
+      for (const n of [1000, 2000, 4000]) {
+        const input = createPathologicalInput(n);
+
+        const start = performance.now();
+        input.match(vulnerableRegex);
+        const elapsed = performance.now() - start;
+
+        times.push({ n, ms: elapsed });
+      }
+
+      // When n doubles, time should roughly quadruple for O(n²).
+      // Check that 4000 takes significantly longer than 1000 (should be ~16x for O(n²)).
+      const ratio = times[2].ms / times[0].ms;
+      // Allow some variance, but it should be at least 4x (would be 16x for perfect O(n²))
+      expect(ratio).toBeGreaterThan(4);
+    });
+
+    it('should show helper maintains linear performance', () => {
+      const times: { n: number; ms: number }[] = [];
+
+      for (const n of [5000, 10000, 20000]) {
+        const input = createPathologicalInput(n);
+
+        const start = performance.now();
+        extractWorkingMemoryTags(input);
+        const elapsed = performance.now() - start;
+
+        times.push({ n, ms: elapsed });
+      }
+
+      // For O(n) complexity, when n doubles, time should roughly double
+      // All should complete very fast (under 1ms typically)
+      for (const t of times) {
+        expect(t.ms).toBeLessThan(5);
+      }
+    });
+  });
+});
+
+describe('removeSystemReminderTags', () => {
+  it('should remove simple system-reminder tags', () => {
+    expect(removeSystemReminderTags('<system-reminder>content</system-reminder>')).toBe('');
+  });
+
+  it('should remove system-reminder tags with attributes', () => {
+    expect(
+      removeSystemReminderTags('<system-reminder type="browser">Current URL: https://example.com</system-reminder>'),
+    ).toBe('');
+  });
+
+  it('should preserve surrounding text', () => {
+    expect(removeSystemReminderTags('Hello <system-reminder>secret</system-reminder> world')).toBe('Hello  world');
+  });
+
+  it('should handle multiple system-reminder tags', () => {
+    expect(
+      removeSystemReminderTags(
+        '<system-reminder>a</system-reminder> middle <system-reminder type="x">b</system-reminder>',
+      ),
+    ).toBe(' middle ');
+  });
+
+  it('should return unchanged text when no tags present', () => {
+    expect(removeSystemReminderTags('no tags here')).toBe('no tags here');
+  });
+
+  it('should handle unclosed tags by keeping them', () => {
+    expect(removeSystemReminderTags('before <system-reminder unclosed')).toBe('before <system-reminder unclosed');
+  });
+
+  it('should handle missing closing tag by keeping from start tag', () => {
+    expect(removeSystemReminderTags('before <system-reminder>unclosed content')).toBe(
+      'before <system-reminder>unclosed content',
+    );
+  });
+});
+
+describe('removeWorkingMemoryToolInvocationParts', () => {
+  const reasoning = { type: 'reasoning' as const, reasoning: 'thinking', details: [] };
+  const call = (toolCallId: string, toolName: string): MastraMessagePart => ({
+    type: 'tool-invocation',
+    toolInvocation: { state: 'result', toolCallId, toolName, args: {}, result: 'ok' },
+  });
+
+  it('drops a step left with only reasoning', () => {
+    const next: MastraMessagePart[] = [{ type: 'step-start' }, reasoning, { type: 'text', text: 'Done' }];
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        reasoning,
+        call('wm', 'updateWorkingMemory'),
+        ...next,
+      ]),
+    ).toEqual(next);
+  });
+
+  it('drops a step left with only reasoning and whitespace text', () => {
+    const next: MastraMessagePart[] = [{ type: 'step-start' }, reasoning, { type: 'text', text: 'Done' }];
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        reasoning,
+        { type: 'text', text: '\n\n' },
+        call('wm', 'updateWorkingMemory'),
+        ...next,
+      ]),
+    ).toEqual(next);
+  });
+
+  it('drops a step left with only reasoning and working-memory tags', () => {
+    const next: MastraMessagePart[] = [{ type: 'step-start' }, reasoning, { type: 'text', text: 'Done' }];
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        reasoning,
+        { type: 'text', text: '<working_memory># User\n- Name: Jim</working_memory>\n' },
+        call('wm', 'updateWorkingMemory'),
+        ...next,
+      ]),
+    ).toEqual(next);
+  });
+
+  it('keeps reasoning when another tool call shares the step', () => {
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        { type: 'step-start' },
+        reasoning,
+        call('wm', 'updateWorkingMemory'),
+        call('other', 'lookupWeather'),
+      ]),
+    ).toEqual([{ type: 'step-start' }, reasoning, call('other', 'lookupWeather')]);
+  });
+
+  it('finds step boundaries after tool parts when step-start markers are missing', () => {
+    const reasoningA = { ...reasoning, reasoning: 'A' };
+    const reasoningB = { ...reasoning, reasoning: 'B' };
+    const reasoningC = { ...reasoning, reasoning: 'C' };
+    expect(
+      removeWorkingMemoryToolInvocationParts([
+        reasoningA,
+        call('wm1', 'updateWorkingMemory'),
+        reasoningB,
+        { type: 'text', text: 'Checking' },
+        call('wm2', 'updateWorkingMemory'),
+        call('other', 'lookupWeather'),
+        reasoningC,
+        { type: 'text', text: 'Done' },
+      ]),
+    ).toEqual([
+      reasoningB,
+      { type: 'text', text: 'Checking' },
+      call('other', 'lookupWeather'),
+      reasoningC,
+      { type: 'text', text: 'Done' },
+    ]);
+  });
+
+  describe('Gemini thought signatures on parallel calls (#27231)', () => {
+    const signed = (part: MastraMessagePart, providerMetadata: Record<string, Record<string, any>>) =>
+      ({ ...part, providerMetadata }) as MastraMessagePart;
+    const SKIP = 'skip_thought_signature_validator';
+
+    it('marks the first surviving call with the skip-validator signature, not the removed call signature', () => {
+      const wm = signed(call('wm', 'updateWorkingMemory'), {
+        google: { thoughtSignature: 'sig-1' },
+        mastra: { createdAt: 1 },
+      });
+      const other = signed(call('other', 'lookupWeather'), { mastra: { createdAt: 2 } });
+      const input = [{ type: 'step-start' }, wm, other, call('third', 'lookupTime')] as MastraMessagePart[];
+      const snapshot = structuredClone(input);
+
+      expect(removeWorkingMemoryToolInvocationParts(input)).toEqual([
+        { type: 'step-start' },
+        signed(call('other', 'lookupWeather'), { mastra: { createdAt: 2 }, google: { thoughtSignature: SKIP } }),
+        call('third', 'lookupTime'),
+      ]);
+      expect(input).toEqual(snapshot);
+    });
+
+    it('keeps an existing signature on the surviving call', () => {
+      const wm = signed(call('wm', 'updateWorkingMemory'), { google: { thoughtSignature: 'sig-wm' } });
+      const other = signed(call('other', 'lookupWeather'), { google: { thoughtSignature: 'sig-other' } });
+      expect(removeWorkingMemoryToolInvocationParts([{ type: 'step-start' }, wm, other])).toEqual([
+        { type: 'step-start' },
+        other,
+      ]);
+    });
+
+    it('uses the removed call provider namespace and copies no other provider metadata', () => {
+      const wm = signed(call('wm', 'updateWorkingMemory'), {
+        vertex: { thoughtSignature: 'sig-vertex', extra: 'wm-only' },
+        openai: { itemId: 'fc_wm' },
+      });
+      expect(
+        removeWorkingMemoryToolInvocationParts([{ type: 'step-start' }, wm, call('other', 'lookupWeather')]),
+      ).toEqual([
+        { type: 'step-start' },
+        signed(call('other', 'lookupWeather'), { vertex: { thoughtSignature: SKIP } }),
+      ]);
+    });
+
+    it('adds nothing when the removed call is unsigned', () => {
+      expect(
+        removeWorkingMemoryToolInvocationParts([
+          { type: 'step-start' },
+          call('wm', 'updateWorkingMemory'),
+          call('other', 'lookupWeather'),
+        ]),
+      ).toEqual([{ type: 'step-start' }, call('other', 'lookupWeather')]);
+    });
+
+    it('still drops a step whose only call was the signed working-memory call', () => {
+      const next: MastraMessagePart[] = [{ type: 'step-start' }, { type: 'text', text: 'Done' }];
+      expect(
+        removeWorkingMemoryToolInvocationParts([
+          { type: 'step-start' },
+          reasoning,
+          signed(call('wm', 'updateWorkingMemory'), { google: { thoughtSignature: 'sig-1' } }),
+          ...next,
+        ]),
+      ).toEqual(next);
+    });
+
+    it('marks only the first surviving call of the same step', () => {
+      expect(
+        removeWorkingMemoryToolInvocationParts([
+          { type: 'step-start' },
+          signed(call('wm', 'updateWorkingMemory'), { google: { thoughtSignature: 'sig-1' } }),
+          call('a', 'lookupWeather'),
+          { type: 'step-start' },
+          call('b', 'lookupWeather'),
+        ]),
+      ).toEqual([
+        { type: 'step-start' },
+        signed(call('a', 'lookupWeather'), { google: { thoughtSignature: SKIP } }),
+        { type: 'step-start' },
+        call('b', 'lookupWeather'),
+      ]);
+    });
+  });
+
+  it('leaves state-signal setWorkingMemory calls alone', () => {
+    const parts: MastraMessagePart[] = [{ type: 'step-start' }, reasoning, call('wm', 'setWorkingMemory')];
+    expect(removeWorkingMemoryToolInvocationParts(parts)).toBe(parts);
+  });
+});
+
+describe('removeWorkingMemoryToolInvocations', () => {
+  const invocation = (toolName: string) => ({
+    state: 'result' as const,
+    toolCallId: toolName,
+    toolName,
+    args: {},
+    result: 'ok',
+  });
+
+  it('removes updateWorkingMemory entries and drops an emptied array', () => {
+    expect(removeWorkingMemoryToolInvocations([invocation('updateWorkingMemory')])).toBeUndefined();
+    expect(
+      removeWorkingMemoryToolInvocations([invocation('updateWorkingMemory'), invocation('lookupWeather')]),
+    ).toEqual([invocation('lookupWeather')]);
+  });
+});

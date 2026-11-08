@@ -1,0 +1,201 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+  createTimeoutAbortSignal,
+  isMastraTimeoutError,
+  MastraTimeoutError,
+  raceAgainstAbort,
+  settledOrElapsed,
+} from './timeout';
+
+const tick = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+describe('createTimeoutAbortSignal', () => {
+  it('aborts with a MastraTimeoutError once the budget elapses', async () => {
+    const { signal, cleanup } = createTimeoutAbortSignal({ timeoutMs: 20, timeoutType: 'total' });
+
+    expect(signal?.aborted).toBe(false);
+    await tick(40);
+
+    expect(signal?.aborted).toBe(true);
+    expect(isMastraTimeoutError(signal?.reason)).toBe(true);
+    expect((signal?.reason as MastraTimeoutError).timeoutType).toBe('total');
+    expect((signal?.reason as MastraTimeoutError).timeoutMs).toBe(20);
+    cleanup();
+  });
+
+  it('rejects timeoutPromise with the same error', async () => {
+    const { timeoutPromise, cleanup } = createTimeoutAbortSignal({ timeoutMs: 10, timeoutType: 'step' });
+
+    await expect(timeoutPromise).rejects.toThrow(MastraTimeoutError);
+    await expect(timeoutPromise).rejects.toMatchObject({ timeoutType: 'step', timeoutMs: 10 });
+    cleanup();
+  });
+
+  it('is a pass-through when no timeout is configured', () => {
+    const parent = new AbortController();
+    const { signal, timeoutPromise, cleanup } = createTimeoutAbortSignal({
+      parentSignal: parent.signal,
+      timeoutType: 'total',
+    });
+
+    expect(signal).toBe(parent.signal);
+    expect(timeoutPromise).toBeUndefined();
+    cleanup();
+  });
+
+  it('ignores non-positive and non-finite budgets', () => {
+    for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { timeoutPromise } = createTimeoutAbortSignal({ timeoutMs, timeoutType: 'step' });
+      expect(timeoutPromise).toBeUndefined();
+    }
+  });
+
+  it('propagates a parent abort and preserves the parent reason', async () => {
+    const parent = new AbortController();
+    const { signal, cleanup } = createTimeoutAbortSignal({
+      parentSignal: parent.signal,
+      timeoutMs: 10_000,
+      timeoutType: 'total',
+    });
+
+    const reason = new Error('user cancelled');
+    parent.abort(reason);
+    await tick(0);
+
+    expect(signal?.aborted).toBe(true);
+    expect(signal?.reason).toBe(reason);
+    expect(isMastraTimeoutError(signal?.reason)).toBe(false);
+    cleanup();
+  });
+
+  it('propagates an already-aborted parent signal', () => {
+    const parent = new AbortController();
+    const reason = new Error('already gone');
+    parent.abort(reason);
+
+    const { signal, cleanup } = createTimeoutAbortSignal({
+      parentSignal: parent.signal,
+      timeoutMs: 10_000,
+      timeoutType: 'total',
+    });
+
+    expect(signal?.aborted).toBe(true);
+    expect(signal?.reason).toBe(reason);
+    cleanup();
+  });
+
+  it('cleanup clears the timer and detaches the parent listener', async () => {
+    const parent = new AbortController();
+    const removeSpy = vi.spyOn(parent.signal, 'removeEventListener');
+
+    const { signal, cleanup } = createTimeoutAbortSignal({
+      parentSignal: parent.signal,
+      timeoutMs: 10,
+      timeoutType: 'step',
+    });
+    cleanup();
+    await tick(30);
+
+    expect(signal?.aborted).toBe(false);
+    expect(removeSpy).toHaveBeenCalled();
+  });
+
+  it('after default cleanup, a parent abort no longer reaches the signal', () => {
+    const parent = new AbortController();
+    const { signal, cleanup } = createTimeoutAbortSignal({
+      parentSignal: parent.signal,
+      timeoutMs: 10_000,
+      timeoutType: 'step',
+    });
+    cleanup();
+    parent.abort(new Error('stop'));
+
+    expect(signal?.aborted).toBe(false);
+  });
+
+  it('with detachParentOnCleanup: false, cleanup only clears the timer and keeps the parent link', async () => {
+    const parent = new AbortController();
+    const { signal, cleanup } = createTimeoutAbortSignal({
+      parentSignal: parent.signal,
+      timeoutMs: 10,
+      timeoutType: 'total',
+      detachParentOnCleanup: false,
+    });
+    cleanup();
+    await tick(30);
+    expect(signal?.aborted).toBe(false);
+
+    const reason = new Error('stop');
+    parent.abort(reason);
+    expect(signal?.aborted).toBe(true);
+    expect(signal?.reason).toBe(reason);
+  });
+});
+
+describe('raceAgainstAbort', () => {
+  it('resolves with the promise when the signal never aborts', async () => {
+    const { signal, cleanup } = createTimeoutAbortSignal({ timeoutMs: 10_000, timeoutType: 'step' });
+    await expect(raceAgainstAbort(Promise.resolve('ok'), signal)).resolves.toBe('ok');
+    cleanup();
+  });
+
+  it('rejects with the timeout error when the budget elapses first', async () => {
+    const { signal, cleanup } = createTimeoutAbortSignal({ timeoutMs: 20, timeoutType: 'step' });
+
+    await expect(raceAgainstAbort(new Promise(() => {}), signal)).rejects.toThrow(MastraTimeoutError);
+    cleanup();
+  });
+
+  it('rejects immediately when the signal is already aborted', async () => {
+    const controller = new AbortController();
+    const reason = new Error('nope');
+    controller.abort(reason);
+
+    await expect(raceAgainstAbort(new Promise(() => {}), controller.signal)).rejects.toBe(reason);
+  });
+
+  it('passes the promise through when no signal is provided', async () => {
+    await expect(raceAgainstAbort(Promise.resolve('ok'), undefined)).resolves.toBe('ok');
+  });
+});
+
+describe('settledOrElapsed', () => {
+  it('resolves as soon as the promise settles, before the wait elapses', async () => {
+    vi.useFakeTimers();
+    try {
+      let done = false;
+      const pending = Promise.withResolvers<string>();
+      const waited = settledOrElapsed(pending.promise, 1_000).then(() => {
+        done = true;
+      });
+      pending.resolve('saved');
+      await vi.advanceTimersByTimeAsync(0);
+      await waited;
+      expect(done).toBe(true);
+      // The wait timer is cleared once the promise wins.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves after the wait when the promise never settles', async () => {
+    vi.useFakeTimers();
+    try {
+      let done = false;
+      void settledOrElapsed(new Promise(() => {}), 1_000).then(() => {
+        done = true;
+      });
+      await vi.advanceTimersByTimeAsync(999);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(done).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('resolves rather than rejects when the promise rejects', async () => {
+    await expect(settledOrElapsed(Promise.reject(new Error('store down')), 1_000)).resolves.toBeUndefined();
+  });
+});

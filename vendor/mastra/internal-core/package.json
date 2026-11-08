@@ -1,0 +1,152 @@
+{
+  "name": "@internal/core",
+  "version": "0.1.4",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    "./storage": {
+      "import": {
+        "types": "./dist/storage/index.d.ts",
+        "default": "./dist/storage/index.js"
+      },
+      "require": {
+        "types": "./dist/storage/index.d.cts",
+        "default": "./dist/storage/index.cjs"
+      }
+    },
+    "./base": {
+      "import": {
+        "types": "./dist/base/index.d.ts",
+        "default": "./dist/base/index.js"
+      },
+      "require": {
+        "types": "./dist/base/index.d.cts",
+        "default": "./dist/base/index.cjs"
+      }
+    },
+    "./error": {
+      "import": {
+        "types": "./dist/error/index.d.ts",
+        "default": "./dist/error/index.js"
+      },
+      "require": {
+        "types": "./dist/error/index.d.cts",
+        "default": "./dist/error/index.cjs"
+      }
+    },
+    "./logger": {
+      "import": {
+        "types": "./dist/logger/index.d.ts",
+        "default": "./dist/logger/index.js"
+      },
+      "require": {
+        "types": "./dist/logger/index.d.cts",
+        "default": "./dist/logger/index.cjs"
+      }
+    },
+    "./types": {
+      "import": {
+        "types": "./dist/types/index.d.ts",
+        "default": "./dist/types/index.js"
+      },
+      "require": {
+        "types": "./dist/types/index.d.cts",
+        "default": "./dist/types/index.cjs"
+      }
+    },
+    "./request-context": {
+      "import": {
+        "types": "./dist/request-context/index.d.ts",
+        "default": "./dist/request-context/index.js"
+      },
+      "require": {
+        "types": "./dist/request-context/index.d.cts",
+        "default": "./dist/request-context/index.cjs"
+      }
+    },
+    "./routes": {
+      "import": {
+        "types": "./dist/routes/index.d.ts",
+        "default": "./dist/routes/index.js"
+      },
+      "require": {
+        "types": "./dist/routes/index.d.cts",
+        "default": "./dist/routes/index.cjs"
+      }
+    },
+    "./durable": {
+      "import": {
+        "types": "./dist/durable/index.d.ts",
+        "default": "./dist/durable/index.js"
+      },
+      "require": {
+        "types": "./dist/durable/index.d.cts",
+        "default": "./dist/durable/index.cjs"
+      }
+    },
+    "./knowledge-compat": {
+      "import": {
+        "types": "./dist/knowledge-compat/index.d.ts",
+        "default": "./dist/knowledge-compat/index.js"
+      },
+      "require": {
+        "types": "./dist/knowledge-compat/index.d.cts",
+        "default": "./dist/knowledge-compat/index.cjs"
+      }
+    },
+    "./memory": {
+      "import": {
+        "types": "./dist/memory/index.d.ts",
+        "default": "./dist/memory/index.js"
+      },
+      "require": {
+        "types": "./dist/memory/index.d.cts",
+        "default": "./dist/memory/index.cjs"
+      }
+    },
+    "./frontmatter": {
+      "import": {
+        "types": "./dist/frontmatter/index.d.ts",
+        "default": "./dist/frontmatter/index.js"
+      },
+      "require": {
+        "types": "./dist/frontmatter/index.d.cts",
+        "default": "./dist/frontmatter/index.cjs"
+      }
+    },
+    "./fs-routing": {
+      "import": {
+        "types": "./dist/fs-routing/index.d.ts",
+        "default": "./dist/fs-routing/index.js"
+      },
+      "require": {
+        "types": "./dist/fs-routing/index.d.cts",
+        "default": "./dist/fs-routing/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown --config tsdown.config.ts"
+  },
+  "dependencies": {
+    "yaml": "^2.9.1"
+  },
+  "peerDependencies": {
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.15",
+    "tsdown": "0.23.1",
+    "typescript": "^7.0.2",
+    "zod": "^4.6.7"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

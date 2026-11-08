@@ -1,0 +1,159 @@
+import { jsonSchemaToZod } from '@mastra/schema-compat/json-to-zod';
+import type { JSONSchema7 } from 'json-schema';
+import type { ZodSchema, ZodError, ZodIssue } from 'zod/v4';
+import { z } from 'zod/v4';
+import { SchemaValidationError } from './errors';
+import type { FieldError, BatchValidationResult } from './errors';
+import { SafeRegExp } from './safe-regex';
+
+/**
+ * Convert JSON Schema string to runtime Zod schema.
+ * Uses Function() to evaluate the generated Zod code - same pattern as workflow validation.
+ * `RegExp` is shadowed with an RE2-backed implementation so user-supplied `pattern` and
+ * `patternProperties` run in linear time; unsupported syntax throws while the schema compiles.
+ */
+function resolveZodSchema(zodString: string): ZodSchema {
+  return Function('z', 'RegExp', `"use strict";return (${zodString});`)(z, SafeRegExp);
+}
+
+const NON_SCHEMA_KEYWORDS = new Set(['const', 'enum', 'default', 'examples']);
+/** Keywords whose object values map arbitrary names (not keywords) to subschemas */
+const SCHEMA_MAP_KEYWORDS = new Set(['properties', 'patternProperties', 'definitions', '$defs', 'dependentSchemas']);
+
+/** Compile every `pattern` / `patternProperties` key up front so unsupported syntax fails at schema compile time */
+export function assertSupportedPatterns(node: unknown, isSchemaMap = false): void {
+  if (Array.isArray(node)) {
+    node.forEach(item => assertSupportedPatterns(item));
+    return;
+  }
+  if (!node || typeof node !== 'object') return;
+  for (const [key, value] of Object.entries(node)) {
+    if (isSchemaMap) {
+      assertSupportedPatterns(value);
+      continue;
+    }
+    if (NON_SCHEMA_KEYWORDS.has(key)) continue;
+    if (key === 'pattern' && typeof value === 'string') {
+      new SafeRegExp(value);
+    } else if (key === 'patternProperties' && value && typeof value === 'object') {
+      Object.keys(value).forEach(p => new SafeRegExp(p));
+    }
+    assertSupportedPatterns(value, SCHEMA_MAP_KEYWORDS.has(key));
+  }
+}
+
+/** Schema validator with compilation caching */
+export class SchemaValidator {
+  private cache = new Map<string, { schema: string; validator: ZodSchema }>();
+
+  /**
+   * Get or compile validator for schema. A cached entry is only reused if it was compiled from the same schema;
+   * the schema is serialized at compile time so in-place mutations of the schema object are detected.
+   */
+  private getValidator(schema: JSONSchema7, cacheKey: string): ZodSchema {
+    const serializedSchema = JSON.stringify(schema);
+    const cached = this.cache.get(cacheKey);
+    if (cached && cached.schema === serializedSchema) {
+      return cached.validator;
+    }
+    assertSupportedPatterns(schema);
+    const validator = resolveZodSchema(jsonSchemaToZod(schema));
+    this.cache.set(cacheKey, { schema: serializedSchema, validator });
+    return validator;
+  }
+
+  /** Evict the cached validator for a cache key */
+  clearCache(cacheKey: string): void {
+    this.cache.delete(cacheKey);
+  }
+
+  /** Validate data against schema */
+  validate(data: unknown, schema: JSONSchema7, field: 'input' | 'groundTruth', cacheKey: string): void {
+    const zodSchema = this.getValidator(schema, cacheKey);
+    const result = zodSchema.safeParse(data);
+    if (!result.success) {
+      throw new SchemaValidationError(field, this.formatErrors(result.error));
+    }
+  }
+
+  /** Validate multiple items, returning valid/invalid split */
+  validateBatch(
+    items: Array<{ input: unknown; groundTruth?: unknown }>,
+    inputSchema: JSONSchema7 | null | undefined,
+    outputSchema: JSONSchema7 | null | undefined,
+    cacheKeyPrefix: string,
+    maxErrors = 10,
+  ): BatchValidationResult {
+    const result: BatchValidationResult = { valid: [], invalid: [] };
+
+    // Pre-compile schemas for performance
+    const inputValidator = inputSchema ? this.getValidator(inputSchema, `${cacheKeyPrefix}:input`) : null;
+    const outputValidator = outputSchema ? this.getValidator(outputSchema, `${cacheKeyPrefix}:output`) : null;
+
+    for (const [i, item] of items.entries()) {
+      let hasError = false;
+
+      // Validate input if schema enabled
+      if (inputValidator) {
+        const inputResult = inputValidator.safeParse(item.input);
+        if (!inputResult.success) {
+          result.invalid.push({
+            index: i,
+            data: item,
+            field: 'input',
+            errors: this.formatErrors(inputResult.error),
+          });
+          hasError = true;
+          if (result.invalid.length >= maxErrors) break;
+        }
+      }
+
+      // Validate groundTruth if schema enabled and value provided
+      if (!hasError && outputValidator && item.groundTruth !== undefined) {
+        const outputResult = outputValidator.safeParse(item.groundTruth);
+        if (!outputResult.success) {
+          result.invalid.push({
+            index: i,
+            data: item,
+            field: 'groundTruth',
+            errors: this.formatErrors(outputResult.error),
+          });
+          hasError = true;
+          if (result.invalid.length >= maxErrors) break;
+        }
+      }
+
+      if (!hasError) {
+        result.valid.push({ index: i, data: item });
+      }
+    }
+
+    return result;
+  }
+
+  /** Format Zod errors to FieldError array */
+  private formatErrors(error: ZodError): FieldError[] {
+    return error.issues.slice(0, 5).map((issue: ZodIssue) => ({
+      // Convert Zod path array to JSON Pointer string
+      path: issue.path.length > 0 ? '/' + issue.path.join('/') : '/',
+      code: issue.code,
+      message: issue.message,
+    }));
+  }
+}
+
+/** Singleton validator instance */
+let validatorInstance: SchemaValidator | null = null;
+
+/** Get or create validator instance */
+export function getSchemaValidator(): SchemaValidator {
+  if (!validatorInstance) {
+    validatorInstance = new SchemaValidator();
+  }
+  return validatorInstance;
+}
+
+/** Create new validator (for testing) */
+export function createValidator(): SchemaValidator {
+  return new SchemaValidator();
+}

@@ -1,0 +1,25 @@
+import { defineConfig } from 'tsdown';
+
+export default defineConfig({
+  entry: [
+    'src/storage/index.ts',
+    'src/base/index.ts',
+    'src/error/index.ts',
+    'src/logger/index.ts',
+    'src/types/index.ts',
+    'src/request-context/index.ts',
+    'src/routes/index.ts',
+    'src/durable/index.ts',
+    'src/knowledge-compat/index.ts',
+    'src/memory/index.ts',
+    'src/frontmatter/index.ts',
+    'src/fs-routing/index.ts',
+  ],
+  format: ['esm', 'cjs'],
+  fixedExtension: false,
+  nodeProtocol: 'strip',
+  clean: true,
+  dts: true,
+  treeshake: true,
+  sourcemap: true,
+});

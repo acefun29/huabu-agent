@@ -1,0 +1,610 @@
+import { ReadableStream } from 'node:stream/web';
+import type { ToolSet } from '@internal/ai-sdk-v5';
+import { beginGoalActivity, stopGoalActivity } from '../../agent/goal';
+import type { MastraDBMessage } from '../../agent/message-list';
+import { getErrorFromUnknown } from '../../error';
+import { validateModelTimeoutSettings } from '../../llm/model/model-settings';
+import { ConsoleLogger } from '../../logger';
+import { createObservabilityContext } from '../../observability';
+import { ProcessorRunner } from '../../processors/runner';
+import type { ProcessorState } from '../../processors/runner';
+import { RequestContext } from '../../request-context';
+import { safeClose, safeEnqueue } from '../../stream/base';
+import { getChunkProducedAt, stampChunkProducedAt } from '../../stream/base/produced-at';
+import type { ChunkType } from '../../stream/types';
+import { ChunkFrom, isDataChunk } from '../../stream/types';
+import { rebindProcessorTools } from '../../utils';
+import { hydrateRunScopeFromInternal } from '../hydrate-run-scope';
+import { REQUEST_TOOLS_KEY, STEP_TOOLS_KEY } from '../run-scope-keys';
+import { createTimeoutAbortSignal, isMastraTimeoutError } from '../timeout';
+import type { LoopRun } from '../types';
+import { AGENTIC_EXECUTION_WORKFLOW_ID } from './agentic-execution';
+import { createAgenticLoopWorkflow } from './agentic-loop';
+
+export function workflowLoopStream<Tools extends ToolSet = ToolSet, OUTPUT = undefined>(
+  {
+    resumeContext,
+    requireToolApproval,
+    models,
+    toolChoice,
+    modelSettings,
+    _internal,
+    messageId,
+    runId,
+    messageList,
+    startTimestamp,
+    streamState,
+    agentId,
+    toolCallId,
+    toolCallConcurrency,
+    ...rest
+  }: LoopRun<Tools, OUTPUT>,
+  finalization?: { register: (cleanup: () => Promise<void>) => void },
+) {
+  let finishQueued = false;
+  let terminalErrorReported = false;
+  const reportTerminalTracingError = (error: unknown) => {
+    if (finishQueued || terminalErrorReported) return;
+    terminalErrorReported = true;
+    try {
+      rest.onTracingTerminalError?.(getErrorFromUnknown(error));
+    } catch {
+      // Optional tracing must not replace the stream's original failure.
+    }
+  };
+  const loopSource = {
+    start: async (streamController: ReadableStreamDefaultController<ChunkType<OUTPUT>>) => {
+      // Stamp chunks when the loop produces them; consumers may read them much later.
+      const controller: ReadableStreamDefaultController<ChunkType<OUTPUT>> = {
+        enqueue: chunk => {
+          if (getChunkProducedAt(chunk) === undefined) stampChunkProducedAt(chunk, Date.now());
+          streamController.enqueue(chunk);
+        },
+        close: () => streamController.close(),
+        error: reason => streamController.error(reason),
+        get desiredSize() {
+          return streamController.desiredSize;
+        },
+      };
+      // Normalize requestContext so data-chunk processors and the agentic loop share the same instance
+      const requestContext = rest.requestContext ?? new RequestContext();
+
+      // Create a ProcessorRunner for chunks routed through outputWriter (data-* custom
+      // chunks plus lifecycle chunks like step-finish) so they go through output processors.
+      // Share the loop's processorStates map so these chunks see the same per-processor state
+      // that the main model-output stream path populates; otherwise the runner would build an
+      // isolated empty state map and break state continuity across the step lifecycle.
+      const hasOutputProcessors = rest.outputProcessors && rest.outputProcessors.length > 0;
+      const dataChunkProcessorStates = hasOutputProcessors
+        ? (rest.processorStates ?? new Map<string, ProcessorState>())
+        : undefined;
+      const dataChunkProcessorRunner = hasOutputProcessors
+        ? new ProcessorRunner({
+            outputProcessors: rest.outputProcessors,
+            logger: rest.logger || new ConsoleLogger({ level: 'error' }),
+            agentName: agentId || 'unknown',
+            agent: rest.agent,
+            processorStates: dataChunkProcessorStates,
+          })
+        : undefined;
+
+      const outputWriter = async (chunk: ChunkType<OUTPUT>, options?: { messageId?: string }) => {
+        const responseMessageId = options?.messageId ?? messageId;
+        const dataChunkStreamWriter = {
+          custom: async (
+            data: { type: string; data?: unknown; transient?: boolean },
+            writerOptions?: { messageId?: string },
+          ) => {
+            const emittedMessageId = writerOptions?.messageId ?? responseMessageId;
+            if (isDataChunk(data) && emittedMessageId && !data.transient) {
+              // Persistence failures must not drop the frame from the stream —
+              // delivery to the client takes priority over saving to memory.
+              try {
+                messageList.add(
+                  {
+                    id: emittedMessageId,
+                    role: 'assistant',
+                    content: {
+                      format: 2,
+                      parts: [{ type: data.type as `data-${string}`, data: data.data }],
+                    },
+                    createdAt: new Date(),
+                    threadId: _internal?.threadId,
+                    resourceId: _internal?.resourceId,
+                  },
+                  'response',
+                );
+              } catch (persistError) {
+                rest.logger?.warn('Failed to persist data chunk to message list; streaming it anyway', {
+                  chunkType: data.type,
+                  error: persistError,
+                });
+              }
+            }
+            safeEnqueue(controller, data as ChunkType<OUTPUT>);
+          },
+        };
+
+        const enqueueTripwire = (
+          reason: string | undefined,
+          tripwireOptions: { retry?: unknown; metadata?: unknown } | undefined,
+          processorId: string | undefined,
+        ) => {
+          safeEnqueue(controller, {
+            type: 'tripwire',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: {
+              reason: reason || 'Output processor blocked content',
+              retry: tripwireOptions?.retry,
+              metadata: tripwireOptions?.metadata,
+              processorId,
+            },
+          } as ChunkType<OUTPUT>);
+        };
+
+        // Emit parts a processor stashed for reprocessing (e.g. the non-text part
+        // that triggered a BatchPartsProcessor flush). Leaving them stashed lets
+        // them leak into the next step — after a retried mid-stream error that
+        // surfaces a stray step-finish on an already-consumed step output.
+        const drainReprocessed = async () => {
+          const reprocessed = await dataChunkProcessorRunner!.drainReprocessParts(
+            dataChunkProcessorStates! as Map<string, ProcessorState<OUTPUT>>,
+            undefined,
+            requestContext,
+            messageList,
+            0,
+            dataChunkStreamWriter,
+          );
+          for (const r of reprocessed) {
+            if (r.blocked) {
+              enqueueTripwire(r.reason, r.tripwireOptions, r.processorId);
+              return;
+            }
+            if (r.part == null) continue;
+            const part = r.part as ChunkType<OUTPUT>;
+            if (isDataChunk(part)) {
+              await dataChunkStreamWriter.custom(part as { type: string; data?: unknown; transient?: boolean });
+            } else {
+              safeEnqueue(controller, part);
+            }
+          }
+        };
+
+        // Handle data-* chunks (custom data chunks from writer.custom())
+        // These need to be persisted to storage, not just streamed
+        // Transient chunks are streamed to the client but not saved to the DB
+        if (isDataChunk(chunk)) {
+          // Run data-* chunks through output processors before persisting
+          let processedChunk: ChunkType<OUTPUT> = chunk;
+          if (dataChunkProcessorRunner) {
+            const {
+              part: processed,
+              blocked,
+              reason,
+              tripwireOptions,
+              processorId,
+            } = await dataChunkProcessorRunner.processPart(
+              chunk,
+              dataChunkProcessorStates! as Map<string, ProcessorState<OUTPUT>>,
+              undefined, // observabilityContext
+              requestContext,
+              messageList,
+              0,
+              dataChunkStreamWriter,
+            );
+
+            if (blocked) {
+              enqueueTripwire(reason, tripwireOptions, processorId);
+              return;
+            }
+
+            if (processed) {
+              processedChunk = processed as ChunkType<OUTPUT>;
+            } else {
+              await drainReprocessed();
+              return;
+            }
+          }
+
+          // If a processor rewrote the chunk to a non-data type, skip persistence
+          if (
+            isDataChunk(processedChunk) &&
+            responseMessageId &&
+            !('transient' in processedChunk && processedChunk.transient)
+          ) {
+            const dataPart = {
+              type: processedChunk.type as `data-${string}`,
+              data: 'data' in processedChunk ? processedChunk.data : undefined,
+            };
+            const message: MastraDBMessage = {
+              id: responseMessageId,
+              role: 'assistant',
+              content: {
+                format: 2,
+                parts: [dataPart],
+              },
+              createdAt: new Date(),
+              threadId: _internal?.threadId,
+              resourceId: _internal?.resourceId,
+            };
+            // Persistence failures must not drop the frame from the stream —
+            // delivery to the client takes priority over saving to memory.
+            try {
+              messageList.add(message, 'response');
+            } catch (persistError) {
+              rest.logger?.warn('Failed to persist data chunk to message list; streaming it anyway', {
+                chunkType: processedChunk.type,
+                error: persistError,
+              });
+            }
+          }
+
+          safeEnqueue(controller, processedChunk);
+          if (dataChunkProcessorRunner) await drainReprocessed();
+          return;
+        }
+
+        // Non data-* chunks injected via this writer (e.g. `tool-output` from
+        // sub-agents delegated through the `agents:` option, or
+        // `workflow-step-output` from workflow tools) bypass the LLM's own
+        // processor pipeline. Route them through configured output processors
+        // here so users can filter/redact nested chunks via processOutputStream.
+        if (dataChunkProcessorRunner) {
+          const {
+            part: processed,
+            blocked,
+            reason,
+            tripwireOptions,
+            processorId,
+          } = await dataChunkProcessorRunner.processPart(
+            chunk,
+            dataChunkProcessorStates! as Map<string, ProcessorState<OUTPUT>>,
+            undefined,
+            requestContext,
+            messageList,
+            0,
+            dataChunkStreamWriter,
+          );
+
+          if (blocked) {
+            enqueueTripwire(reason, tripwireOptions, processorId);
+            return;
+          }
+
+          if (processed) safeEnqueue(controller, processed as ChunkType<OUTPUT>);
+          await drainReprocessed();
+          return;
+        }
+
+        safeEnqueue(controller, chunk);
+      };
+
+      // Bound the whole run (every loop iteration, tool call and retry) by composing the
+      // caller's abort signal with modelSettings.timeout.totalMs. Everything downstream
+      // reads `options.abortSignal`, so injecting here covers the entire agentic loop.
+      const timeout = validateModelTimeoutSettings(modelSettings?.timeout);
+      const {
+        signal: totalTimeoutSignal,
+        timeoutPromise: totalTimeoutPromise,
+        cleanup: cleanupTotalTimeout,
+      } = createTimeoutAbortSignal({
+        parentSignal: rest.options?.abortSignal,
+        timeoutMs: timeout?.totalMs,
+        timeoutType: 'total',
+      });
+
+      // A run-owned signal linked to the caller's. Callers often reuse one long-lived signal
+      // across many runs, so run internals listen here rather than on the caller's signal;
+      // the single link back is removed in the `finally` below. Tools and sub-agents still
+      // receive the caller's signal unchanged through `options.abortSignal`.
+      const upstreamAbortSignal = totalTimeoutPromise ? totalTimeoutSignal : rest.options?.abortSignal;
+      const runAbortController = upstreamAbortSignal ? new AbortController() : undefined;
+      const onUpstreamAbort = () => runAbortController?.abort(upstreamAbortSignal?.reason);
+      if (upstreamAbortSignal?.aborted) {
+        onUpstreamAbort();
+      } else {
+        upstreamAbortSignal?.addEventListener('abort', onUpstreamAbort, { once: true });
+      }
+
+      const restWithTimeoutSignal = {
+        ...(totalTimeoutPromise ? { ...rest, options: { ...rest.options, abortSignal: totalTimeoutSignal } } : rest),
+        runAbortSignal: runAbortController?.signal,
+      };
+
+      const agenticLoopWorkflow = createAgenticLoopWorkflow<Tools, OUTPUT>({
+        resumeContext,
+        messageId: messageId,
+        models,
+        _internal,
+        modelSettings,
+        toolChoice,
+        controller,
+        outputWriter,
+        runId,
+        messageList,
+        startTimestamp,
+        streamState,
+        agentId,
+        requireToolApproval,
+        toolCallConcurrency,
+        ...restWithTimeoutSignal,
+      });
+
+      if (rest.mastra) {
+        // Register as internal so the evented engine's event processor can
+        // resolve `agentic-loop` by id via __hasInternalWorkflow/getWorkflowById.
+        // Scope by runId so concurrent/nested agent invocations (parent + sub-agent
+        // each owning their own agentic-loop instance with distinct controller and
+        // agentId closures) don't clobber each other in the global id-keyed registry.
+        // __registerInternalWorkflow also calls __registerMastra under the hood.
+        rest.mastra.__registerInternalWorkflow(agenticLoopWorkflow, runId);
+        // Hydrate the RunScope from the bootstrap `_internal` bag. Done right
+        // after registration so the scope is the single source of truth for
+        // non-serializable state by the time any step runs. The scope's
+        // refcount is owned by the internal-workflow registration above —
+        // no separate release needed here.
+        hydrateRunScopeFromInternal(rest.mastra, runId, _internal);
+        // A scope kept alive across suspension still holds the previous request's step tools,
+        // which close over that request's requestContext. Let the tools built for this call
+        // replace the ones the previous request configured, but keep the ones a processor added
+        // or swapped in, since the suspended call may be one of them and the processors do not
+        // run again before it resumes. Processor-added tools are rebuilt for this call's
+        // requestContext instead, so an approved one runs with the approver's context (#27544).
+        const runScope = rest.mastra.__getRunScope(runId);
+        const previousStepTools = resumeContext ? runScope?.get(STEP_TOOLS_KEY) : undefined;
+        if (previousStepTools) {
+          const previousRequestTools = runScope!.get(REQUEST_TOOLS_KEY);
+          const stepTools = rebindProcessorTools({ ...previousStepTools }, requestContext);
+          for (const [name, tool] of Object.entries(rest.tools ?? {})) {
+            // A name the previous request configured but the step tools lack was withheld by a processor.
+            const refresh =
+              name in previousStepTools
+                ? previousStepTools[name] === previousRequestTools?.[name]
+                : !previousRequestTools || !(name in previousRequestTools);
+            if (refresh) {
+              stepTools[name] = tool;
+            }
+          }
+          runScope!.set(STEP_TOOLS_KEY, stepTools);
+        }
+        if (rest.tools) runScope?.set(REQUEST_TOOLS_KEY, rest.tools);
+      }
+
+      // Once the run reaches a terminal state its snapshot rows are no longer
+      // needed for resume. Delete both the agentic-loop row and the nested
+      // execution workflow's row (persisted under the same runId) — otherwise
+      // the nested row leaks as a stale "pending"/"suspended" record in
+      // workflow snapshot storage for every completed agent run.
+      // Best-effort: a cleanup failure must never turn a finished run into a
+      // stream error (a stale row is preferable to a broken stream).
+      const deleteRunSnapshots = async () => {
+        try {
+          await agenticLoopWorkflow.deleteWorkflowRunById(runId);
+          const workflowsStore = await rest.mastra?.getStorage()?.getStore('workflows');
+          await workflowsStore?.deleteWorkflowRunById({ runId, workflowName: AGENTIC_EXECUTION_WORKFLOW_ID });
+        } catch (error) {
+          rest.logger?.warn('Failed to delete agentic-loop snapshot rows after terminal state', { runId, error });
+        }
+      };
+
+      // Keep the run-scoped registration alive only when the run suspends — a
+      // later resume on the same runId must still resolve this instance. Every
+      // other exit (success, failure, or a throw before completion) must drop
+      // it via the `finally` below, otherwise a stale workflow holding the old
+      // stream/controller closures leaks under this runId.
+      let keepRegisteredForResume = false;
+      try {
+        const initialData = {
+          messageId: messageId,
+          messages: {
+            all: messageList.get.all.aiV5.model(),
+            user: messageList.get.input.aiV5.model(),
+            nonUser: [],
+          },
+          output: {
+            steps: [],
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          metadata: {},
+          stepResult: {
+            reason: 'undefined',
+            warnings: [],
+            isContinued: true,
+            totalUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+        };
+
+        if (!resumeContext) {
+          safeEnqueue(controller, {
+            type: 'start',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: {
+              id: agentId,
+              messageId,
+            },
+          });
+        }
+
+        const run = await agenticLoopWorkflow.createRun({
+          runId,
+          resourceId: _internal?.resourceId,
+        });
+
+        if (typeof requireToolApproval === 'function') {
+          // Store the function so the tool-call-step can evaluate it per call. RequestContext.toJSON()
+          // strips non-serializable values, so this never reaches the persisted suspend snapshot — that
+          // is fine because approval is only decided at call time, before any suspend/resume.
+          requestContext.set('__mastra_requireToolApproval', requireToolApproval);
+        } else if (requireToolApproval) {
+          requestContext.set('__mastra_requireToolApproval', true);
+        } else {
+          // Clear any value left over from a prior call so a reused RequestContext can't leak a
+          // stale function/`true` into a call where approval is no longer required.
+          requestContext.delete('__mastra_requireToolApproval');
+        }
+
+        if (rest.goal) {
+          await beginGoalActivity({
+            mastra: rest.mastra,
+            agentId,
+            threadId: _internal?.threadId,
+            runId,
+            requestContext,
+            now: _internal?.now,
+          });
+        }
+
+        await resumeContext?.claim?.start?.();
+
+        const executionPromise = resumeContext?.claim?.snapshot
+          ? run.resumeClaimed({
+              resumeData: resumeContext.resumeData,
+              ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
+              requestContext,
+              actor: rest.actor,
+              label: toolCallId,
+              claimedSnapshot: resumeContext.claim.snapshot,
+              onExecutionStarted: resumeContext.claim.onExecutionStarted,
+            })
+          : resumeContext
+            ? run.resume({
+                resumeData: resumeContext.resumeData,
+                ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
+                requestContext,
+                actor: rest.actor,
+                label: toolCallId,
+              })
+            : run.start({
+                inputData: initialData,
+                ...createObservabilityContext(rest.modelSpanTracker?.getTracingContext()),
+                requestContext,
+                actor: rest.actor,
+              });
+
+        let executionResult: Awaited<typeof executionPromise>;
+        try {
+          if (totalTimeoutPromise) {
+            // The abort signal alone can't guarantee the run settles, so race the budget
+            // and let the timeout win. The losing branch is never observed by callers.
+            executionPromise.catch(() => {});
+            executionResult = await Promise.race([executionPromise, totalTimeoutPromise]);
+          } else {
+            executionResult = await executionPromise;
+          }
+        } catch (err) {
+          if (!isMastraTimeoutError(err)) throw err;
+
+          const error = getErrorFromUnknown(err, {
+            fallbackMessage: 'Agent execution timed out',
+          });
+
+          safeEnqueue(controller, {
+            type: 'error',
+            runId,
+            from: ChunkFrom.AGENT,
+            payload: { error },
+          });
+
+          try {
+            await rest.options?.onError?.({ error });
+          } finally {
+            reportTerminalTracingError(error);
+          }
+          await deleteRunSnapshots();
+          safeClose(controller);
+          return;
+        }
+
+        if (executionResult.status !== 'success') {
+          if (executionResult.status === 'failed') {
+            const error = getErrorFromUnknown(executionResult.error, {
+              fallbackMessage: 'Unknown error in agent workflow stream',
+            });
+
+            safeEnqueue(controller, {
+              type: 'error',
+              runId,
+              from: ChunkFrom.AGENT,
+              payload: { error },
+            });
+
+            try {
+              await rest.options?.onError?.({ error });
+            } finally {
+              reportTerminalTracingError(error);
+            }
+          }
+
+          if (executionResult.status !== 'suspended') {
+            await deleteRunSnapshots();
+          } else {
+            keepRegisteredForResume = true;
+          }
+
+          safeClose(controller);
+          return;
+        }
+
+        // Enqueuing finish does not await the agent's final memory save. Hand successful
+        // cleanup to the output's awaited finish lifecycle; bails retain immediate cleanup.
+        if (finalization && executionResult.result.stepResult.reason !== 'tripwire' && !upstreamAbortSignal?.aborted) {
+          finalization.register(deleteRunSnapshots);
+        } else {
+          await deleteRunSnapshots();
+        }
+
+        // Always emit finish chunk, even for abort (tripwire) cases
+        // This ensures the stream properly completes and all promises are resolved
+        // The tripwire/abort status is communicated through the stepResult.reason
+        finishQueued = safeEnqueue(controller, {
+          type: 'finish',
+          runId,
+          from: ChunkFrom.AGENT,
+          payload: {
+            ...executionResult.result,
+            stepResult: {
+              ...executionResult.result.stepResult,
+              // runtime reason can be 'tripwire' | 'retry' from processors
+              reason: executionResult.result.stepResult.reason,
+            },
+          },
+        });
+
+        safeClose(controller);
+      } finally {
+        // The run is over, so close any output stream processor span still open, e.g. one
+        // opened by a tool result resumed after approval when no step follows it.
+        dataChunkProcessorRunner?.endStreamProcessorSpans(dataChunkProcessorStates!);
+        upstreamAbortSignal?.removeEventListener('abort', onUpstreamAbort);
+        cleanupTotalTimeout();
+        await stopGoalActivity({ agentId, runId, now: _internal?.now });
+        await resumeContext?.claim?.release();
+        if (!keepRegisteredForResume) {
+          rest.mastra?.__unregisterInternalWorkflow(agenticLoopWorkflow.id, runId);
+        }
+      }
+    },
+  };
+
+  // A rejected `start` would error the stream at once, and erroring a ReadableStream discards every
+  // chunk still queued for a reader that has not caught up (e.g. one that began reading late). Hold
+  // the failure until `pull` runs, which only happens once the queue is empty.
+  let failure: { error: unknown } | undefined;
+  return new ReadableStream<ChunkType<OUTPUT>>({
+    start: async streamController => {
+      try {
+        await loopSource.start(streamController);
+      } catch (error) {
+        // Also cover throws before the workflow returns a result. If finish was
+        // queued, its consumer still owns finalization after draining the queue.
+        reportTerminalTracingError(error);
+        failure = { error };
+      }
+    },
+    pull: streamController => {
+      if (failure) streamController.error(failure.error);
+    },
+  });
+}

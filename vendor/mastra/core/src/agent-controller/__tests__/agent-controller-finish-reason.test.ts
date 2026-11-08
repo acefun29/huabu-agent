@@ -1,0 +1,335 @@
+/**
+ * Tests that the AgentController finalizes a run into an explicit terminal state for
+ * non-success stream finish reasons.
+ *
+ * Anthropic's `claude-fable-5` can block a turn server-side and return a
+ * `refusal` stop reason, which the AI SDK surfaces as a `content-filter` finish
+ * reason. Previously the AgentController mapped any non-`stop`/non-`tool-calls` finish
+ * reason to `complete`, so the run ended on an empty assistant message with no
+ * error — it appeared to silently stop. These tests pin the fix: the run ends
+ * on `stopReason: 'error'`, carries an `errorMessage`, emits an `error` event,
+ * and `agent_end` reports `reason: 'error'`.
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { Agent } from '../../agent';
+import { Mastra } from '../../mastra';
+import { InMemoryStore } from '../../storage';
+import { MastraLanguageModelV2Mock } from '../../test-utils/llm-mock';
+
+import { AgentController } from '../agent-controller';
+import { SessionStartupCancelledError } from '../errors';
+import { describeNonSuccessFinishReason } from '../stream-content';
+import { createMockWorkspace } from '../test-utils';
+
+vi.setConfig({ testTimeout: 30_000 });
+
+function createFinishReasonStream(finishReason: string, providerMetadata?: Record<string, unknown>) {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue({ type: 'stream-start', warnings: [] });
+      controller.enqueue({ type: 'response-metadata', id: 'id-0', modelId: 'mock', timestamp: new Date(0) });
+      controller.enqueue({ type: 'text-start', id: 'text-1' });
+      controller.enqueue({ type: 'text-delta', id: 'text-1', delta: 'partial' });
+      controller.enqueue({ type: 'text-end', id: 'text-1' });
+      controller.enqueue({
+        type: 'finish',
+        finishReason,
+        ...(providerMetadata ? { providerMetadata } : {}),
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+      });
+      controller.close();
+    },
+  });
+}
+
+async function buildController(id: string, stream: () => ReadableStream) {
+  const agent = new Agent({
+    id: `agent-${id}`,
+    name: `Agent ${id}`,
+    instructions: 'You are a helpful assistant.',
+    model: new MastraLanguageModelV2Mock({
+      doStream: async () => ({ stream: stream() }),
+    }),
+  });
+
+  const storage = new InMemoryStore();
+  const mastra = new Mastra({ agents: { [`agent-${id}`]: agent }, logger: false, storage });
+  const registeredAgent = mastra.getAgent(`agent-${id}`);
+
+  const controller = new AgentController({
+    workspace: createMockWorkspace(),
+    id: `controller-${id}`,
+    storage,
+    modes: [{ id: 'default', name: 'Default', default: true, agent: registeredAgent }],
+    initialState: { yolo: true } as any,
+  });
+
+  await controller.init();
+  const session = await controller.createSession({ id: 'test-session', ownerId: 'test-owner' });
+  await session.thread.create();
+  return { controller, session };
+}
+
+describe('describeNonSuccessFinishReason', () => {
+  it('includes the refusal explanation from anthropic stop details', () => {
+    const message = describeNonSuccessFinishReason('content-filter', {
+      anthropic: {
+        stopDetails: {
+          type: 'refusal',
+          category: 'cyber',
+          explanation: 'This request was blocked under the Usage Policy.',
+        },
+      },
+    });
+    expect(message).toBe('The model stopped on a content filter (This request was blocked under the Usage Policy.).');
+  });
+
+  it('falls back to the category when no explanation is present', () => {
+    const message = describeNonSuccessFinishReason('content-filter', {
+      anthropic: { stopDetails: { type: 'refusal', category: 'cyber' } },
+    });
+    expect(message).toBe('The model stopped on a content filter (category: cyber).');
+  });
+
+  it('returns a generic content-filter message when details are absent', () => {
+    expect(describeNonSuccessFinishReason('content-filter', undefined)).toBe('The model stopped on a content filter.');
+  });
+
+  it('returns undefined for success reasons', () => {
+    expect(describeNonSuccessFinishReason('stop', undefined)).toBeUndefined();
+    expect(describeNonSuccessFinishReason('tool-calls', undefined)).toBeUndefined();
+  });
+
+  it('returns an error message when the stream ended without a finish reason', () => {
+    expect(describeNonSuccessFinishReason('', undefined)).toBe(
+      'The model stream ended without a finish reason before producing a final response.',
+    );
+  });
+});
+
+describe('AgentController: non-success finish reasons', () => {
+  it('finalizes a content-filter refusal into an explicit terminal error state', async () => {
+    const { session } = await buildController('content-filter', () =>
+      createFinishReasonStream('content-filter', {
+        anthropic: {
+          stopDetails: {
+            type: 'refusal',
+            category: 'cyber',
+            explanation: 'This request was blocked under the Usage Policy.',
+          },
+        },
+      }),
+    );
+
+    const events: any[] = [];
+    session.subscribe(event => {
+      events.push(event);
+    });
+
+    await session.sendMessage({ content: 'do something blocked' });
+
+    // The run must not silently complete.
+    const agentEnd = events.find(e => e.type === 'agent_end');
+    expect(agentEnd?.reason).toBe('error');
+
+    // A user-visible error event is emitted with diagnostic context.
+    const errorEvent = events.find(e => e.type === 'error');
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent.error.message).toContain('content filter');
+    expect(errorEvent.finishReason).toBe('content-filter');
+
+    const messageStart = events.find(e => e.type === 'message_start' && e.message.role === 'assistant');
+    const messageEnd = [...events].reverse().find(e => e.type === 'message_end');
+    expect(messageEnd?.id).toBe(messageStart?.message.id);
+    expect(messageStart?.message.content.parts).toEqual([{ type: 'text', text: '' }]);
+  });
+
+  it('surfaces a content-filter refusal even without provider stop details', async () => {
+    const { session } = await buildController('content-filter-no-details', () =>
+      createFinishReasonStream('content-filter'),
+    );
+
+    const events: any[] = [];
+    session.subscribe(event => {
+      events.push(event);
+    });
+
+    await session.sendMessage({ content: 'do something blocked' });
+
+    expect(events.find(e => e.type === 'agent_end')?.reason).toBe('error');
+    expect(events.find(e => e.type === 'error')?.error.message).toBe('The model stopped on a content filter.');
+    const messageStart = events.find(e => e.type === 'message_start' && e.message.role === 'assistant');
+    const messageEnd = [...events].reverse().find(e => e.type === 'message_end');
+    expect(messageEnd?.id).toBe(messageStart?.message.id);
+    expect(messageStart?.message.content.parts).toEqual([{ type: 'text', text: '' }]);
+  });
+
+  it('surfaces a length finish reason as a terminal error state', async () => {
+    const { session } = await buildController('length', () => createFinishReasonStream('length'));
+
+    const events: any[] = [];
+    session.subscribe(event => {
+      events.push(event);
+    });
+
+    await session.sendMessage({ content: 'write a very long answer' });
+
+    expect(events.find(e => e.type === 'agent_end')?.reason).toBe('error');
+    expect(events.find(e => e.type === 'error')?.error.message).toBe(
+      'The model stopped because it reached its maximum output length before finishing.',
+    );
+    expect(events.find(e => e.type === 'error')?.finishReason).toBe('length');
+    const messageStart = events.find(e => e.type === 'message_start' && e.message.role === 'assistant');
+    const messageEnd = [...events].reverse().find(e => e.type === 'message_end');
+    expect(messageEnd?.id).toBe(messageStart?.message.id);
+    expect(messageStart?.message.content.parts).toEqual([{ type: 'text', text: '' }]);
+  });
+
+  it('emits an info notice when a server-side fallback model served the turn', async () => {
+    const { session } = await buildController('fallback-served', () =>
+      createFinishReasonStream('stop', {
+        anthropic: {
+          iterations: [
+            { type: 'message', model: 'claude-fable-5', inputTokens: 10, outputTokens: 0 },
+            { type: 'fallback_message', model: 'claude-opus-4-8', inputTokens: 10, outputTokens: 50 },
+          ],
+        },
+      }),
+    );
+
+    const events: any[] = [];
+    session.subscribe(event => {
+      events.push(event);
+    });
+
+    await session.sendMessage({ content: 'do something borderline' });
+
+    // The turn still completes normally — the fallback answered it.
+    expect(events.find(e => e.type === 'agent_end')?.reason).toBe('complete');
+    expect(events.some(e => e.type === 'error')).toBe(false);
+
+    // But the user is told the response did not come from the selected model.
+    const info = events.find(e => e.type === 'info');
+    expect(info).toBeDefined();
+    expect(info.message).toContain('fallback model claude-opus-4-8');
+  });
+
+  it('still completes normally on a stop finish reason', async () => {
+    const { session } = await buildController('stop', () => createFinishReasonStream('stop'));
+
+    const events: any[] = [];
+    session.subscribe(event => {
+      events.push(event);
+    });
+
+    await session.sendMessage({ content: 'say hi' });
+
+    expect(events.find(e => e.type === 'agent_end')?.reason).toBe('complete');
+    expect(events.some(e => e.type === 'error')).toBe(false);
+    const messageStart = events.find(e => e.type === 'message_start' && e.message.role === 'assistant');
+    const messageEnd = [...events].reverse().find(e => e.type === 'message_end');
+    expect(messageEnd?.id).toBe(messageStart?.message.id);
+    expect(messageStart?.message.content.parts).toEqual([{ type: 'text', text: '' }]);
+  });
+});
+
+describe('Session cancellation during startup', () => {
+  it('releases the aborted-stream watcher when a pending startup is cancelled', async () => {
+    const model = vi.fn(() => createFinishReasonStream('stop'));
+    const { session } = await buildController('startup-watcher', model);
+    vi.spyOn(session.run, 'isAbortRequested').mockReturnValue(true);
+    vi.spyOn(session.run, 'isRunning').mockReturnValue(false);
+    vi.spyOn(session.stream, 'isOpen').mockReturnValue(true);
+    const wait = vi.spyOn(session.stream, 'waitForTeardown');
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    vi.spyOn(session.thread, 'ensureSubscription').mockImplementationOnce(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const pending = session.sendSignal({ content: 'Cancelled follow-up' }, { requireDelivery: true }).accepted;
+    const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await entered.promise;
+    const signal = wait.mock.calls[0]![0];
+    expect(signal.aborted).toBe(false);
+    session.abort();
+    release.resolve();
+    await rejected;
+    expect(signal.aborted).toBe(true);
+    expect(model).not.toHaveBeenCalled();
+  });
+
+  it.each(['subscription', 'model-sync'] as const)('does not dispatch after cancellation during %s', async phase => {
+    const model = vi.fn(() => createFinishReasonStream('stop'));
+    const { session } = await buildController(`startup-${phase}`, model);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    if (phase === 'subscription') {
+      const original = session.thread.ensureSubscription.bind(session.thread);
+      vi.spyOn(session.thread, 'ensureSubscription').mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return original(...args);
+      });
+    } else {
+      const original = session.model.syncFromPersisted.bind(session.model);
+      vi.spyOn(session.model, 'syncFromPersisted').mockImplementationOnce(async (...args) => {
+        entered.resolve();
+        await release.promise;
+        return original(...args);
+      });
+    }
+    const pending = session.sendMessage({ content: 'Cancel before model dispatch' });
+    const rejection = expect(pending).rejects.toBeInstanceOf(SessionStartupCancelledError);
+    await entered.promise;
+    session.abort();
+    release.resolve();
+    await rejection;
+    expect(model).not.toHaveBeenCalled();
+    const secondEntered = Promise.withResolvers<void>();
+    const secondRelease = Promise.withResolvers<void>();
+    const ensureSubscription = session.thread.ensureSubscription.bind(session.thread);
+    vi.spyOn(session.thread, 'ensureSubscription').mockImplementationOnce(async (...args) => {
+      secondEntered.resolve();
+      await secondRelease.promise;
+      return ensureSubscription(...args);
+    });
+    const second = session.sendMessage({ content: 'Cancel a second startup' });
+    const secondRejection = expect(second).rejects.toMatchObject({ name: 'AbortError' });
+    await secondEntered.promise;
+    session.abort();
+    secondRelease.resolve();
+    await secondRejection;
+    expect(model).not.toHaveBeenCalled();
+    await session.sendMessage({ content: 'A fresh turn still works' });
+    expect(model).toHaveBeenCalledOnce();
+  });
+});
+
+it('rejects an obsolete startup without aborting a newer streaming turn', async () => {
+  const streaming = Promise.withResolvers<ReadableStreamDefaultController>();
+  const model = vi.fn(() => new ReadableStream({ start: controller => streaming.resolve(controller) }));
+  const { session } = await buildController('startup-concurrent', model);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const original = session.model.syncFromPersisted.bind(session.model);
+  vi.spyOn(session.model, 'syncFromPersisted').mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return original(...args);
+  });
+  const obsolete = session.sendSignal({ content: 'Old startup' }, { requireDelivery: true }).accepted;
+  const rejection = expect(obsolete).rejects.toMatchObject({ name: 'AbortError' });
+  await entered.promise;
+  session.abort();
+  const newer = session.sendMessage({ content: 'New turn' });
+  const stream = await streaming.promise;
+  const signal = session.run.ensureAbortController().signal;
+  release.resolve();
+  await rejection;
+  expect(signal.aborted).toBe(false);
+  expect(model).toHaveBeenCalledOnce();
+  stream.enqueue({ type: 'finish', finishReason: 'stop', usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 } });
+  stream.close();
+  await newer;
+});

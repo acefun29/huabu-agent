@@ -1,0 +1,599 @@
+import { describe, it, expect } from 'vitest';
+import { Agent } from '../agent';
+import { FGADeniedError } from '../auth/ee/fga-check';
+import type { IFGAProvider } from '../auth/ee/interfaces/fga';
+import { RequestContext } from '../request-context';
+import { InMemoryStore } from '../storage/mock';
+import { AgentController } from './agent-controller';
+import { createMockWorkspace } from './test-utils';
+import type { AgentControllerEvent } from './types';
+
+function createController(
+  storage: InMemoryStore,
+  options: { resourceId?: string; initialState?: Record<string, unknown> } = {},
+) {
+  const agent = new Agent({
+    name: 'test-agent',
+    instructions: 'You are a test agent.',
+    model: { provider: 'openai', name: 'gpt-4o', toolChoice: 'auto' },
+  });
+
+  return new AgentController({
+    workspace: createMockWorkspace(),
+    id: 'test-controller',
+    resourceId: options.resourceId,
+    storage,
+    initialState: options.initialState,
+    modes: [
+      { id: 'build', name: 'Build', default: true, agent, defaultModelId: 'openai/gpt-4o' },
+      { id: 'plan', name: 'Plan', agent, defaultModelId: 'anthropic/claude-sonnet-4' },
+    ],
+  });
+}
+
+describe('AgentController.createSession — cross-session isolation', () => {
+  it('gives each session an independent current thread', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const b = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    expect(a.thread.getId()).toBeDefined();
+    expect(b.thread.getId()).toBeDefined();
+    expect(a.thread.getId()).not.toBe(b.thread.getId());
+  });
+
+  it('isolates mode switches between sessions', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const b = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    expect(a.mode.get()).toBe('build');
+    expect(b.mode.get()).toBe('build');
+
+    await a.mode.switch({ modeId: 'plan' });
+
+    // Only session a moved to plan; neither session's model changed.
+    expect(a.mode.get()).toBe('plan');
+    expect(b.mode.get()).toBe('build');
+    expect(a.model.get()).toBe('openai/gpt-4o');
+    expect(b.model.get()).toBe('openai/gpt-4o');
+  });
+
+  it('isolates model selection between sessions', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const b = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    await a.model.switch('cerebras/zai-glm-4.7');
+
+    expect(a.model.get()).toBe('cerebras/zai-glm-4.7');
+    // b still resolves its mode default, unaffected by a's override.
+    expect(b.model.get()).toBe('openai/gpt-4o');
+  });
+
+  it('isolates session state between sessions', async () => {
+    const storage = new InMemoryStore();
+    const agent = new Agent({
+      name: 'test-agent',
+      instructions: 'You are a test agent.',
+      model: { provider: 'openai', name: 'gpt-4o', toolChoice: 'auto' },
+    });
+    const controller = new AgentController<{ counter: number }>({
+      workspace: createMockWorkspace(),
+      id: 'test-controller',
+      storage,
+      initialState: { counter: 0 },
+      modes: [{ id: 'build', name: 'Build', default: true, agent }],
+    });
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const b = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    await a.state.set({ counter: 5 });
+
+    expect(a.state.get().counter).toBe(5);
+    expect(b.state.get().counter).toBe(0);
+  });
+
+  it('skips a guarded state update when ownership changes before it applies', async () => {
+    const storage = new InMemoryStore();
+    const agent = new Agent({
+      name: 'test-agent',
+      instructions: 'You are a test agent.',
+      model: { provider: 'openai', name: 'gpt-4o', toolChoice: 'auto' },
+    });
+    const controller = new AgentController<{ counter: number }>({
+      workspace: createMockWorkspace(),
+      id: 'test-controller',
+      storage,
+      initialState: { counter: 0 },
+      modes: [{ id: 'build', name: 'Build', default: true, agent }],
+    });
+    await controller.init();
+    const session = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    let ownsUpdate = true;
+
+    const update = session.state.setIf({ counter: 5 }, () => ownsUpdate);
+    ownsUpdate = false;
+
+    await expect(update).resolves.toBe(false);
+    expect(session.state.get().counter).toBe(0);
+  });
+
+  it('isolates event buses between sessions', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const b = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    const aEvents: AgentControllerEvent[] = [];
+    const bEvents: AgentControllerEvent[] = [];
+    a.subscribe(event => {
+      aEvents.push(event);
+    });
+    b.subscribe(event => {
+      bEvents.push(event);
+    });
+
+    await a.mode.switch({ modeId: 'plan' });
+
+    expect(aEvents.some(e => e.type === 'mode_changed')).toBe(true);
+    expect(bEvents.some(e => e.type === 'mode_changed')).toBe(false);
+  });
+
+  it('does not auto-claim a matching projectPath thread from another resource', async () => {
+    const storage = new InMemoryStore();
+    const projectPath = '/tmp/mastra-project';
+
+    const oldController = createController(storage, { resourceId: 'old-resource', initialState: { projectPath } });
+    await oldController.init();
+    const oldSession = await oldController.createSession();
+    const oldThreadId = oldSession.thread.requireId();
+
+    const currentController = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath },
+    });
+    await currentController.init();
+    const currentSession = await currentController.createSession();
+
+    expect(currentSession.thread.requireId()).not.toBe(oldThreadId);
+    await expect(currentSession.thread.switch({ threadId: oldThreadId })).rejects.toThrow(
+      `Thread not found: ${oldThreadId}`,
+    );
+    expect(await storage.stores.memory.getThreadById({ threadId: oldThreadId })).toMatchObject({
+      id: oldThreadId,
+      resourceId: 'old-resource',
+    });
+  });
+
+  it('resumes the matching projectPath thread from the same resource', async () => {
+    const storage = new InMemoryStore();
+    const projectPath = '/tmp/mastra-project';
+    const controller = createController(storage, { resourceId: 'current-resource', initialState: { projectPath } });
+    await controller.init();
+
+    const first = await controller.createSession();
+    const threadId = first.thread.requireId();
+
+    const restartedController = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath },
+    });
+    await restartedController.init();
+    const restarted = await restartedController.createSession();
+
+    expect(restarted.thread.requireId()).toBe(threadId);
+  });
+
+  it('can defer thread creation when no thread matches', async () => {
+    const storage = new InMemoryStore();
+    const controller = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath: '/tmp/mastra-project' },
+    });
+    await controller.init();
+
+    const session = await controller.createSession({ createInitialThread: false });
+
+    expect(session.thread.getId()).toBeNull();
+    expect(await session.thread.list()).toEqual([]);
+  });
+
+  it('creates a thread when a cached threadless session later requests one', async () => {
+    const storage = new InMemoryStore();
+    const controller = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath: '/tmp/mastra-project' },
+    });
+    await controller.init();
+
+    const threadless = await controller.createSession({ createInitialThread: false });
+    const resumed = await controller.createSession();
+
+    expect(resumed).toBe(threadless);
+    expect(resumed.thread.getId()).not.toBeNull();
+    expect(await resumed.thread.list()).toHaveLength(1);
+  });
+
+  it('creates one shared thread for concurrent ensureId calls on a threadless session', async () => {
+    const controller = createController(new InMemoryStore(), {
+      resourceId: 'current-resource',
+      initialState: { projectPath: '/tmp/mastra-project' },
+    });
+    await controller.init();
+    const session = await controller.createSession({ createInitialThread: false });
+
+    const [first, second] = await Promise.all([session.thread.ensureId(), session.thread.ensureId()]);
+
+    expect(second).toBe(first);
+    expect(session.thread.getId()).toBe(first);
+    expect(await session.thread.ensureId()).toBe(first);
+    expect((await session.thread.list()).map(thread => thread.id)).toEqual([first]);
+  });
+
+  it('still resumes a matching thread when initial thread creation is deferred', async () => {
+    const storage = new InMemoryStore();
+    const projectPath = '/tmp/mastra-project';
+    const firstController = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath },
+    });
+    await firstController.init();
+    const first = await firstController.createSession();
+
+    const restartedController = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath },
+    });
+    await restartedController.init();
+    const restarted = await restartedController.createSession({ createInitialThread: false });
+
+    expect(restarted.thread.requireId()).toBe(first.thread.requireId());
+  });
+
+  it('binds request-context thread setting writes to the originating thread', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+    const session = await controller.createSession({ resourceId: 'user-a' });
+    const originatingThreadId = session.thread.requireId();
+    const requestContext = await (controller as any).buildRequestContext(session, undefined, {
+      threadId: originatingThreadId,
+    });
+    const controllerContext = requestContext.get('controller');
+    expect(controllerContext.isThreadActive()).toBe(true);
+
+    const nextThread = await session.thread.create({ title: 'next' });
+    expect(controllerContext.isThreadActive()).toBe(false);
+    await controllerContext.setThreadSetting({ key: 'delayedSetting', value: 'origin' });
+
+    expect(session.thread.requireId()).toBe(nextThread.id);
+    expect(await session.thread.getSetting({ key: 'delayedSetting' })).toBeUndefined();
+    expect(await controllerContext.getThreadSetting('delayedSetting')).toBe('origin');
+    await session.thread.switch({ threadId: originatingThreadId });
+    expect(await session.thread.getSetting({ key: 'delayedSetting' })).toBe('origin');
+  });
+});
+
+describe('AgentController session — cross-resource thread ownership', () => {
+  it('cannot switch to a thread owned by another resource', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ resourceId: 'user-a' });
+    const b = await controller.createSession({ resourceId: 'user-b' });
+
+    const aThreadId = a.thread.requireId();
+    const bThreadBefore = b.thread.getId();
+
+    await expect(b.thread.switch({ threadId: aThreadId })).rejects.toThrow(`Thread not found: ${aThreadId}`);
+    // b stays bound to its own thread; it never moved onto a's.
+    expect(b.thread.getId()).toBe(bThreadBefore);
+
+    // The failed switch released its lock on b's thread before validating
+    // ownership; b must still own (and be able to re-bind) its own thread,
+    // proving the previous lock was restored on the failure path.
+    await expect(b.thread.switch({ threadId: bThreadBefore! })).resolves.toBeUndefined();
+    expect(b.thread.getId()).toBe(bThreadBefore);
+  });
+
+  it('cannot delete a thread owned by another resource', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ resourceId: 'user-a' });
+    const b = await controller.createSession({ resourceId: 'user-b' });
+
+    const aThreadId = a.thread.requireId();
+
+    await expect(b.thread.delete({ threadId: aThreadId })).rejects.toThrow(`Thread not found: ${aThreadId}`);
+    // a's thread still exists and is reachable by its owner.
+    expect(await a.thread.getById({ threadId: aThreadId })).not.toBeNull();
+  });
+
+  it('cannot list messages of a thread owned by another resource', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ resourceId: 'user-a' });
+    const b = await controller.createSession({ resourceId: 'user-b' });
+
+    const aThreadId = a.thread.requireId();
+
+    await expect(b.thread.listMessages({ threadId: aThreadId })).rejects.toThrow(`Thread not found: ${aThreadId}`);
+  });
+
+  it('cannot clone a thread owned by another resource', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ resourceId: 'user-a' });
+    const b = await controller.createSession({ resourceId: 'user-b' });
+
+    const aThreadId = a.thread.requireId();
+
+    await expect(b.thread.clone({ sourceThreadId: aThreadId })).rejects.toThrow(`Thread not found: ${aThreadId}`);
+  });
+
+  it('only clones a cross-resource thread when the detected resource and project path still match', async () => {
+    const storage = new InMemoryStore();
+    const projectPath = '/tmp/mastra-project';
+    const oldController = createController(storage, { resourceId: 'old-resource', initialState: { projectPath } });
+    await oldController.init();
+    const oldSession = await oldController.createSession();
+    const oldThreadId = oldSession.thread.requireId();
+
+    const currentController = createController(storage, {
+      resourceId: 'current-resource',
+      initialState: { projectPath },
+    });
+    await currentController.init();
+    const currentSession = await currentController.createSession();
+
+    await expect(
+      currentSession.thread.cloneToCurrentResource({
+        threadId: oldThreadId,
+        expectedResourceId: 'another-resource',
+        expectedProjectPath: projectPath,
+      }),
+    ).rejects.toThrow(`Thread not found: ${oldThreadId}`);
+
+    await expect(
+      currentSession.thread.cloneToCurrentResource({
+        threadId: oldThreadId,
+        expectedResourceId: 'old-resource',
+        expectedProjectPath: '/tmp/other-project',
+      }),
+    ).rejects.toThrow(`Thread not found: ${oldThreadId}`);
+
+    const clonedThread = await currentSession.thread.cloneToCurrentResource({
+      threadId: oldThreadId,
+      expectedResourceId: 'old-resource',
+      expectedProjectPath: projectPath,
+    });
+
+    expect(await storage.stores.memory.getThreadById({ threadId: oldThreadId })).toMatchObject({
+      id: oldThreadId,
+      resourceId: 'old-resource',
+    });
+    expect(clonedThread).toMatchObject({
+      resourceId: 'current-resource',
+      metadata: { projectPath },
+    });
+    expect(clonedThread.id).not.toBe(oldThreadId);
+  });
+
+  it('still allows the owning resource to switch, list, and delete its own thread', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ resourceId: 'user-a' });
+    const aThreadId = a.thread.requireId();
+
+    // Owner can read its own messages and switch to its own thread.
+    await expect(a.thread.listMessages({ threadId: aThreadId })).resolves.toEqual([]);
+    await expect(a.thread.switch({ threadId: aThreadId })).resolves.toBeUndefined();
+
+    // Owner can delete its own thread.
+    await expect(a.thread.delete({ threadId: aThreadId })).resolves.toBeUndefined();
+    expect(await a.thread.getById({ threadId: aThreadId })).toBeNull();
+  });
+});
+
+describe('AgentController session registry', () => {
+  it('resolves a created session by its sessionId', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const b = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    expect(await controller.getSession('session-a')).toBe(a);
+    expect(await controller.getSession('session-b')).toBe(b);
+    expect(await controller.getSession('user-a')).toBeUndefined();
+    expect(await controller.getSession('session-unknown')).toBeUndefined();
+  });
+
+  it('defaults the sessionId to the resourceId', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const session = await controller.createSession({ ownerId: 'test-owner', resourceId: 'user-a' });
+
+    expect(session.identity.getId()).toBe('user-a');
+    expect(await controller.getSession('user-a')).toBe(session);
+  });
+
+  it('returns the same session for the same sessionId (get-or-create)', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const first = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    const second = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+
+    expect(second).toBe(first);
+  });
+
+  it("refuses to hand another resource's live session to a caller that reuses its sessionId", async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const victim = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+    const victimThread = victim.thread.getId();
+    await controller.createSession({ id: 'own-thread', ownerId: 'test-owner', resourceId: 'user-a' });
+
+    await expect(
+      controller.createSession({
+        id: 'session-b',
+        ownerId: 'test-owner',
+        resourceId: 'user-a',
+        threadId: 'own-thread',
+      }),
+    ).rejects.toThrow('Session session-b belongs to another resource');
+    expect(victim.thread.getId()).toBe(victimThread);
+  });
+
+  it("authorizes a caller that leaves out resourceId against the live session's own resource", async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+    const victim = await controller.createSession({ id: 'session-b', ownerId: 'test-owner', resourceId: 'user-b' });
+
+    // The caller may act on its own resource (and the controller default), never on user-b's.
+    const provider: IFGAProvider = {
+      check: async () => false,
+      require: async (user, { resource, permission, context }) => {
+        if ((context as { resourceId?: string } | undefined)?.resourceId === 'user-b') {
+          throw new FGADeniedError(user as { id: string }, resource, permission);
+        }
+      },
+      filterAccessible: async () => [],
+    };
+    controller.__registerMastra({ getServer: () => ({ fga: provider }) } as any);
+    const requestContext = new RequestContext();
+    requestContext.set('user', { id: 'user-a' });
+
+    await expect(controller.createSession({ id: 'session-b', requestContext })).rejects.toBeInstanceOf(FGADeniedError);
+    await expect(
+      controller.createSession({ id: 'session-b', resourceId: 'user-b', requestContext }),
+    ).rejects.toBeInstanceOf(FGADeniedError);
+    expect(await controller.getSession('session-b')).toBe(victim);
+  });
+
+  it('keeps a session reachable by its sessionId when its resourceId changes', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({ id: 'session-a', ownerId: 'test-owner', resourceId: 'user-a' });
+    await controller.setResourceId(a, { resourceId: 'user-a-renamed' });
+
+    expect(a.identity.getResourceId()).toBe('user-a-renamed');
+    expect(await controller.getSession('session-a')).toBe(a);
+  });
+
+  it('creates independent sessions for different sessionIds on one resource', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({
+      id: 'run-a',
+      ownerId: 'test-owner',
+      resourceId: 'factory-1',
+      tags: { projectPath: '/worktrees/a' },
+    });
+    const b = await controller.createSession({
+      id: 'run-b',
+      ownerId: 'test-owner',
+      resourceId: 'factory-1',
+      tags: { projectPath: '/worktrees/b' },
+    });
+
+    expect(b).not.toBe(a);
+    expect(await controller.getSession('run-a')).toBe(a);
+    expect(await controller.getSession('run-b')).toBe(b);
+    // Each session has its own thread binding and mode/model state.
+    expect(a.thread.getId()).not.toBe(b.thread.getId());
+    await a.mode.switch({ modeId: 'plan' });
+    expect(a.mode.get()).toBe('plan');
+    expect(b.mode.get()).toBe('build');
+  });
+
+  it('binds each session on a shared resource to its own thread', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+
+    const a = await controller.createSession({
+      id: 'run-a',
+      threadId: 'run-a',
+      ownerId: 'test-owner',
+      resourceId: 'factory-1',
+    });
+    const b = await controller.createSession({
+      id: 'run-b',
+      threadId: 'run-b',
+      ownerId: 'test-owner',
+      resourceId: 'factory-1',
+    });
+
+    expect(a.thread.getId()).toBe('run-a');
+    expect(b.thread.getId()).toBe('run-b');
+    const threads = await a.thread.list();
+    expect(threads.map(thread => thread.id).sort()).toEqual(['run-a', 'run-b']);
+  });
+
+  it('keeps the resolved workspace isolated on each session sharing a resource', async () => {
+    const controller = createController(new InMemoryStore());
+    await controller.init();
+    const workspaceA = createMockWorkspace();
+    const workspaceB = createMockWorkspace();
+
+    const a = await controller.createSession({
+      id: 'user-a::wt-a',
+      ownerId: 'test-owner',
+      resourceId: 'user-a',
+      workspace: workspaceA,
+    });
+    const b = await controller.createSession({
+      id: 'user-a::wt-b',
+      ownerId: 'test-owner',
+      resourceId: 'user-a',
+      workspace: workspaceB,
+    });
+
+    expect(a.getWorkspace()).toBe(workspaceA);
+    expect(b.getWorkspace()).toBe(workspaceB);
+    expect(a.getWorkspace()).not.toBe(b.getWorkspace());
+  });
+
+  it('exposes the sessionId through the session request context', async () => {
+    let observed: { sessionId?: string; resourceId?: string } | undefined;
+    const agent = new Agent({
+      name: 'test-agent',
+      instructions: 'You are a test agent.',
+      model: { provider: 'openai', name: 'gpt-4o', toolChoice: 'auto' },
+    });
+    const controller = new AgentController({
+      id: 'test-controller',
+      storage: new InMemoryStore(),
+      initialState: {},
+      workspace: ({ requestContext }) => {
+        const context = requestContext.get('controller');
+        observed = { sessionId: context?.sessionId, resourceId: context?.resourceId };
+        return createMockWorkspace();
+      },
+      modes: [{ id: 'build', name: 'Build', default: true, agent, defaultModelId: 'openai/gpt-4o' }],
+    });
+    await controller.init();
+
+    await controller.createSession({ id: 'session-a', resourceId: 'user-a' });
+
+    expect(observed).toEqual({ sessionId: 'session-a', resourceId: 'user-a' });
+  });
+});

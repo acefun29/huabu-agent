@@ -1,0 +1,1327 @@
+import type { AssistantContent, UserContent, CoreMessage } from '@internal/ai-sdk-v4';
+import type { MastraDBMessage } from '../agent/message-list';
+import type { AgentSignalType } from '../agent/signals';
+import { agentThreadStreamTopic } from '../agent/thread-stream-topic';
+import { MastraBase } from '../base';
+import { ErrorDomain, MastraError } from '../error';
+import { ModelRouterEmbeddingModel } from '../llm/model';
+import type { EmbeddingModelId, ModelRouterModelId } from '../llm/model';
+import type { Mastra } from '../mastra';
+import type { ObservabilityContext } from '../observability';
+import type {
+  ErrorProcessor,
+  ErrorProcessorOrWorkflow,
+  InputProcessor,
+  OutputProcessor,
+  InputProcessorOrWorkflow,
+  OutputProcessorOrWorkflow,
+} from '../processors';
+import { isProcessorWorkflow, TokenLimiterProcessor } from '../processors';
+import { MemoryInputFilter, MessageHistory, WorkingMemory, SemanticRecall } from '../processors/memory';
+import { assertEmbeddingDimension } from '../processors/memory/embedding-dimension';
+import type { RequestContext } from '../request-context';
+import type {
+  MastraCompositeStore,
+  StorageListMessagesInput,
+  StorageListThreadsInput,
+  StorageListThreadsOutput,
+  StorageCloneThreadInput,
+  StorageCloneThreadOutput,
+  StorageCopyThreadOutput,
+} from '../storage';
+import { augmentWithInit } from '../storage/storageWithInit';
+import type { ToolAction } from '../tools';
+import type { IdGeneratorContext } from '../types';
+import { deepMerge } from '../utils';
+import type { MastraEmbeddingModel, MastraEmbeddingOptions, MastraVector } from '../vector';
+import {
+  advanceMemoryTokenBoundary,
+  getMemoryTokenBoundary,
+  normalizeMessageHistoryConfig,
+} from './message-history-config';
+import { checkThreadFGA } from './thread-fga';
+import type { CheckThreadFGAOptions } from './thread-fga';
+
+import type {
+  SharedMemoryConfig,
+  StorageThreadType,
+  MemoryConfig,
+  MemoryConfigInternal,
+  MastraMessageV1,
+  WorkingMemoryTemplate,
+  MessageDeleteInput,
+  MemoryRequestContext,
+  SerializedMemoryConfig,
+  SerializedObservationalMemoryConfig,
+  ObservationalMemoryOptions,
+} from './types';
+import { isObservationalMemoryEnabled } from './types';
+
+/**
+ * Extract a string model ID from an AgentConfig['model'] value.
+ * Returns undefined for non-serializable values (functions, LanguageModel instances).
+ */
+function extractModelIdString(model: unknown): string | undefined {
+  if (typeof model === 'string') return model;
+  if (typeof model === 'function') return undefined;
+  if (model && typeof model === 'object' && 'id' in model && typeof (model as { id: unknown }).id === 'string') {
+    return (model as { id: string }).id;
+  }
+  return undefined;
+}
+
+export type MemoryProcessorOpts = {
+  systemMessage?: string;
+  memorySystemMessage?: string;
+  newMessages?: CoreMessage[];
+};
+/**
+ * Interface for message processors that can filter or transform messages
+ * before they're sent to the LLM.
+ */
+export abstract class MemoryProcessor extends MastraBase {
+  /**
+   * Process a list of messages and return a filtered or transformed list.
+   * @param messages The messages to process
+   * @returns The processed messages
+   */
+  process(messages: CoreMessage[], _opts: MemoryProcessorOpts): CoreMessage[] | Promise<CoreMessage[]> {
+    return messages;
+  }
+}
+
+export const memoryDefaultOptions = {
+  lastMessages: 10,
+  semanticRecall: false,
+  generateTitle: false,
+  workingMemory: {
+    enabled: false,
+    template: `
+# User Information
+- **First Name**: 
+- **Last Name**: 
+- **Location**: 
+- **Occupation**: 
+- **Interests**: 
+- **Goals**: 
+- **Events**: 
+- **Facts**: 
+- **Projects**: 
+`,
+  },
+} satisfies MemoryConfigInternal;
+
+export { filterSystemReminderMessages, isSystemReminderMessage } from './system-reminders';
+
+/**
+ * Abstract base class for implementing conversation memory systems.
+ *
+ * Key features:
+ * - Thread-based conversation organization with resource association
+ * - Optional vector database integration for semantic similarity search
+ * - Working memory templates for structured conversation state
+ * - Handles memory processors to manipulate messages before they are sent to the LLM
+ */
+export abstract class MastraMemory extends MastraBase {
+  /**
+   * Unique identifier for the memory instance.
+   * If not provided, defaults to a static name 'default-memory'.
+   */
+  readonly id: string;
+
+  MAX_CONTEXT_TOKENS?: number;
+
+  protected _storage?: MastraCompositeStore;
+  vector?: MastraVector;
+  embedder?: MastraEmbeddingModel<string>;
+  embedderOptions?: MastraEmbeddingOptions;
+  /** Configured embedder output dimension; when set, the dimension probe is skipped. */
+  protected readonly embeddingDimension?: number;
+  protected threadConfig: MemoryConfigInternal = { ...memoryDefaultOptions };
+  private readonly hasExplicitLastMessages: boolean;
+  #mastra?: Mastra;
+
+  constructor(config: { id?: string; name: string } & SharedMemoryConfig) {
+    super({ component: 'MEMORY', name: config.name });
+    this.id = config.id ?? config.name ?? 'default-memory';
+    this.hasExplicitLastMessages = config.options?.lastMessages !== undefined;
+
+    if (config.options) this.threadConfig = this.getMergedThreadConfig(config.options);
+
+    if (
+      config.embeddingDimension !== undefined &&
+      !(Number.isInteger(config.embeddingDimension) && config.embeddingDimension > 0)
+    ) {
+      throw new MastraError({
+        id: 'MASTRA_MEMORY_INVALID_EMBEDDING_DIMENSION',
+        domain: ErrorDomain.MASTRA_MEMORY,
+        category: 'USER',
+        text: `embeddingDimension must be a positive integer, received ${String(config.embeddingDimension)}.`,
+      });
+    }
+    this.embeddingDimension = config.embeddingDimension;
+
+    // DEPRECATION: Block old processors config
+    if (config.processors) {
+      throw new Error(
+        `The 'processors' option in Memory is deprecated and has been removed.
+      
+Please use the new Input/Output processor system instead:
+
+OLD (deprecated):
+  new Memory({
+    processors: [new TokenLimiter(100000)]
+  })
+
+NEW (use this):
+  new Agent({
+    memory,
+    outputProcessors: [
+      new TokenLimiterProcessor(100000)
+    ]
+  })
+
+Or pass memory directly to processor arrays:
+  new Agent({
+    inputProcessors: [memory],
+    outputProcessors: [memory]
+  })
+
+See: https://mastra.ai/en/docs/memory/processors`,
+      );
+    }
+    if (config.storage) {
+      this._storage = augmentWithInit(config.storage);
+      this._hasOwnStorage = true;
+    }
+
+    if (this.threadConfig.semanticRecall) {
+      if (!config.vector) {
+        throw new Error(
+          `Semantic recall requires a vector store to be configured.
+
+https://mastra.ai/en/docs/memory/semantic-recall`,
+        );
+      }
+      this.vector = config.vector;
+
+      // An embedder is required only when the application supplies the vectors.
+      if (!config.embedder && !config.vector.isSelfEmbedding) {
+        throw new Error(
+          `Semantic recall requires an embedder, or a vector store that generates embeddings itself.
+
+https://mastra.ai/en/docs/memory/semantic-recall`,
+        );
+      }
+
+      // Convert string embedder to ModelRouterEmbeddingModel
+      if (typeof config.embedder === 'string') {
+        this.embedder = new ModelRouterEmbeddingModel(config.embedder);
+      } else {
+        this.embedder = config.embedder;
+      }
+
+      // Set embedder options (e.g., providerOptions for Google models)
+      if (config.embedderOptions) {
+        this.embedderOptions = config.embedderOptions;
+      }
+    } else {
+      // Even without semanticRecall, store vector/embedder if provided
+      // (used by retrieval search in observational memory)
+      if (config.vector) {
+        this.vector = config.vector;
+      }
+      if (config.embedder) {
+        if (typeof config.embedder === 'string') {
+          this.embedder = new ModelRouterEmbeddingModel(config.embedder);
+        } else {
+          this.embedder = config.embedder;
+        }
+      }
+      if (config.embedderOptions) {
+        this.embedderOptions = config.embedderOptions;
+      }
+    }
+  }
+
+  /**
+   * Internal method used by Mastra to register itself with the memory.
+   * @param mastra The Mastra instance.
+   * @internal
+   */
+  __registerMastra(mastra: Mastra): void {
+    this.#mastra = mastra;
+  }
+
+  /**
+   * Delete a thread's live event stream from the registered Mastra pubsub.
+   * Call after the thread itself is deleted: nothing else ever clears an
+   * open-ended thread topic, so without this it lingers until the pubsub's
+   * idle TTL (or forever, if the pubsub has none). Best-effort; no-op when
+   * no Mastra instance is registered.
+   */
+  protected async clearThreadStream(threadId: string, resourceId?: string): Promise<void> {
+    try {
+      await this.#mastra?.pubsub?.clearTopic(agentThreadStreamTopic(resourceId, threadId));
+    } catch (error) {
+      this.logger.warn('Failed to clear thread event stream after deleting thread', { threadId, error });
+    }
+  }
+
+  protected _hasOwnStorage = false;
+  get hasOwnStorage() {
+    return this._hasOwnStorage;
+  }
+
+  get storage() {
+    if (!this._storage) {
+      throw new Error(
+        `Memory requires a storage provider to function. Add a storage configuration to Memory or to your Mastra instance.
+
+https://mastra.ai/en/docs/memory/overview`,
+      );
+    }
+    return this._storage;
+  }
+
+  public setStorage(storage: MastraCompositeStore) {
+    this._storage = augmentWithInit(storage);
+  }
+
+  public setVector(vector: MastraVector) {
+    this.vector = vector;
+  }
+
+  public setEmbedder(
+    embedder: EmbeddingModelId | MastraEmbeddingModel<string>,
+    embedderOptions?: MastraEmbeddingOptions,
+  ) {
+    if (typeof embedder === 'string') {
+      this.embedder = new ModelRouterEmbeddingModel(embedder);
+    } else {
+      this.embedder = embedder;
+    }
+    if (embedderOptions) {
+      this.embedderOptions = embedderOptions;
+    }
+  }
+
+  /**
+   * Get a system message to inject into the conversation.
+   * This will be called before each conversation turn.
+   * Implementations can override this to inject custom system messages.
+   */
+  public async getSystemMessage(_input: {
+    threadId: string;
+    resourceId?: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<string | null> {
+    return null;
+  }
+
+  /**
+   * Get tools that should be available to the agent.
+   * This will be called when converting tools for the agent.
+   * Implementations can override this to provide additional tools.
+   */
+  public listTools(_config?: MemoryConfig): Record<string, ToolAction<any, any, any, any, any>> {
+    return {};
+  }
+
+  /**
+   * Cached promise for the embedding dimension probe.
+   * Stored as a promise to deduplicate concurrent calls.
+   */
+  private _embeddingDimensionPromise?: Promise<number | undefined>;
+
+  /**
+   * Determine the embedder's output dimension: the configured `embeddingDimension` when set,
+   * otherwise probe the embedder. The probe result is cached so subsequent calls are free.
+   */
+  protected async getEmbeddingDimension(): Promise<number | undefined> {
+    if (!this.embedder) return undefined;
+    if (this.embeddingDimension !== undefined) return this.embeddingDimension;
+    if (!this._embeddingDimensionPromise) {
+      this._embeddingDimensionPromise = (async () => {
+        try {
+          const result = await this.embedder!.doEmbed({
+            values: ['a'],
+            ...(this.embedderOptions || {}),
+          } as any);
+          const dimension = result.embeddings[0]?.length;
+          if (!dimension) {
+            throw new Error('Embedder returned no usable embedding for the dimension probe.');
+          }
+          return dimension;
+        } catch (e) {
+          throw new MastraError(
+            {
+              id: 'MASTRA_MEMORY_GET_EMBEDDING_DIMENSION_FAILED',
+              domain: ErrorDomain.MASTRA_VECTOR,
+              category: 'THIRD_PARTY',
+              text:
+                `Failed to determine the embedder's output dimension. Semantic recall cannot safely select a ` +
+                `vector index until the embedder returns a usable embedding. Check that the embedder is reachable ` +
+                `and correctly configured.`,
+            },
+            e,
+          );
+        }
+      })();
+    }
+    return this._embeddingDimensionPromise;
+  }
+
+  /**
+   * Get the index name for semantic recall embeddings.
+   * This is used to ensure consistency between the Memory class and SemanticRecall processor.
+   */
+  /**
+   * True when the attached vector store produces the embeddings itself, so this Memory sends it
+   * text. False whenever an embedder is configured, which keeps the client-side path intact.
+   */
+  protected get isSelfEmbedding(): boolean {
+    return !this.embedder && this.vector?.isSelfEmbedding === true;
+  }
+
+  protected getEmbeddingIndexName(dimensions?: number): string {
+    const separator = this.vector?.indexSeparator ?? '_';
+    // A self-embedding store picks its own dimension, so this name is keyed on the mode.
+    // The names below belong to indexes of client-supplied vectors.
+    if (this.isSelfEmbedding) {
+      return `memory${separator}messages${separator}selfembed`;
+    }
+    assertEmbeddingDimension(this.embeddingDimension, dimensions);
+
+    const defaultDimensions = 1536;
+    const usedDimensions = dimensions ?? defaultDimensions;
+    const isDefault = usedDimensions === defaultDimensions;
+    return isDefault ? `memory${separator}messages` : `memory${separator}messages${separator}${usedDimensions}`;
+  }
+
+  protected async createEmbeddingIndex(
+    dimensions?: number,
+    config?: MemoryConfigInternal,
+  ): Promise<{ indexName: string }> {
+    const defaultDimensions = 1536;
+    const usedDimensions = dimensions ?? defaultDimensions;
+    const indexName = this.getEmbeddingIndexName(dimensions);
+
+    if (typeof this.vector === `undefined`) {
+      throw new Error(`Tried to create embedding index but no vector db is attached to this Memory instance.`);
+    }
+
+    // Get index configuration from memory config
+    const semanticConfig = typeof config?.semanticRecall === 'object' ? config.semanticRecall : undefined;
+    const indexConfig = semanticConfig?.indexConfig;
+
+    // Base parameters that all vector stores support. A self-embedding store derives the
+    // dimension and the metric from its own model configuration.
+    const createParams: any = this.isSelfEmbedding
+      ? { indexName }
+      : {
+          indexName,
+          dimension: usedDimensions,
+          ...(indexConfig?.metric && { metric: indexConfig.metric }),
+        };
+
+    // Add PG-specific configuration if provided
+    // Only PG vector store will use these parameters
+    if (indexConfig && (indexConfig.type || indexConfig.ivf || indexConfig.hnsw)) {
+      createParams.indexConfig = {};
+      if (indexConfig.type) createParams.indexConfig.type = indexConfig.type;
+      if (indexConfig.ivf) createParams.indexConfig.ivf = indexConfig.ivf;
+      if (indexConfig.hnsw) createParams.indexConfig.hnsw = indexConfig.hnsw;
+    }
+
+    if (!this.isSelfEmbedding) {
+      // Request btree indexes on metadata fields used for filtering
+      // This avoids sequential scans on large tables when querying by thread_id or resource_id
+      createParams.metadataIndexes = ['thread_id', 'resource_id'];
+    }
+
+    await this.vector.createIndex(createParams);
+    return { indexName };
+  }
+
+  public getMergedThreadConfig(config?: MemoryConfigInternal): MemoryConfigInternal {
+    if (config?.workingMemory && typeof config.workingMemory === 'object' && 'use' in config.workingMemory) {
+      throw new Error('The workingMemory.use option has been removed. Working memory always uses tool-call mode.');
+    }
+
+    if (config?.threads?.generateTitle !== undefined) {
+      throw new Error(
+        'The threads.generateTitle option has been moved. Use the top-level generateTitle option instead.',
+      );
+    }
+
+    const mergedConfig = deepMerge(this.threadConfig, config || {});
+
+    // A token budget replaces the default count window; an explicit numeric `lastMessages` still applies on top.
+    if (
+      config?.messageHistory !== undefined &&
+      config.lastMessages === undefined &&
+      !this.hasExplicitLastMessages &&
+      this.threadConfig.messageHistory === undefined &&
+      this.threadConfig.lastMessages === memoryDefaultOptions.lastMessages
+    ) {
+      mergedConfig.lastMessages = undefined;
+    }
+
+    if (
+      typeof config?.workingMemory === 'object' &&
+      config.workingMemory?.schema &&
+      typeof mergedConfig.workingMemory === 'object'
+    ) {
+      mergedConfig.workingMemory.schema = config.workingMemory.schema;
+    }
+
+    return mergedConfig;
+  }
+
+  estimateTokens(text: string): number {
+    return Math.ceil(text.split(' ').length * 1.3);
+  }
+
+  /**
+   * Retrieves a specific thread by its ID
+   * @param threadId - The unique identifier of the thread
+   * @returns Promise resolving to the thread or null if not found
+   */
+  abstract getThreadById({ threadId }: { threadId: string }): Promise<StorageThreadType | null>;
+
+  /**
+   * Lists threads with optional filtering by resourceId and metadata.
+   * This method supports:
+   * - Optional resourceId filtering (not required)
+   * - Metadata filtering with AND logic (all key-value pairs must match)
+   * - Pagination via `page` / `perPage`, optional ordering via `orderBy`
+   *
+   * @param args.filter - Optional filters for resourceId and/or metadata
+   * @param args.filter.resourceId - Optional resource ID to filter by
+   * @param args.filter.metadata - Optional metadata key-value pairs to filter by (AND logic)
+   * @param args.page - Zero-indexed page number for pagination (defaults to 0)
+   * @param args.perPage - Number of items per page, or false to fetch all (defaults to 100)
+   * @param args.orderBy - Optional sorting configuration with `field` and `direction`
+   * @returns Promise resolving to paginated thread results with metadata
+   *
+   * @example
+   * ```typescript
+   * // Filter by resourceId only
+   * await memory.listThreads({ filter: { resourceId: 'user-123' } });
+   *
+   * // Filter by metadata only
+   * await memory.listThreads({ filter: { metadata: { category: 'support' } } });
+   *
+   * // Filter by both
+   * await memory.listThreads({
+   *   filter: {
+   *     resourceId: 'user-123',
+   *     metadata: { priority: 'high', status: 'open' }
+   *   }
+   * });
+   * ```
+   */
+  abstract listThreads(args: StorageListThreadsInput): Promise<StorageListThreadsOutput>;
+
+  /**
+   * Saves or updates a thread
+   * @param thread - The thread data to save
+   * @returns Promise resolving to the saved thread
+   */
+  abstract saveThread({
+    thread,
+    memoryConfig,
+  }: {
+    thread: StorageThreadType;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<StorageThreadType>;
+
+  /**
+   * Saves messages to a thread
+   * @param messages - Array of messages to save
+   * @returns Promise resolving to the saved messages
+   */
+  abstract saveMessages(args: {
+    messages: MastraDBMessage[];
+    memoryConfig?: MemoryConfig | undefined;
+    observabilityContext?: Partial<ObservabilityContext>;
+  }): Promise<{ messages: MastraDBMessage[]; usage?: { tokens: number } }>;
+
+  /**
+   * Retrieves messages for a specific thread with optional semantic recall
+   * @param threadId - The unique identifier of the thread
+   * @param resourceId - Optional resource ID for validation
+   * @param vectorSearchString - Optional search string for semantic recall
+   * @param config - Optional memory configuration
+   * @returns Promise resolving to array of messages in mastra-db format
+   */
+  abstract recall(
+    args: StorageListMessagesInput & {
+      threadConfig?: MemoryConfigInternal;
+      vectorSearchString?: string;
+      /** @deprecated Use hideSignals: [] to include all, or ['reactive', 'system-reminder'] to hide reminders. */
+      includeSystemReminders?: boolean;
+      /** true hides all recognized signals, false includes all, or select exact stored types with an array. Overrides includeSystemReminders. */
+      hideSignals?: boolean | AgentSignalType[];
+      observabilityContext?: Partial<ObservabilityContext>;
+    },
+  ): Promise<{
+    messages: MastraDBMessage[];
+    usage?: { tokens: number };
+    total: number;
+    page: number;
+    perPage: number | false;
+    hasMore: boolean;
+  }>;
+
+  /**
+   * Helper method to create a new thread
+   * @param title - Optional title for the thread
+   * @param metadata - Optional metadata for the thread
+   * @returns Promise resolving to the created thread
+   */
+  async createThread({
+    threadId,
+    resourceId,
+    title,
+    metadata,
+    memoryConfig,
+    saveThread = true,
+  }: {
+    resourceId: string;
+    threadId?: string;
+    title?: string;
+    metadata?: Record<string, unknown>;
+    memoryConfig?: MemoryConfigInternal;
+    saveThread?: boolean;
+  }): Promise<StorageThreadType> {
+    const thread: StorageThreadType = {
+      id:
+        threadId ||
+        this.generateId({
+          idType: 'thread',
+          source: 'memory',
+          resourceId,
+        }),
+      title: title || '',
+      resourceId,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      metadata,
+    };
+
+    return saveThread ? this.saveThread({ thread, memoryConfig }) : thread;
+  }
+
+  /**
+   * Helper method to update an existing thread
+   * @param id - The thread ID to update
+   * @param title - The new title for the thread
+   * @param metadata - The new metadata for the thread
+   * @param memoryConfig - Optional memory config
+   * @returns Promise resolving to the updated thread
+   */
+  abstract updateThread({
+    id,
+    title,
+    metadata,
+    memoryConfig,
+  }: {
+    id: string;
+    title?: string;
+    metadata?: Record<string, unknown>;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<StorageThreadType>;
+
+  /**
+   * Helper method to delete a thread
+   * @param threadId - the id of the thread to delete
+   */
+  abstract deleteThread(threadId: string): Promise<void>;
+
+  /**
+   * Resolve once all background work this memory started has finished.
+   *
+   * Some memory work continues after an agent run returns, and it writes to storage.
+   * Callers that own the storage connection should await this before closing it,
+   * otherwise background statements can race the close.
+   *
+   * ```ts
+   * await agent.generate('hello', { memory: { thread, resource } });
+   * await memory.settled();
+   * await store.close();
+   * ```
+   *
+   * Implementations that do no background work can leave this as a no-op.
+   */
+  async settled(): Promise<void> {}
+
+  /**
+   * Helper method to add a single message to a thread
+   * @param threadId - The thread to add the message to
+   * @param content - The message content
+   * @param role - The role of the message sender
+   * @param type - The type of the message
+   * @param toolNames - Optional array of tool names that were called
+   * @param toolCallArgs - Optional array of tool call arguments
+   * @param toolCallIds - Optional array of tool call ids
+   * @returns Promise resolving to the saved message
+   * @deprecated use saveMessages instead
+   */
+  async addMessage(_params: {
+    threadId: string;
+    resourceId: string;
+    config?: MemoryConfigInternal;
+    content: UserContent | AssistantContent;
+    role: 'user' | 'assistant';
+    type: 'text' | 'tool-call' | 'tool-result';
+    toolNames?: string[];
+    toolCallArgs?: Record<string, unknown>[];
+    toolCallIds?: string[];
+  }): Promise<MastraMessageV1> {
+    throw new Error('addMessage is deprecated. Please use saveMessages instead.');
+  }
+
+  /**
+   * Generates a unique identifier
+   * @param context - Optional context information for deterministic ID generation
+   * @returns A unique string ID
+   */
+  public generateId(context?: IdGeneratorContext): string {
+    return this.#mastra?.generateId(context) || crypto.randomUUID();
+  }
+
+  /**
+   * Static helper to check FGA authorization for thread access.
+   * Can be called from HTTP handlers and agent execution paths.
+   */
+  static async checkThreadFGA(options: CheckThreadFGAOptions): Promise<void> {
+    return checkThreadFGA(options);
+  }
+
+  /**
+   * Retrieves working memory for a specific thread
+   * @param threadId - The unique identifier of the thread
+   * @param resourceId - The unique identifier of the resource
+   * @param memoryConfig - Optional memory configuration
+   * @returns Promise resolving to working memory data or null if not found
+   */
+  abstract getWorkingMemory({
+    threadId,
+    resourceId,
+    memoryConfig,
+  }: {
+    threadId: string;
+    resourceId?: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<string | null>;
+
+  /**
+   * Get working memory template
+   * @param threadId - Thread ID
+   * @param resourceId - Resource ID
+   * @returns Promise resolving to working memory template or null if not found
+   */
+  abstract getWorkingMemoryTemplate({
+    memoryConfig,
+  }: {
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<WorkingMemoryTemplate | null>;
+
+  abstract updateWorkingMemory({
+    threadId,
+    resourceId,
+    workingMemory,
+    memoryConfig,
+    observabilityContext,
+  }: {
+    threadId: string;
+    resourceId?: string;
+    workingMemory: string;
+    memoryConfig?: MemoryConfigInternal;
+    observabilityContext?: Partial<ObservabilityContext>;
+  }): Promise<void>;
+
+  /**
+   * Whether `mergeWorkingMemory` is available (atomic merge supported by storage).
+   */
+  async supportsAtomicWorkingMemoryMerge(): Promise<boolean> {
+    return false;
+  }
+
+  /**
+   * Atomically deep-merges a partial JSON object into resource-scoped working memory.
+   * Implementations without atomic merge support throw.
+   */
+  async mergeWorkingMemory(_: {
+    threadId: string;
+    resourceId?: string;
+    workingMemory: string | Record<string, unknown>;
+    memoryConfig?: MemoryConfigInternal;
+    observabilityContext?: Partial<ObservabilityContext>;
+  }): Promise<void> {
+    throw new Error(`Atomic working memory merge is not supported by ${this.constructor.name}`);
+  }
+
+  /**
+   * @warning experimental! can be removed or changed at any time
+   */
+  abstract __experimental_updateWorkingMemoryVNext({
+    threadId,
+    resourceId,
+    workingMemory,
+    searchString,
+    memoryConfig,
+  }: {
+    threadId: string;
+    resourceId?: string;
+    workingMemory: string;
+    searchString?: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<{ success: boolean; reason: string }>;
+
+  protected createMemoryTokenCounter(): { countMessage(message: MastraDBMessage): number } | undefined {
+    return undefined;
+  }
+
+  /**
+   * Get input processors for this memory instance
+   * This allows Memory to be used as a ProcessorProvider in Agent's inputProcessors array.
+   * @param configuredProcessors - Processors already configured by the user (for deduplication)
+   * @returns Array of input processors configured for this memory instance
+   */
+  async getInputProcessors(
+    configuredProcessors: InputProcessorOrWorkflow[] = [],
+    context?: RequestContext,
+  ): Promise<InputProcessor[]> {
+    const memoryStore = await this.storage.getStore('memory');
+    const processors: InputProcessor[] = [];
+
+    // Extract runtime memoryConfig from context if available
+    const memoryContext = context?.get('MastraMemory') as MemoryRequestContext | undefined;
+    const runtimeMemoryConfig = memoryContext?.memoryConfig;
+    const effectiveConfig = runtimeMemoryConfig ? this.getMergedThreadConfig(runtimeMemoryConfig) : this.threadConfig;
+
+    const lastMessages = normalizeMessageHistoryConfig(effectiveConfig.lastMessages, effectiveConfig.messageHistory);
+
+    // Check if user already manually added MessageHistory
+    const hasMessageHistory = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'message-history');
+
+    // Check if ObservationalMemory is present (via processor or config) - it handles its own message loading and saving
+    const hasObservationalMemory =
+      configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'observational-memory') ||
+      isObservationalMemoryEnabled(effectiveConfig.observationalMemory);
+
+    // MemoryInputFilter trims the request down to the part that stored history does
+    // not already cover. That is only correct when a loader is about to pull stored
+    // history in underneath it: with no loader, the request is the entire context
+    // and trimming it deletes messages the caller meant the model to see.
+    // Semantic recall does not qualify - it adds recalled fragments, not the thread's history.
+    const loadsStoredHistory = hasMessageHistory || hasObservationalMemory || lastMessages.enabled;
+
+    if (memoryStore && loadsStoredHistory) {
+      processors.push(
+        new MemoryInputFilter({
+          storage: memoryStore,
+          // Resolved from the merged config so the flag can be set agent-wide (Memory options)
+          // or per call (memory.options on the request), matching how the other memory options
+          // are resolved. The filter reads config nowhere else.
+          retainFullInput: effectiveConfig.retainFullInput === true,
+        }),
+      );
+    }
+
+    // Add working memory input processor if configured
+    const isWorkingMemoryEnabled =
+      typeof effectiveConfig.workingMemory === 'object' && effectiveConfig.workingMemory.enabled !== false;
+
+    // When useStateSignals is opted in, the WorkingMemoryStateProcessor delivers
+    // working memory via the state-signal lane. Skip the legacy system-message
+    // injection so the model doesn't receive the WORKING_MEMORY_SYSTEM_INSTRUCTION
+    // block alongside the signal.
+    const useStateSignals =
+      typeof effectiveConfig.workingMemory === 'object' && effectiveConfig.workingMemory.useStateSignals === true;
+
+    if (isWorkingMemoryEnabled && !useStateSignals) {
+      if (!memoryStore)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.STORAGE,
+          id: 'WORKING_MEMORY_MISSING_STORAGE_ADAPTER',
+          text: 'Using Mastra Memory working memory requires a storage adapter but no attached adapter was detected.',
+        });
+
+      // Check if user already manually added WorkingMemory
+      const hasWorkingMemory = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'working-memory');
+
+      if (!hasWorkingMemory) {
+        // Convert string template to WorkingMemoryTemplate format
+        let template: { format: 'markdown' | 'json'; content: string } | undefined;
+        if (typeof effectiveConfig.workingMemory === 'object' && effectiveConfig.workingMemory.template) {
+          template = {
+            format: 'markdown',
+            content: effectiveConfig.workingMemory.template,
+          };
+        }
+
+        processors.push(
+          new WorkingMemory({
+            storage: memoryStore,
+            template,
+            scope: typeof effectiveConfig.workingMemory === 'object' ? effectiveConfig.workingMemory.scope : undefined,
+            useVNext:
+              typeof effectiveConfig.workingMemory === 'object' &&
+              'version' in effectiveConfig.workingMemory &&
+              effectiveConfig.workingMemory.version === 'vnext',
+            templateProvider: this,
+            readOnly: effectiveConfig.readOnly,
+            agentManaged:
+              typeof effectiveConfig.workingMemory === 'object'
+                ? effectiveConfig.workingMemory.agentManaged
+                : undefined,
+          }),
+        );
+      }
+    }
+
+    const messageTokenCounter =
+      lastMessages.maxTokens === undefined
+        ? undefined
+        : (this.createMemoryTokenCounter() ?? new TokenLimiterProcessor(lastMessages.maxTokens));
+    if (lastMessages.enabled) {
+      if (!memoryStore)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.STORAGE,
+          id: 'MESSAGE_HISTORY_MISSING_STORAGE_ADAPTER',
+          text: 'Using Mastra Memory message history requires a storage adapter but no attached adapter was detected.',
+        });
+
+      // Skip MessageHistory input processor if ObservationalMemory handles message loading
+      if (!hasMessageHistory && !hasObservationalMemory) {
+        processors.push(
+          new MessageHistory({
+            storage: memoryStore,
+            lastMessages: lastMessages.maxMessages ?? false,
+            tokenLimit:
+              lastMessages.maxTokens === undefined
+                ? undefined
+                : {
+                    maxTokens: lastMessages.maxTokens,
+                    atMaxRemoveTokens: lastMessages.atMaxRemoveTokens!,
+                  },
+            tokenCounter: messageTokenCounter,
+          }),
+        );
+      }
+    }
+
+    // Add semantic recall input processor if configured
+    if (effectiveConfig.semanticRecall) {
+      if (!memoryStore)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.STORAGE,
+          id: 'SEMANTIC_RECALL_MISSING_STORAGE_ADAPTER',
+          text: 'Using Mastra Memory semantic recall requires a storage adapter but no attached adapter was detected.',
+        });
+
+      if (!this.vector)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.MASTRA_VECTOR,
+          id: 'SEMANTIC_RECALL_MISSING_VECTOR_ADAPTER',
+          text: 'Using Mastra Memory semantic recall requires a vector adapter but no attached adapter was detected.',
+        });
+
+      // A self-embedding store needs no embedder: it takes the text and produces the
+      // vectors itself.
+      if (!this.embedder && !this.vector.isSelfEmbedding)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.MASTRA_VECTOR,
+          id: 'SEMANTIC_RECALL_MISSING_EMBEDDER',
+          text: 'Using Mastra Memory semantic recall requires an embedder, or a vector store that generates embeddings itself. Neither was detected.',
+        });
+
+      // Check if user already manually added SemanticRecall
+      const hasSemanticRecall = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'semantic-recall');
+
+      if (!hasSemanticRecall) {
+        const semanticConfig = typeof effectiveConfig.semanticRecall === 'object' ? effectiveConfig.semanticRecall : {};
+
+        // Probe the embedder for its actual dimension to generate the correct index name.
+        // This ensures the processor uses the same dimension-aware index name as recall().
+        const embeddingDimension = await this.getEmbeddingDimension();
+        const indexName = this.getEmbeddingIndexName(embeddingDimension);
+
+        processors.push(
+          new SemanticRecall({
+            storage: memoryStore,
+            vector: this.vector,
+            embedder: this.embedder,
+            embedderOptions: this.embedderOptions,
+            embeddingDimension: this.embeddingDimension,
+            indexName,
+            ...semanticConfig,
+          }),
+        );
+      }
+    }
+
+    if (
+      lastMessages.enabled &&
+      lastMessages.maxTokens !== undefined &&
+      !isObservationalMemoryEnabled(effectiveConfig.observationalMemory) &&
+      !configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'observational-memory')
+    ) {
+      const maxTokens = lastMessages.maxTokens;
+      const atMaxRemoveTokens = lastMessages.atMaxRemoveTokens!;
+      const limiter = new TokenLimiterProcessor({
+        limit: maxTokens,
+        trimMode: 'memory-only',
+        atMaxRemoveTokens,
+        tokenCounter: messageTokenCounter,
+        onMemoryTrim: async (removed, requestContext) => {
+          const memoryContext = (requestContext ?? context)?.get('MastraMemory') as MemoryRequestContext | undefined;
+          const thread = memoryContext?.thread;
+          const executionConfig = memoryContext?.memoryConfig
+            ? this.getMergedThreadConfig(memoryContext.memoryConfig)
+            : effectiveConfig;
+          if (!thread || executionConfig.readOnly) return;
+          const localMessages = removed.filter(message => message.threadId === thread.id);
+          if (!localMessages.length) return;
+
+          const updated = await memoryStore!.updateThreadMetadata({
+            id: thread.id,
+            resourceId: memoryContext.resourceId,
+            update: latest => {
+              const stored = getMemoryTokenBoundary(latest);
+              const previous =
+                stored?.maxTokens === maxTokens && stored.atMaxRemoveTokens === atMaxRemoveTokens ? stored : undefined;
+              const boundary = advanceMemoryTokenBoundary(previous, localMessages, maxTokens, atMaxRemoveTokens);
+              return boundary === previous ? undefined : { memoryTokenLimiter: boundary };
+            },
+          });
+          if (updated) thread.metadata = updated.metadata;
+        },
+      });
+      processors.push({
+        id: 'memory-token-limiter',
+        name: 'Memory Token Limiter',
+        processInput: args => limiter.processInput(args),
+        processInputStep: args => limiter.processInputStep(args),
+      });
+    }
+
+    // Return only the auto-generated processors (not the configured ones)
+    // The agent will merge them with configuredProcessors
+    return processors;
+  }
+
+  /**
+   * Get error processors for this memory instance.
+   * An agent appends these to its resolved `errorProcessors`, so memory can recover from failed
+   * model calls (for example, a request rejected for exceeding the context window) without the
+   * user registering a processor. They are kept when a call overrides `errorProcessors`.
+   * @param configuredProcessors - Error processors already resolved for the agent (for deduplication)
+   * @returns Error processors for this memory instance. The base implementation contributes none.
+   */
+  async getErrorProcessors(
+    _configuredProcessors: ErrorProcessorOrWorkflow[] = [],
+    _context?: RequestContext,
+  ): Promise<ErrorProcessor[]> {
+    return [];
+  }
+
+  /**
+   * Get output processors for this memory instance
+   * This allows Memory to be used as a ProcessorProvider in Agent's outputProcessors array.
+   * @param configuredProcessors - Processors already configured by the user (for deduplication)
+   * @returns Array of output processors configured for this memory instance
+   *
+   * Note: We intentionally do NOT check readOnly here. The readOnly check happens at execution time
+   * in each processor's processOutputResult method. This allows proper isolation when agents share
+   * a RequestContext - each agent's readOnly setting is respected when its processors actually run,
+   * not when processors are resolved (which may happen before the agent sets its MastraMemory context).
+   * See: https://github.com/mastra-ai/mastra/issues/11651
+   */
+  async getOutputProcessors(
+    configuredProcessors: OutputProcessorOrWorkflow[] = [],
+    context?: RequestContext,
+  ): Promise<OutputProcessor[]> {
+    const memoryStore = await this.storage.getStore('memory');
+    const processors: OutputProcessor[] = [];
+
+    // Extract runtime memoryConfig from context if available
+    const memoryContext = context?.get('MastraMemory') as MemoryRequestContext | undefined;
+    const runtimeMemoryConfig = memoryContext?.memoryConfig;
+    const effectiveConfig = runtimeMemoryConfig ? this.getMergedThreadConfig(runtimeMemoryConfig) : this.threadConfig;
+
+    // Add SemanticRecall output processor if configured
+    if (effectiveConfig.semanticRecall) {
+      if (!memoryStore)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.STORAGE,
+          id: 'SEMANTIC_RECALL_MISSING_STORAGE_ADAPTER',
+          text: 'Using Mastra Memory semantic recall requires a storage adapter but no attached adapter was detected.',
+        });
+
+      if (!this.vector)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.MASTRA_VECTOR,
+          id: 'SEMANTIC_RECALL_MISSING_VECTOR_ADAPTER',
+          text: 'Using Mastra Memory semantic recall requires a vector adapter but no attached adapter was detected.',
+        });
+
+      // A self-embedding store needs no embedder: it takes the text and produces the
+      // vectors itself.
+      if (!this.embedder && !this.vector.isSelfEmbedding)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.MASTRA_VECTOR,
+          id: 'SEMANTIC_RECALL_MISSING_EMBEDDER',
+          text: 'Using Mastra Memory semantic recall requires an embedder, or a vector store that generates embeddings itself. Neither was detected.',
+        });
+
+      // Check if user already manually added SemanticRecall
+      const hasSemanticRecall = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'semantic-recall');
+
+      if (!hasSemanticRecall) {
+        const semanticRecallConfig =
+          typeof effectiveConfig.semanticRecall === 'object' ? effectiveConfig.semanticRecall : {};
+
+        // Probe the embedder for its actual dimension to generate the correct index name.
+        // This ensures the processor uses the same dimension-aware index name as recall().
+        const embeddingDimension = await this.getEmbeddingDimension();
+        const indexName = this.getEmbeddingIndexName(embeddingDimension);
+
+        processors.push(
+          new SemanticRecall({
+            storage: memoryStore,
+            vector: this.vector,
+            embedder: this.embedder,
+            embedderOptions: this.embedderOptions,
+            embeddingDimension: this.embeddingDimension,
+            indexName,
+            ...semanticRecallConfig,
+          }),
+        );
+      }
+    }
+
+    const lastMessages = normalizeMessageHistoryConfig(effectiveConfig.lastMessages, effectiveConfig.messageHistory);
+    if (lastMessages.enabled) {
+      if (!memoryStore)
+        throw new MastraError({
+          category: 'USER',
+          domain: ErrorDomain.STORAGE,
+          id: 'MESSAGE_HISTORY_MISSING_STORAGE_ADAPTER',
+          text: 'Using Mastra Memory message history requires a storage adapter but no attached adapter was detected.',
+        });
+
+      // Check if user already manually added MessageHistory
+      const hasMessageHistory = configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'message-history');
+
+      // Check if ObservationalMemory is present (via processor or config) - it handles its own message saving
+      const hasObservationalMemory =
+        configuredProcessors.some(p => !isProcessorWorkflow(p) && p.id === 'observational-memory') ||
+        isObservationalMemoryEnabled(effectiveConfig.observationalMemory);
+
+      // Skip MessageHistory output processor if ObservationalMemory handles message saving
+      if (!hasMessageHistory && !hasObservationalMemory) {
+        processors.push(
+          new MessageHistory({
+            storage: memoryStore,
+            lastMessages: lastMessages.maxMessages ?? false,
+            tokenLimit:
+              lastMessages.maxTokens === undefined
+                ? undefined
+                : {
+                    maxTokens: lastMessages.maxTokens,
+                    atMaxRemoveTokens: lastMessages.atMaxRemoveTokens!,
+                  },
+          }),
+        );
+      }
+    }
+
+    // Return only the auto-generated processors (not the configured ones)
+    // The agent will merge them with configuredProcessors
+    return processors;
+  }
+
+  abstract deleteMessages(
+    messageIds: MessageDeleteInput,
+    observabilityContext?: Partial<ObservabilityContext>,
+  ): Promise<void>;
+
+  /**
+   * Clones a thread with all its messages to a new thread
+   * @param args - Clone parameters including source thread ID and optional filtering options
+   * @returns Promise resolving to the cloned thread and copied messages
+   */
+  abstract cloneThread(args: StorageCloneThreadInput): Promise<StorageCloneThreadOutput>;
+
+  /**
+   * Copies a thread and its messages to a new thread without returning the message
+   * payloads. Prefer this over `cloneThread` when only the new thread id is needed
+   * (e.g. forking), so large threads never have to be loaded into memory.
+   * @param args - Clone parameters including source thread ID and optional filtering options
+   * @returns Promise resolving to the new thread and the source→new message id map
+   */
+  async copyThread(args: StorageCloneThreadInput): Promise<StorageCopyThreadOutput> {
+    const { thread, messageIdMap } = await this.cloneThread(args);
+    return { thread, messageIdMap };
+  }
+
+  /**
+   * Reassign a thread and all of its messages to a different resource.
+   * Preserves the thread's `createdAt`. Performs no ownership authorization.
+   * @param args - The thread to reassign and the resource that should own it.
+   * @returns Promise resolving to the updated thread
+   */
+  updateThreadResourceId(_args: {
+    threadId: string;
+    resourceId: string;
+    memoryConfig?: MemoryConfigInternal;
+  }): Promise<StorageThreadType> {
+    throw new Error('Thread resource transfer is not supported by this memory implementation.');
+  }
+
+  /**
+   * Get serializable configuration for this memory instance
+   * @returns Serializable memory configuration
+   */
+  getConfig(): SerializedMemoryConfig {
+    const { generateTitle, workingMemory, threads, observationalMemory, ...restConfig } = this.threadConfig;
+
+    const config: SerializedMemoryConfig = {
+      vector: this.vector?.id,
+      options: {
+        ...restConfig,
+      },
+    };
+
+    // Serialize generateTitle configuration
+    if (generateTitle !== undefined && config.options) {
+      if (typeof generateTitle === 'boolean') {
+        config.options.generateTitle = generateTitle;
+      } else if (typeof generateTitle === 'object' && generateTitle !== null) {
+        const model = generateTitle.model;
+        // Extract ModelRouterModelId from string or config-object model specs.
+        // AI SDK LanguageModel instances are deliberately left unset — their
+        // modelId is not a valid model-router ID; dynamic functions cannot serialize.
+        let modelId: string | undefined;
+
+        if (typeof model === 'string') {
+          modelId = model;
+        } else if (model && typeof model === 'object') {
+          // Handle config objects with id field
+          if ('id' in model && typeof model.id === 'string') {
+            modelId = model.id;
+          }
+        }
+
+        config.options.generateTitle = {
+          ...(modelId ? { model: modelId as ModelRouterModelId } : {}),
+          ...(typeof generateTitle.instructions === 'string' ? { instructions: generateTitle.instructions } : {}),
+          ...(typeof generateTitle.minMessages === 'number' ? { minMessages: generateTitle.minMessages } : {}),
+          ...(typeof generateTitle.emitEvent === 'boolean' ? { emitEvent: generateTitle.emitEvent } : {}),
+        };
+      }
+    }
+
+    if (this.embedder) {
+      config.embedder = this.embedder as unknown as EmbeddingModelId;
+    }
+
+    if (this.embedderOptions) {
+      const { telemetry, ...rest } = this.embedderOptions;
+      config.embedderOptions = rest;
+    }
+
+    // Serialize observationalMemory configuration
+    if (observationalMemory !== undefined) {
+      config.observationalMemory = this.serializeObservationalMemory(observationalMemory);
+    }
+
+    return config;
+  }
+
+  /**
+   * Serialize observational memory config to a JSON-safe representation.
+   * Model references that aren't string IDs are dropped (non-serializable).
+   */
+  private serializeObservationalMemory(
+    om: boolean | ObservationalMemoryOptions,
+  ): SerializedMemoryConfig['observationalMemory'] {
+    if (typeof om === 'boolean') {
+      return om;
+    }
+
+    if (om.enabled === false) {
+      return false;
+    }
+
+    const result: SerializedObservationalMemoryConfig = {
+      scope: om.scope,
+      activateAfterIdle: om.activateAfterIdle,
+      activateOnProviderChange: om.activateOnProviderChange,
+      shareTokenBudget: om.shareTokenBudget,
+      temporalMarkers: om.temporalMarkers,
+      retrieval: om.retrieval,
+    };
+
+    // Extract model ID string from the top-level model
+    const topModelId = extractModelIdString(om.model);
+    if (topModelId) {
+      result.model = topModelId;
+    }
+
+    // Serialize observation config
+    if (om.observation) {
+      const obs = om.observation;
+      result.observation = {
+        messageTokens: obs.messageTokens,
+        modelSettings: obs.modelSettings as Record<string, unknown>,
+        providerOptions: obs.providerOptions,
+        maxTokensPerBatch: obs.maxTokensPerBatch,
+        bufferTokens: obs.bufferTokens,
+        bufferActivation: obs.bufferActivation,
+        blockAfter: obs.blockAfter,
+        previousObserverTokens: obs.previousObserverTokens,
+        observeAttachments: obs.observeAttachments,
+        maxRetries: obs.maxRetries,
+        failurePolicy: obs.failurePolicy,
+      };
+      const obsModelId = extractModelIdString(obs.model);
+      if (obsModelId) {
+        result.observation.model = obsModelId;
+      }
+    }
+
+    // Serialize reflection config
+    if (om.reflection) {
+      const ref = om.reflection;
+      result.reflection = {
+        observationTokens: ref.observationTokens,
+        modelSettings: ref.modelSettings as Record<string, unknown>,
+        providerOptions: ref.providerOptions,
+        blockAfter: ref.blockAfter,
+        bufferActivation: ref.bufferActivation,
+        maxRetries: ref.maxRetries,
+        failurePolicy: ref.failurePolicy,
+      };
+      const refModelId = extractModelIdString(ref.model);
+      if (refModelId) {
+        result.reflection.model = refModelId;
+      }
+    }
+
+    return result;
+  }
+}

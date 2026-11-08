@@ -1,0 +1,1085 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { MessageList } from '../../agent';
+import { MemoryRunState } from '../../memory';
+import type { MastraDBMessage } from '../../memory';
+import { RequestContext } from '../../request-context';
+import type { MemoryStorage } from '../../storage';
+
+import type { WorkingMemoryTemplate } from './working-memory';
+import { WorkingMemory } from './working-memory';
+
+describe('WorkingMemory', () => {
+  let mockStorage: MemoryStorage;
+  let requestContext: RequestContext;
+
+  beforeEach(() => {
+    mockStorage = {
+      getThreadById: vi.fn(),
+      getResourceById: vi.fn(),
+    } as any;
+
+    requestContext = new RequestContext();
+  });
+
+  describe('Input Processing', () => {
+    it('should inject thread-scoped working memory as system message', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+      const workingMemoryData = '# User Info\n- Name: John\n- Preference: Dark mode';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: workingMemoryData },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages as any, 'input');
+
+      const result = await processor.processInput({
+        messages: messages as any,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(resultMessages[1].role).toBe('user');
+      expect(mockStorage.getThreadById).toHaveBeenCalledWith({ threadId });
+    });
+
+    it('should inject resource-scoped working memory as system message', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'resource',
+      });
+
+      const resourceId = 'resource-456';
+      const workingMemoryData = '# Project Context\n- Status: In Progress\n- Deadline: Friday';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: 'thread-1', resourceId, title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId,
+      });
+
+      vi.mocked(mockStorage.getResourceById).mockResolvedValue({
+        id: resourceId,
+        workingMemory: workingMemoryData,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'What is the status?' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(mockStorage.getResourceById).toHaveBeenCalledWith({ resourceId });
+    });
+
+    it('reuses resource-scoped working memory within a memory run', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'resource',
+      });
+      const threadId = 'thread-1';
+      const resourceId = 'resource-1';
+      const runState = new MemoryRunState({ memory: {}, threadId, resourceId });
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId },
+        resourceId,
+        runState: () => runState,
+      });
+      vi.mocked(mockStorage.getResourceById).mockResolvedValue({
+        id: resourceId,
+        workingMemory: '# Cached context',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      for (const id of ['msg-1', 'msg-2']) {
+        const message: MastraDBMessage = {
+          id,
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: id }] },
+          createdAt: new Date(),
+        };
+        const messageList = new MessageList();
+        messageList.add(message, 'input');
+        await processor.processInput({
+          messages: [message],
+          messageList,
+          abort: () => {
+            throw new Error('Aborted');
+          },
+          requestContext,
+        });
+      }
+
+      expect(mockStorage.getResourceById).toHaveBeenCalledTimes(1);
+    });
+
+    it('should use default template when no working memory exists', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: null },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION');
+      expect(resultMessages[0].content).toContain('# User Information');
+    });
+
+    it('should use custom template when provided', async () => {
+      const customTemplate: WorkingMemoryTemplate = {
+        format: 'markdown',
+        content: '# Custom Template\n- Field 1:\n- Field 2:',
+      };
+
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+        template: customTemplate,
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: null },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages[0].content).toContain('# Custom Template');
+      expect(resultMessages[0].content).toContain('- Field 1:');
+    });
+
+    it('should use VNext instruction format when useVNext is true', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+        useVNext: true,
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: 'Some data' },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages[0].content).toContain('If your memory has not changed');
+      expect(resultMessages[0].content).toContain('Information not being relevant to the current conversation');
+    });
+
+    it('should return original messages when no threadId or resourceId', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext: new RequestContext(),
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(1);
+      expect(resultMessages[0].role).toBe('user');
+      expect(mockStorage.getThreadById).not.toHaveBeenCalled();
+      expect(mockStorage.getResourceById).not.toHaveBeenCalled();
+    });
+
+    it('should default to resource scope when scope not specified', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        // scope not specified, should default to 'resource'
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getResourceById).mockResolvedValue({
+        id: 'resource-1',
+        workingMemory: 'Test data',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(mockStorage.getResourceById).toHaveBeenCalledWith({ resourceId: 'resource-1' });
+      expect(mockStorage.getThreadById).not.toHaveBeenCalled();
+    });
+
+    it('should handle JSON format template', async () => {
+      const jsonTemplate: WorkingMemoryTemplate = {
+        format: 'json',
+        content: JSON.stringify({
+          user: { name: '', email: '' },
+          preferences: { theme: '', language: '' },
+        }),
+      };
+
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+        template: jsonTemplate,
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: null },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages[0].content).toContain('Use JSON format for all data');
+      expect(resultMessages[0].content).not.toContain('IMPORTANT: When calling updateWorkingMemory');
+    });
+
+    it('should handle JSON format template with pre-parsed object content', async () => {
+      const jsonTemplate: WorkingMemoryTemplate = {
+        format: 'json',
+        content: {
+          type: 'object',
+          properties: {
+            user: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+                email: { type: 'string' },
+              },
+            },
+            score: { type: 'number' },
+          },
+        },
+      };
+
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+        template: jsonTemplate,
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: null },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages[0].content).toContain('Use JSON format for all data');
+      // Should contain the recursively generated empty object template
+      expect(resultMessages[0].content).toContain('"user":{"name":"","email":""}');
+      expect(resultMessages[0].content).toContain('"score":0');
+    });
+
+    it('should prepend working memory before existing messages', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: 'Test data' },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'First message' }] },
+          createdAt: new Date(),
+        },
+        {
+          id: 'msg-2',
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'Second message' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(3);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[1].role).toBe('user');
+      expect(resultMessages[2].role).toBe('assistant');
+    });
+
+    it('should handle empty working memory data', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: '' },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('<working_memory_data>');
+      expect(resultMessages[0].content).toContain('</working_memory_data>');
+    });
+
+    it('should use read-only instruction format when readOnly option is true', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+        readOnly: true,
+      });
+
+      const threadId = 'thread-123';
+      const workingMemoryData = '# User Info\n- Name: John';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: workingMemoryData },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(resultMessages[0].content).toContain('read-only in the current session');
+      expect(resultMessages[0].content).not.toContain('updated automatically');
+      expect(resultMessages[0].content).toContain('Act naturally');
+      expect(resultMessages[0].content).not.toContain('updateWorkingMemory');
+      expect(resultMessages[0].content).not.toContain('Store and update');
+    });
+
+    it('should use read-only instruction format when memoryConfig.readOnly is true', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+      const workingMemoryData = '# User Info\n- Name: Jane';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+        memoryConfig: { readOnly: true },
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: workingMemoryData },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(resultMessages[0].content).not.toContain('updateWorkingMemory');
+    });
+
+    it('should use auto-updated instruction format when workingMemory.agentManaged is false (#25896, #28367)', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+      const workingMemoryData = '# User Info\n- Name: Jane';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+        memoryConfig: { workingMemory: { enabled: true, agentManaged: false } },
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: workingMemoryData },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (AUTO-UPDATED)');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(resultMessages[0].content).not.toContain('updateWorkingMemory');
+      // The app updates the memory, so the agent must not be told it can't (#28367)
+      expect(resultMessages[0].content).toContain('This memory is updated automatically after each response');
+      expect(resultMessages[0].content).toContain("Never say you can't save or update it");
+      expect(resultMessages[0].content).not.toContain('read-only in the current session');
+    });
+
+    it('keeps read-only wording when readOnly is set alongside agentManaged false (#28367)', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+      });
+
+      const threadId = 'thread-123';
+      const workingMemoryData = '# User Info\n- Name: Jane';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+        memoryConfig: { readOnly: true, workingMemory: { enabled: true, agentManaged: false } },
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: workingMemoryData },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(resultMessages[0].content).toContain('read-only in the current session - you cannot update it');
+      expect(resultMessages[0].content).not.toContain('updated automatically');
+    });
+
+    // The Memory class passes these as constructor options (no runtime memoryConfig flags), which is the live agent path.
+    it.each([
+      { readOnly: undefined, agentManaged: undefined, expected: 'tools' },
+      { readOnly: undefined, agentManaged: true, expected: 'tools' },
+      { readOnly: undefined, agentManaged: false, expected: 'auto-updated' },
+      { readOnly: true, agentManaged: undefined, expected: 'read-only' },
+      { readOnly: true, agentManaged: true, expected: 'read-only' },
+      { readOnly: true, agentManaged: false, expected: 'read-only' },
+    ] as const)(
+      'uses $expected instructions for constructor options readOnly=$readOnly agentManaged=$agentManaged (#28367)',
+      async ({ readOnly, agentManaged, expected }) => {
+        const processor = new WorkingMemory({ storage: mockStorage, scope: 'thread', readOnly, agentManaged });
+        const threadId = 'thread-123';
+        requestContext.set('MastraMemory', {
+          thread: {
+            id: threadId,
+            resourceId: 'resource-1',
+            title: 'Test',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          resourceId: 'resource-1',
+        });
+        vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+          id: threadId,
+          resourceId: 'resource-1',
+          title: 'Test Thread',
+          metadata: { workingMemory: '# User Info\n- Name: Jane' },
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        const messages: MastraDBMessage[] = [
+          {
+            id: 'msg-1',
+            role: 'user',
+            content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+            createdAt: new Date(),
+          },
+        ];
+        const messageList = new MessageList();
+        messageList.add(messages, 'input');
+        const result = await processor.processInput({
+          messages,
+          messageList,
+          abort: () => {
+            throw new Error('Aborted');
+          },
+          requestContext,
+        });
+        const content = String((result instanceof MessageList ? result.get.all.aiV5.prompt() : result)[0].content);
+
+        expect(content).toContain('Name: Jane');
+        if (expected === 'tools') {
+          expect(content).toContain('updateWorkingMemory');
+          expect(content).not.toContain('(READ-ONLY)');
+          expect(content).not.toContain('(AUTO-UPDATED)');
+        } else if (expected === 'auto-updated') {
+          expect(content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (AUTO-UPDATED)');
+          expect(content).toContain('This memory is updated automatically after each response');
+          expect(content).not.toContain('read-only');
+          expect(content).not.toContain('updateWorkingMemory');
+        } else {
+          expect(content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+          expect(content).toContain('read-only in the current session - you cannot update it');
+          expect(content).not.toContain('updated automatically');
+          expect(content).not.toContain('updateWorkingMemory');
+        }
+      },
+    );
+
+    it('should show fallback message when readOnly and no working memory data exists', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'thread',
+        readOnly: true,
+      });
+
+      const threadId = 'thread-123';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: threadId, resourceId: 'resource-1', title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId: 'resource-1',
+      });
+
+      vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+        id: threadId,
+        resourceId: 'resource-1',
+        title: 'Test Thread',
+        metadata: { workingMemory: null },
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+      expect(resultMessages[0].content).toContain('No working memory data available.');
+    });
+
+    it('should use read-only instruction format with resource-scoped memory', async () => {
+      const processor = new WorkingMemory({
+        storage: mockStorage,
+        scope: 'resource',
+        readOnly: true,
+      });
+
+      const resourceId = 'resource-456';
+      const workingMemoryData = '# User Profile\n- Name: Alice\n- Preferences: Dark mode';
+
+      requestContext.set('MastraMemory', {
+        thread: { id: 'thread-123', resourceId, title: 'Test', createdAt: new Date(), updatedAt: new Date() },
+        resourceId,
+      });
+
+      vi.mocked(mockStorage.getResourceById).mockResolvedValue({
+        id: resourceId,
+        workingMemory: workingMemoryData,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+
+      const messages: MastraDBMessage[] = [
+        {
+          id: 'msg-1',
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+          createdAt: new Date(),
+        },
+      ];
+
+      const messageList = new MessageList();
+      messageList.add(messages, 'input');
+      const result = await processor.processInput({
+        messages,
+        messageList,
+        abort: () => {
+          throw new Error('Aborted');
+        },
+        requestContext,
+      });
+
+      const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+      expect(resultMessages).toHaveLength(2);
+      expect(resultMessages[0].role).toBe('system');
+      expect(resultMessages[0].content).toContain('WORKING_MEMORY_SYSTEM_INSTRUCTION (READ-ONLY)');
+      expect(resultMessages[0].content).toContain(workingMemoryData);
+      expect(resultMessages[0].content).not.toContain('updateWorkingMemory');
+      expect(mockStorage.getResourceById).toHaveBeenCalledWith({ resourceId });
+      expect(mockStorage.getThreadById).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Empty working memory', () => {
+    const templates: WorkingMemoryTemplate[] = [
+      { format: 'markdown', content: '# User Profile\n- Name:' },
+      { format: 'json', content: { type: 'object', properties: { name: { type: 'string' } } } },
+    ];
+
+    it.each([
+      ...templates.flatMap(template => [
+        { mode: 'tool', useVNext: false, scope: 'thread' as const, template },
+        { mode: 'tool', useVNext: false, scope: 'resource' as const, template },
+        { mode: 'vNext', useVNext: true, scope: 'thread' as const, template },
+        { mode: 'vNext', useVNext: true, scope: 'resource' as const, template },
+      ]),
+    ])(
+      'renders a fallback instead of "null" ($mode, $scope, $template.format)',
+      async ({ useVNext, scope, template }) => {
+        const processor = new WorkingMemory({ storage: mockStorage, scope, useVNext, template });
+
+        requestContext.set('MastraMemory', {
+          thread: {
+            id: 'thread-123',
+            resourceId: 'resource-1',
+            title: 'Test',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          resourceId: 'resource-1',
+        });
+        vi.mocked(mockStorage.getThreadById).mockResolvedValue({
+          id: 'thread-123',
+          resourceId: 'resource-1',
+          title: 'Test Thread',
+          metadata: {},
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        });
+        vi.mocked(mockStorage.getResourceById).mockResolvedValue(null);
+
+        const messageList = new MessageList();
+        messageList.add(
+          [
+            {
+              id: 'msg-1',
+              role: 'user',
+              content: { format: 2, parts: [{ type: 'text', text: 'Hello' }] },
+              createdAt: new Date(),
+            },
+          ],
+          'input',
+        );
+
+        const result = await processor.processInput({
+          messages: [],
+          messageList,
+          abort: () => {
+            throw new Error('Aborted');
+          },
+          requestContext,
+        });
+
+        const resultMessages = result instanceof MessageList ? result.get.all.aiV5.prompt() : result;
+        expect(resultMessages[0].role).toBe('system');
+        expect(resultMessages[0].content).toContain(
+          '<working_memory_data>\nNo working memory data available.\n</working_memory_data>',
+        );
+        expect(resultMessages[0].content).not.toContain('<working_memory_data>\nnull');
+      },
+    );
+  });
+});

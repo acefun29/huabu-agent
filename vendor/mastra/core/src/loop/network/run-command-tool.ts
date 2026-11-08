@@ -1,0 +1,316 @@
+/**
+ * Node.js-specific tool for running shell commands.
+ * This file is separated from validation.ts to avoid bundling Node.js
+ * dependencies into browser builds.
+ *
+ * @security WARNING: This tool executes shell commands and can be dangerous.
+ * - NEVER use with untrusted input or in multi-tenant environments
+ * - Always configure allowedCommands to restrict executable commands
+ * - Always set allowedBasePaths to restrict working directories
+ * - Consider running in a sandboxed environment (container, VM)
+ * - Review all commands that agents may construct before deployment
+ */
+
+import { exec } from 'node:child_process';
+import nodePath from 'node:path';
+import { promisify } from 'node:util';
+
+import { z } from 'zod/v4';
+
+import { createTool } from '../../tools';
+
+const execAsync = promisify(exec);
+
+/**
+ * Characters that could enable shell injection attacks.
+ * These are rejected when found in command input.
+ */
+const DANGEROUS_PATTERNS = [
+  /[;&|`$(){}[\]<>]/, // Shell metacharacters
+  /\n|\r/, // Newlines (command chaining)
+  /\\(?![ ])/, // Backslashes (except escaped spaces)
+];
+
+/**
+ * Commands that are inherently dangerous and blocked by default.
+ */
+const BLOCKED_COMMANDS = [
+  'rm',
+  'rmdir',
+  'del',
+  'format',
+  'mkfs',
+  'dd',
+  'shutdown',
+  'reboot',
+  'halt',
+  'poweroff',
+  'init',
+  'kill',
+  'killall',
+  'pkill',
+  'chmod',
+  'chown',
+  'chgrp',
+  'sudo',
+  'su',
+  'passwd',
+  'useradd',
+  'userdel',
+  'usermod',
+  'groupadd',
+  'visudo',
+  'crontab',
+  'systemctl',
+  'service',
+  'curl',
+  'wget',
+  'nc',
+  'netcat',
+  'ssh',
+  'scp',
+  'ftp',
+  'telnet',
+  'eval',
+  'source',
+  'exec',
+];
+
+export interface RunCommandToolOptions {
+  /**
+   * Allowlist of command prefixes that are permitted.
+   * If empty, all non-blocked commands are allowed (less secure).
+   * @example ['git', 'npm', 'node', 'ls', 'cat', 'echo']
+   */
+  allowedCommands?: string[];
+
+  /**
+   * Base paths where command execution is permitted.
+   * The cwd parameter must resolve to a path under one of these directories.
+   * If empty, any cwd is allowed (less secure).
+   * @example ['/home/user/projects', '/tmp/workspace']
+   */
+  allowedBasePaths?: string[];
+
+  /**
+   * Additional commands to block beyond the default blocklist.
+   */
+  additionalBlockedCommands?: string[];
+
+  /**
+   * Maximum execution time in milliseconds.
+   * @default 30000 (30 seconds)
+   */
+  maxTimeout?: number;
+
+  /**
+   * Maximum buffer size for stdout/stderr in bytes.
+   * @default 1048576 (1MB)
+   */
+  maxBuffer?: number;
+
+  /**
+   * Whether to allow potentially dangerous shell metacharacters.
+   * Setting this to true is NOT recommended.
+   * @default false
+   */
+  allowUnsafeCharacters?: boolean;
+}
+
+/**
+ * Validates that a path is under one of the allowed base paths.
+ */
+export function isPathAllowed(
+  targetPath: string,
+  allowedBasePaths: string[],
+  pathImpl: typeof nodePath.posix = nodePath,
+): boolean {
+  if (allowedBasePaths.length === 0) return true;
+
+  const target = pathImpl.resolve(targetPath);
+  return allowedBasePaths.some(basePath => {
+    const rel = pathImpl.relative(pathImpl.resolve(basePath), target);
+    return rel === '' || (rel !== '..' && !rel.startsWith('..' + pathImpl.sep) && !pathImpl.isAbsolute(rel));
+  });
+}
+
+/**
+ * Extracts the base command from a command string, handling both `/` and `\\`
+ * separators and common Windows executable extensions.
+ */
+export function extractBaseCommand(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  stripExtension = true,
+): string {
+  const trimmed = command.trim();
+  // Read the first shell word: whitespace ends it only outside quotes, and quote
+  // characters are dropped, since the shell joins `r"m"` / `"r"m` into `rm`.
+  let baseCmd = '';
+  let quote = '';
+  for (const ch of trimmed) {
+    if (quote) {
+      if (ch === quote) quote = '';
+      else baseCmd += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      break;
+    } else {
+      baseCmd += ch;
+    }
+  }
+  const lastSep = Math.max(baseCmd.lastIndexOf('/'), baseCmd.lastIndexOf('\\'));
+  const name = lastSep === -1 ? baseCmd : baseCmd.substring(lastSep + 1);
+  const lower = name.toLowerCase();
+  if (platform !== 'win32') return lower;
+  // Windows ignores trailing dots/spaces and resolves executable extensions (`rm.exe.` runs `rm.exe`).
+  // On POSIX these are distinct files, so normalizing there would let `./echo.` match an `echo` allowlist entry.
+  let end = lower.length;
+  while (end > 0 && (lower[end - 1] === '.' || lower[end - 1] === ' ')) end--;
+  const trimmedName = lower.slice(0, end);
+  return stripExtension ? trimmedName.replace(/\.(exe|cmd|bat|com)$/, '') : trimmedName;
+}
+
+/**
+ * Creates a tool that lets agents run shell commands with security restrictions.
+ *
+ * @security WARNING: This tool executes shell commands. Even with restrictions,
+ * it should NEVER be used with untrusted input. Always:
+ * - Configure allowedCommands to restrict which commands can run
+ * - Configure allowedBasePaths to restrict working directories
+ * - Review agent prompts to understand what commands may be generated
+ * - Consider additional sandboxing (containers, VMs) for production use
+ *
+ * @example
+ * ```typescript
+ * // Secure configuration with allowlists
+ * const agent = new Agent({
+ *   tools: {
+ *     runCommand: createRunCommandTool({
+ *       allowedCommands: ['git', 'npm', 'node'],
+ *       allowedBasePaths: ['/home/user/project'],
+ *       maxTimeout: 10000,
+ *     }),
+ *   },
+ * });
+ * ```
+ */
+export function createRunCommandTool(options: RunCommandToolOptions = {}) {
+  const {
+    allowedCommands = [],
+    allowedBasePaths = [],
+    additionalBlockedCommands = [],
+    maxTimeout = 30000,
+    maxBuffer = 1024 * 1024, // 1MB
+    allowUnsafeCharacters = false,
+  } = options;
+
+  // Normalize configured names the same way as commands so `tool.exe` still matches on Windows.
+  const blockedCommands = new Set([...BLOCKED_COMMANDS, ...additionalBlockedCommands.map(c => extractBaseCommand(c))]);
+  // An allowlist entry with an explicit extension (`safe.cmd`) only permits that exact file,
+  // so it can't authorize `safe.exe` or a bare `safe` that Windows might resolve to another file.
+  const allowedEntries = allowedCommands.map(c => ({
+    name: extractBaseCommand(c),
+    full: extractBaseCommand(c, process.platform, false),
+  }));
+
+  return createTool({
+    id: 'run-command',
+    description:
+      'Execute a shell command and return the result. Only permitted commands in allowed directories can be executed.',
+    inputSchema: z.object({
+      command: z.string().describe('The shell command to execute'),
+      timeout: z.number().default(30000).describe('Timeout in milliseconds (capped by server configuration)'),
+      cwd: z.string().optional().describe('Working directory (must be within allowed paths)'),
+    }),
+    execute: async ({ command, timeout, cwd }) => {
+      // Validate: reject dangerous characters
+      if (!allowUnsafeCharacters) {
+        for (const pattern of DANGEROUS_PATTERNS) {
+          if (pattern.test(command)) {
+            return {
+              success: false,
+              exitCode: 1,
+              stdout: '',
+              stderr: '',
+              message: `Command rejected: contains potentially unsafe characters. Pattern: ${pattern.source}`,
+            };
+          }
+        }
+      }
+
+      // Validate: extract and check base command
+      const baseCommand = extractBaseCommand(command);
+
+      // Check blocked commands
+      if (blockedCommands.has(baseCommand)) {
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr: '',
+          message: `Command rejected: '${baseCommand}' is not permitted for security reasons`,
+        };
+      }
+
+      // Check allowlist if configured
+      if (allowedCommands.length > 0) {
+        const fullCommand = extractBaseCommand(command, process.platform, false);
+        const isAllowed = allowedEntries.some(entry =>
+          entry.full === entry.name ? entry.name === baseCommand : entry.full === fullCommand,
+        );
+        if (!isAllowed) {
+          return {
+            success: false,
+            exitCode: 1,
+            stdout: '',
+            stderr: '',
+            message: `Command rejected: '${baseCommand}' is not in the allowed commands list`,
+          };
+        }
+      }
+
+      // Validate: check cwd against allowed base paths
+      if (cwd && !isPathAllowed(cwd, allowedBasePaths)) {
+        return {
+          success: false,
+          exitCode: 1,
+          stdout: '',
+          stderr: '',
+          message: `Command rejected: working directory '${cwd}' is not within allowed paths`,
+        };
+      }
+
+      // Apply timeout cap
+      const effectiveTimeout = Math.min(timeout || maxTimeout, maxTimeout);
+
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          timeout: effectiveTimeout,
+          cwd,
+          maxBuffer,
+          env: {
+            ...process.env,
+            // Restrict PATH to reduce attack surface (optional hardening)
+            // PATH: '/usr/local/bin:/usr/bin:/bin',
+          },
+        });
+        return {
+          success: true,
+          exitCode: 0,
+          stdout: stdout.slice(-3000),
+          stderr: stderr.slice(-1000),
+        };
+      } catch (error: any) {
+        return {
+          success: false,
+          exitCode: error.code,
+          stdout: error.stdout?.slice(-2000),
+          stderr: error.stderr?.slice(-2000),
+          message: error.message,
+        };
+      }
+    },
+  });
+}

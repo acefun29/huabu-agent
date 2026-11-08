@@ -1,0 +1,660 @@
+import type {
+  BackgroundTaskFailedPayload,
+  BackgroundTaskResultPayload,
+  BackgroundTaskStartedPayload,
+  BackgroundTaskProgressPayload,
+  BackgroundTaskSuspendedPayload,
+  BackgroundTaskResumedPayload,
+  AgentChunkType,
+} from '../stream/types';
+
+export type BackgroundTaskStatus =
+  | 'pending'
+  | 'running'
+  | 'suspended'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out';
+
+export interface BackgroundTask {
+  id: string;
+  status: BackgroundTaskStatus;
+
+  // What to execute
+  toolName: string;
+  toolCallId: string;
+  args: Record<string, unknown>;
+
+  // Context
+  agentId: string;
+  threadId?: string;
+  resourceId?: string;
+  runId: string;
+
+  // Result
+  result?: unknown;
+  error?: { message: string; stack?: string };
+
+  // Timing
+  createdAt: Date;
+  startedAt?: Date;
+  /**
+   * When the task was last suspended (i.e. the tool called `suspend()`).
+   * Cleared on resume.
+   */
+  suspendedAt?: Date;
+  completedAt?: Date;
+
+  /**
+   * Identity of the worker process that currently owns execution of this task.
+   * Set when a worker acquires the execution lease and cleared when the task
+   * reaches a terminal state, suspends, or is cancelled. Combined with
+   * `leaseExpiresAt` so recovery can prove whether the previous owner is dead
+   * before reclaiming a `running` task.
+   */
+  ownerId?: string;
+  /**
+   * Wall-clock expiry of the current owner's execution lease. While this is in
+   * the future the owner is considered alive and no other worker may reclaim
+   * the task. Renewed by the owner's heartbeat; recovery may only reclaim a
+   * `running` task once its lease has expired.
+   */
+  leaseExpiresAt?: Date;
+
+  // Retry
+  retryCount: number;
+  maxRetries: number;
+
+  // Timeout
+  timeoutMs: number;
+
+  /**
+   * Last value passed to `suspend()` while the task was running. Set when
+   * `status === 'suspended'`; cleared on resume. Surfaced on lifecycle events
+   * so consumers don't have to read the workflow snapshot directly.
+   */
+  suspendPayload?: unknown;
+
+  /**
+   * Owner-defined retention deadline. When set, `cleanup()` deletes the row once
+   * it is terminal and `expiresAt` has passed, instead of applying the global
+   * `cleanup.completedTtlMs` / `cleanup.failedTtlMs`. Non-terminal rows are never
+   * deleted by cleanup, even after `expiresAt`.
+   */
+  expiresAt?: Date;
+
+  /** Owner-defined JSON metadata persisted with the row. Not interpreted by the manager. */
+  metadata?: Record<string, unknown>;
+}
+
+export type BackgroundTaskOutputChunk = Extract<AgentChunkType, { type: 'tool-output' }>;
+
+export interface BackgroundTaskEvent extends BackgroundTask {
+  chunk?: BackgroundTaskOutputChunk;
+}
+
+export type UpdateBackgroundTask = Partial<
+  Omit<
+    BackgroundTask,
+    'id' | 'createdAt' | 'threadId' | 'resourceId' | 'runId' | 'agentId' | 'toolCallId' | 'toolName' | 'args'
+  >
+>;
+
+/**
+ * Optional conditions for `updateTask`. When provided, the update is applied
+ * only if the stored row still matches every supplied condition — a
+ * compare-and-set that fences writes from superseded owners.
+ *
+ * `expectedOwnerId` / `expectedLeaseExpiresAt` / `expectedSuspendedAt` use
+ * `string | null` / `Date | null` because "expect the column to be unset"
+ * (null) is a meaningful condition distinct from "don't check it" (undefined).
+ */
+export interface UpdateBackgroundTaskOptions {
+  /**
+   * Apply only if the stored suspension time equals this value (null = not
+   * suspended / unset). Distinguishes one suspension of a task from the next:
+   * owner and lease are cleared on suspend, so status alone can't tell a stale
+   * write for an earlier suspension from a write for the current one.
+   */
+  expectedSuspendedAt?: Date | null;
+  /** Apply only if the stored status equals this value. */
+  expectedStatus?: BackgroundTaskStatus;
+  /** Apply only if the stored owner equals this value (null = unowned). */
+  expectedOwnerId?: string | null;
+  /** Apply only if the stored lease expiry equals this value (null = unset). */
+  expectedLeaseExpiresAt?: Date | null;
+}
+
+/**
+ * Payload accepted by `BackgroundTaskManager.enqueue()`.
+ */
+export interface TaskPayload {
+  runId: string;
+  toolName: string;
+  toolCallId: string;
+  args: Record<string, unknown>;
+  agentId: string;
+  threadId?: string;
+  resourceId?: string;
+  timeoutMs?: number;
+  maxRetries?: number;
+  /** See `BackgroundTask.expiresAt`. */
+  expiresAt?: Date;
+  /** See `BackgroundTask.metadata`. */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Options for `BackgroundTaskManager.enqueue()`.
+ */
+export interface EnqueueOptions {
+  /**
+   * Pin the `pending` row to this worker. Use it when work for the task is
+   * already in flight on this worker, for example an execution the caller
+   * started before enqueueing that the task's executor adopts. Requires a
+   * `context`.
+   *
+   * The row is written with this worker's owner ID and an execution lease,
+   * which the lease heartbeat renews while the row waits for a local slot.
+   * While the lease is live, other workers' recovery and dispatch skip the row.
+   *
+   * If this worker dies and the lease lapses, the in-flight work is lost, so the
+   * row counts as a lost attempt, like a `running` task whose worker died: it
+   * consumes a retry and is re-dispatched if `retryCount < maxRetries`,
+   * otherwise it fails. It never re-runs on another worker for free, so a task
+   * with `maxRetries: 0` is never run elsewhere. Workers with
+   * `recoverStaleTasksOnStart` check for lapsed pins at startup and then every
+   * `leaseDurationMs`.
+   *
+   * A lapsed lease only proves this worker stopped renewing it, not that the
+   * adopted work stopped (for example, an event loop stalled past the lease).
+   * Pinned work must be idempotent, or fence its side effects, if it can be
+   * retried on another worker.
+   */
+  pinToWorker?: boolean;
+}
+
+/**
+ * Options for `BackgroundTaskManager.resume()`.
+ */
+export interface ResumeOptions {
+  /**
+   * What to do when no concurrency slot is free.
+   * - `'throw'` (default): throw a `Concurrency limit reached` error.
+   * - `'queue'`: keep the task `suspended` and dispatch the resume once a slot
+   *   frees. Slots are rechecked when a task settles and on the lease-heartbeat
+   *   tick, so a slot freed by another process is picked up too.
+   *
+   * The queue is process-local and not durable. If the process exits before
+   * dispatch, the row stays `suspended` and the queued `resumeData` is lost.
+   * Owners that need durability must persist their resume data and call
+   * `resume()` again.
+   */
+  onNoSlot?: 'throw' | 'queue';
+  /**
+   * The `suspendedAt` the caller read. When set, resume throws a
+   * `suspension has changed` error unless the task is still in that same
+   * suspension, so an answer to an earlier question can't resume a later one.
+   */
+  suspendedAt?: Date | number;
+}
+
+/**
+ * Filter for querying and managing tasks.
+ */
+export type TaskDateColumn = 'createdAt' | 'startedAt' | 'suspendedAt' | 'completedAt' | 'expiresAt';
+
+export interface TaskFilter {
+  toolCallId?: string;
+  status?: BackgroundTaskStatus | BackgroundTaskStatus[];
+  agentId?: string;
+  threadId?: string;
+  resourceId?: string;
+  toolName?: string;
+  runId?: string;
+  /** Start of the date range (inclusive). Filtered on `dateFilterBy` column. */
+  fromDate?: Date;
+  /** End of the date range (exclusive). Filtered on `dateFilterBy` column. */
+  toDate?: Date;
+  /** Which date column to use for fromDate/toDate filtering. Default: 'createdAt' */
+  dateFilterBy?: TaskDateColumn;
+  /** `true` matches only rows with `expiresAt` set; `false` only rows without it. */
+  hasExpiresAt?: boolean;
+  /** Column to sort by. Default: 'createdAt'. Sorting by `expiresAt` is not supported. */
+  orderBy?: Exclude<TaskDateColumn, 'expiresAt'>;
+  orderDirection?: 'asc' | 'desc';
+  /** Page number (0-indexed). Used with perPage for pagination. */
+  page?: number;
+  /** Number of results per page. */
+  perPage?: number;
+}
+
+export interface TaskListResult {
+  tasks: BackgroundTask[];
+  total: number;
+}
+
+// --- Configuration ---
+
+export interface RetryConfig {
+  /** Maximum retry attempts. Default: 0 (no retries) */
+  maxRetries?: number;
+  /** Delay between retries in ms. Default: 1000 */
+  retryDelayMs?: number;
+  /** Backoff multiplier applied to retryDelayMs on each attempt. Default: 2 */
+  backoffMultiplier?: number;
+  /** Maximum delay between retries regardless of backoff. Default: 30_000 */
+  maxRetryDelayMs?: number;
+  /** Which errors should be retried. Default: all errors */
+  retryableErrors?: (error: Error) => boolean;
+}
+
+export interface CleanupConfig {
+  /** How long to keep completed task records in ms. Default: 3_600_000 (1 hour) */
+  completedTtlMs?: number;
+  /** How long to keep failed task records in ms. Default: 86_400_000 (24 hours) */
+  failedTtlMs?: number;
+  /** How often the cleanup process runs in ms. Default: 60_000 (1 minute) */
+  cleanupIntervalMs?: number;
+}
+
+export interface BackgroundTaskManagerConfig {
+  /** Whether background tasks are enabled. Default: false */
+  enabled: boolean;
+  /**
+   * Controls which PubSub subscriptions the manager creates during `init()`.
+   *
+   * - `'full'` (default): Subscribes to both the dispatch topic (worker group,
+   *   exactly-once) and the result topic (fan-out). The manager can enqueue,
+   *   execute, **and** receive completion notifications. Suitable for monolithic
+   *   deployments where the producer and worker live in the same process.
+   *
+   * - `'producer'`: Subscribes **only** to the result topic (fan-out) so it
+   *   receives completion/failure notifications. Does **not** join the worker
+   *   consumer group and does **not** register the `__background-task` internal
+   *   workflow. Use this on the API tier in Option E (fully split) so the API
+   *   can dispatch tasks without competing with the dedicated worker process.
+   *
+   * - `'worker'`: Subscribes to both topics, identical to `'full'`. Exists for
+   *   symmetry and documentation clarity on dedicated worker processes.
+   */
+  mode?: 'full' | 'producer' | 'worker';
+  /** Global concurrency limit across all agents. Default: 10 */
+  globalConcurrency?: number;
+  /** Per-agent concurrency limit. Default: 5 */
+  perAgentConcurrency?: number;
+  /**
+   * Concurrency limits for specific owners, keyed by the task's `agentId`.
+   * Overrides `perAgentConcurrency` for matching owners. Tasks still count
+   * toward `globalConcurrency`, so raise it if an override exceeds it.
+   *
+   * Non-agent owners (such as MCP servers) should use a namespaced key like
+   * `'mcp-server:<id>'` so they can't collide with an agent ID.
+   */
+  perOwnerConcurrency?: Record<string, number>;
+  /**
+   * What happens when concurrency limit is reached.
+   * - 'queue': task waits in pending state until a slot opens (default)
+   * - 'reject': enqueue() throws an error
+   * - 'fallback-sync': returns a signal to run the tool synchronously in the agentic loop
+   */
+  backpressure?: 'queue' | 'reject' | 'fallback-sync';
+  /** Default timeout for tasks in ms. Default: 300_000 (5 minutes) */
+  defaultTimeoutMs?: number;
+  /** Default retry configuration */
+  defaultRetries?: RetryConfig;
+  /** Cleanup configuration for old task records */
+  cleanup?: CleanupConfig;
+  /**
+   * Whether to recover running and pending tasks during manager startup.
+   * Recovery is fenced by persisted execution leases: a running task is only
+   * reclaimed once its owner's lease has expired, so it is safe when multiple
+   * live managers share storage. When enabled, the manager also checks every
+   * `leaseDurationMs` for `pinToWorker` tasks whose worker stopped renewing
+   * their lease. Set to false to skip recovery entirely.
+   * Default: true.
+   */
+  recoverStaleTasksOnStart?: boolean;
+  /**
+   * Duration of the execution lease each worker acquires before running a task,
+   * in ms. While the lease is valid no other worker may recover the task; once
+   * it expires an unresponsive owner is treated as dead and the task becomes
+   * reclaimable. The owner renews the lease at `leaseDurationMs / 3`. Must be at
+   * least 3000ms so the lease can be renewed before it lapses — the manager
+   * throws at construction for anything lower. Default: 30_000 (30 seconds).
+   */
+  leaseDurationMs?: number;
+  /**
+   * Minimum delay between chunk-based progress output events for each task, in ms.
+   * Default: undefined (publish every progress chunk).
+   */
+  progressThrottleMs?: number;
+  /**
+   * How long the agentic loop waits for a background task to complete before
+   * moving on (in ms). If a task hasn't finished within this time, the loop
+   * proceeds without setting isContinued — allowing it to end naturally.
+   * Can be overridden per-agent or per-tool. Default: undefined (wait indefinitely).
+   */
+  waitTimeoutMs?: number;
+  /**
+   * Default idle timeout (in ms) for `stream(..., { untilIdle: true })` when the
+   * call does not set `maxIdleMs`. The stream closes once background tasks are
+   * still running but no event has arrived for this long. A per-call
+   * `untilIdle: { maxIdleMs }` always takes precedence. Default: 300_000 (5 minutes).
+   */
+  untilIdleMaxIdleMs?: number;
+  /**
+   * Whether a deferred task that finishes with no `untilIdle` stream open for
+   * its thread sends the agent a `background-task` signal, so the agent reports
+   * the outcome (waking an idle thread). Set to `false` when the app delivers
+   * its own completion signal, for example from `onTaskComplete`. Default: `true`.
+   */
+  notifyAgentOnFinish?: boolean;
+  /**
+   * Whether a run that a signal starts on an idle thread ends after its own turn
+   * instead of staying open until the background tasks it dispatched finish. Its
+   * deferred tasks then report through the `background-task` signal (see
+   * `notifyAgentOnFinish`). A signal's own `ifIdle.streamOptions.untilIdle`
+   * takes precedence. Default: `false`.
+   *
+   * Temporary: in the next major, ending after the turn becomes the only behavior and this
+   * option is removed. Pass `untilIdle: true` in `ifIdle.streamOptions` to keep a run open.
+   */
+  wokenRunsEndAfterTurn?: boolean;
+  /** Optional callback invoked when a task completes (in addition to stream + message list injection) */
+  onTaskComplete?: (task: BackgroundTask) => void | Promise<void>;
+  /** Optional callback invoked when a task fails (in addition to stream + message list injection) */
+  onTaskFailed?: (task: BackgroundTask) => void | Promise<void>;
+  /** Optional callback invoked when a task is cancelled */
+  onTaskCancelled?: (task: BackgroundTask) => void | Promise<void>;
+}
+
+// --- Tool-level and agent-level config ---
+
+export type BackgroundExecutionDisposition = 'foreground' | 'deferred' | 'awaited';
+
+/**
+ * A process-local operation started by a tool and adopted by its native
+ * background task. The operation handle is never persisted or published.
+ */
+export interface BackgroundTaskOperation<TResult = unknown> {
+  /** Resolves with the task's terminal result after the complete operation and cleanup finish. */
+  completion: Promise<TResult>;
+  /** Cancels the operation when the native background task is cancelled or times out. */
+  cancel?: (reason?: unknown) => void | Promise<void>;
+}
+
+/** Runtime bridge exposed only while a tool executes as a native background task. */
+export interface BackgroundTaskAdoptionContext {
+  taskId: string;
+  disposition: Exclude<BackgroundExecutionDisposition, 'foreground'>;
+  /**
+   * Transfers lifecycle ownership of an already-started process-local operation
+   * to the native background task. A tool may adopt at most one operation.
+   */
+  adopt<TResult>(operation: BackgroundTaskOperation<TResult>): void;
+}
+
+export interface ToolBackgroundConfig {
+  /** Whether this tool is eligible for background execution. Default: false */
+  enabled?: boolean;
+  /**
+   * How an eligible tool runs when the call carries no `_background` override.
+   * - `'deferred'` (default): eligible calls run in the background.
+   * - `'foreground'`: eligible calls run inline unless the model explicitly
+   *   opts in via `_background` — eligibility only grants the *option*.
+   */
+  defaultDisposition?: 'foreground' | 'deferred';
+  /** Override the manager's default timeout for this tool */
+  timeoutMs?: number;
+  /** Override retry config for this tool */
+  maxRetries?: number;
+  /** Override how long the loop waits for this tool's background task to complete (in ms) */
+  waitTimeoutMs?: number;
+  /** Per-tool callback on completion */
+  onComplete?: (task: BackgroundTask) => void | Promise<void>;
+  /** Per-tool callback on failure */
+  onFailed?: (task: BackgroundTask) => void | Promise<void>;
+}
+
+export type AgentBackgroundToolConfig =
+  | boolean
+  | { enabled: boolean; timeoutMs?: number; defaultDisposition?: 'foreground' | 'deferred' };
+
+export interface AgentBackgroundConfig {
+  /**
+   * When true, background task dispatch is disabled for this agent — every tool
+   * call runs synchronously in the loop. Useful when this agent is invoked as a
+   * sub-agent and the parent has wrapped the entire sub-agent invocation as the
+   * background task; you don't want the sub-agent's own tools to also dispatch
+   * separate background tasks.
+   */
+  disabled?: boolean;
+  /**
+   * Which tools are eligible for background execution. Eligible tools run
+   * deferred by default; set `defaultDisposition: 'foreground'` to make a
+   * tool run inline unless the call opts in via `_background`.
+   * - `true`: allow the tool's own background config
+   * - `false`: always foreground, even if the tool is eligible
+   * - `{ enabled, timeoutMs, defaultDisposition }`: override specific settings
+   * - `'all'`: make all tools eligible for background execution
+   */
+  tools?: Record<string, AgentBackgroundToolConfig> | 'all';
+  /** Per-agent concurrency override */
+  concurrency?: number;
+  /** Override how long the loop waits for background tasks from this agent (in ms) */
+  waitTimeoutMs?: number;
+  /** Per-agent callback on completion */
+  onTaskComplete?: (task: BackgroundTask) => void | Promise<void>;
+  /** Per-agent callback on failure */
+  onTaskFailed?: (task: BackgroundTask) => void | Promise<void>;
+}
+
+/**
+ * The `_background` field shape that the LLM can include in tool call args
+ * to override background behavior per-call.
+ */
+export interface LLMBackgroundOverride {
+  /** Force deferred (true) or foreground (false). Undefined uses the configured default disposition. */
+  enabled?: boolean;
+  /** Choose foreground, deferred, or awaited execution for this call. */
+  disposition?: BackgroundExecutionDisposition;
+  /** Override timeout for this specific call */
+  timeoutMs?: number;
+  /** Override max retries for this specific call */
+  maxRetries?: number;
+}
+
+// --- Stream chunk types ---
+
+export interface BackgroundTaskStartedChunk {
+  type: 'background-task-started';
+  payload: BackgroundTaskStartedPayload;
+}
+
+export interface BackgroundTaskCompletedChunk {
+  type: 'background-task-completed';
+  payload: BackgroundTaskResultPayload;
+}
+
+export interface BackgroundTaskFailedChunk {
+  type: 'background-task-failed';
+  payload: BackgroundTaskFailedPayload;
+}
+
+export interface BackgroundTaskProgressChunk {
+  type: 'background-task-progress';
+  payload: BackgroundTaskProgressPayload;
+}
+
+export interface BackgroundTaskSuspendedChunk {
+  type: 'background-task-suspended';
+  payload: BackgroundTaskSuspendedPayload;
+}
+
+export interface BackgroundTaskResumedChunk {
+  type: 'background-task-resumed';
+  payload: BackgroundTaskResumedPayload;
+}
+
+export type BackgroundTaskResultChunk = BackgroundTaskCompletedChunk | BackgroundTaskFailedChunk;
+
+// --- Tool executor ---
+
+/**
+ * Interface for executing a tool. Passed per-task so each background task
+ * carries its own execution context.
+ */
+export interface ToolExecutor {
+  execute(
+    args: Record<string, unknown>,
+    options?: {
+      abortSignal?: AbortSignal;
+      /**
+       * Emit intermediate progress during execution.
+       * Called by tools that support streaming progress from background execution.
+       * Each call produces a `background-task-progress` chunk on the SSE stream.
+       */
+      onProgress?: (chunk: BackgroundTaskProgressChunk) => Promise<void>;
+      /**
+       * Pause the task. Persists `status: 'suspended'` + `suspendPayload`,
+       * publishes a `task.suspended` lifecycle event, and signals the workflow
+       * runtime so the run snapshot is preserved. The tool should return
+       * shortly after `await suspend(data)` — its return value is discarded
+       * on the suspend path. Resume the task with
+       * `manager.resume(taskId, resumeData)`.
+       */
+      suspend?: (data?: unknown) => Promise<void>;
+      /**
+       * Set when the task was resumed via `manager.resume(taskId, resumeData)` —
+       * carries whatever was passed as the second arg. Undefined on the initial
+       * execution.
+       */
+      resumeData?: unknown;
+      /** Framework-resolved delegated run ID recovered from persisted suspension state. */
+      suspendedToolRunId?: string;
+      /** On resume, the payload the task suspended with. Undefined on the initial execution. */
+      suspendPayload?: unknown;
+    },
+  ): Promise<unknown>;
+}
+
+// --- Result injection ---
+
+/**
+ * Callback for injecting background task results into the agent's message history.
+ * Called when a task completes or fails.
+ */
+export type ResultInjector = (params: {
+  runId: string;
+  taskId: string;
+  toolCallId: string;
+  toolName: string;
+  agentId: string;
+  threadId?: string;
+  resourceId?: string;
+  result?: unknown;
+  error?: { message: string };
+  status: 'completed' | 'failed';
+  completedAt: Date;
+  startedAt: Date;
+}) => void | Promise<void>;
+
+export type ToolExecutionInjector = (params: {
+  runId: string;
+  taskId: string;
+  toolCallId: string;
+  toolName: string;
+  agentId: string;
+  threadId?: string;
+  resourceId?: string;
+  startedAt: Date;
+  suspendedAt?: Date;
+  /** The payload the task suspended with; set together with `suspendedAt`. */
+  suspendPayload?: unknown;
+}) => void | Promise<void>;
+
+// --- Per-task context ---
+
+/**
+ * Per-task hooks that are scoped to a specific stream/session.
+ * Stored in-memory on the manager, keyed by task ID.
+ * These capture closures from the caller (controller, messageList, etc.)
+ * and are never serialized.
+ */
+export interface TaskContext {
+  /** The tool executor for this specific task */
+  executor: ToolExecutor;
+  /** Emits stream chunks (background-task-completed/failed) to the caller's stream */
+  onChunk?: (chunk: BackgroundTaskResultChunk) => void;
+  /** Injects tool results into the caller's message list */
+  onResult?: ResultInjector;
+  /** Injects tool execution into the caller's message list */
+  onExecution?: ToolExecutionInjector;
+  /** Per-task callback on completion */
+  onComplete?: (task: BackgroundTask) => void | Promise<void>;
+  /** Per-task callback on failure */
+  onFailed?: (task: BackgroundTask) => void | Promise<void>;
+}
+
+// --- createBackgroundTask options ---
+
+export interface CreateBackgroundTaskOptions extends TaskPayload {
+  /** Per-task execution and delivery hooks */
+  context: TaskContext;
+}
+
+// --- Enqueue result ---
+
+export interface EnqueueResult {
+  task: BackgroundTask;
+  /**
+   * When backpressure is 'fallback-sync' and concurrency is at limit,
+   * this is set to true to signal the caller should run the tool synchronously.
+   */
+  fallbackToSync?: boolean;
+}
+
+// --- Background task handle ---
+
+export interface CheckIfSuspendedPayload {
+  toolCallId: string;
+  runId: string;
+  agentId: string;
+  threadId?: string;
+  resourceId?: string;
+  toolName: string;
+}
+
+export type CheckIfRunningPayload = CheckIfSuspendedPayload;
+export type CheckIfExistingPayload = CheckIfSuspendedPayload;
+
+/**
+ * A handle returned by `createBackgroundTask()`.
+ * Encapsulates a single background task with its per-stream hooks.
+ */
+export interface BackgroundTaskHandle {
+  /** The task record (available after dispatch) */
+  readonly task: BackgroundTask;
+  /** Dispatch the task for background execution. Returns the enqueue result. */
+  dispatch(): Promise<EnqueueResult>;
+  /** Check if the task is suspended */
+  checkIfSuspended(args: CheckIfSuspendedPayload): Promise<boolean>;
+  /** Adopt one persisted task matching this invocation, regardless of status. */
+  checkIfExisting(args: CheckIfExistingPayload): Promise<BackgroundTask | undefined>;
+  /** Check if the task is running */
+  checkIfRunning(args: CheckIfRunningPayload): Promise<boolean>;
+  /** Resume the task */
+  resume(resumeData?: unknown, options?: ResumeOptions): Promise<BackgroundTask>;
+  /** Restarts a task */
+  restart(): Promise<BackgroundTask>;
+  /** Cancel this task */
+  cancel(): Promise<void>;
+  /** Wait for this task to complete */
+  waitForCompletion(options?: {
+    timeoutMs?: number;
+    onProgress?: (elapsedMs: number) => void;
+    abortSignal?: AbortSignal;
+  }): Promise<BackgroundTask>;
+}

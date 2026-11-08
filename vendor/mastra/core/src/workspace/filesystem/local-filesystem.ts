@@ -1,0 +1,1006 @@
+/**
+ * Local Filesystem Provider
+ *
+ * A filesystem implementation backed by a folder on the local disk.
+ * This is the default filesystem for development and local agents.
+ */
+
+import { constants as fsConstants, lstatSync, readlinkSync, realpathSync } from 'node:fs';
+import type { Stats } from 'node:fs';
+import * as fs from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import * as nodePath from 'node:path';
+import type { RequestContext } from '../../request-context';
+import {
+  FileNotFoundError,
+  DirectoryNotFoundError,
+  FileExistsError,
+  IsDirectoryError,
+  NotDirectoryError,
+  DirectoryNotEmptyError,
+  PermissionError,
+  StaleFileError,
+  WorkspaceReadOnlyError,
+} from '../errors';
+import type { ProviderStatus } from '../lifecycle';
+import type { InstructionsOption } from '../types';
+import { resolveInstructions } from '../utils';
+import type {
+  FilesystemInfo,
+  FileContent,
+  FileStat,
+  FileEntry,
+  ReadOptions,
+  WriteOptions,
+  ListOptions,
+  RemoveOptions,
+  CopyOptions,
+} from './filesystem';
+import {
+  expandTilde,
+  fsExists,
+  fsStat,
+  getMimeType,
+  isEnoentError,
+  isEexistError,
+  resolveToBasePath,
+} from './fs-utils';
+import { MastraFilesystem } from './mastra-filesystem';
+import type { MastraFilesystemOptions } from './mastra-filesystem';
+import type { FilesystemMountConfig } from './mount';
+
+/**
+ * Local filesystem provider configuration.
+ */
+export interface LocalFilesystemOptions extends MastraFilesystemOptions {
+  /** Unique identifier for this filesystem instance */
+  id?: string;
+  /** Base directory path on disk */
+  basePath: string;
+  /**
+   * When true, all file operations are restricted to stay within basePath.
+   * Prevents path traversal attacks and symlink escapes.
+   *
+   * - `contained: true` (default) — File access is restricted to basePath
+   *   (and any allowedPaths). Paths that escape these boundaries throw a
+   *   PermissionError.
+   * - `contained: false` — No access restrictions. Any path on the host
+   *   filesystem is accessible.
+   *
+   * Set to `false` when the filesystem needs to access paths outside basePath,
+   * such as global skills directories or user home directories.
+   *
+   * @default true
+   */
+  contained?: boolean;
+  /**
+   * When true, all write operations to this filesystem are blocked.
+   * Read operations are still allowed.
+   * @default false
+   */
+  readOnly?: boolean;
+  /**
+   * Additional directories the agent can access outside of `basePath`.
+   *
+   * Relative paths resolve against `basePath`.
+   * Absolute and tilde paths are used as-is.
+   *
+   * @example
+   * ```typescript
+   * new LocalFilesystem({
+   *   basePath: './workspace',
+   *   contained: true,
+   *   allowedPaths: ['../skills', '~/.claude/skills'],
+   * })
+   * ```
+   */
+  allowedPaths?: string[];
+  /**
+   * Custom instructions that override the default instructions
+   * returned by `getInstructions()`.
+   *
+   * - `string` — Fully replaces the default instructions.
+   *   Pass an empty string to suppress instructions entirely.
+   * - `(opts) => string` — Receives the default instructions and
+   *   optional request context so you can extend or customise per-request.
+   */
+  instructions?: InstructionsOption;
+}
+
+/**
+ * Mount configuration for local filesystems.
+ *
+ * When a `LocalFilesystem` is used as a mount in a Workspace with `LocalSandbox`,
+ * the sandbox creates a symlink from `<workingDir>/<mountPath>` → `basePath`.
+ * No FUSE tools are needed for local mounts.
+ *
+ * **Note:** When mounted with `contained: false`, the agent can access any
+ * path on the host filesystem through this mount. Workspace logs a warning
+ * at construction time if this combination is detected.
+ */
+export interface LocalMountConfig extends FilesystemMountConfig {
+  type: 'local';
+  basePath: string;
+}
+
+/**
+ * Stores workspace files in a folder on the host machine for development
+ * and persistent local storage.
+ *
+ * @example
+ * ```typescript
+ * import { Workspace, LocalFilesystem } from '@mastra/core/workspace';
+ *
+ * const workspace = new Workspace({
+ *   filesystem: new LocalFilesystem({ basePath: './my-workspace' }),
+ * });
+ * ```
+ *
+ * @see For documentation bundled with your installed package, locate
+ * `@mastra/core/package.json` with your project's resolver or package-manager
+ * tooling, then read `dist/docs/SKILL.md` from that package root and follow its
+ * reference links. Use package-manager tools for virtual or archived packages.
+ *
+ * @see [Local filesystem documentation](https://mastra.ai/reference/workspace/local-filesystem)
+ * if packaged docs are unavailable.
+ */
+export class LocalFilesystem extends MastraFilesystem {
+  readonly id: string;
+  readonly name = 'LocalFilesystem';
+  readonly provider = 'local';
+  readonly readOnly?: boolean;
+
+  status: ProviderStatus = 'pending';
+
+  private readonly _basePath: string;
+  private readonly _contained: boolean;
+  private _allowedPaths: string[];
+  private readonly _instructionsOverride?: InstructionsOption;
+
+  /**
+   * The absolute base path on disk where files are stored.
+   * Useful for understanding how workspace paths map to disk paths.
+   */
+  get basePath(): string {
+    return this._basePath;
+  }
+
+  /**
+   * Whether file operations are restricted to stay within basePath.
+   *
+   * When `true` (default), relative paths resolve against basePath and
+   * absolute paths are kept as-is. Any resolved path that falls outside
+   * basePath (and allowedPaths) throws a PermissionError. When `false`,
+   * no containment check is applied.
+   *
+   * **Note:** When used as a CompositeFilesystem mount with `contained: false`,
+   * the agent can access any path on the host filesystem through this mount.
+   */
+  get contained(): boolean {
+    return this._contained;
+  }
+
+  /**
+   * Current set of resolved allowed paths.
+   * These paths are permitted beyond basePath when containment is enabled.
+   */
+  get allowedPaths(): readonly string[] {
+    return this._allowedPaths;
+  }
+
+  /**
+   * Update allowed paths. Accepts a direct array or an updater callback
+   * receiving the current paths (React setState pattern).
+   *
+   * @example
+   * ```typescript
+   * // Set directly
+   * fs.setAllowedPaths(['../shared-data']);
+   *
+   * // Update with callback
+   * fs.setAllowedPaths(prev => [...prev, '~/.claude/skills']);
+   * ```
+   */
+  setAllowedPaths(pathsOrUpdater: string[] | ((current: readonly string[]) => string[])): void {
+    const newPaths = typeof pathsOrUpdater === 'function' ? pathsOrUpdater(this._allowedPaths) : pathsOrUpdater;
+    this._allowedPaths = newPaths.map(p => resolveToBasePath(this._basePath, p));
+  }
+
+  constructor(options: LocalFilesystemOptions) {
+    super({ ...options, name: 'LocalFilesystem' });
+    this.id = options.id ?? this.generateId();
+    this._basePath = nodePath.resolve(expandTilde(options.basePath));
+    this._contained = options.contained ?? true;
+    this.readOnly = options.readOnly;
+    this._allowedPaths = (options.allowedPaths ?? []).map(p => resolveToBasePath(this._basePath, p));
+    this._instructionsOverride = options.instructions;
+  }
+
+  /**
+   * Return mount config for sandbox integration.
+   * LocalSandbox uses this to create a symlink from the mount path to basePath.
+   */
+  getMountConfig(): LocalMountConfig {
+    return { type: 'local', basePath: this._basePath };
+  }
+
+  private generateId(): string {
+    return `local-fs-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  /**
+   * Check if an absolute path falls within basePath or any allowed path.
+   */
+  private _isWithinRoot(absolutePath: string, root: string): boolean {
+    const relative = nodePath.relative(root, absolutePath);
+    return !relative.startsWith('..') && !nodePath.isAbsolute(relative);
+  }
+
+  private _resolvePathForContainment(absolutePath: string): string | undefined {
+    try {
+      return realpathSync.native(absolutePath);
+    } catch (error: unknown) {
+      if (!isEnoentError(error)) throw error;
+    }
+
+    // Missing targets need component-wise resolution: normalizing a symlink's
+    // target before following its links would give `..` the wrong parent.
+    let currentPath = nodePath.parse(absolutePath).root;
+    const pending = absolutePath.slice(currentPath.length).split(nodePath.sep);
+    let symlinkDepth = 0;
+    let currentIsDirectory: boolean | undefined = true;
+
+    while (pending.length > 0) {
+      const component = pending.shift();
+      if (!component) continue;
+      if (currentIsDirectory === false) {
+        // Preserve the native ENOTDIR error, including for `file/..`.
+        realpathSync.native(`${currentPath}${nodePath.sep}${component}`);
+      }
+      if (component === '.') continue;
+      if (component === '..') {
+        currentPath = nodePath.dirname(currentPath);
+        currentIsDirectory = undefined;
+        continue;
+      }
+
+      const candidate = nodePath.join(currentPath, component);
+      try {
+        const stat = lstatSync(candidate);
+        if (stat.isSymbolicLink()) {
+          if (++symlinkDepth > 40) return undefined;
+          const target = readlinkSync(candidate);
+          const root = nodePath.parse(target).root;
+          if (root) currentPath = root;
+          pending.unshift(...target.slice(root.length).split(nodePath.sep));
+          currentIsDirectory = undefined;
+          continue;
+        }
+        currentIsDirectory = stat.isDirectory();
+        // Resolve natively so Windows 8.3 short names expand the same way the root does.
+        currentPath = realpathSync.native(candidate);
+        continue;
+      } catch (error: unknown) {
+        if (!isEnoentError(error)) throw error;
+        currentIsDirectory = undefined;
+      }
+      currentPath = candidate;
+    }
+
+    return currentPath;
+  }
+
+  private _isWithinAnyRoot(absolutePath: string): boolean {
+    const roots = [this._basePath, ...this._allowedPaths];
+    const resolvedPath = this._resolvePathForContainment(absolutePath);
+    if (!resolvedPath) {
+      return false;
+    }
+
+    return roots.some(root => {
+      const resolvedRoot = this._resolvePathForContainment(root);
+      return resolvedRoot ? this._isWithinRoot(resolvedPath, resolvedRoot) : false;
+    });
+  }
+
+  private toBuffer(content: FileContent): Buffer {
+    if (Buffer.isBuffer(content)) return content;
+    if (content instanceof Uint8Array) return Buffer.from(content);
+    return Buffer.from(content, 'utf-8');
+  }
+
+  private resolvePath(inputPath: string): string {
+    const absolutePath = resolveToBasePath(this._basePath, inputPath);
+
+    if (this._contained) {
+      if (!this._isWithinAnyRoot(absolutePath)) {
+        throw new PermissionError(inputPath, this._accessOperationHint(inputPath));
+      }
+    }
+
+    return absolutePath;
+  }
+
+  /**
+   * Build the operation string for a containment-violation `PermissionError`.
+   *
+   * When the caller passed an absolute path, suggest a concrete relative form
+   * only when that suffix names an existing entry under the workspace (e.g.
+   * `/src/app.ts` → `src/app.ts` if `<basePath>/src` exists). Otherwise emit a
+   * soft hint that doesn't lie about specific paths — agents that mistake `/`
+   * for the workspace root learn the workspace is sandboxed without us
+   * inventing a fictitious in-workspace location for `/etc/passwd`.
+   */
+  private _accessOperationHint(inputPath: string): string {
+    if (!nodePath.isAbsolute(inputPath)) return 'access';
+
+    const stripped = inputPath.replace(/^[/\\]+/, '');
+    if (!stripped) return 'access';
+
+    // If the first segment exists under basePath, the LLM almost certainly
+    // meant a workspace-relative path. Suggest the exact form. Reject any
+    // segment that would escape basePath (`.`, `..`) — suggesting those would
+    // just produce another containment failure on the next turn.
+    const firstSegment = stripped.split(/[/\\]/, 1)[0];
+    if (firstSegment && firstSegment !== '.' && firstSegment !== '..') {
+      try {
+        if (realpathSync(nodePath.join(this._basePath, firstSegment))) {
+          return `access (path is outside the workspace; use a relative path like "${stripped}")`;
+        }
+      } catch {
+        // Fall through to the soft hint
+      }
+    }
+
+    return 'access (path is outside the workspace; use a path relative to the workspace root, without a leading "/")';
+  }
+
+  /**
+   * Resolve a workspace-relative path to an absolute disk path.
+   * Uses the same resolution logic as internal file operations.
+   * Returns `undefined` if the path violates containment.
+   */
+  resolveAbsolutePath(inputPath: string): string | undefined {
+    try {
+      return this.resolvePath(inputPath);
+    } catch {
+      // PermissionError from containment check — path is not resolvable
+      return undefined;
+    }
+  }
+
+  private toRelativePath(absolutePath: string): string {
+    return nodePath.relative(this._basePath, absolutePath).replace(/\\/g, '/');
+  }
+
+  private assertWritable(operation: string): void {
+    if (this.readOnly) {
+      throw new WorkspaceReadOnlyError(operation);
+    }
+  }
+
+  /**
+   * Check canonical roots even when the target does not exist yet: the nearest
+   * existing ancestor may be a symlink outside the workspace.
+   */
+  private async assertPathContained(absolutePath: string): Promise<void> {
+    if (this._contained && !this._isWithinAnyRoot(absolutePath)) {
+      throw new PermissionError(absolutePath, 'access');
+    }
+  }
+
+  private async containedRoots(): Promise<string[]> {
+    const roots: string[] = [];
+    for (const root of [this._basePath, ...this._allowedPaths]) {
+      try {
+        roots.push(await fs.realpath(root));
+      } catch (error) {
+        if (!isEnoentError(error)) throw error;
+      }
+    }
+    return roots;
+  }
+
+  private assertCanonicalPathContained(canonicalPath: string, absolutePath: string, roots: string[]): void {
+    if (!roots.some(root => this._isWithinRoot(canonicalPath, root))) {
+      throw new PermissionError(absolutePath, 'access');
+    }
+  }
+
+  private async openContainedPath(
+    absolutePath: string,
+    metadataOnly = false,
+  ): Promise<{ handle: FileHandle; canonicalPath: string }> {
+    const roots = await this.containedRoots();
+    const checkedPath = await fs.realpath(absolutePath);
+    this.assertCanonicalPathContained(checkedPath, absolutePath, roots);
+    // O_PATH opens a metadata-only descriptor without requiring file read permission on Linux.
+    const flags = metadataOnly
+      ? process.platform === 'linux'
+        ? 0o10000000 // O_PATH, not exposed by Node's fs.constants
+        : fsConstants.O_RDONLY | fsConstants.O_NONBLOCK
+      : 'r';
+    const handle = await fs.open(absolutePath, flags);
+    try {
+      const opened = await handle.stat({ bigint: true });
+      const canonicalPath = await fs.realpath(absolutePath);
+      this.assertCanonicalPathContained(canonicalPath, absolutePath, roots);
+      const current = await fs.stat(canonicalPath, { bigint: true });
+      if (
+        opened.dev === 0n ||
+        opened.ino === 0n ||
+        current.dev === 0n ||
+        current.ino === 0n ||
+        opened.dev !== current.dev ||
+        opened.ino !== current.ino
+      ) {
+        throw new PermissionError(absolutePath, 'access');
+      }
+      return { handle, canonicalPath };
+    } catch (error) {
+      await handle.close();
+      throw error;
+    }
+  }
+
+  async readFile(inputPath: string, options?: ReadOptions): Promise<string | Buffer> {
+    this.logger.debug('Reading file', { path: inputPath, encoding: options?.encoding });
+    await this.ensureReady();
+    const absolutePath = this.resolvePath(inputPath);
+
+    try {
+      if (this._contained) {
+        const { handle } = await this.openContainedPath(absolutePath);
+        try {
+          if ((await handle.stat()).isDirectory()) throw new IsDirectoryError(inputPath);
+          return options?.encoding ? await handle.readFile({ encoding: options.encoding }) : await handle.readFile();
+        } finally {
+          await handle.close();
+        }
+      }
+      const stats = await fs.stat(absolutePath);
+      if (stats.isDirectory()) throw new IsDirectoryError(inputPath);
+      return options?.encoding
+        ? await fs.readFile(absolutePath, { encoding: options.encoding })
+        : await fs.readFile(absolutePath);
+    } catch (error: unknown) {
+      if (error instanceof IsDirectoryError) throw error;
+      if (isEnoentError(error)) throw new FileNotFoundError(inputPath);
+      throw error;
+    }
+  }
+
+  async writeFile(inputPath: string, content: FileContent, options?: WriteOptions): Promise<void> {
+    const contentSize = Buffer.isBuffer(content) ? content.length : content.length;
+    this.logger.debug('Writing file', { path: inputPath, size: contentSize, recursive: options?.recursive });
+    await this.ensureReady();
+    this.assertWritable('writeFile');
+    const absolutePath = this.resolvePath(inputPath);
+    await this.assertPathContained(absolutePath);
+
+    // When recursive is explicitly false, verify parent directory exists
+    if (options?.recursive === false) {
+      const dir = nodePath.dirname(absolutePath);
+      const parentPath = nodePath.dirname(inputPath);
+      try {
+        const stat = await fs.stat(dir);
+        if (!stat.isDirectory()) {
+          throw new NotDirectoryError(parentPath);
+        }
+      } catch (error: unknown) {
+        if (error instanceof NotDirectoryError) throw error;
+        if (isEnoentError(error)) {
+          throw new DirectoryNotFoundError(parentPath);
+        }
+        throw error;
+      }
+    }
+
+    if (options?.recursive !== false) {
+      const dir = nodePath.dirname(absolutePath);
+      await fs.mkdir(dir, { recursive: true });
+    }
+
+    // Optimistic concurrency: reject if file was modified since caller last read it
+    if (options?.expectedMtime) {
+      try {
+        const currentStat = await fs.stat(absolutePath);
+        // Compare via Date objects — Node's stats.mtime applies internal
+        // rounding that can diverge from Math.floor(stats.mtimeMs).
+        if (currentStat.mtime.getTime() !== options.expectedMtime.getTime()) {
+          throw new StaleFileError(inputPath, options.expectedMtime, currentStat.mtime);
+        }
+      } catch (error: unknown) {
+        if (error instanceof StaleFileError) throw error;
+        // File doesn't exist yet — no conflict possible, proceed with write
+        if (!isEnoentError(error)) throw error;
+      }
+    }
+
+    // Use 'wx' flag for atomic overwrite check (avoids TOCTOU race)
+    const writeFlag = options?.overwrite === false ? 'wx' : 'w';
+    try {
+      await fs.writeFile(absolutePath, this.toBuffer(content), { flag: writeFlag });
+    } catch (error: unknown) {
+      if (options?.overwrite === false && isEexistError(error)) {
+        throw new FileExistsError(inputPath);
+      }
+      throw error;
+    }
+  }
+
+  async appendFile(inputPath: string, content: FileContent): Promise<void> {
+    const contentSize = Buffer.isBuffer(content) ? content.length : content.length;
+    this.logger.debug('Appending to file', { path: inputPath, size: contentSize });
+    await this.ensureReady();
+    this.assertWritable('appendFile');
+    const absolutePath = this.resolvePath(inputPath);
+    await this.assertPathContained(absolutePath);
+    const dir = nodePath.dirname(absolutePath);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.appendFile(absolutePath, this.toBuffer(content));
+  }
+
+  async deleteFile(inputPath: string, options?: RemoveOptions): Promise<void> {
+    this.logger.debug('Deleting file', { path: inputPath, force: options?.force });
+    await this.ensureReady();
+    this.assertWritable('deleteFile');
+    const absolutePath = this.resolvePath(inputPath);
+    await this.assertPathContained(absolutePath);
+
+    try {
+      const stats = await fs.stat(absolutePath);
+      if (stats.isDirectory()) {
+        throw new IsDirectoryError(inputPath);
+      }
+      await fs.unlink(absolutePath);
+    } catch (error: unknown) {
+      if (error instanceof IsDirectoryError) throw error;
+      if (isEnoentError(error)) {
+        if (!options?.force) {
+          throw new FileNotFoundError(inputPath);
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  async copyFile(src: string, dest: string, options?: CopyOptions): Promise<void> {
+    this.logger.debug('Copying file', { src, dest, recursive: options?.recursive });
+    await this.ensureReady();
+    this.assertWritable('copyFile');
+    const srcPath = this.resolvePath(src);
+    const destPath = this.resolvePath(dest);
+    await this.assertPathContained(srcPath);
+    await this.assertPathContained(destPath);
+
+    try {
+      const stats = await fs.stat(srcPath);
+      if (stats.isDirectory()) {
+        if (!options?.recursive) {
+          throw new IsDirectoryError(src);
+        }
+        await this.copyDirectory(srcPath, destPath, options);
+      } else {
+        await fs.mkdir(nodePath.dirname(destPath), { recursive: true });
+        // Use COPYFILE_EXCL for atomic overwrite check (avoids TOCTOU race)
+        const copyFlags = options?.overwrite === false ? fsConstants.COPYFILE_EXCL : 0;
+        try {
+          await fs.copyFile(srcPath, destPath, copyFlags);
+        } catch (error: unknown) {
+          if (options?.overwrite === false && isEexistError(error)) {
+            throw new FileExistsError(dest);
+          }
+          throw error;
+        }
+      }
+    } catch (error: unknown) {
+      if (error instanceof IsDirectoryError || error instanceof FileExistsError) throw error;
+      if (isEnoentError(error)) {
+        throw new FileNotFoundError(src);
+      }
+      throw error;
+    }
+  }
+
+  private async copyDirectory(src: string, dest: string, options?: CopyOptions): Promise<void> {
+    await this.ensureReady();
+    await fs.mkdir(dest, { recursive: true });
+    const entries = await fs.readdir(src, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const srcEntry = nodePath.join(src, entry.name);
+      const destEntry = nodePath.join(dest, entry.name);
+
+      // Verify entries don't escape sandbox via symlink
+      await this.assertPathContained(srcEntry);
+      await this.assertPathContained(destEntry);
+
+      if (entry.isDirectory()) {
+        await this.copyDirectory(srcEntry, destEntry, options);
+      } else {
+        // Use COPYFILE_EXCL for atomic overwrite check (avoids TOCTOU race)
+        const copyFlags = options?.overwrite === false ? fsConstants.COPYFILE_EXCL : 0;
+        try {
+          await fs.copyFile(srcEntry, destEntry, copyFlags);
+        } catch (error: unknown) {
+          if (options?.overwrite === false && isEexistError(error)) {
+            // Skip existing files when overwrite is false
+            continue;
+          }
+          throw error;
+        }
+      }
+    }
+  }
+
+  async moveFile(src: string, dest: string, options?: CopyOptions): Promise<void> {
+    this.logger.debug('Moving file', { src, dest, overwrite: options?.overwrite });
+    await this.ensureReady();
+    this.assertWritable('moveFile');
+    const srcPath = this.resolvePath(src);
+    const destPath = this.resolvePath(dest);
+    await this.assertPathContained(srcPath);
+    await this.assertPathContained(destPath);
+
+    try {
+      await fs.mkdir(nodePath.dirname(destPath), { recursive: true });
+
+      // When overwrite: false, use copy+delete to avoid TOCTOU race condition.
+      // copyFile uses COPYFILE_EXCL which atomically checks and writes.
+      if (options?.overwrite === false) {
+        await this.copyFile(src, dest, { ...options, overwrite: false });
+        await fs.rm(srcPath, { recursive: true, force: true });
+        return;
+      }
+
+      try {
+        await fs.rename(srcPath, destPath);
+      } catch (error: unknown) {
+        // Only fall back to copy+delete for cross-device moves (EXDEV)
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EXDEV') {
+          throw error;
+        }
+        await this.copyFile(src, dest, options);
+        await fs.rm(srcPath, { recursive: true, force: true });
+      }
+    } catch (error: unknown) {
+      if (error instanceof FileExistsError) throw error;
+      if (isEnoentError(error)) {
+        throw new FileNotFoundError(src);
+      }
+      throw error;
+    }
+  }
+
+  async mkdir(inputPath: string, options?: { recursive?: boolean }): Promise<void> {
+    this.logger.debug('Creating directory', { path: inputPath, recursive: options?.recursive });
+    await this.ensureReady();
+    this.assertWritable('mkdir');
+    const absolutePath = this.resolvePath(inputPath);
+    await this.assertPathContained(absolutePath);
+
+    try {
+      await fs.mkdir(absolutePath, { recursive: options?.recursive ?? true });
+    } catch (error: unknown) {
+      if (isEexistError(error)) {
+        const stats = await fs.stat(absolutePath);
+        if (!stats.isDirectory()) {
+          throw new FileExistsError(inputPath);
+        }
+      } else if (isEnoentError(error)) {
+        // Parent directory doesn't exist (only happens when recursive: false)
+        const parentPath = nodePath.dirname(inputPath);
+        throw new DirectoryNotFoundError(parentPath);
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  async rmdir(inputPath: string, options?: RemoveOptions): Promise<void> {
+    this.logger.debug('Removing directory', { path: inputPath, recursive: options?.recursive, force: options?.force });
+    await this.ensureReady();
+    this.assertWritable('rmdir');
+    const absolutePath = this.resolvePath(inputPath);
+    await this.assertPathContained(absolutePath);
+
+    try {
+      const stats = await fs.stat(absolutePath);
+      if (!stats.isDirectory()) {
+        throw new NotDirectoryError(inputPath);
+      }
+
+      if (options?.recursive) {
+        await fs.rm(absolutePath, { recursive: true, force: options?.force ?? false });
+      } else {
+        const entries = await fs.readdir(absolutePath);
+        if (entries.length > 0) {
+          throw new DirectoryNotEmptyError(inputPath);
+        }
+        await fs.rmdir(absolutePath);
+      }
+    } catch (error: unknown) {
+      if (error instanceof NotDirectoryError || error instanceof DirectoryNotEmptyError) {
+        throw error;
+      }
+      if (isEnoentError(error)) {
+        if (!options?.force) {
+          throw new DirectoryNotFoundError(inputPath);
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  async readdir(inputPath: string, options?: ListOptions): Promise<FileEntry[]> {
+    this.logger.debug('Reading directory', { path: inputPath, recursive: options?.recursive });
+    await this.ensureReady();
+    const absolutePath = this.resolvePath(inputPath);
+    let directoryHandle: FileHandle | undefined;
+
+    try {
+      if (this._contained) {
+        directoryHandle = (await this.openContainedPath(absolutePath)).handle;
+      }
+      const stats = directoryHandle
+        ? await directoryHandle.stat({ bigint: true })
+        : await fs.stat(absolutePath, { bigint: true });
+      if (!stats.isDirectory()) {
+        throw new NotDirectoryError(inputPath);
+      }
+
+      // Linux supports fd-backed child paths. Other platforms use the original
+      // path and revalidate the directory before returning.
+      const directoryPath =
+        directoryHandle && process.platform === 'linux' ? `/proc/self/fd/${directoryHandle.fd}` : absolutePath;
+      const entries = await fs.readdir(directoryPath, { withFileTypes: true });
+      const result: FileEntry[] = [];
+
+      for (const entry of entries) {
+        const entryPath = nodePath.join(absolutePath, entry.name);
+        const entryDiskPath = nodePath.join(directoryPath, entry.name);
+
+        if (options?.extension) {
+          const extensions = Array.isArray(options.extension) ? options.extension : [options.extension];
+          if (entry.isFile()) {
+            const ext = nodePath.extname(entry.name);
+            if (!extensions.some(e => e === ext || e === ext.slice(1))) {
+              continue;
+            }
+          }
+        }
+
+        // Check if entry is a symlink
+        const isSymlink = entry.isSymbolicLink();
+        let symlinkTarget: string | undefined;
+        let resolvedType: 'file' | 'directory' = 'file';
+
+        if (isSymlink) {
+          try {
+            // Get the symlink target path
+            symlinkTarget = await fs.readlink(entryDiskPath);
+            // Determine the type of the target (follow the symlink)
+            const targetStat = await fs.stat(entryDiskPath);
+            resolvedType = targetStat.isDirectory() ? 'directory' : 'file';
+          } catch {
+            // If we can't read the symlink target or it's broken, treat as file
+            resolvedType = 'file';
+          }
+        } else {
+          resolvedType = entry.isDirectory() ? 'directory' : 'file';
+        }
+
+        const fileEntry: FileEntry = {
+          name: entry.name,
+          type: resolvedType,
+          isSymlink: isSymlink || undefined,
+          symlinkTarget,
+        };
+
+        if (resolvedType === 'file' && !isSymlink) {
+          try {
+            const stat = await fs.stat(entryDiskPath);
+            fileEntry.size = stat.size;
+          } catch {
+            // Ignore
+          }
+        }
+
+        result.push(fileEntry);
+
+        // Only recurse into directories (follow symlinks to directories)
+        if (options?.recursive && resolvedType === 'directory') {
+          // Default to 100 to prevent stack overflow on deeply nested structures
+          const depth = options.maxDepth ?? 100;
+          if (depth > 0) {
+            const subEntries = await this.readdir(this.toRelativePath(entryPath), { ...options, maxDepth: depth - 1 });
+            result.push(
+              ...subEntries.map(e => ({
+                ...e,
+                name: `${entry.name}/${e.name}`,
+              })),
+            );
+          }
+        }
+      }
+
+      if (directoryHandle && directoryPath === absolutePath) {
+        const current = await this.openContainedPath(absolutePath);
+        try {
+          const currentStat = await current.handle.stat({ bigint: true });
+          if (
+            stats.dev === 0n ||
+            stats.ino === 0n ||
+            currentStat.dev === 0n ||
+            currentStat.ino === 0n ||
+            stats.dev !== currentStat.dev ||
+            stats.ino !== currentStat.ino
+          ) {
+            throw new PermissionError(absolutePath, 'access');
+          }
+        } finally {
+          await current.handle.close();
+        }
+      }
+      return result;
+    } catch (error: unknown) {
+      if (error instanceof NotDirectoryError) throw error;
+      if (isEnoentError(error)) {
+        throw new DirectoryNotFoundError(inputPath);
+      }
+      throw error;
+    } finally {
+      await directoryHandle?.close();
+    }
+  }
+
+  private async containedMetadata(absolutePath: string): Promise<Stats> {
+    if (process.platform === 'linux') {
+      const { handle } = await this.openContainedPath(absolutePath, true);
+      try {
+        return await handle.stat();
+      } finally {
+        await handle.close();
+      }
+    }
+
+    // Node does not expose a portable metadata-only open on other platforms.
+    // Recheck canonical path and identity around stat when read access is denied.
+    try {
+      const { handle } = await this.openContainedPath(absolutePath, true);
+      try {
+        return await handle.stat();
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'EACCES') throw error;
+      const roots = await this.containedRoots();
+      const before = await fs.realpath(absolutePath);
+      this.assertCanonicalPathContained(before, absolutePath, roots);
+      const stats = await fs.stat(absolutePath);
+      const after = await fs.realpath(absolutePath);
+      this.assertCanonicalPathContained(after, absolutePath, roots);
+      const current = await fs.stat(after, { bigint: true });
+      if (
+        before !== after ||
+        !Number.isSafeInteger(stats.dev) ||
+        !Number.isSafeInteger(stats.ino) ||
+        current.dev === 0n ||
+        current.ino === 0n ||
+        BigInt(stats.dev) !== current.dev ||
+        BigInt(stats.ino) !== current.ino
+      ) {
+        throw new PermissionError(absolutePath, 'access');
+      }
+      return stats;
+    }
+  }
+
+  async exists(inputPath: string): Promise<boolean> {
+    await this.ensureReady();
+    const absolutePath = this.resolvePath(inputPath);
+    if (!this._contained) return fsExists(absolutePath);
+    try {
+      await this.containedMetadata(absolutePath);
+      return true;
+    } catch (error) {
+      if (isEnoentError(error)) return false;
+      throw error;
+    }
+  }
+
+  async stat(inputPath: string): Promise<FileStat> {
+    await this.ensureReady();
+    const absolutePath = this.resolvePath(inputPath);
+    if (!this._contained) {
+      const result = await fsStat(absolutePath, inputPath);
+      return { ...result, path: this.toRelativePath(absolutePath) };
+    }
+    try {
+      const stats = await this.containedMetadata(absolutePath);
+      return {
+        name: nodePath.basename(absolutePath),
+        path: this.toRelativePath(absolutePath),
+        type: stats.isDirectory() ? 'directory' : 'file',
+        size: stats.size,
+        createdAt: stats.birthtime,
+        modifiedAt: stats.mtime,
+        mimeType: stats.isFile() ? getMimeType(absolutePath) : undefined,
+      };
+    } catch (error) {
+      if (isEnoentError(error)) throw new FileNotFoundError(inputPath);
+      throw error;
+    }
+  }
+
+  async realpath(inputPath: string): Promise<string> {
+    await this.ensureReady();
+    const absolutePath = this.resolvePath(inputPath);
+    if (!this._contained) return this.toRelativePath(await fs.realpath(absolutePath));
+    const { handle, canonicalPath } = await this.openContainedPath(absolutePath, true);
+    await handle.close();
+    return this.toRelativePath(canonicalPath);
+  }
+
+  /**
+   * Initialize the local filesystem by creating the base directory.
+   * Status management is handled by the base class.
+   */
+  async init(): Promise<void> {
+    this.logger.debug('Initializing filesystem', { basePath: this._basePath });
+    await fs.mkdir(this._basePath, { recursive: true });
+    this.logger.debug('Filesystem initialized', { basePath: this._basePath });
+  }
+
+  /**
+   * Clean up the local filesystem.
+   * LocalFilesystem doesn't delete files on destroy by default.
+   * Status management is handled by the base class.
+   */
+  async destroy(): Promise<void> {
+    // LocalFilesystem doesn't delete files on destroy
+  }
+
+  getInfo(): FilesystemInfo<{ basePath: string; contained: boolean; allowedPaths?: string[] }> {
+    return {
+      id: this.id,
+      name: this.name,
+      provider: this.provider,
+      readOnly: this.readOnly,
+      status: this.status,
+      error: this.error,
+      metadata: {
+        basePath: this.basePath,
+        contained: this._contained,
+        ...(this._allowedPaths.length > 0 && { allowedPaths: [...this._allowedPaths] }),
+      },
+    };
+  }
+
+  getInstructions(opts?: { requestContext?: RequestContext<any> }): string {
+    return resolveInstructions(this._instructionsOverride, () => this._getDefaultInstructions(), opts?.requestContext);
+  }
+
+  private _getDefaultInstructions(): string {
+    const parts = [`Local filesystem at "${this.basePath}". Relative paths resolve from this directory.`];
+
+    if (this._contained) {
+      if (this._allowedPaths.length > 0) {
+        parts.push(
+          `File access is restricted to this directory and the following allowed paths: ${this._allowedPaths.join(', ')}.`,
+        );
+      } else {
+        parts.push('File access is restricted to this directory.');
+      }
+    } else {
+      parts.push('Containment is disabled, so any path on the host filesystem is accessible.');
+    }
+
+    return parts.join(' ');
+  }
+}

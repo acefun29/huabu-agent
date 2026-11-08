@@ -1,0 +1,1414 @@
+import { describe, expect, it, vi } from 'vitest';
+import { z } from 'zod/v4';
+import { MockMemory } from '../../memory/mock';
+import { MASTRA_RESOURCE_ID_KEY, MASTRA_THREAD_ID_KEY, RequestContext } from '../../request-context';
+import { createTool } from '../../tools';
+import { Agent } from '../agent';
+import { MockLanguageModelV2, convertArrayToReadableStream } from './mock-model';
+
+/**
+ * Regression test for issue #12800:
+ * "Your API request included an `assistant` message in the final position"
+ *
+ * The network loop's routing agent prompt is constructed as an assistant-role message
+ * (see packages/core/src/loop/network/index.ts line 574-607). When the routing agent
+ * calls generate/stream with structuredOutput + memory, the prompt ends up being:
+ *   [system] [memory user] [memory assistant] [assistant: routing prompt]
+ *
+ * Anthropic's API rejects this when using output format (structured output) because
+ * the last message is an assistant message, which would pre-fill the response.
+ *
+ * This test reproduces the issue at the agent level by simulating the network loop's
+ * behavior: passing an assistant-role message as input with structuredOutput + memory.
+ */
+describe('Structured output with memory - assistant message in final position (#12800)', () => {
+  it('should not send prompt ending with assistant message when input is assistant-role with structuredOutput and memory', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = 'user-12800';
+
+    const mockMemory = new MockMemory();
+
+    // Track what prompts are sent to the model
+    const capturedPrompts: any[] = [];
+
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic',
+      modelId: 'claude-opus-4-6',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                primitiveId: 'agent1',
+                primitiveType: 'agent',
+                prompt: 'research dolphins',
+                selectionReason: 'best fit',
+              }),
+            },
+          ],
+          warnings: [],
+        };
+      },
+      doStream: async options => {
+        capturedPrompts.push((options as any).prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: convertArrayToReadableStream([
+            {
+              type: 'stream-start',
+              warnings: [],
+            },
+            {
+              type: 'response-metadata',
+              id: 'response-1',
+              modelId: 'mock-model',
+              timestamp: new Date(0),
+            },
+            { type: 'text-start', id: 'text-1' },
+            {
+              type: 'text-delta',
+              id: 'text-1',
+              delta: JSON.stringify({
+                primitiveId: 'agent1',
+                primitiveType: 'agent',
+                prompt: 'research dolphins',
+                selectionReason: 'best fit',
+              }),
+            },
+            { type: 'text-end', id: 'text-1' },
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ]),
+        };
+      },
+    });
+
+    const agent = new Agent({
+      id: 'test-agent-12800',
+      name: 'Test Agent 12800',
+      instructions: 'You are a helpful assistant.',
+      model: mockModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    // Pre-populate memory with conversation history
+    await mockMemory.saveMessages({
+      messages: [
+        {
+          id: globalThis.crypto.randomUUID(),
+          role: 'user',
+          content: { format: 2, parts: [{ type: 'text', text: 'Which agent should research dolphins?' }] },
+          threadId,
+          resourceId,
+          createdAt: new Date(),
+        },
+        {
+          id: globalThis.crypto.randomUUID(),
+          role: 'assistant',
+          content: { format: 2, parts: [{ type: 'text', text: 'Let me route this request.' }] },
+          threadId,
+          resourceId,
+          createdAt: new Date(),
+        },
+      ],
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Please select the best agent for research dolphins' }], {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+      structuredOutput: {
+        schema: z.object({
+          primitiveId: z.string(),
+          primitiveType: z.string(),
+          prompt: z.string(),
+          selectionReason: z.string(),
+        }),
+      },
+    });
+
+    // The critical assertion: the prompt sent to the model should NOT end with an assistant message
+    expect(capturedPrompts.length).toBeGreaterThan(0);
+    const lastPrompt = capturedPrompts[capturedPrompts.length - 1];
+
+    // Find the last non-system message in the prompt
+    const nonSystemMessages = lastPrompt.filter((msg: any) => msg.role !== 'system');
+    expect(nonSystemMessages.length).toBeGreaterThan(0);
+
+    const lastMessage = nonSystemMessages[nonSystemMessages.length - 1];
+    expect(lastMessage.role).toBe('user');
+
+    // The synthetic turn is request-only: it must not be written to the thread.
+    const { messages: persisted } = await mockMemory.recall({ threadId, resourceId });
+    expect(JSON.stringify(persisted)).not.toContain('Generate the structured response.');
+  });
+
+  it('guards Claude 5 assistant-role input without configured input processors or memory', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic',
+      modelId: 'claude-opus-5',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'claude-5-trailing-assistant-guard-test',
+      name: 'Claude 5 Trailing Assistant Guard Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Draft response' }], {
+      structuredOutput: { schema: z.object({ answer: z.string() }) },
+    });
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'user' });
+  });
+
+  it('preserves assistant prefill for Claude 4.5', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic',
+      modelId: 'claude-sonnet-4-5',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'claude-4-5-assistant-prefill-test',
+      name: 'Claude 4.5 Assistant Prefill Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Draft response' }], {
+      structuredOutput: { schema: z.object({ answer: z.string() }) },
+    });
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'assistant' });
+  });
+
+  it('does not guard non-Anthropic assistant-role input', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'openai',
+      modelId: 'gpt-5',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'non-anthropic-trailing-assistant-control-test',
+      name: 'Non-Anthropic Trailing Assistant Control Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate([{ role: 'assistant', content: 'Draft response' }], {
+      structuredOutput: { schema: z.object({ answer: z.string() }) },
+    });
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'assistant' });
+  });
+
+  it('guards Gemini 3 assistant-role input without configured input processors or memory', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'google',
+      modelId: 'gemini-3.5-flash-lite',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'gemini-3-trailing-assistant-guard-test',
+      name: 'Gemini 3 Trailing Assistant Guard Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate(
+      [
+        { role: 'user', content: 'Give me a verdict.' },
+        { role: 'assistant', content: 'Draft response' },
+      ],
+      { structuredOutput: { schema: z.object({ answer: z.string() }) } },
+    );
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'user' });
+  });
+
+  it('guards Gemini 3 assistant-role input even without structured output', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'google',
+      modelId: 'gemini-3.5-flash-lite',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'gemini-3-plain-trailing-assistant-guard-test',
+      name: 'Gemini 3 Plain Trailing Assistant Guard Test',
+      instructions: 'Reply briefly.',
+      model: mockModel,
+    });
+
+    await agent.generate([
+      { role: 'user', content: 'Give me a verdict.' },
+      { role: 'assistant', content: 'Draft response' },
+    ]);
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'user' });
+    expect(nonSystemMessages.at(-1).content).toMatchObject([{ type: 'text', text: 'Continue.' }]);
+  });
+
+  it('guards when an input processor swaps a non-Google model to Gemini 3 mid-step', async () => {
+    const capturedPrompts: any[] = [];
+    const makeModel = (provider: string, modelId: string) =>
+      new MockLanguageModelV2({
+        provider,
+        modelId,
+        doGenerate: async options => {
+          capturedPrompts.push({ modelId, prompt: options.prompt });
+          return {
+            rawCall: { rawPrompt: null, rawSettings: {} },
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            content: [{ type: 'text', text: 'done' }],
+            warnings: [],
+          };
+        },
+      });
+    const openai = makeModel('openai.chat', 'gpt-5');
+    const gemini3 = makeModel('google', 'gemini-3.5-flash-lite');
+    const agent = new Agent({
+      id: 'model-swap-trailing-assistant-guard-test',
+      name: 'Model Swap Trailing Assistant Guard Test',
+      instructions: 'Reply briefly.',
+      model: openai,
+      inputProcessors: [
+        {
+          id: 'swap-to-gemini',
+          name: 'Swap To Gemini',
+          processInputStep: () => ({ model: gemini3 }),
+        },
+      ],
+    });
+
+    await agent.generate([
+      { role: 'user', content: 'Give me a verdict.' },
+      { role: 'assistant', content: 'Draft response' },
+    ]);
+
+    expect(capturedPrompts).toHaveLength(1);
+    expect(capturedPrompts[0].modelId).toBe('gemini-3.5-flash-lite');
+    const nonSystemMessages = capturedPrompts[0].prompt.filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'user' });
+    expect(nonSystemMessages.at(-1).content).toMatchObject([{ type: 'text', text: 'Continue.' }]);
+  });
+
+  it('does not inject a user turn into Gemini 3 agentic-loop steps that follow a tool result', async () => {
+    const capturedPrompts: any[] = [];
+    let call = 0;
+    const mockModel = new MockLanguageModelV2({
+      provider: 'google',
+      modelId: 'gemini-3.5-flash-lite',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        call += 1;
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: call === 1 ? 'tool-calls' : 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content:
+            call === 1
+              ? [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'weather', input: '{"city":"SF"}' }]
+              : [{ type: 'text', text: 'Sunny.' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'gemini-3-tool-loop-guard-test',
+      name: 'Gemini 3 Tool Loop Guard Test',
+      instructions: 'Use tools.',
+      model: mockModel,
+      tools: {
+        weather: createTool({
+          id: 'weather',
+          description: 'weather',
+          inputSchema: z.object({ city: z.string() }),
+          execute: async () => ({ temperature: 72 }),
+        }),
+      },
+    });
+
+    const result = await agent.generate('Weather in SF?', { maxSteps: 3 });
+
+    expect(result.text).toBe('Sunny.');
+    expect(capturedPrompts).toHaveLength(2);
+    // Step 2 prompt already ends on the tool-result turn; the guard must not append "Continue."
+    const secondStep = capturedPrompts[1].filter((message: any) => message.role !== 'system');
+    expect(secondStep.at(-1)).toMatchObject({ role: 'tool' });
+    expect(JSON.stringify(secondStep)).not.toContain('Continue.');
+  });
+
+  it('guards Gemini 3 when history ends on assistant text followed by an unfinished tool call', async () => {
+    // Shape left behind when a previous run died mid-tool: the call never got a result. Default
+    // prompt conversion drops the unpaired call, leaving the assistant text as the trailing turn.
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'google',
+      modelId: 'gemini-3.5-flash-lite',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'gemini-3-orphaned-call-guard-test',
+      name: 'Gemini 3 Orphaned Call Guard Test',
+      instructions: 'Reply briefly.',
+      model: mockModel,
+    });
+
+    await agent.generate([
+      { role: 'user', content: 'Weather in SF?' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Let me check.' },
+          { type: 'tool-call', toolCallId: 'call-1', toolName: 'weather', input: { city: 'SF' } },
+        ],
+      },
+    ]);
+
+    expect(capturedPrompts).toHaveLength(1);
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(JSON.stringify(nonSystemMessages)).not.toContain('call-1');
+    expect(nonSystemMessages.at(-2)).toMatchObject({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'Let me check.' }],
+    });
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'user', content: [{ type: 'text', text: 'Continue.' }] });
+  });
+
+  it('preserves the trailing assistant turn for Anthropic without structured output (valid prefill)', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic.messages',
+      modelId: 'claude-opus-4-6',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: 'done' }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'anthropic-plain-trailing-assistant-test',
+      name: 'Anthropic Plain Trailing Assistant Test',
+      instructions: 'Reply briefly.',
+      model: mockModel,
+    });
+
+    await agent.generate([
+      { role: 'user', content: 'Give me a verdict.' },
+      { role: 'assistant', content: 'Draft response' },
+    ]);
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'assistant' });
+  });
+
+  it('preserves the trailing assistant turn for Gemini 2.5', async () => {
+    const capturedPrompts: any[] = [];
+    const mockModel = new MockLanguageModelV2({
+      provider: 'google',
+      modelId: 'gemini-2.5-flash',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ answer: 'done' }) }],
+          warnings: [],
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'gemini-2-5-trailing-assistant-test',
+      name: 'Gemini 2.5 Trailing Assistant Test',
+      instructions: 'Return a structured response.',
+      model: mockModel,
+    });
+
+    await agent.generate(
+      [
+        { role: 'user', content: 'Give me a verdict.' },
+        { role: 'assistant', content: 'Draft response' },
+      ],
+      { structuredOutput: { schema: z.object({ answer: z.string() }) } },
+    );
+
+    const nonSystemMessages = capturedPrompts[0].filter((message: any) => message.role !== 'system');
+    expect(nonSystemMessages.at(-1)).toMatchObject({ role: 'assistant' });
+  });
+
+  it('should not send prompt ending with assistant message when using stream with assistant-role input, structuredOutput and memory', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = 'user-12800-stream';
+
+    const mockMemory = new MockMemory();
+
+    // Track what prompts are sent to the model
+    const capturedPrompts: any[] = [];
+
+    const mockModel = new MockLanguageModelV2({
+      provider: 'anthropic',
+      modelId: 'claude-opus-4-6',
+      doGenerate: async options => {
+        capturedPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                primitiveId: 'agent1',
+                primitiveType: 'agent',
+                prompt: 'research dolphins',
+                selectionReason: 'best fit',
+              }),
+            },
+          ],
+          warnings: [],
+        };
+      },
+      doStream: async options => {
+        capturedPrompts.push((options as any).prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: convertArrayToReadableStream([
+            {
+              type: 'stream-start',
+              warnings: [],
+            },
+            {
+              type: 'response-metadata',
+              id: 'response-1',
+              modelId: 'mock-model',
+              timestamp: new Date(0),
+            },
+            { type: 'text-start', id: 'text-1' },
+            {
+              type: 'text-delta',
+              id: 'text-1',
+              delta: JSON.stringify({
+                primitiveId: 'agent1',
+                primitiveType: 'agent',
+                prompt: 'research dolphins',
+                selectionReason: 'best fit',
+              }),
+            },
+            { type: 'text-end', id: 'text-1' },
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ]),
+        };
+      },
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-memory-stream-test',
+      name: 'Routing Agent Stream',
+      instructions: 'You are a routing agent that selects primitives.',
+      model: mockModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    // Pre-populate memory with a conversation ending with an assistant message
+    const now = new Date();
+    await mockMemory.saveMessages({
+      messages: [
+        {
+          id: globalThis.crypto.randomUUID(),
+          role: 'user' as const,
+          content: {
+            format: 2 as const,
+            parts: [{ type: 'text' as const, text: 'Research dolphins' }],
+          },
+          threadId,
+          createdAt: new Date(now.getTime() - 2000),
+          resourceId,
+          type: 'text' as const,
+        },
+        {
+          id: globalThis.crypto.randomUUID(),
+          role: 'assistant' as const,
+          content: {
+            format: 2 as const,
+            parts: [{ type: 'text' as const, text: 'Dolphins are intelligent marine mammals.' }],
+          },
+          threadId,
+          createdAt: new Date(now.getTime() - 1000),
+          resourceId,
+          type: 'text' as const,
+        },
+      ],
+    });
+
+    // Call stream with assistant-role input + structuredOutput + memory
+    const response = await agent.stream(
+      [
+        {
+          role: 'assistant' as const,
+          content: 'Select the most appropriate primitive to handle this task...',
+        },
+      ],
+      {
+        memory: {
+          thread: threadId,
+          resource: resourceId,
+        },
+        structuredOutput: {
+          schema: z.object({
+            primitiveId: z.string(),
+            primitiveType: z.string(),
+            prompt: z.string(),
+            selectionReason: z.string(),
+          }),
+        },
+      },
+    );
+
+    await response.consumeStream();
+
+    // The critical assertion: the last message in the prompt should NOT be an assistant message.
+    expect(capturedPrompts.length).toBeGreaterThan(0);
+    const lastPrompt = capturedPrompts[capturedPrompts.length - 1];
+    const nonSystemMessages = lastPrompt.filter((msg: any) => msg.role !== 'system');
+    expect(nonSystemMessages.length).toBeGreaterThan(0);
+    const lastMessage = nonSystemMessages[nonSystemMessages.length - 1];
+    expect(lastMessage.role).toBe('user');
+  });
+});
+
+describe('Structured output memory inheritance', () => {
+  it('includes prior memory context when useAgent is true for a separate structuring model', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = `structured-output-memory-${globalThis.crypto.randomUUID()}`;
+    const mockMemory = new MockMemory();
+
+    const mainModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: 'Acknowledged.' }],
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'main-response',
+            modelId: 'main-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'main-text' },
+          { type: 'text-delta', id: 'main-text', delta: 'Acknowledged.' },
+          { type: 'text-end', id: 'main-text' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+
+    const structuringPrompts: any[] = [];
+    const structuringModel = new MockLanguageModelV2({
+      doGenerate: async options => {
+        structuringPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                favoriteColor: 'violet',
+                hometown: 'Lisbon',
+                petName: 'Mochi',
+              }),
+            },
+          ],
+          warnings: [],
+        };
+      },
+      doStream: async options => {
+        structuringPrompts.push((options as any).prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            {
+              type: 'response-metadata',
+              id: 'structuring-response',
+              modelId: 'structuring-model',
+              timestamp: new Date(0),
+            },
+            { type: 'text-start', id: 'structuring-text' },
+            {
+              type: 'text-delta',
+              id: 'structuring-text',
+              delta: JSON.stringify({
+                favoriteColor: 'violet',
+                hometown: 'Lisbon',
+                petName: 'Mochi',
+              }),
+            },
+            { type: 'text-end', id: 'structuring-text' },
+            {
+              type: 'object-result',
+              object: {
+                favoriteColor: 'violet',
+                hometown: 'Lisbon',
+                petName: 'Mochi',
+              },
+            } as any,
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ] as any),
+        };
+      },
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-cross-turn-memory-test',
+      name: 'Memory Agent',
+      instructions: 'Answer briefly and use the provided conversation context.',
+      model: mainModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    await agent.generate('My favorite color is violet.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+    });
+
+    await agent.generate('I grew up in Lisbon.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+    });
+
+    await agent.generate('My dog is named Mochi.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+    });
+
+    const requestContext = new RequestContext();
+    requestContext.set(MASTRA_THREAD_ID_KEY, threadId);
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, resourceId);
+
+    const result = await agent.generate(
+      'Return my profile as structured data. If a field is missing from this message, fill it from earlier conversation memory.',
+      {
+        memory: {
+          thread: threadId,
+          resource: resourceId,
+        },
+        requestContext,
+        structuredOutput: {
+          schema: z.object({
+            favoriteColor: z.string(),
+            hometown: z.string(),
+            petName: z.string(),
+          }),
+          model: structuringModel,
+          useAgent: true,
+        },
+      },
+    );
+
+    expect(result.object).toEqual({
+      favoriteColor: 'violet',
+      hometown: 'Lisbon',
+      petName: 'Mochi',
+    });
+
+    expect(structuringPrompts.length).toBeGreaterThan(0);
+    const prompt = structuringPrompts.at(-1)!;
+    const promptText = prompt
+      .flatMap((message: any) =>
+        Array.isArray(message.content)
+          ? message.content.map((part: any) => (typeof part === 'string' ? part : (part.text ?? JSON.stringify(part))))
+          : [typeof message.content === 'string' ? message.content : JSON.stringify(message.content)],
+      )
+      .join('\n');
+
+    expect(promptText).toContain('violet');
+    expect(promptText).toContain('Lisbon');
+    expect(promptText).toContain('Mochi');
+  });
+
+  it('keeps memory context but excludes rejected output when useAgent retries', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = `structured-output-retry-memory-${globalThis.crypto.randomUUID()}`;
+    const mockMemory = new MockMemory();
+    const mainModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: 'Seed response.' }],
+        warnings: [],
+      }),
+    });
+    const structuringPrompts: unknown[] = [];
+    const structuringModel = new MockLanguageModelV2({
+      doStream: async options => {
+        structuringPrompts.push(options.prompt);
+        const count = structuringPrompts.length === 1 ? 'invalid' : 4;
+        const text = JSON.stringify({ count });
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            { type: 'text-start', id: 'structuring-text' },
+            { type: 'text-delta', id: 'structuring-text', delta: text },
+            { type: 'text-end', id: 'structuring-text' },
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ]),
+        };
+      },
+    });
+    const agent = new Agent({
+      id: 'structured-output-use-agent-retry-boundary',
+      name: 'Structured output useAgent retry boundary',
+      instructions: 'Answer briefly.',
+      model: mainModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+    await agent.generate('Remember the project is Wren.', {
+      memory: { thread: threadId, resource: resourceId },
+    });
+    let requestCalls = 0;
+    (mainModel as any).doGenerate = async () => {
+      requestCalls++;
+      const text = requestCalls === 1 ? 'There are three files.' : 'There are four files.';
+      return {
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text }],
+        warnings: [],
+      };
+    };
+    const requestContext = new RequestContext();
+    requestContext.set(MASTRA_THREAD_ID_KEY, threadId);
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, resourceId);
+
+    const result = await agent.generate('Count the files.', {
+      maxProcessorRetries: 1,
+      memory: { thread: threadId, resource: resourceId },
+      requestContext,
+      structuredOutput: {
+        schema: z.object({ count: z.number() }),
+        model: structuringModel,
+        useAgent: true,
+      },
+    });
+
+    expect(result.object).toEqual({ count: 4 });
+    expect(structuringPrompts).toHaveLength(2);
+    const retryPrompt = JSON.stringify(structuringPrompts[1]);
+    expect(retryPrompt).toContain('Remember the project is Wren.');
+    expect(retryPrompt).toContain('There are four files.');
+    expect(retryPrompt).not.toContain('There are three files.');
+  });
+
+  it('does not leak the structuring agent readOnly memory config into the parent request context', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = `structured-output-memory-${globalThis.crypto.randomUUID()}`;
+    const mockMemory = new MockMemory();
+
+    const mainModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: 'Main agent summary.' }],
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'main-response-request-context',
+            modelId: 'main-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'main-text-request-context' },
+          { type: 'text-delta', id: 'main-text-request-context', delta: 'Main agent summary.' },
+          { type: 'text-end', id: 'main-text-request-context' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+
+    const structuringModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: JSON.stringify({ summary: 'Structured summary' }) }],
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        request: { body: undefined },
+        response: { headers: {}, body: undefined },
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'structuring-response-request-context',
+            modelId: 'structuring-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'structuring-text-request-context' },
+          { type: 'text-delta', id: 'structuring-text-request-context', delta: '{"summary":"Structured summary"}' },
+          { type: 'text-end', id: 'structuring-text-request-context' },
+          { type: 'object-result', object: { summary: 'Structured summary' } } as any,
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ] as any),
+      }),
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-request-context-isolation-test',
+      name: 'Request Context Isolation Agent',
+      instructions: 'Answer briefly and use the provided conversation context.',
+      model: mainModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    const requestContext = new RequestContext();
+    requestContext.set(MASTRA_THREAD_ID_KEY, threadId);
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, resourceId);
+
+    const result = await agent.generate('Return a short structured summary.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+      requestContext,
+      structuredOutput: {
+        schema: z.object({
+          summary: z.string(),
+        }),
+        model: structuringModel,
+        useAgent: true,
+      },
+    });
+
+    expect(result.object).toEqual({ summary: 'Structured summary' });
+
+    const mastraMemory = requestContext.get('MastraMemory') as { memoryConfig?: { readOnly?: boolean } } | undefined;
+    expect(mastraMemory?.memoryConfig?.readOnly).not.toBe(true);
+  });
+
+  it('does not include prior memory context when useAgent is omitted for a separate structuring model', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = `structured-output-memory-${globalThis.crypto.randomUUID()}`;
+    const mockMemory = new MockMemory();
+
+    const mainModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: 'Acknowledged.' }],
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'main-response-no-agent',
+            modelId: 'main-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'main-text-no-agent' },
+          { type: 'text-delta', id: 'main-text-no-agent', delta: 'Acknowledged.' },
+          { type: 'text-end', id: 'main-text-no-agent' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+
+    const structuringPrompts: any[] = [];
+    const structuringModel = new MockLanguageModelV2({
+      doGenerate: async options => {
+        structuringPrompts.push(options.prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          finishReason: 'stop',
+          usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          content: [{ type: 'text', text: JSON.stringify({ summary: 'Structured summary' }) }],
+          warnings: [],
+        };
+      },
+      doStream: async options => {
+        structuringPrompts.push((options as any).prompt);
+        return {
+          rawCall: { rawPrompt: null, rawSettings: {} },
+          warnings: [],
+          request: { body: undefined },
+          response: { headers: {}, body: undefined },
+          stream: convertArrayToReadableStream([
+            { type: 'stream-start', warnings: [] },
+            {
+              type: 'response-metadata',
+              id: 'structuring-response-no-agent',
+              modelId: 'structuring-model',
+              timestamp: new Date(0),
+            },
+            { type: 'text-start', id: 'structuring-text-no-agent' },
+            { type: 'text-delta', id: 'structuring-text-no-agent', delta: '{"summary":"Structured summary"}' },
+            { type: 'text-end', id: 'structuring-text-no-agent' },
+            { type: 'object-result', object: { summary: 'Structured summary' } } as any,
+            {
+              type: 'finish',
+              finishReason: 'stop',
+              usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+            },
+          ] as any),
+        };
+      },
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-cross-turn-memory-disabled-test',
+      name: 'Memory Agent',
+      instructions: 'Answer briefly and use the provided conversation context.',
+      model: mainModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    await agent.generate('My favorite color is violet.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+    });
+
+    await agent.generate('I grew up in Lisbon.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+    });
+
+    await agent.generate('My dog is named Mochi.', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+    });
+
+    const requestContext = new RequestContext();
+    requestContext.set(MASTRA_THREAD_ID_KEY, threadId);
+    requestContext.set(MASTRA_RESOURCE_ID_KEY, resourceId);
+
+    const result = await agent.generate(
+      'Return my profile as structured data. If a field is missing from this message, fill it from earlier conversation memory.',
+      {
+        memory: {
+          thread: threadId,
+          resource: resourceId,
+        },
+        requestContext,
+        structuredOutput: {
+          schema: z.object({
+            summary: z.string(),
+          }),
+          model: structuringModel,
+        },
+      },
+    );
+
+    expect(result.object).toEqual({ summary: 'Structured summary' });
+
+    expect(structuringPrompts.length).toBeGreaterThan(0);
+    const prompt = structuringPrompts.at(-1)!;
+    const promptText = prompt
+      .flatMap((message: any) =>
+        Array.isArray(message.content)
+          ? message.content.map((part: any) => (typeof part === 'string' ? part : (part.text ?? JSON.stringify(part))))
+          : [typeof message.content === 'string' ? message.content : JSON.stringify(message.content)],
+      )
+      .join('\n');
+
+    expect(promptText).not.toContain('violet');
+    expect(promptText).not.toContain('Lisbon');
+    expect(promptText).not.toContain('Mochi');
+  });
+
+  it('keeps main-agent text chunks in the outer stream while suppressing structuring-agent text chunks', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = `structured-output-streaming-${globalThis.crypto.randomUUID()}`;
+    const mockMemory = new MockMemory();
+
+    const mainModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: 'Main agent summary.' }],
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'main-response-streaming',
+            modelId: 'main-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'main-text-streaming' },
+          { type: 'text-delta', id: 'main-text-streaming', delta: 'Main ' },
+          { type: 'text-delta', id: 'main-text-streaming', delta: 'agent ' },
+          { type: 'text-delta', id: 'main-text-streaming', delta: 'summary.' },
+          { type: 'text-end', id: 'main-text-streaming' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+
+    const structuringModel = new MockLanguageModelV2({
+      doGenerate: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        finishReason: 'stop',
+        usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+        content: [{ type: 'text', text: JSON.stringify({ summary: 'Structured summary' }) }],
+        warnings: [],
+      }),
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'structuring-response-streaming',
+            modelId: 'structuring-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'structuring-text-streaming' },
+          {
+            type: 'text-delta',
+            id: 'structuring-text-streaming',
+            delta: '{"summary":"Structured summary"}',
+          },
+          { type: 'text-end', id: 'structuring-text-streaming' },
+          { type: 'object-result', object: { summary: 'Structured summary' } } as any,
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ] as any),
+      }),
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-streaming-visibility-test',
+      name: 'Streaming Visibility Agent',
+      instructions: 'Answer briefly and structure the result afterward.',
+      model: mainModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    const result = await agent.stream('Summarize this briefly', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+      structuredOutput: {
+        schema: z.object({
+          summary: z.string(),
+        }),
+        model: structuringModel,
+      },
+    });
+
+    const textChunks: string[] = [];
+    const structuredObjects: Array<{ summary: string }> = [];
+
+    for await (const chunk of result.fullStream) {
+      if (chunk.type === 'text-delta') {
+        textChunks.push(chunk.payload.text);
+      }
+
+      if (chunk.type === 'object-result') {
+        structuredObjects.push(chunk.object as { summary: string });
+      }
+    }
+
+    const fullOutput = await result.getFullOutput();
+
+    expect(textChunks.join('')).toBe('Main agent summary.');
+    expect(textChunks.join('')).not.toContain('Structured summary');
+    expect(structuredObjects).toEqual([{ summary: 'Structured summary' }]);
+    expect(fullOutput.text).toBe('Main agent summary.');
+    expect(fullOutput.object).toEqual({ summary: 'Structured summary' });
+
+    await vi.waitFor(async () => {
+      const recalled = await mockMemory.recall({ threadId, resourceId });
+      const lastAssistantMessage = [...recalled.messages].reverse().find(message => message.role === 'assistant');
+      const assistantText =
+        lastAssistantMessage?.content.parts
+          .filter(part => part.type === 'text')
+          .map(part => part.text)
+          .join('') ?? '';
+
+      expect(assistantText).toBe('Main agent summary.');
+    });
+  });
+});
+
+/**
+ * Regression test for issue #14659:
+ * `agent.stream()` with `structuredOutput` persists "[object Object]" as message text
+ *
+ * Root cause: the stream path's `onFinish` handler computed `outputText` by calling
+ * `.map(m => m.content).join('\n')` on the message list, which serialized content
+ * objects to "[object Object]" instead of extracting text from their parts.
+ *
+ * Fix: use `payload.text` for plain text output and `JSON.stringify(payload.object)`
+ * for structured output — matching the generate path's behaviour.
+ */
+describe('Structured output stream memory persistence (#14659)', () => {
+  it('should persist well-formed text when using stream with structuredOutput, not "[object Object]"', async () => {
+    const threadId = globalThis.crypto.randomUUID();
+    const resourceId = 'user-14659';
+
+    const mockMemory = new MockMemory();
+
+    const expectedObject = {
+      primitiveId: 'agent1',
+      primitiveType: 'agent',
+      prompt: 'research dolphins',
+      selectionReason: 'best fit',
+    };
+    const expectedText = JSON.stringify(expectedObject);
+
+    const mockModel = new MockLanguageModelV2({
+      doStream: async () => ({
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+        stream: convertArrayToReadableStream([
+          { type: 'stream-start', warnings: [] },
+          {
+            type: 'response-metadata',
+            id: 'response-14659',
+            modelId: 'mock-model',
+            timestamp: new Date(0),
+          },
+          { type: 'text-start', id: 'text-1' },
+          { type: 'text-delta', id: 'text-1', delta: expectedText },
+          { type: 'text-end', id: 'text-1' },
+          {
+            type: 'finish',
+            finishReason: 'stop',
+            usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+          },
+        ]),
+      }),
+    });
+
+    const agent = new Agent({
+      id: 'structured-output-stream-text-test',
+      name: 'Stream Structured Output Agent',
+      instructions: 'You are a routing agent.',
+      model: mockModel,
+      memory: mockMemory,
+    });
+
+    await mockMemory.createThread({ threadId, resourceId });
+
+    const response = await agent.stream('Select a primitive', {
+      memory: {
+        thread: threadId,
+        resource: resourceId,
+      },
+      structuredOutput: {
+        schema: z.object({
+          primitiveId: z.string(),
+          primitiveType: z.string(),
+          prompt: z.string(),
+          selectionReason: z.string(),
+        }),
+      },
+    });
+
+    await response.consumeStream();
+
+    const { messages } = await mockMemory.recall({ threadId, resourceId });
+    const savedTexts = messages
+      .filter(msg => msg.role === 'assistant')
+      .map(msg => {
+        const content = msg.content as any;
+        return Array.isArray(content?.parts)
+          ? content.parts
+              .filter((p: any) => p.type === 'text')
+              .map((p: any) => p.text)
+              .join('')
+          : typeof content === 'string'
+            ? content
+            : String(content);
+      });
+
+    // Ensure at least one assistant message was persisted so the loop below is not vacuous.
+    expect(savedTexts.length).toBeGreaterThan(0);
+
+    // If any assistant message was persisted, it must not contain "[object Object]".
+    // Before the fix, outputText was computed as `.map(m => m.content).join('\n')`
+    // which serialized content objects, producing "[object Object]\n[object Object]\n...".
+    for (const text of savedTexts) {
+      expect(text, `Persisted message text must not be "[object Object]"`).not.toContain('[object Object]');
+    }
+  });
+});

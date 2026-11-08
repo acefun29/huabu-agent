@@ -1,0 +1,13 @@
+{
+  "attachment": ["deepseek-v4.1-flash-fast"],
+  "temperature": ["deepseek-v4.1-flash-fast"],
+  "structuredOutput": ["deepseek-v4.1-flash-fast"],
+  "reasoning": {
+    "deepseek-v4.1-flash-fast": [
+      {
+        "type": "effort",
+        "values": ["none", "low", "high", "max"]
+      }
+    ]
+  }
+}

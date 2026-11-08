@@ -1,0 +1,137 @@
+{
+  "name": "@mastra/schema-compat",
+  "version": "1.3.17",
+  "description": "Tool schema compatibility layer for Mastra.ai",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./schema": {
+      "import": {
+        "types": "./dist/schema.d.ts",
+        "default": "./dist/schema.js"
+      },
+      "require": {
+        "types": "./dist/schema.d.ts",
+        "default": "./dist/schema.cjs"
+      }
+    },
+    "./zod-to-json": {
+      "import": {
+        "types": "./dist/zod-to-json.d.ts",
+        "default": "./dist/zod-to-json.js"
+      },
+      "require": {
+        "types": "./dist/zod-to-json.d.ts",
+        "default": "./dist/zod-to-json.cjs"
+      }
+    },
+    "./json-to-zod": {
+      "import": {
+        "types": "./dist/json-to-zod.d.ts",
+        "default": "./dist/json-to-zod.js"
+      },
+      "require": {
+        "types": "./dist/json-to-zod.d.ts",
+        "default": "./dist/json-to-zod.cjs"
+      }
+    },
+    "./adapters/ai-sdk": {
+      "import": {
+        "types": "./dist/standard-schema/adapters/ai-sdk.d.ts",
+        "default": "./dist/standard-schema/adapters/ai-sdk.js"
+      },
+      "require": {
+        "types": "./dist/standard-schema/adapters/ai-sdk.d.ts",
+        "default": "./dist/standard-schema/adapters/ai-sdk.cjs"
+      }
+    },
+    "./adapters/json-schema": {
+      "import": {
+        "types": "./dist/standard-schema/adapters/json-schema.d.ts",
+        "default": "./dist/standard-schema/adapters/json-schema.js"
+      },
+      "require": {
+        "types": "./dist/standard-schema/adapters/json-schema.d.ts",
+        "default": "./dist/standard-schema/adapters/json-schema.cjs"
+      }
+    },
+    "./adapters/zod-v3": {
+      "import": {
+        "types": "./dist/standard-schema/adapters/zod-v3.d.ts",
+        "default": "./dist/standard-schema/adapters/zod-v3.js"
+      },
+      "require": {
+        "types": "./dist/standard-schema/adapters/zod-v3.d.ts",
+        "default": "./dist/standard-schema/adapters/zod-v3.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsdown --silent --config tsdown.config.ts",
+    "build:watch": "tsdown --watch --silent --config tsdown.config.ts"
+  },
+  "keywords": [
+    "mastra",
+    "schema",
+    "tool",
+    "compatibility",
+    "zod"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "json-schema-to-zod": "^2.8.1",
+    "zod-from-json-schema": "0.5.2"
+  },
+  "peerDependencies": {
+    "zod": "^3.25.0 || ^4.0.0"
+  },
+  "devDependencies": {
+    "@ai-sdk/anthropic": "^3.0.137",
+    "@ai-sdk/google": "^3.0.140",
+    "@ai-sdk/openai": "^3.0.135",
+    "@internal/ai-sdk-v4": "workspace:*",
+    "@internal/ai-sdk-v5": "workspace:*",
+    "@internal/ai-v6": "workspace:*",
+    "@internal/types-builder": "workspace:*",
+    "@standard-schema/spec": "^1.1.0",
+    "@types/json-schema": "^7.0.15",
+    "@types/node": "22.19.15",
+    "ajv": "^8.20.0",
+    "arktype": "^2.2.9",
+    "json-schema-traverse": "^1.0.0",
+    "tsdown": "0.23.1",
+    "typescript": "^7.0.2",
+    "zod": "^4.6.7",
+    "zod-from-json-schema-v3": "npm:zod-from-json-schema@^0.0.5",
+    "zod-to-json-schema": "^3.25.2",
+    "zod-v3": "npm:zod@^3.25.76"
+  },
+  "homepage": "https://mastra.ai",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mastra-ai/mastra.git",
+    "directory": "packages/schema-compat"
+  },
+  "bugs": {
+    "url": "https://github.com/mastra-ai/mastra/issues"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
