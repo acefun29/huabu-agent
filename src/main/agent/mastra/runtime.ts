@@ -34,7 +34,7 @@ import type { AgentRuntime } from '../runtime'
 import type { ToolDefinitionLike } from '../mediaTools'
 import { aiSdkLanguageModel, createModelGateway } from './modelGateway'
 import type { ModelGateway } from './modelGateway'
-import { mastraMemoryFor } from './memory'
+import { mastraMemoryFor, registerOmBinding, unregisterOmBinding } from './memory'
 import { MEMORY_RESOURCE } from './storage'
 import { TokenLimiterProcessor } from '@mastra/core/processors'
 import { toMastraTools, type AdaptedToolOutput } from './tools'
@@ -160,6 +160,13 @@ export class MastraAgentRuntime implements AgentRuntime {
     })
 
     const qualified = formatRef(ref)
+    // OM 后台模型与压缩事件按线程反查：登记本会话（setModel 后 modelRef 动态生效）
+    registerOmBinding(dir, threadId, {
+      nodeId: req.nodeId,
+      broadcast: this.deps.broadcast,
+      modelRef: () => this.sessions.get(req.nodeId)?.modelRef ?? ref,
+      gateway: this.sessions.get(req.nodeId)?.gateway ?? createModelGateway({ registrations: () => manager.registrations() }),
+    })
     console.log(`[mastra-runtime] create nodeId=${req.nodeId} thread=${threadId} model=${qualified}`)
     return ok({
       nodeId: req.nodeId,
@@ -344,6 +351,7 @@ export class MastraAgentRuntime implements AgentRuntime {
     const session = this.sessions.get(req.nodeId)
     if (!session) return fail('session_missing', `节点 ${req.nodeId} 尚未创建会话`)
     session.run?.abort()
+    unregisterOmBinding(session.workspaceDir, session.threadId)
     this.sessions.delete(req.nodeId)
     return ok(undefined)
   }
@@ -376,8 +384,27 @@ export class MastraAgentRuntime implements AgentRuntime {
     })
   }
 
-  compact(_req: ChatNodeRequest): Promise<ChatResult> {
-    return Promise.resolve(fail('unknown', 'compact 尚未迁移（Phase 2：observational memory + 压缩可观测）'))
+  /** 手动压缩入口（计划 §7.3）：强制跑一轮 observational memory，事件经 OM 钩子广播 */
+  async compact(req: ChatNodeRequest): Promise<ChatResult> {
+    const session = this.sessions.get(req.nodeId)
+    if (!session) return fail('session_missing', `节点 ${req.nodeId} 尚未创建会话`)
+    try {
+      const engine = await (session.memory as unknown as { omEngine: Promise<{ observe?: (opts: unknown) => Promise<unknown> } | null> }).omEngine
+      if (!engine?.observe) return fail('unknown', 'observational memory 引擎不可用（检查 memory 配置）')
+      const result = (await engine.observe({
+        threadId: session.threadId,
+        resourceId: MEMORY_RESOURCE,
+        force: true,
+        trigger: 'manual',
+      })) as { observed?: boolean; reflected?: boolean } | undefined
+      console.log(
+        `[mastra-runtime] compact nodeId=${req.nodeId} thread=${session.threadId} ` +
+          `observed=${result?.observed ?? false} reflected=${result?.reflected ?? false}`
+      )
+      return ok(undefined)
+    } catch (error) {
+      return fail('unknown', `压缩失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 
   fork(_req: ChatForkRequest): Promise<ChatResult<ChatForkResult>> {

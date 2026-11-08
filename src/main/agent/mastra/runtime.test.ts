@@ -115,7 +115,8 @@ describe('MastraAgentRuntime 契约（无网络）', () => {
   it('未迁移方法显式失败：steer / compact / fork；prompt 未创建 → session_missing', async () => {
     const rt = new MastraAgentRuntime(stubDeps())
     expect(await rt.steer({ nodeId: 'n1', text: 'x' })).toMatchObject({ ok: false, code: 'unknown' })
-    expect(await rt.compact({ nodeId: 'n1' })).toMatchObject({ ok: false, code: 'unknown' })
+    // compact 已实装（Phase 2 收尾）：未创建会话才是 session_missing
+    expect(await rt.compact({ nodeId: 'n1' })).toMatchObject({ ok: false, code: 'session_missing' })
     expect(await rt.fork({ nodeId: 'n1', sessionFile: 'mastra:t' })).toMatchObject({ ok: false, code: 'unknown' })
     expect(await rt.prompt({ nodeId: 'ghost', text: 'hi' })).toMatchObject({ ok: false, code: 'session_missing' })
   })
@@ -306,6 +307,54 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       await rtTh.dispose({ nodeId: 'e2e-thinking' })
     },
     180_000
+  )
+
+  it(
+    'Phase 2 收尾：compact() 手动触发 observational memory——compaction 事件 + 原文仍可 recall',
+    async () => {
+      const omEvents: ChatEvent[] = []
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rtOm = new MastraAgentRuntime({
+        broadcast: (e) => omEvents.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
+      })
+      await rtOm.create({ nodeId: 'e2e-om' })
+      // 两轮真实对话（制造可观察历史）
+      for (const text of ['记住暗号是蓝鲸七号。只回复"好的"。', '暗号是什么？只回答暗号。']) {
+        omEvents.length = 0
+        await rtOm.prompt({ nodeId: 'e2e-om', text })
+        const start = Date.now()
+        while (Date.now() - start < 120_000) {
+          if (omEvents.some((e) => e.type === 'agent_end')) break
+          await new Promise((r) => setTimeout(r, 100))
+        }
+      }
+      // 手动压缩（force 观察）——真实调用 OM 后台 Observer 模型
+      omEvents.length = 0
+      const compacted = await rtOm.compact({ nodeId: 'e2e-om' })
+      expect(compacted.ok).toBe(true)
+      // 压缩事件：start/end 成对（钩子桥接）。force 观察在有两轮真实消息时必须实际发生
+      const starts = omEvents.filter((e) => e.type === 'compaction_start')
+      const ends = omEvents.filter((e) => e.type === 'compaction_end')
+      expect(starts.length).toBeGreaterThan(0)
+      expect(starts.length).toBe(ends.length)
+      const endEvent = ends[0] as Extract<ChatEvent, { type: 'compaction_end' }> | undefined
+      expect(endEvent?.aborted).toBe(false)
+      // 原文仍可回查（计划 §16.2-6：压缩后 recall 可回查原文）
+      const recalled = await rtOm.history({ nodeId: 'e2e-om', sessionFile: 'mastra:node-e2e-om' })
+      expect(recalled.ok).toBe(true)
+      if (recalled.ok) {
+        expect(recalled.value.messages.some((m) => m.text.includes('蓝鲸七号'))).toBe(true)
+      }
+      await rtOm.dispose({ nodeId: 'e2e-om' })
+    },
+    240_000
   )
 
   it(
