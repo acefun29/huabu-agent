@@ -112,9 +112,10 @@ describe('MastraAgentRuntime 契约（无网络）', () => {
     expect(history).toMatchObject({ ok: false, code: 'unknown' })
   })
 
-  it('未迁移方法显式失败：steer / compact / fork；prompt 未创建 → session_missing', async () => {
+  it('未创建会话的显式失败：steer / compact / fork；prompt → session_missing', async () => {
     const rt = new MastraAgentRuntime(stubDeps())
-    expect(await rt.steer({ nodeId: 'n1', text: 'x' })).toMatchObject({ ok: false, code: 'unknown' })
+    // steer 已实装（Mastra signals）：未创建会话才是 session_missing
+    expect(await rt.steer({ nodeId: 'n1', text: 'x' })).toMatchObject({ ok: false, code: 'session_missing' })
     // compact 已实装（Phase 2 收尾）：未创建会话才是 session_missing
     expect(await rt.compact({ nodeId: 'n1' })).toMatchObject({ ok: false, code: 'session_missing' })
     expect(await rt.fork({ nodeId: 'n1', sessionFile: 'mastra:t' })).toMatchObject({ ok: false, code: 'unknown' })
@@ -307,6 +308,52 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       await rtTh.dispose({ nodeId: 'e2e-thinking' })
     },
     180_000
+  )
+
+  it(
+    'steer：运行中插话经 Mastra signals 投递（deliver 到活跃 run）',
+    async () => {
+      const stEvents: ChatEvent[] = []
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const rtSt = new MastraAgentRuntime({
+        broadcast: (e) => stEvents.push(e),
+        currentDir: () => wsDir,
+        defaultModel: () => 'deepseek/deepseek-flash',
+        managerForWorkspace: async () => manager,
+        runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
+        assembleTools: async () => [],
+      })
+      await rtSt.create({ nodeId: 'e2e-steer' })
+      // 启动一个较长的生成，等出现首个 delta 后插话
+      const p = await rtSt.prompt({ nodeId: 'e2e-steer', text: '请从 1 数到 60，每个数字单独一行。' })
+      expect(p.ok).toBe(true)
+      const start = Date.now()
+      while (Date.now() - start < 60_000) {
+        if (stEvents.some((e) => e.type === 'delta')) break
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      const steerResult = await rtSt.steer({ nodeId: 'e2e-steer', text: '停止数数，只回复：收到插话' })
+      expect(steerResult.ok).toBe(true)
+      // 等本轮/续跑结束
+      const waitStart = Date.now()
+      while (Date.now() - waitStart < 120_000) {
+        if (stEvents.some((e) => e.type === 'agent_end')) break
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      // 插话经信号进入 transcript：历史里能看到这条用户消息（seal 后作为下一轮输入）
+      const recalled = await rtSt.history({ nodeId: 'e2e-steer', sessionFile: 'mastra:node-e2e-steer' })
+      expect(recalled.ok).toBe(true)
+      // Mastra signals 以 data part 形式进 transcript（Seal + 轮换 message id），
+      // 不转成独立 user 消息——断言「插话内容确实落进会话 + 模型据此响应」即可
+      if (recalled.ok) {
+        const all = recalled.value.messages.map((m) => m.text).join(String.fromCharCode(10))
+        expect(all).toContain('收到插话')
+      }
+      await rtSt.dispose({ nodeId: 'e2e-steer' })
+    },
+    240_000
   )
 
   it(

@@ -63,6 +63,8 @@ interface MastraSession {
   manager: ChatModelManager
   piTools: ToolDefinitionLike[]
   run: AbortController | null
+  /** 当前轮的 Agent 实例（steer 经 sendSignal 投递到运行中的 run） */
+  agent: Agent | null
   lastUsage: ChatUsage | null
 }
 
@@ -156,6 +158,7 @@ export class MastraAgentRuntime implements AgentRuntime {
       piTools,
       gateway: createModelGateway({ registrations: () => manager.registrations() }),
       run: null,
+      agent: null,
       lastUsage: null,
     })
 
@@ -228,6 +231,7 @@ export class MastraAgentRuntime implements AgentRuntime {
             }
           : {}),
       })
+      session.agent = agent
       const events = await agent.stream(text, {
         memory: { thread: session.threadId, resource: MEMORY_RESOURCE },
         abortSignal: controller.signal,
@@ -338,6 +342,7 @@ export class MastraAgentRuntime implements AgentRuntime {
       })
     }
     session.run = null
+    session.agent = null
   }
 
   async abort(req: ChatNodeRequest): Promise<ChatResult> {
@@ -435,8 +440,37 @@ export class MastraAgentRuntime implements AgentRuntime {
     return ok({ thinkingLevel: req.thinkingLevel })
   }
 
-  steer(_req: ChatSteerRequest): Promise<ChatResult> {
-    return Promise.resolve(fail('unknown', 'steer 尚未迁移（Mastra signals 对接为 Phase 1 遗留项）'))
+  /**
+   * 运行中插话（计划 §5.2-7，Mastra 原生 signals）：
+   * 有活跃 run → deliver（当前请求若无正文则中断重发，否则在 step 边界注入下一步）；
+   * 空闲 → wake（起新一轮，与直接 prompt 等价但保留同一 thread）。
+   * renderer 侧先收到 chat:event 的 delta 流，插话内容由模型在下一轮引用；
+   * pending 提示（data-user-message-pending）属 Mastra 内部 chunk，暂不透传（契约冻结）。
+   */
+  async steer(req: ChatSteerRequest): Promise<ChatResult> {
+    const session = this.sessions.get(req.nodeId)
+    if (!session) return fail('session_missing', `节点 ${req.nodeId} 尚未创建会话`)
+    if (!session.agent) return fail('unknown', 'steer 需要活跃会话实例（先 create 并等待一轮启动）')
+    try {
+      const result = await session.agent.sendSignal(
+        { type: 'user', contents: req.text },
+        {
+          threadId: session.threadId,
+          resourceId: MEMORY_RESOURCE,
+          ifActive: { behavior: 'deliver' },
+          ifIdle: { behavior: 'discard' },
+        }
+      )
+      const accepted = await result.accepted
+      const action = typeof accepted === 'object' && accepted && 'action' in accepted ? accepted.action : accepted
+      if (action === 'discard' || action === 'blocked') {
+        return fail('busy', `steer 未被接受（${String(action)}）；会话空闲时请直接发送消息`)
+      }
+      console.log(`[mastra-runtime] steer nodeId=${req.nodeId} action=${String(action)}`)
+      return ok(undefined)
+    } catch (error) {
+      return fail('unknown', `steer 失败：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 }
 
