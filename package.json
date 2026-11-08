@@ -54,6 +54,8 @@
     "chat-catalog:check": "node scripts/chat-catalog-check.mjs",
     "chat-catalog:wire": "node scripts/t4-wire-capture.mjs",
     "test:scenario": "node scripts/full-scenario.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test:full": "node scripts/full-scenario.mjs --with-e2e",
     "test:blockout": "node src/main/blockout/selftest.mjs",
     "smoke:packaged": "node scripts/packaged-smoke.mjs",
@@ -94,6 +96,7 @@
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.3",
     "vite": "^7.3.6",
+    "vitest": "^5.1.0",
     "zod": "^4.6.5",
     "zustand": "^5.0.15"
   },

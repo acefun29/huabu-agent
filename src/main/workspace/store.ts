@@ -208,6 +208,8 @@ interface WorkspaceMetaFile {
    * 这里只存禁用名单；清单每次现扫目录（与会话加载同源，防两套解析漂移）。
    */
   skills?: WorkspaceSkillsConfig
+  /** Agent 运行时 feature flag（Mastra 迁移计划 v1.2 §14.1）：缺省 = pi */
+  agent?: WorkspaceAgentConfig
   /** 素材库映射（新原型同步）：名字 → 工作区内相对路径。公共库首个建库时播种 */
   libraries?: WorkspaceLibrary[]
 }
@@ -216,6 +218,12 @@ interface WorkspaceMetaFile {
 export interface WorkspaceSkillsConfig {
   /** 被禁用的技能名（= SKILL.md frontmatter name = 目录名） */
   disabled?: string[]
+}
+
+/** workspace.json 的 agent 段：运行时开关（工作区级灰度 / 回滚） */
+export interface WorkspaceAgentConfig {
+  /** pi = 现有运行时（默认，回滚路径）；mastra = 新运行时（灰度） */
+  runtime?: AgentRuntimeKind
 }
 
 /** workspace.json 的 libraries 段条目（素材库 = 名字 → 相对路径的映射，不复制文件） */
@@ -241,6 +249,7 @@ function isNonEmptyString(value: unknown): value is string {
 /* 状态目录/凭据路径已拆到 stateDir.ts（轻量模块，避免无关闭包）；此处 re-export 保住既有引用 */
 export { getCredentialsFile } from './stateDir'
 import { getAppStateDir, getCredentialsFile } from './stateDir'
+import { normalizeAgentRuntime, type AgentRuntimeKind } from '../agent/runtime'
 
 export class WorkspaceStore {
   private current: WorkspaceInfo | null = null
@@ -398,6 +407,7 @@ export class WorkspaceStore {
       ...(Object.keys(chat).length > 0 ? { chat } : {}),
       ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
       ...(raw.skills !== undefined ? { skills: normalizeSkillsSegment(raw.skills) } : {}),
+      ...(raw.agent !== undefined ? { agent: normalizeAgentSegment(raw.agent) } : {}),
       ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
     }
     metaCache.set(dir, { mtimeMs, value: meta })
@@ -492,6 +502,21 @@ export class WorkspaceStore {
     meta.skills = cleaned.length > 0 ? { disabled: cleaned } : {}
     this.writeMeta(dir, meta)
     return cleaned
+  }
+
+  /** 当前工作区的 Agent 运行时 flag（未打开工作区 / 非法值 = pi，回滚友好） */
+  agentRuntime(): AgentRuntimeKind {
+    const dir = this.current?.path
+    return dir ? normalizeAgentRuntime(this.readMeta(dir).agent?.runtime) : 'pi'
+  }
+
+  /** 设置运行时 flag（工作区级；只影响之后新建的会话，已绑定会话保持原运行时） */
+  setAgentRuntime(runtime: AgentRuntimeKind): void {
+    if (!this.current) throw new Error('尚未打开工作区')
+    const dir = this.current.path
+    const meta = this.readMeta(dir)
+    meta.agent = { ...meta.agent, runtime }
+    this.writeMeta(dir, meta)
   }
 
   /**
@@ -662,6 +687,12 @@ function sanitizeLibraries(raw: unknown[]): WorkspaceLibrary[] {
     })
   }
   return out
+}
+
+/** agent 段读入清洗：只认 pi/mastra，坏值丢弃（读取侧 normalizeAgentRuntime 兜底 pi） */
+function normalizeAgentSegment(raw: unknown): WorkspaceAgentConfig {
+  const runtime = (raw as { runtime?: unknown } | null)?.runtime
+  return runtime === 'pi' || runtime === 'mastra' ? { runtime } : {}
 }
 
 /* -------------------------------------------------------------------------- */
