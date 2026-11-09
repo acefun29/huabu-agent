@@ -20,6 +20,11 @@ const MediaViewer = lazy(() => import('./components/MediaViewer').then((m) => ({
  * 标题栏（窗口控制 + 工作区切换）常驻所有页面；左侧图标栏（会话/素材库/清空画布/设置）
  * 与底部对话坞都是浮层，画布属于整个工作区；未打开工作区时显示工作区选择页。
  */
+/** 是否为浏览器预览（webHarness 打的标记；Electron 内不存在） */
+const isWebPreview =
+  typeof globalThis !== 'undefined' &&
+  Boolean((globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__)
+
 function WorkspaceBody() {
   const booted = useCanvasStore((s) => s.booted)
   const workspace = useCanvasStore((s) => s.workspace)
@@ -62,11 +67,14 @@ export default function App() {
         <div className="h-full w-full overflow-hidden bg-(--surface) text-(--on-surface)">
           <TitleBar />
           <WorkspaceBody />
-          <MediaConfigGate />
+          {/* Web 预览：媒体配置引导依赖真实 provider 数据，跳过以免误弹设置页 */}
+      {isWebPreview ? null : <MediaConfigGate />}
         </div>
-        <Suspense fallback={null}>
-          <SettingsPanel />
-        </Suspense>
+        {isWebPreview ? null : (
+          <Suspense fallback={null}>
+            <SettingsPanel />
+          </Suspense>
+        )}
         <ConfirmDialog />
         <Suspense fallback={null}>
           <MediaViewer />

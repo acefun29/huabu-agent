@@ -467,10 +467,10 @@ export function installWebHarness(): void {
   }
 
   const mediaApi = {
-    providers: async () => ({ ok: true, value: { providers: [], config: {} } }),
-    adapterKinds: async () => ({ ok: true, value: { kinds: [] } }),
-    jobs: async () => ({ ok: true, value: { jobs: [] } }),
-    'jobs-status': async () => ({ ok: true, value: { jobs: [] } }),
+    providers: async () => ({ ok: true, value: [] }),
+    adapterKinds: async () => ({ ok: true, value: [] }),
+    jobs: async () => ({ ok: true, value: [] }),
+    
     pathForFile: async () => null,
     onJobEvent: () => () => undefined,
     onConfirmRequest: () => () => undefined,
@@ -533,6 +533,8 @@ export function installWebHarness(): void {
     }
   )
 
+  // 标记浏览器预览（App 据此跳过依赖真实主进程数据的浮层）
+  ;(globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__ = true
   global.huabu = huabuProxy as Record<string, unknown>
   console.info('[web-harness] 浏览器预览模式：project 域走内存 demo 数据，其余能力受限')
 }
