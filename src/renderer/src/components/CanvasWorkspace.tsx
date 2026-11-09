@@ -13,7 +13,6 @@ import {
 } from 'lucide-react'
 import { LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
 import { ProjectScopeView } from './project/ProjectScopeView'
-import { StructureChatRail } from './project/StructureChatRail'
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
@@ -139,12 +138,11 @@ export function CanvasWorkspace() {
   const hasNodes = useCanvasStore((s) => s.nodes.length > 0)
   /** 画布 / 结构 两种视图：结构视图是项目层级骨架（原型 index-projects.html），
    *  与自由画布并行，互不替换——切换只影响当前显示 */
-  const [workspaceView, setWorkspaceView] = useState<'canvas' | 'structure'>('canvas')
+  // 默认进入项目结构（原型主界面）；自由画布作为可切换的次要视图
+  const [workspaceView, setWorkspaceView] = useState<'canvas' | 'structure'>('structure')
   const [structureViewMode, setStructureViewMode] = useState<'canvas' | 'list'>('canvas')
   const [scopeId, setScopeId] = useState<string | null>(null)
   const [structureSelectedId, setStructureSelectedId] = useState<string | null>(null)
-  /** 结构视图右栏展示的「当前范围」标题（由 ProjectScopeView 上报面包屑） */
-  const [structureScopeTitle, setStructureScopeTitle] = useState('项目')
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
   const { appearance, setAppearance } = useSettings()
@@ -660,7 +658,7 @@ export function CanvasWorkspace() {
    */
   if (workspaceView === 'structure') {
     return (
-      <div className="absolute inset-0 z-40 flex bg-(--surface)">
+      <div className="absolute inset-0 flex bg-(--surface)">
         {/* 左：项目结构（自适应） */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex h-9 shrink-0 items-center gap-2 border-b border-(--outline-soft) px-4">
@@ -682,18 +680,12 @@ export function CanvasWorkspace() {
               onSelect={setStructureSelectedId}
               viewMode={structureViewMode}
               onViewModeChange={setStructureViewMode}
-              onScopeTitleChange={setStructureScopeTitle}
               onAddToChat={(node) => {
                 useCanvasStore.getState().showToast(`已把「${node.title}」加入对话上下文`)
               }}
             />
           </div>
         </div>
-        {/* 右：对话面板（原型 chat-panel：400px，含头部/消息/输入区） */}
-        <StructureChatRail
-          scopeTitle={structureScopeTitle}
-          onBack={() => setWorkspaceView('canvas')}
-        />
       </div>
     )
   }

@@ -37,14 +37,20 @@ function WorkspaceBody() {
 
   if (!workspace) return <WorkspaceGate />
 
+  /**
+   * 双栏骨架（原型 index-projects.html）：
+   *   左：画布区（默认渲染项目结构视图）| 右：对话面板 400px
+   * 画布顶部让出自绘标题栏（pt-11），右栏占满剩余高度。
+   */
   return (
-    <div className="relative h-full w-full overflow-hidden">
-      {/* 画布整体让出自绘标题栏的高度，画布内部几何（框选/拖拽）按容器实测计算 */}
-      <div className="absolute inset-x-0 bottom-0 top-11">
+    <div className="relative flex h-full w-full overflow-hidden pt-11">
+      <div className="relative min-w-0 flex-1">
         <CanvasWorkspace />
+        <SessionSidebar />
       </div>
-      <SessionSidebar />
-      <ChatDock />
+      <aside className="flex w-[400px] shrink-0 flex-col border-l border-(--outline-soft) bg-(--surface-card)">
+        <ChatDock />
+      </aside>
     </div>
   )
 }

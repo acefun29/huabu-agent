@@ -222,7 +222,7 @@ export const Composer = memo(function Composer() {
         // 拖文件卡片进来 = 递给助手当本轮上下文
         injectAsset(id)
       }}
-      className={`pointer-events-auto w-full max-w-3xl rounded-[28px] bg-(--surface-card) p-3 shadow-[0_8px_30px_rgba(0,0,0,0.08)] transition ${
+      className={`pointer-events-auto w-full max-w-3xl rounded-[18px] border border-(--outline-soft) bg-(--surface-card) p-2.5 shadow-[0_2px_10px_rgba(0,0,0,0.04)] transition ${
         dragOver ? 'ring-2 ring-(--accent)' : 'ring-1 ring-(--outline)'
       }`}
     >
@@ -349,8 +349,8 @@ export const Composer = memo(function Composer() {
             submit()
           }
         }}
-        placeholder="向 Agent 描述你的需求；选中画布资源、拖入文件（临时引用）即作为上下文…"
-        className="max-h-36 w-full resize-none bg-transparent py-1.5 text-[13px] leading-relaxed outline-none placeholder:text-(--on-surface-muted)"
+        placeholder="向 Agent 描述你的需求…"
+        className="max-h-36 w-full resize-none bg-transparent py-1.5 text-[12.5px] leading-[1.6] outline-none placeholder:text-(--on-surface-muted)"
       />
 
       {/* 控制条：+ 钉引用、访问、思考在左，发送在右 */}

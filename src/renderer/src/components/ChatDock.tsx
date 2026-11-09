@@ -41,7 +41,9 @@ const CompactionDivider = memo(function CompactionDivider({
   message: ChatMessage
   faded?: boolean
 }) {
-  const [expanded, setExpanded] = useState(false)
+  /** 右栏常驻展开（折叠语义在结构视图里由外层控制） */
+  const expanded = true
+  const [compactOpen, setCompactOpen] = useState(false)
   const divider = message.compaction!
   return (
     <div
@@ -52,9 +54,9 @@ const CompactionDivider = memo(function CompactionDivider({
       <div className="flex-1 border-t border-dashed border-(--outline)" />
       <div className="max-w-[85%] rounded-full bg-(--surface-chip) px-2.5 py-1 text-[10.5px] leading-relaxed text-(--on-surface-muted)">
         <button
-          onClick={() => setExpanded((v) => !v)}
+          onClick={() => setCompactOpen((v) => !v)}
           className="flex items-center gap-1 font-medium"
-          title={expanded ? '收起压缩摘要' : '展开压缩摘要'}
+          title={compactOpen ? '收起压缩摘要' : '展开压缩摘要'}
         >
           <FoldVertical size={10} className="shrink-0 text-(--accent)" />
           上下文已压缩
@@ -180,13 +182,6 @@ const MessageBubble = memo(function MessageBubble({ m, expanded }: { m: ChatMess
   )
 })
 
-/** 折叠态高度上限：恰好露出最近一到两轮对话；内容不足时高度自适应收紧 */
-const COLLAPSED_MAX_H = 148
-/** 折叠态渲染的尾部消息条数（溢出部分本来就被裁掉，不必进 DOM） */
-const COLLAPSED_TAIL = 6
-/** 把手行高度 + 底部留白 */
-const HEADER_H = 42
-
 /**
  * 底部对话坞 = 对话抽屉 + 全局对话输入框。
  * 抽屉默认折叠：半透明毛玻璃、自适应收紧到最近一两轮对话，流式输出照常滚动可见；
@@ -200,18 +195,10 @@ export function ChatDock() {
   const activeSessionId = useCanvasStore((s) => s.activeSessionId)
   // 压缩/fork 走输入框 / 命令（用户裁决）；头部只留 + 新建对话、删除；停止在 Composer 的发送按钮上
   const { createSession, requestRemoveSession } = useCanvasStore.getState()
-  const [expanded, setExpanded] = useState(false)
-  const [expandedH, setExpandedH] = useState(520)
-  const [contentH, setContentH] = useState(0)
+  /** 右栏常驻展开（折叠语义在结构视图里由外层控制） */
+  const expanded = true
   const bodyRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const onResize = () => setExpandedH(Math.min(560, Math.round(window.innerHeight * 0.58)))
-    onResize()
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
 
   const fullHistory = activeChat?.history ?? []
   const running = Boolean(activeChat?.running)
@@ -220,33 +207,16 @@ export function ChatDock() {
   // 水位告警线：窗口 − 16384（pi 自动压缩保留量，见实施计划 2.1）≈ 87% 起显眼
   const usageCritical = usage?.percent !== null && usage !== undefined && (usage.percent ?? 0) >= 80
   // 折叠态只渲染尾部几条（DOM 里不再挂着全部历史靠 CSS 裁剪）；展开态才全量
-  const history = expanded ? fullHistory : fullHistory.slice(-COLLAPSED_TAIL)
+  const history = fullHistory
 
-  // 测量消息内容真实高度：折叠态抽屉随之收紧，不出现大块空白
+  // 新消息 / 流式回填自动滚到底部
   useEffect(() => {
-    const el = contentRef.current
-    if (!el) return
-    const update = () => setContentH(el.scrollHeight)
-    update()
-    const ro = new ResizeObserver(update)
-    ro.observe(el)
-    return () => ro.disconnect()
-  }, [])
-
-  // 展开态下新消息 / 流式回填自动滚到底部
-  useEffect(() => {
-    if (!expanded) return
     const el = bodyRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [history, expanded])
+  }, [history])
 
-  // 切换会话后回到默认折叠态
-  useEffect(() => {
-    setExpanded(false)
-  }, [activeSessionId])
-
-  const collapsedH = Math.min(COLLAPSED_MAX_H, HEADER_H + contentH)
-  const clipped = HEADER_H + contentH > COLLAPSED_MAX_H
+  void activeSessionId
+  const clipped = false
 
   const usageTitle = usage
     ? usage.tokens === null
@@ -255,32 +225,14 @@ export function ChatDock() {
     : undefined
 
   return (
-    <div className="pointer-events-none absolute bottom-4 left-[72px] right-4 z-30 flex flex-col items-center gap-2.5">
-      {history.length > 0 && (
-        <motion.div
+    <div className="pointer-events-auto flex h-full min-h-0 w-full flex-col gap-2 px-3 pb-3 pt-2">
+      <div
           data-testid="chat-dock"
-          initial={false}
-          animate={{ height: expanded ? expandedH : collapsedH }}
-          transition={{ type: 'spring', stiffness: 360, damping: 36, mass: 0.9 }}
-          style={{ transitionProperty: 'background-color, box-shadow' }}
-          className={`pointer-events-auto flex w-full max-w-3xl flex-col overflow-hidden rounded-[24px] backdrop-blur-md duration-200 ${
-            expanded
-              ? 'bg-(--surface-card) shadow-xl ring-1 ring-(--outline)'
-              : 'bg-(--drawer-peek) shadow-sm ring-1 ring-(--outline-soft)'
-          }`}
+          className="flex min-h-0 w-full flex-1 flex-col overflow-hidden"
         >
           {/* 把手行：点击或上下拖动切换展开态；折叠态细到一条 */}
           <motion.div
-            drag="y"
-            dragConstraints={{ top: 0, bottom: 0 }}
-            dragElastic={0.12}
-            onDragEnd={(_e, info) => {
-              if (info.offset.y < -36) setExpanded(true)
-              else if (info.offset.y > 36) setExpanded(false)
-            }}
-            onClick={() => setExpanded((v) => !v)}
-            className="relative flex h-[34px] shrink-0 cursor-grab touch-none select-none items-center gap-2 px-4 active:cursor-grabbing"
-            title={expanded ? '点击或向下拖动收起' : '点击或向上拖动展开全部历史'}
+            className="relative flex h-[34px] shrink-0 select-none items-center gap-2 px-3"
           >
             <span className="absolute left-1/2 top-[5px] h-1 w-9 -translate-x-1/2 rounded-full bg-(--outline)" />
             <MessageSquare size={12} className="mt-1 shrink-0 text-(--accent)" />
@@ -357,13 +309,23 @@ export function ChatDock() {
             }
           >
             <div ref={contentRef} className="space-y-1.5 py-1">
+              {history.length === 0 ? (
+                <div className="flex flex-col items-center justify-center gap-2 px-4 py-16 text-center">
+                  <div className="grid h-10 w-10 place-items-center rounded-xl bg-(--surface-chip) text-(--on-surface-muted)">
+                    <MessageSquare size={17} />
+                  </div>
+                  <div className="text-[12px] font-medium text-(--on-surface-variant)">开始一轮对话</div>
+                  <div className="max-w-[260px] text-[11px] leading-relaxed text-(--on-surface-muted)">
+                    选中画布资源、拖入文件（临时引用）或直接描述需求；当前层级的节点会作为上下文。
+                  </div>
+                </div>
+              ) : null}
               {history.map((m) => (
                 <MessageBubble key={m.id} m={m} expanded={expanded} />
               ))}
             </div>
           </div>
-        </motion.div>
-      )}
+      </div>
       <Composer />
     </div>
   )
