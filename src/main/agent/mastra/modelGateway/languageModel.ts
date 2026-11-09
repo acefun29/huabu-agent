@@ -85,16 +85,35 @@ function toGatewayMessages(prompt: LanguageModelV2CallOptions['prompt']): Gatewa
 }
 
 function toToolMessage(part: { toolCallId: string; toolName: string; output: unknown; isError?: boolean }): GatewayMessage {
+  const output = part.output as { type?: string; value?: unknown } | undefined
+  // vision 通道：V2 tool-result 的 content/media 输出 → 网关 image part（read_media 图片）
+  if (output && typeof output === 'object' && output.type === 'content') {
+    const blocks = Array.isArray(output.value) ? (output.value as unknown[]) : []
+    const texts = blocks
+      .filter((b): b is { type: 'text'; text: string } => Boolean(b) && (b as { type?: string }).type === 'text')
+      .map((b) => b.text)
+    const media = blocks.filter(
+      (b): b is { type: 'media'; data: string; mediaType?: string } =>
+        Boolean(b) && (b as { type?: string }).type === 'media'
+    )
+    if (media.length) {
+      return {
+        role: 'tool',
+        toolCallId: part.toolCallId,
+        toolName: part.toolName,
+        content: [
+          ...texts.map((text) => ({ type: 'text' as const, text })),
+          ...media.map((m) => normalizeMediaPart(m.data, m.mediaType)),
+        ],
+        isError: part.isError,
+      }
+    }
+  }
   let text: string
   if (typeof part.output === 'string') {
     text = part.output
-  } else if (
-    part.output &&
-    typeof part.output === 'object' &&
-    'type' in part.output &&
-    (part.output as { type: string }).type === 'json'
-  ) {
-    text = JSON.stringify((part.output as unknown as { value?: unknown }).value ?? null)
+  } else if (output && typeof output === 'object' && output.type === 'json') {
+    text = JSON.stringify(output.value ?? null)
   } else {
     text = JSON.stringify(part.output ?? null)
   }
@@ -305,4 +324,18 @@ export function aiSdkLanguageModel(gateway: ModelGateway, ref: ModelRef): Langua
       return { content, finishReason, usage, warnings: [] }
     },
   } satisfies LanguageModelV2
+}
+
+/**
+ * media part 归一化：上游（Mastra normalizeModelOutput / AI SDK 转换层）可能给
+ * data 字段塞完整 data: URI，也可能给纯 base64——统一成纯 base64 + 独立 mimeType
+ * （pi-ai 与网关契约：data 不含前缀）。供应商差异归一化在网关内（计划 §7.7-4）。
+ */
+function normalizeMediaPart(data: string, mediaType?: string): { type: 'image'; data: string; mimeType: string } {
+  if (data.startsWith('data:')) {
+    const comma = data.indexOf(',')
+    const rawMime = data.slice(5, data.indexOf(';'))
+    return { type: 'image', data: data.slice(comma + 1), mimeType: mediaType ?? rawMime ?? 'image/png' }
+  }
+  return { type: 'image', data, mimeType: mediaType ?? 'image/png' }
 }

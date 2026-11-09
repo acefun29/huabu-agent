@@ -313,9 +313,9 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
   it(
     'vision：工具返回图片经 toModelOutput content/media 进模型（模型描述图片内容）',
     async () => {
-      // 8x8 纯红 PNG（大色块，避免 1x1 被模型误读成灰）
+      // 128x128 纯红 PNG（System.Drawing 生成；手写 PNG 会被 DeepSeek 判无效且报错文案误导）
       const RED_PNG_BASE64 =
-        'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC'
+        'iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAFPSURBVHhe7dIxAQAgDMCwiZh/ZXiBHwvpkad35+zeuOYPsTQArgFwDYBrAFwD4BoA1wC4BsA1AK4BcA2AawBcA+AaANcAuAbANQCuAXANgGsAXAPgGgDXALgGwDUArgFwDYBrAFwD4BoA1wC4BsA1AK4BcA2AawBcA+AaANcAuAbANQCuAXANgGsAXAPgGgDXALgGwDUArgFwDYBrAFwD4BoA1wC4BsA1AK4BcA2AawBcA+AaANcAuAbANQCuAXANgGsAXAPgGgDXALgGwDUArgFwDYBrAFwD4BoA1wC4BsA1AK4BcA2AawBcA+AaANcAuAbANQCuAXANgGsAXAPgGgDXALgGwDUArgFwDYBrAFwD4BoA1wC4BsA1AK4BcA2AawBcA+AaANcAuAbANQCuAXANgGsAXAPgGgDXALgGwDUArgFwDYBrAFwD4BoA9wCbRceBrjn07gAAAABJRU5ErkJggg=='
       const visionEvents: ChatEvent[] = []
       const visionTool = {
         name: 'look_at_image',
@@ -324,10 +324,10 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         parameters: { type: 'object', properties: {}, required: [] },
         execute: async () => ({
           content: [
-            { type: 'text' as const, text: '图片已读取（8x8 纯色块）' },
+            { type: 'text' as const, text: '图片已读取（128x128 纯色块）' },
             { type: 'image' as const, data: RED_PNG_BASE64, mimeType: 'image/png' },
           ],
-          details: { width: 8, height: 8 },
+          details: { width: 128, height: 128 },
         }),
       }
       const credentials = new InMemoryCredentialStore()
@@ -341,14 +341,17 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [visionTool as never],
       })
-      await rtV.create({ nodeId: 'e2e-vision' })
+      // 临时工作区跨测试运行复用，threadId 又是确定性的——脏历史会污染 vision 判定，
+      // 每次运行用唯一 nodeId 开新 thread
+      const visionNode = 'e2e-vision-' + Date.now().toString(36)
+      await rtV.create({ nodeId: visionNode })
       // deepseek-flash 目录声明 input 含 image → 网关能力支持 vision
       const handle = await (await import('./modelGateway')).createModelGateway({
         registrations: () => manager.registrations(),
       }).resolve({ providerId: 'deepseek', modelId: 'deepseek-flash' })
       expect(handle.capabilities.imageInput).toBe(true)
       const p = await rtV.prompt({
-        nodeId: 'e2e-vision',
+        nodeId: visionNode,
         text: '请调用 look_at_image 看图，然后只回答你看到的主色调是什么颜色（一个词）。',
       })
       expect(p.ok).toBe(true)
@@ -367,7 +370,7 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
       const answer = (msg?.message.content ?? []).map((b) => b.text ?? '').join(' ')
       console.log('[debug] vision answer:', answer.slice(0, 120))
       expect(/红|red/i.test(answer)).toBe(true)
-      await rtV.dispose({ nodeId: 'e2e-vision' })
+      await rtV.dispose({ nodeId: visionNode })
     },
     240_000
   )

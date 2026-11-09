@@ -167,9 +167,11 @@ export class PiModelGateway {
             ? { apiKey: resolved.apiKey }
             : {}),
         signal: controller.signal,
-        ...(req.maxOutputTokens != null ? { maxTokens: req.maxOutputTokens } : {}),
+        // maxTokens clamp 到目录上限：Mastra 默认给 384k，clamp 保证不超模型声明上限
+        ...(req.maxOutputTokens != null
+          ? { maxTokens: Math.min(req.maxOutputTokens, maxOutputOf(resolved)) }
+          : {}),
         ...(req.temperature != null ? { temperature: req.temperature } : {}),
-        // 思考档位：pi 按模型 thinkingLevelMap 映射到供应商字段（目录数据随 Model 带入）
         ...(req.reasoning ? { reasoning: req.reasoning } : {}),
       })
       for await (const ev of events) {
@@ -211,23 +213,26 @@ export class PiModelGateway {
         // pi AssistantMessage 的必需字段要补全：历史消息缺 usage 时 convertMessages
         // 读 usage.totalTokens 会崩（streamSimple 路径实测）；网关重放的历史不带真实
         // 用量，用零值占位——真实用量只从当轮 done 事件取
+        const content = msg.content.map((part) => {
+          if (part.type === 'text') return { type: 'text', text: part.text }
+          if (part.type === 'thinking') return { type: 'thinking', thinking: part.text }
+          return {
+            type: 'toolCall',
+            id: part.toolCallId,
+            name: part.toolName,
+            arguments: part.args,
+          }
+        })
         messages.push({
           role: 'assistant',
           api: piModelApi,
           provider: resolved.providerId,
           model: resolved.model.id,
-          content: msg.content.map((part) => {
-            if (part.type === 'text') return { type: 'text', text: part.text }
-            if (part.type === 'thinking') return { type: 'thinking', thinking: part.text }
-            return {
-              type: 'toolCall',
-              id: part.toolCallId,
-              name: part.toolName,
-              arguments: part.args,
-            }
-          }),
+          content,
           usage: ZERO_USAGE,
-          stopReason: 'stop',
+          // 带 toolCall 的 assistant 轮必须标 toolUse：pi 据此配对后续 toolResult
+          // （图片搬运、消息转换都依赖这个状态；实测 stop 会导致 toolResult 图像被丢弃）
+          stopReason: content.some((part) => (part as { type?: string }).type === 'toolCall') ? 'toolUse' : 'stop',
           timestamp,
         })
         continue
@@ -302,3 +307,10 @@ export class PiModelGateway {
     }
   }
 }
+
+/** 模型目录的输出上限（缺省兜底 32k） */
+function maxOutputOf(resolved: ResolvedModel): number {
+  const max = (resolved.model as { maxTokens?: number }).maxTokens
+  return typeof max === 'number' && max > 0 ? max : 32_768
+}
+
