@@ -14,6 +14,7 @@
 import type { ChatMessageBlock, ChatStopReason } from './chatBlocks'
 import type { ChatCompactionDivider, ChatContextUsage, ChatHistoryImage } from '@shared/ipc'
 import type { MediaRatio, MediaRefRole } from '@shared/media'
+import type { Facet } from '@shared/facets'
 
 export type { ChatMessageBlock, ChatToolCallView } from './chatBlocks'
 
@@ -156,6 +157,12 @@ export interface AssetData {
    * 文件级元数据（真相在主进程 .huabu/tags.json），画布卡片与素材库条目同源。
    */
   tags?: string[]
+  /**
+   * 文件分级坐标（「第03集 / 第2场 / 第12镜」这种从粗到细的定位）。
+   * 文件级元数据（真相在主进程 .huabu/facets.json），与 tags 同源同步；
+   * 层级命名由 schema 决定（见 @shared/facets），换 schema 不迁移数据。
+   */
+  facet?: Facet
   mime?: string
   bytes?: number
   meta?: string

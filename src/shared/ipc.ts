@@ -9,6 +9,7 @@
  */
 
 import type { MediaAccessMode, MediaKind, MediaProviderType, MediaRatio, ModelCapabilities } from './media'
+import type { Facet, FacetSchema } from './facets'
 
 export const IpcChannel = {
   /** 联通性自检：渲染进程 -> 主进程，返回 'pong' */
@@ -246,6 +247,10 @@ export const IpcChannel = {
   AssetRename: 'asset:rename',
   /** 设置文件标签（文件级元数据，写 .huabu/tags.json 并广播 asset:changed） */
   AssetSetTags: 'asset:set-tags',
+  /** 设置文件分级（文件级元数据，写 .huabu/facets.json 并广播 asset:changed） */
+  AssetSetFacet: 'asset:set-facet',
+  /** 批量设置文件分级（Agent 标注整个场景时一次写完） */
+  AssetSetFacetsBulk: 'asset:set-facets',
   /** 事件类：素材库目录变更广播（导入/建库/删库后；未来的本地索引挂在这条链路上） */
   AssetChanged: 'asset:changed'
 } as const
@@ -1213,6 +1218,8 @@ export interface AssetLibraryFile {
   bytes: number
   /** 文件标签（.huabu/tags.json 索引；素材库按标签搜索用） */
   tags?: string[]
+  /** 文件分级坐标（.huabu/facets.json 索引；层级位置由 schema 定义） */
+  facet?: Facet
 }
 
 /**
@@ -1235,6 +1242,8 @@ export interface AssetLibrariesInfo {
   workspaceDir: string | null
   /** 临时收件箱绝对路径（import-temp 的落点，工作区之外） */
   inboxDir: string
+  /** 当前工作区启用的分级 schema（缺省 = 内置短剧三级）；渲染端据此渲染层级选择器 */
+  facetSchema?: FacetSchema
   libraries: AssetLibrary[]
 }
 

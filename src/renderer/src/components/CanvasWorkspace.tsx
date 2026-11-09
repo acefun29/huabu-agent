@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react'
 import { LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
+import { collectFacetValues, facetMatchesPrefix, type FacetLevel } from '@shared/facets'
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
@@ -50,6 +51,7 @@ function CanvasFilterBar({
 }) {
   const nodes = useCanvasStore((s) => s.nodes)
   const libraries = useCanvasStore((s) => s.libraries)
+  const facetSchema = useCanvasStore((s) => s.facetSchema)
 
   const tags = useMemo(
     () => Array.from(new Set(nodes.flatMap((n) => n.data.tags ?? []))).sort((a, b) => a.localeCompare(b)),
@@ -63,6 +65,33 @@ function CanvasFilterBar({
     const present = new Set(nodes.map((n) => n.data.libraryId).filter(Boolean) as string[])
     return (libraries ?? []).filter((l) => present.has(l.id))
   }, [nodes, libraries])
+
+  /**
+   * 分级筛选：按 schema 逐层展开「当前前缀下真实存在的值」。
+   * 例如已选「第01集」时，第二行只剩第01集里的场景（而不是全片的场）。
+   * 层级名来自 schema，代码里不写死「集/场/镜」。
+   */
+  const facetLevels = useMemo(() => {
+    const schema = facetSchema
+    if (!schema) return []
+    const facets = nodes.map((n) => n.data.facet).filter(Boolean)
+    if (facets.length === 0) return []
+    const rows: Array<{ level: FacetLevel; values: string[]; prefix: string[] }> = []
+    const prefix: string[] = []
+    for (const level of schema.levels) {
+      const values = collectFacetValues(
+        facets.filter((f) => facetMatchesPrefix(f, prefix)),
+        prefix.length
+      )
+      if (values.length === 0) break
+      rows.push({ level, values, prefix: [...prefix] })
+      // 只有当前缀已选时才继续往下展开
+      const picked = filter.facetPrefix?.[prefix.length]
+      if (!picked || !values.includes(picked)) break
+      prefix.push(picked)
+    }
+    return rows
+  }, [nodes, facetSchema, filter.facetPrefix])
   const active = hasActiveFilter(filter)
   const set = (patch: Partial<CanvasFilter>): void => onChange({ ...filter, ...patch })
 
@@ -93,6 +122,40 @@ function CanvasFilterBar({
           ))}
         </div>
       ) : null}
+
+      {/* 分级：按 schema 逐层下钻，选中某一层值 = 只看该位置下的素材 */}
+      {facetLevels.map((row) => (
+        <div key={row.level.key} className="flex items-center gap-1">
+          <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">
+            {row.level.label}
+          </span>
+          {row.values.map((value) => {
+            const selected =
+              filter.facetPrefix?.length === row.prefix.length + 1 &&
+              filter.facetPrefix[row.prefix.length] === value
+            const nextPrefix = [...row.prefix, value]
+            return (
+              <button
+                key={value}
+                onClick={() =>
+                  set({
+                    // 再点一次同一项 = 回到上一层（前缀缩短到该层之前）
+                    facetPrefix: selected ? (row.prefix.length > 0 ? row.prefix : null) : nextPrefix
+                  })
+                }
+                title={nextPrefix.join(' / ')}
+                className={`max-w-[160px] truncate rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+                  selected
+                    ? 'bg-(--accent) text-white'
+                    : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
+                }`}
+              >
+                {value}
+              </button>
+            )
+          })}
+        </div>
+      ))}
 
       {/* 标签 */}
       {tags.length > 0 ? (

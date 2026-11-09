@@ -6,6 +6,7 @@ import {
   FolderOpen,
   GitBranch,
   Image as ImageIcon,
+  Layers,
   Loader2,
   Maximize2,
   Paperclip,
@@ -258,6 +259,147 @@ function TagRow({
           <option key={t} value={t} />
         ))}
       </datalist>
+    </div>
+  )
+}
+
+/**
+ * 分级行：显示「第03集 / 第2场 / 第12镜」这种定位，逐层可点选编辑。
+ * 与 TagRow 并排（标签回答"是什么"，分级回答"在项目的哪个位置"）。
+ * 层级名与深度全部来自工作区 schema，代码里不写死「集/场/镜」。
+ */
+function FacetRow({
+  node,
+  data,
+  single,
+  tone = 'dark',
+}: {
+  node: CanvasNode
+  data: AssetData
+  single: boolean
+  tone?: 'dark' | 'light'
+}) {
+  const setNodeFacet = useCanvasStore((s) => s.setNodeFacet)
+  const schema = useCanvasStore((s) => s.facetSchema)
+  const [editing, setEditing] = useState(false)
+  /** 编辑中的草稿（长度对齐 schema 深度） */
+  const [draft, setDraft] = useState<string[]>([])
+  const facet = data.facet
+  const dark = tone === 'dark'
+
+  if (!schema) return null
+
+  const openEditor = () => {
+    // 预填现有值，多余层留空
+    const next = schema.levels.map((_, i) => facet?.chain[i] ?? '')
+    setDraft(next)
+    setEditing(true)
+  }
+
+  const commit = () => {
+    setEditing(false)
+    // 空值截断到第一个空洞之前（不允许中间留空）
+    const chain: string[] = []
+    for (const value of draft) {
+      const trimmed = value.trim()
+      if (!trimmed) break
+      chain.push(trimmed)
+    }
+    void setNodeFacet(node.id, chain.length > 0 ? { chain } : null)
+  }
+
+  return (
+    <div
+      className="mt-1 flex flex-wrap items-center gap-1"
+      onClick={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <Layers size={10} className={`shrink-0 ${dark ? 'text-white/70' : 'text-(--on-surface-muted)'}`} />
+      {!editing ? (
+        <>
+          {facet?.chain.length ? (
+            facet.chain.map((value, index) => (
+              <span
+                key={`${index}-${value}`}
+                className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                  dark ? 'bg-white/20 text-white' : 'bg-(--active-tint) text-(--accent)'
+                }`}
+                title={schema.levels[index]?.title ?? schema.levels[index]?.label ?? `第${index + 1}层`}
+              >
+                {value}
+              </span>
+            ))
+          ) : (
+            <span className={`text-[10px] ${dark ? 'text-white/60' : 'text-(--on-surface-muted)'}`}>未分级</span>
+          )}
+          {single && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                openEditor()
+              }}
+              className={`flex items-center gap-0.5 rounded-full border border-dashed px-1.5 py-0.5 text-[10px] transition-colors ${
+                dark
+                  ? 'border-white/50 text-white/85 hover:border-white hover:text-white'
+                  : 'border-(--outline) text-(--on-surface-muted) hover:border-(--accent) hover:text-(--accent)'
+              }`}
+              title={`设置分级（${schema.label}）`}
+            >
+              <Plus size={9} />
+              {facet ? '改' : '分级'}
+            </button>
+          )}
+        </>
+      ) : (
+        <>
+          {schema.levels.map((level, index) => (
+            <input
+              key={level.key}
+              autoFocus={index === 0}
+              value={draft[index] ?? ''}
+              onChange={(e) => {
+                const next = [...draft]
+                next[index] = e.target.value
+                setDraft(next)
+              }}
+              onKeyDown={(e) => {
+                e.stopPropagation()
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing) commit()
+                if (e.key === 'Escape') setEditing(false)
+              }}
+              // 用 onBlur 提交会与「逐层填完点下一步」冲突；改为显式回车/√ 提交
+              placeholder={level.hint ?? level.title ?? level.label}
+              title={level.title ?? level.label}
+              className={`w-16 rounded-full px-2 py-0.5 text-[10.5px] outline-none ring-1 transition-colors ${
+                dark
+                  ? 'bg-neutral-800 text-white ring-transparent placeholder:text-white/45 focus:bg-neutral-700 focus:ring-white/30'
+                  : 'bg-(--surface-input) text-(--on-surface) ring-(--accent)/40 placeholder:text-(--on-surface-muted) focus:ring-(--accent)/70'
+              }`}
+            />
+          ))}
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              commit()
+            }}
+            className={`rounded-full p-0.5 ${dark ? 'text-white/85 hover:text-white' : 'text-(--accent)'}`}
+            title="保存分级"
+          >
+            <Check size={11} />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              setEditing(false)
+            }}
+            className={`rounded-full p-0.5 ${dark ? 'text-white/60 hover:text-white' : 'text-(--on-surface-muted)'}`}
+            title="取消"
+          >
+            <X size={11} />
+          </button>
+        </>
+      )}
     </div>
   )
 }
@@ -612,6 +754,7 @@ const UnifiedAssetCard = memo(function UnifiedAssetCard({ node, data }: { node: 
                   }`}
                 >
                   <TagRow node={node} data={data} single={selectedCount === 1} tone={viewable ? undefined : 'light'} />
+                  <FacetRow node={node} data={data} single={selectedCount === 1} tone={viewable ? undefined : 'light'} />
                 </div>
               </Collapse>
             </div>

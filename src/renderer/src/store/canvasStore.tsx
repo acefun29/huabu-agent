@@ -9,6 +9,7 @@ import type {
   WorkspaceInfo
 } from '@shared/ipc'
 import type { MediaKind, ResolvedRefCaps } from '@shared/media'
+import type { Facet, FacetSchema } from '@shared/facets'
 import { useSettings, useSettingsUi } from './settingsStore'
 import type {
   AssetData,
@@ -172,6 +173,8 @@ export interface CanvasState {
   libraries: MaterialLibrary[]
   /** 临时收件箱绝对路径（素材库清单顺带返回；临时附件预览/ reveal 用） */
   inboxDir: string | null
+  /** 当前工作区的分级 schema（层级名为 集/场/镜 还是 话/页/格，由它决定） */
+  facetSchema: FacetSchema | null
   refreshLibraries: () => Promise<void>
   createLibrary: (name: string) => Promise<void>
   removeLibrary: (id: string) => Promise<void>
@@ -196,9 +199,11 @@ export interface CanvasState {
   /** OS 外部文件拖到素材库条目：复制进该库目录 */
   dropFilesToLibrary: (files: File[], libraryId: string) => Promise<void>
 
-  /* 标签与笔记 */
+  /* 标签与分级 */
   /** 设置卡片标签（写 .huabu/tags.json，同一文件的多张卡同步） */
   setNodeTags: (nodeId: string, tags: string[]) => Promise<void>
+  /** 设置卡片分级（写 .huabu/facets.json，同一文件的多张卡同步；null = 清除） */
+  setNodeFacet: (nodeId: string, facet: Facet | null) => Promise<void>
   /** 新建 md 笔记：落公共素材库并钉到画布（返回卡片 id；失败 null） */
   createNote: (title?: string) => Promise<string | null>
 
@@ -582,6 +587,7 @@ export const useCanvasStore = create<CanvasState>()(
       cardInspector: null,
       libraries: [],
       inboxDir: null,
+      facetSchema: null,
       dirFiles: [],
       sessions: [],
       chatsMap: {},

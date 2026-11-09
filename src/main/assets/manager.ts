@@ -28,6 +28,8 @@ import type {
 } from '../../shared/ipc'
 import { copyIntoDir, WorkspaceStore } from '../workspace/store'
 import { loadTagsIndex, setFileTags } from './tagsIndex'
+import { loadFacetsIndex, migrateFacetKey, removeFacetKey } from './facetsIndex'
+import { BUILTIN_FACET_SCHEMAS, findFacetSchema, type Facet } from '../../shared/facets'
 
 /**
  * 素材域（asset）主进程模块。
@@ -178,7 +180,8 @@ async function pruneInbox(now: Date = new Date()): Promise<void> {
 async function scanLibraryDir(
   absDir: string,
   workspaceDir: string,
-  tagsIndex: Record<string, string[]>
+  tagsIndex: Record<string, string[]>,
+  facetsIndex: Record<string, Facet>
 ): Promise<AssetLibraryFile[]> {
   if (!existsSync(absDir)) return []
   const out: AssetLibraryFile[] = []
@@ -193,7 +196,8 @@ async function scanLibraryDir(
       relPath,
       absPath: normalizePath(abs),
       bytes: (await stat(abs)).size,
-      ...(tagsIndex[relPath]?.length ? { tags: tagsIndex[relPath] } : {})
+      ...(tagsIndex[relPath]?.length ? { tags: tagsIndex[relPath] } : {}),
+      ...(facetsIndex[relPath] ? { facet: facetsIndex[relPath] } : {})
     })
     if (out.length >= MAX_LIBRARY_FILES) break
   }
@@ -212,12 +216,15 @@ export async function listLibraries(store: WorkspaceStore): Promise<AssetLibrari
   const libraries: AssetLibrary[] = []
   if (dir) {
     const root = resolve(dir)
-    // 标签索引每次现读（.huabu/tags.json 小文件，避免标签写入后清单不同步）
+    // 标签/分级索引每次现读（都是小文件，避免写入后清单不同步）
     const tagsIndex = loadTagsIndex(root)
+    const facetsIndex = loadFacetsIndex(root)
     // 内置合成库：assets/ 根（分类归档的落盘点）。files 列各分类子目录的并集
     const assetFiles: AssetLibraryFile[] = []
     for (const category of [...ASSET_CATEGORIES, OTHER_CATEGORY]) {
-      assetFiles.push(...(await scanLibraryDir(resolve(root, category.dir), root, tagsIndex)))
+      assetFiles.push(
+        ...(await scanLibraryDir(resolve(root, category.dir), root, tagsIndex, facetsIndex))
+      )
     }
     libraries.push({
       id: 'builtin-assets',
@@ -232,14 +239,16 @@ export async function listLibraries(store: WorkspaceStore): Promise<AssetLibrari
         name: lib.name,
         path: lib.path,
         ...(lib.isPublic ? { isPublic: true } : {}),
-        files: await scanLibraryDir(resolve(root, lib.path), root, tagsIndex)
+        files: await scanLibraryDir(resolve(root, lib.path), root, tagsIndex, facetsIndex)
       })
     }
   }
   return {
     workspaceDir: dir ? normalizePath(dir) : null,
     inboxDir: normalizePath(inboxRoot()),
-    libraries
+    libraries,
+    /** 当前 schema（阶段一固定内置短剧三级；facet.schemaId 已预留，切换不迁移数据） */
+    facetSchema: findFacetSchema(BUILTIN_FACET_SCHEMAS, null) ?? undefined
   }
 }
 
@@ -389,8 +398,9 @@ export function deleteAsset(store: WorkspaceStore, request: AssetDeleteRequest):
   const abs = resolveInsideWorkspace(root, request.relPath)
   const relPath = normalizePath(relative(root, abs))
   rmSync(abs, { force: true })
-  // 标签索引键清理（不存在该键时为无害空操作）
+  // 标签/分级索引键清理（不存在该键时为无害空操作）
   setFileTags(root, relPath, [])
+  removeFacetKey(root, relPath)
 }
 
 /**
@@ -428,5 +438,7 @@ export function renameAsset(store: WorkspaceStore, request: AssetRenameRequest):
     setFileTags(root, fromRel, [])
     setFileTags(root, toRel, tags)
   }
+  // 分级同理：键随文件走（无分级时为无害空操作）
+  migrateFacetKey(root, fromRel, toRel)
   return { relPath: toRel, name: finalName }
 }

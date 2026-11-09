@@ -1,4 +1,5 @@
 import type { AssetLibraryFile } from '@shared/ipc'
+import type { Facet } from '@shared/facets'
 import { assetDirForKind, MEDIA_ROOT_REL } from '@shared/assets'
 import { KIND_LABEL, type AssetData, type CanvasNode, type DirEntry, type MaterialLibrary, type MediaKind, type MessageAttachment } from '../../types'
 import type { CanvasState } from '../canvasStore'
@@ -32,10 +33,15 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     if (!BRIDGE_AVAILABLE || !get().workspace) return
     const result = await window.huabu.asset.libraries()
     if (!result.ok) return
-    set({ libraries: result.value.libraries, inboxDir: result.value.inboxDir })
-    // 清单里带着每个文件的最新标签（主进程现扫 tags.json），顺手对齐画布卡片：
-    // 钉卡时漏带的旧卡片、标签的跨端/库面板改动都在这里补齐（syncCardTags 定义见标签段）
+    set({
+      libraries: result.value.libraries,
+      inboxDir: result.value.inboxDir,
+      facetSchema: result.value.facetSchema ?? null
+    })
+    // 清单里带着每个文件的最新标签与分级（主进程现扫 tags.json / facets.json），
+    // 顺手对齐画布卡片：钉卡时漏带的旧卡片、跨端改动都在这里补齐
     syncCardTags(result.value.libraries)
+    syncCardFacets(result.value.libraries)
   }
 
   const refreshDirFiles = async () => {
@@ -106,8 +112,9 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
             libraryId: lib.id,
             bytes: entry.bytes,
             meta: KIND_LABEL[entry.kind],
-            // 文件级标签随钉卡带入：卡片、右上角标签筛选、卡片详情读的都是 data.tags
-            ...(entry.tags?.length ? { tags: entry.tags } : {})
+            // 文件级标签与分级随钉卡带入：卡片、右上角筛选、卡片详情读的都是 data.tags / data.facet
+            ...(entry.tags?.length ? { tags: entry.tags } : {}),
+            ...(entry.facet ? { facet: entry.facet } : {})
           } satisfies AssetData
       } satisfies CanvasNode
     ])
@@ -422,6 +429,70 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   /**
+   * 库清单的文件级分级（真相 .huabu/facets.json）对齐到画布卡片。
+   * 与 syncCardTags 同一手法：只对齐库内文件，无变化走快路径。
+   */
+  const syncCardFacets = (libraries: MaterialLibrary[]) => {
+    const facetByRel = new Map<string, Facet>()
+    for (const lib of libraries) {
+      for (const f of lib.files) {
+        if (f.facet) facetByRel.set(f.relPath, f.facet)
+      }
+    }
+    if (facetByRel.size === 0) return
+    applyNodes((prev) => {
+      let touched = false
+      const next = prev.map((node) => {
+        const d = node.data
+        if (!d) return node
+        const facet = facetByRel.get(nodeRelPath(d) ?? '')
+        if (!facet) return node
+        const current = d.facet
+        // 逐项比较（chain 是唯一实质内容，顺序敏感）
+        if (
+          current &&
+          current.chain.length === facet.chain.length &&
+          current.chain.every((v, i) => v === facet.chain[i]) &&
+          current.schemaId === facet.schemaId
+        ) {
+          return node
+        }
+        touched = true
+        return { ...node, data: { ...d, facet } }
+      })
+      return touched ? next : prev
+    })
+  }
+
+  /**
+   * 设置卡片分级：写主进程 .huabu/facets.json（schema 深度截断后的坐标为准备份），
+   * 同文件的多张卡同步更新。
+   */
+  const setNodeFacet = async (nodeId: string, facet: Facet | null) => {
+    if (!BRIDGE_AVAILABLE) return
+    const data = get().nodes.find((n) => n.id === nodeId)?.data
+    const relPath = data ? nodeRelPath(data) : null
+    if (!data || !relPath) {
+      showToast('该卡片没有落盘文件，无法设置分级')
+      return
+    }
+    const result = await window.huabu.asset.setFacet(relPath, facet)
+    if (!result.ok) {
+      showToast(`设置分级失败：${result.error}`)
+      return
+    }
+    const saved = result.value.facet
+    applyNodes((prev) =>
+      prev.map((n) => {
+        const d = n.data
+        if (!d || nodeRelPath(d) !== relPath) return n
+        return { ...n, data: { ...d, ...(saved ? { facet: saved } : { facet: undefined }) } }
+      })
+    )
+    await refreshLibraries()
+  }
+
+  /**
    * 设置卡片标签：写主进程 .huabu/tags.json（清洗后的标签为准），卡片与素材库条目同源刷新。
    * media 形态产物同样可打标签（key = 工作区相对路径）。
    */
@@ -579,6 +650,7 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     moveLibraryFile,
     dropFilesToLibrary,
     setNodeTags,
+    setNodeFacet,
     createNote,
     deleteAsset,
     renameAsset

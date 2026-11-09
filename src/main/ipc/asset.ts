@@ -18,6 +18,8 @@ import {
   transferToLibrary
 } from '../assets/manager'
 import { setFileTags } from '../assets/tagsIndex'
+import { setFileFacet, setFileFacetsBulk } from '../assets/facetsIndex'
+import { BUILTIN_FACET_SCHEMAS, findFacetSchema, type Facet, type FacetSchema } from '../../shared/facets'
 import type { IpcContext } from './shared'
 import { guardAsync, guardSync, invalidPayload, isNonEmptyString } from './shared'
 import { consumeSourcePath } from './workspace'
@@ -26,6 +28,13 @@ export function registerAssetIpc(ctx: IpcContext): void {
   const store = ctx.store
   const currentDir = ctx.currentDir
   const broadcastAssetChanged = ctx.broadcastAssetChanged
+
+  /**
+   * 当前工作区启用的分级 schema。
+   * 阶段一固定取内置短剧三级（最常见场景）；schema 的选择 UI 与 workspace.json
+   * 持久化留在后续迭代——数据格式（facet.schemaId）已经预留，切换不需要迁移数据。
+   */
+  const currentFacetSchema = (): FacetSchema => findFacetSchema(BUILTIN_FACET_SCHEMAS, null)!
 
   const asImportFiles = (payload: unknown): unknown[] | null => {
     const files = (payload as { files?: unknown } | null)?.files
@@ -110,6 +119,53 @@ export function registerAssetIpc(ctx: IpcContext): void {
     return guardAsync(async () => {
       const result = await transferToLibrary(store, { libraryId: request!.libraryId as string, movePaths, copyFiles })
       if (result.moved.length > 0 || result.copied.length > 0) broadcastAssetChanged()
+      return result
+    })
+  })
+
+  /** @backend(asset:set-facet)：文件分级写 .huabu/facets.json 并广播（卡片/库面板同源刷新） */
+  ipcMain.handle(IpcChannel.AssetSetFacet, (_event, payload: unknown) => {
+    const request = payload as { relPath?: unknown; facet?: unknown } | null
+    if (!isNonEmptyString(request?.relPath)) return invalidPayload('asset:set-facet 需要 relPath')
+    return guardSync(() => {
+      const dir = currentDir()
+      if (!dir) throw new Error('尚未打开工作区')
+      const target = resolve(dir, request!.relPath as string)
+      if (target !== dir && !target.startsWith(dir + sep)) {
+        throw new Error(`路径越出工作区：${request!.relPath}`)
+      }
+      const relPath = normalizePath(relative(dir, target))
+      const saved = setFileFacet(dir, relPath, request!.facet as Facet | null, currentFacetSchema())
+      broadcastAssetChanged()
+      return { relPath, facet: saved }
+    })
+  })
+
+  /** @backend(asset:set-facets)：批量分级（Agent 标注整个场景时一次写完，避免 N 次读改写） */
+  ipcMain.handle(IpcChannel.AssetSetFacetsBulk, (_event, payload: unknown) => {
+    const raw = (payload as { entries?: unknown } | null)?.entries
+    if (!Array.isArray(raw) || raw.length === 0) return invalidPayload('asset:set-facets 需要 entries 数组')
+    // 上限与其它批量通道一致：一次最多 200 条，防止误传整盘路径
+    const entries = raw
+      .filter((item): item is { relPath?: unknown; facet?: unknown } => Boolean(item) && typeof item === 'object')
+      .slice(0, 200)
+    if (entries.length === 0) return invalidPayload('asset:set-facets 的 entries 形状不合法')
+    return guardSync(() => {
+      const dir = currentDir()
+      if (!dir) throw new Error('尚未打开工作区')
+      const normalized: Array<{ relPath: string; facet: Facet | null }> = []
+      for (const entry of entries) {
+        if (!isNonEmptyString(entry.relPath)) continue
+        const target = resolve(dir, entry.relPath as string)
+        // 单条越界不整单失败：跳过非法项，合法项继续（批量场景容忍部分失败）
+        if (target !== dir && !target.startsWith(dir + sep)) continue
+        normalized.push({
+          relPath: normalizePath(relative(dir, target)),
+          facet: (entry.facet ?? null) as Facet | null
+        })
+      }
+      const result = setFileFacetsBulk(dir, normalized, currentFacetSchema())
+      if (result.updated > 0 || result.removed > 0) broadcastAssetChanged()
       return result
     })
   })

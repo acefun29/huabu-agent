@@ -1,3 +1,4 @@
+import { facetMatchesPrefix } from '@shared/facets'
 import { useCanvasStore } from '../../store/canvasStore'
 import { NodeFrame, type NodeGestureApi } from '../NodeFrame'
 
@@ -14,19 +15,24 @@ import { NodeFrame, type NodeGestureApi } from '../NodeFrame'
  * 返回 fragment 不引入额外包裹层：变换层的子节点结构（卡片 + 框选矩形的
  * DOM 叠放顺序）与拆分前完全一致。
  */
-/** 画布筛选条件（按素材属性分类：类型 / 标签 / 素材库） */
+/** 画布筛选条件（按素材属性分类：类型 / 分级 / 标签 / 素材库） */
 export interface CanvasFilter {
   tag: string | null
   /** 素材大类型：image / video / audio / doc / code / other */
   kind: string | null
   /** 所属素材库 id */
   libraryId: string | null
+  /**
+   * 分级前缀（「第03集」或「第03集 / 第2场」）：选中某一层 = 看该位置下的全部素材。
+   * 用数组而非字符串，避免分隔符与用户输入的层级名冲突。
+   */
+  facetPrefix: string[] | null
 }
 
-export const EMPTY_FILTER: CanvasFilter = { tag: null, kind: null, libraryId: null }
+export const EMPTY_FILTER: CanvasFilter = { tag: null, kind: null, libraryId: null, facetPrefix: null }
 
 export function hasActiveFilter(f: CanvasFilter): boolean {
-  return Boolean(f.tag || f.kind || f.libraryId)
+  return Boolean(f.tag || f.kind || f.libraryId || (f.facetPrefix && f.facetPrefix.length > 0))
 }
 
 export function NodeLayer({ api, filter }: { api: NodeGestureApi; filter: CanvasFilter }) {
@@ -38,6 +44,9 @@ export function NodeLayer({ api, filter }: { api: NodeGestureApi; filter: Canvas
     if (filter.tag && !(d.tags ?? []).includes(filter.tag)) return false
     if (filter.kind && d.kind !== filter.kind) return false
     if (filter.libraryId && d.libraryId !== filter.libraryId) return false
+    if (filter.facetPrefix && filter.facetPrefix.length > 0 && !facetMatchesPrefix(d.facet, filter.facetPrefix)) {
+      return false
+    }
     return true
   }
 

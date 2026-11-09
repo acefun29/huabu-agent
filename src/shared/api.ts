@@ -57,6 +57,7 @@ import type {
   CanvasSnapshot,
   WindowStateInfo
 } from './ipc'
+import type { Facet } from './facets'
 
 /**
  * 渲染进程可用的全部能力（window.huabu）。
@@ -386,6 +387,20 @@ export interface AssetApi {
 
   /** 设置文件标签（文件级元数据 → .huabu/tags.json，广播 asset:changed；返回清洗后的标签） */
   setTags(relPath: string, tags: string[]): Promise<ChatResult<{ relPath: string; tags: string[] }>>
+
+  /**
+   * 设置文件分级（文件级元数据 → .huabu/facets.json，广播 asset:changed）。
+   * `facet` 传 null = 清除分级；返回实际落盘的坐标（可能被 schema 深度截断）。
+   */
+  setFacet(relPath: string, facet: Facet | null): Promise<ChatResult<{ relPath: string; facet: Facet | null }>>
+
+  /**
+   * 批量设置分级（Agent 一次标注整个场景）：每项 facet 为 null 表示清除。
+   * 返回实际更新/清除的条数。
+   */
+  setFacets(
+    entries: Array<{ relPath: string; facet: Facet | null }>
+  ): Promise<ChatResult<{ updated: number; removed: number }>>
 
   /** 真删素材文件（破坏性，渲染端二次确认；广播 asset:changed） */
   deleteAsset(relPath: string): Promise<ChatResult>
