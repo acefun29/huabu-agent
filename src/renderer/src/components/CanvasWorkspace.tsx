@@ -41,12 +41,6 @@ const KIND_FILTERS = [
   { key: 'doc', label: '文档' },
 ] as const
 
-const STATUS_FILTERS = [
-  { key: 'pending', label: '待生成' },
-  { key: 'generating', label: '生成中' },
-  { key: 'done', label: '已生成' },
-] as const
-
 function CanvasFilterBar({
   filter,
   onChange,
@@ -99,24 +93,6 @@ function CanvasFilterBar({
           ))}
         </div>
       ) : null}
-
-      {/* 状态 */}
-      <div className="flex items-center gap-1">
-        <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">状态</span>
-        {STATUS_FILTERS.map((st) => (
-          <button
-            key={st.key}
-            onClick={() => set({ status: filter.status === st.key ? null : st.key })}
-            className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
-              filter.status === st.key
-                ? 'bg-(--accent) text-white'
-                : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
-            }`}
-          >
-            {st.label}
-          </button>
-        ))}
-      </div>
 
       {/* 标签 */}
       {tags.length > 0 ? (

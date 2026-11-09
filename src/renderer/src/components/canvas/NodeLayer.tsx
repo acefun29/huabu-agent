@@ -14,26 +14,23 @@ import { NodeFrame, type NodeGestureApi } from '../NodeFrame'
  * 返回 fragment 不引入额外包裹层：变换层的子节点结构（卡片 + 框选矩形的
  * DOM 叠放顺序）与拆分前完全一致。
  */
-/** 画布筛选条件（按素材属性分类：类型 / 状态 / 标签 / 素材库） */
+/** 画布筛选条件（按素材属性分类：类型 / 标签 / 素材库） */
 export interface CanvasFilter {
   tag: string | null
   /** 素材大类型：image / video / audio / doc / code / other */
   kind: string | null
-  /** 生成状态：done（有产物）/ pending（无产物）/ generating（任务在跑） */
-  status: 'done' | 'pending' | 'generating' | null
   /** 所属素材库 id */
   libraryId: string | null
 }
 
-export const EMPTY_FILTER: CanvasFilter = { tag: null, kind: null, status: null, libraryId: null }
+export const EMPTY_FILTER: CanvasFilter = { tag: null, kind: null, libraryId: null }
 
 export function hasActiveFilter(f: CanvasFilter): boolean {
-  return Boolean(f.tag || f.kind || f.status || f.libraryId)
+  return Boolean(f.tag || f.kind || f.libraryId)
 }
 
 export function NodeLayer({ api, filter }: { api: NodeGestureApi; filter: CanvasFilter }) {
   const nodes = useCanvasStore((s) => s.nodes)
-  const jobStates = useCanvasStore((s) => s.jobStates)
 
   /** 素材是否满足全部筛选条件（AND 语义，与素材库/列表的收窄方式一致） */
   const matches = (node: (typeof nodes)[number]): boolean => {
@@ -41,14 +38,6 @@ export function NodeLayer({ api, filter }: { api: NodeGestureApi; filter: Canvas
     if (filter.tag && !(d.tags ?? []).includes(filter.tag)) return false
     if (filter.kind && d.kind !== filter.kind) return false
     if (filter.libraryId && d.libraryId !== filter.libraryId) return false
-    if (filter.status) {
-      const job = jobStates[node.id]
-      const running = job?.status === 'queued' || job?.status === 'running'
-      const hasArtifact = Boolean(d.storage && d.path)
-      if (filter.status === 'generating' && !running) return false
-      if (filter.status === 'done' && !hasArtifact) return false
-      if (filter.status === 'pending' && (hasArtifact || running)) return false
-    }
     return true
   }
 
