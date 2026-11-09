@@ -11,7 +11,8 @@
  * TEXT_EXTS / READ_FILE_MAX_BYTES（文本读写白名单与大小上限）、
  * sourcePathRegistry / consumeSourcePath（拖拽登记表，media/asset 域导入闸消费）。
  */
-import { ipcMain, shell } from 'electron'
+import { ipcMain } from './ipcMainBridge'
+import { shell } from 'electron'
 import { existsSync, readFileSync, statSync } from 'fs'
 import { readdir, stat } from 'fs/promises'
 import { extname, join, relative, resolve, sep } from 'path'

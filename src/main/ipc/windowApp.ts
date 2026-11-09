@@ -4,7 +4,8 @@
  * 覆盖通道：app:ping / app:version / window:control / window:state。
  * 自绘标题栏（无边框窗口）走 window:control 与 window:state。
  */
-import { app, BrowserWindow, ipcMain } from 'electron'
+import { app, BrowserWindow } from 'electron'
+import { ipcMain } from './ipcMainBridge'
 import {
   IpcChannel,
   type AppVersionInfo,

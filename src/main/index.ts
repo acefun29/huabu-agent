@@ -1,6 +1,7 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
 import { join } from 'path'
 import { getAgentHost, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
+import { startWebBridge, setActiveBridge } from './webBridge/server'
 import { IpcChannel } from '../shared/ipc'
 import { initMediaProtocol, registerMediaSchemePrivileged } from './media/protocol'
 import { inboxRoot } from './assets/manager'
@@ -102,6 +103,17 @@ void app.whenReady().then(() => {
   // 自绘标题栏替代原生菜单栏（File/Edit/View/Window 是 Electron 默认菜单）
   Menu.setApplicationMenu(null)
   registerIpcHandlers()
+  // Web 后端桥（默认关闭）：HUABU_WEB_BRIDGE=1 时监听 127.0.0.1，供浏览器里的
+  // renderer 调同一批 IPC handler（复用业务逻辑，不重写）。token 打印到控制台，
+  // 浏览器用 ?token= 接入。仅本地开发用途，生产不启用。
+  if (process.env.HUABU_WEB_BRIDGE === '1') {
+    void startWebBridge({ port: Number(process.env.HUABU_WEB_BRIDGE_PORT ?? 4788) })
+      .then((bridge) => {
+        setActiveBridge(bridge)
+        console.log(`[web-bridge] 浏览器接入：http://localhost:5174/?bridge=${bridge.port}&token=${bridge.token}`)
+      })
+      .catch((error) => console.error('[web-bridge] 启动失败：', error))
+  }
   // 媒体协议服务四个根：media=产物目录，ws=工作区根，inbox=临时收件箱（工作区之外），thumbs=缩略图缓存
   initMediaProtocol(() => {
     const store = getWorkspaceStore()

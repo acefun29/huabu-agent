@@ -5,7 +5,7 @@
  * asset:library-create / asset:library-remove / asset:transfer / asset:set-tags /
  * asset:delete / asset:rename。目录变更统一经 broadcastAssetChanged 广播 asset:changed。
  */
-import { ipcMain } from 'electron'
+import { ipcMain } from './ipcMainBridge'
 import { relative, resolve, sep } from 'path'
 import { IpcChannel } from '../../shared/ipc'
 import { normalizePath } from '../../shared/assets'

@@ -11,6 +11,7 @@
  */
 
 import type { Project, ProjectFile, ProjectLevel } from '../../main/project/model'
+import { createWebBridgeApi, resolveBridgeConfig } from './webBridgeClient'
 
 const DRAMA_LEVELS: ProjectLevel[] = [
   {
@@ -470,6 +471,20 @@ const webWorkspaceState = {
 export function installWebHarness(): void {
   const global = window as unknown as { huabu?: Record<string, unknown> }
   if (global.huabu) return
+
+  // 优先：真后端桥（main 以 HUABU_WEB_BRIDGE=1 启动时，URL 带 ?bridge=&token=）
+  // 此时 window.huabu 与 Electron preload 同形状，业务代码零改动，操作的是真实数据。
+  const bridgeConfig = resolveBridgeConfig()
+  if (bridgeConfig) {
+    ;(globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__ = true
+    global.huabu = createWebBridgeApi(bridgeConfig) as unknown as Record<string, unknown>
+    console.info(
+      `[web-bridge] 已连接真后端 http://127.0.0.1:${bridgeConfig.port}（对话/模型/素材库均为真实数据）`
+    )
+    return
+  }
+
+  console.info('[web-harness] 未检测到 ?bridge= 参数：使用内置 demo 数据（仅画布样式可看）')
 
   const project = new WebProjectHarness()
 

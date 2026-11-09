@@ -10,6 +10,7 @@
  * 事件广播前检查 webContents 是否已销毁，否则关窗瞬间会抛错。
  */
 import { BrowserWindow } from 'electron'
+import { forwardEvent } from '../webBridge/server'
 import type { AgentHost } from '../agent/host'
 import type { WorkspaceStore } from '../workspace/store'
 import type { MediaJobManager } from '../media/manager'
@@ -70,6 +71,8 @@ async function guardAsync<T>(fn: () => Promise<T>): Promise<ChatResult<T>> {
 
 /** chat:event 广播：作为 AgentHost 的 onUpdate 回调传入（见 src/main/ipc.ts 编排器） */
 export function broadcastChatEvent(event: ChatEvent): void {
+  // Web 桥：同一事件转给浏览器（未启用时零开销）
+  forwardEvent(IpcChannel.ChatEvent, event)
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue
@@ -84,6 +87,7 @@ export function broadcastChatEvent(event: ChatEvent): void {
 
 /** task:event 广播：SuperAgent 任务/验收进度（计划 §9.7 新增可选事件，渲染端未接时忽略） */
 export function broadcastTaskEvent(event: TaskEvent): void {
+  forwardEvent(IpcChannel.TaskEvent, event)
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue
@@ -97,6 +101,7 @@ export function broadcastTaskEvent(event: TaskEvent): void {
 
 /** project:changed 广播：项目结构变更后渲染端刷新（层级/状态/进度） */
 export function broadcastProjectChangedEvent(): void {
+  forwardEvent(IpcChannel.ProjectChanged, { at: Date.now() })
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue
@@ -110,6 +115,7 @@ export function broadcastProjectChangedEvent(): void {
 
 /** 素材目录变更广播（import/建库/删库后渲染端刷新素材库面板与目录约定） */
 export function broadcastAssetChanged(): void {
+  forwardEvent(IpcChannel.AssetChanged, { at: Date.now() })
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue
@@ -122,6 +128,8 @@ export function broadcastAssetChanged(): void {
 }
 
 export function broadcastMediaJob(job: MediaJobStatus): void {
+  // Web 桥：同一事件转给浏览器（未启用时零开销）
+  forwardEvent(IpcChannel.MediaJobEvent, job)
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue
@@ -135,6 +143,7 @@ export function broadcastMediaJob(job: MediaJobStatus): void {
 
 /** MCP 服务器状态变化广播（连接中/已连接/失败），设置页徽章实时更新 */
 export function broadcastMcpStatus(): void {
+  forwardEvent('mcp:status', { at: Date.now() })
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue

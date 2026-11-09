@@ -9,7 +9,7 @@
  * 中途改 flag 只影响新建会话（与 defaultModel 同款语义），dispose 解绑。
  * chat:dispose 成功后经 media.ts 的 settleApprovalsForNode 把该节点的挂起确认按拒绝 settle。
  */
-import { ipcMain } from 'electron'
+import { ipcMain } from './ipcMainBridge'
 import { broadcastChatEvent } from './shared'
 import { assembleBlockoutTool } from '../agent/blockoutTools'
 import { assembleNoteTool } from '../agent/noteTool'

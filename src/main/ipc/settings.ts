@@ -13,7 +13,7 @@
  *
  * 域内局部（不进 IpcContext）：afterChatConfigChange（覆盖层写完后的统一收尾）。
  */
-import { ipcMain } from 'electron'
+import { ipcMain } from './ipcMainBridge'
 import {
   IpcChannel,
   type ChatResult,

@@ -11,7 +11,7 @@
  * - 运行态（任务在跑/验收失败）由渲染端作为 hint 传入，结构文件不随任务状态频繁重写。
  */
 
-import { ipcMain } from 'electron'
+import { ipcMain } from './ipcMainBridge'
 import {
   IpcChannel,
   type ChatResult,
