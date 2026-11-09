@@ -37,6 +37,31 @@ export const IpcChannel = {
   ChatSteer: 'chat:steer',
   /** 事件类：SuperAgent 任务/验收状态推送（主进程 -> 渲染进程，可选事件） */
   TaskEvent: 'task:event',
+
+  /* ------------------------------------------------------------------ */
+  /* project 域（项目结构：层级 / 节点 / 状态 / 提示词继承）                 */
+  /* ------------------------------------------------------------------ */
+
+  /** 读取项目结构全量（含派生状态、当前 scope 子节点、提示词继承） */
+  ProjectSnapshot: 'project:snapshot',
+  /** 新建项目（名字 + 类型即生成层级定义） */
+  ProjectCreate: 'project:create',
+  /** 切换当前项目 */
+  ProjectActivate: 'project:activate',
+  /** 删除项目 */
+  ProjectDelete: 'project:delete',
+  /** 更新项目元信息（名字/tagline/项目级提示词/层级定义） */
+  ProjectUpdate: 'project:update',
+  /** 新增节点 */
+  ProjectAddNode: 'project:add-node',
+  /** 更新节点（标题/字段/提示词/assetId） */
+  ProjectPatchNode: 'project:patch-node',
+  /** 删除节点及其子树 */
+  ProjectRemoveNode: 'project:remove-node',
+  /** 同级重排 */
+  ProjectReorder: 'project:reorder',
+  /** 事件类：项目结构变更（主进程 -> 渲染进程，结构刷新用） */
+  ProjectChanged: 'project:changed',
   /** 中止当前生成 */
   ChatAbort: 'chat:abort',
   /** 会话与画布节点解绑并释放资源 */
@@ -426,6 +451,71 @@ export type TaskEvent =
       version: string
       artifactId: string
     }
+
+/* ---------------------------- 项目结构（原型 index-projects.html） ---------------------------- */
+
+/** 单个节点在快照里的形态（含派生状态与继承后的提示词） */
+export interface ProjectNodeView {
+  id: string
+  level: number
+  parentId: string | null
+  title: string
+  subtitle?: string
+  order: number
+  fields: Record<string, string>
+  /** 派生状态：todo / generating / done / attention（无 review） */
+  status: 'todo' | 'generating' | 'done' | 'attention'
+  /** 叶子引用的素材 id（空 = 待生成） */
+  assetId?: string
+  cover?: string
+  /** 自己这层的 prompt（可空 = 靠继承） */
+  prompt?: string
+  /** 容器专用：子树叶子进度 */
+  stats?: { total: number; done: number; pct: number }
+}
+
+/** 项目快照（一次 IPC 拿全，避免前端多次往返） */
+export interface ProjectSnapshot {
+  /** 项目列表（pill 切换用） */
+  projects: { id: string; name: string; kind: string; dot?: string; summary?: string }[]
+  activeProjectId: string | null
+  /** 当前项目完整定义（含层级 schema，前端据此渲染，不写死层级） */
+  project: {
+    id: string
+    name: string
+    kind: string
+    rootLabel: string
+    dot?: string
+    tagline?: string
+    promptBase?: string
+    levels: {
+      key: string
+      label: string
+      plural: string
+      icon: string
+      container: boolean
+      fields: { key: string; label: string }[]
+      cardFields: string[]
+      detailFields: string[]
+    }[]
+  } | null
+  /** 当前 scope 下的子节点（scopeId 为空 = 根看板） */
+  nodes: ProjectNodeView[]
+  /** 面包屑（根 → 当前 scope） */
+  breadcrumb: { id: string | null; title: string }[]
+  /** 当前 scope 节点的提示词继承层（详情用；根为项目级） */
+  promptLayers: { level: string; label: string; prompt: string }[]
+  /** 读取错误（project.json 损坏时的原因，UI 可提示） */
+  error?: string
+}
+
+/** 项目快照请求 */
+export interface ProjectSnapshotRequest {
+  /** 当前浏览的容器节点；null/省略 = 根 */
+  scopeId?: string | null
+  /** 可选：实时运行态提示（任务在跑/验收失败），用于状态派生 */
+  runtime?: Record<string, { generating?: boolean; attention?: boolean }>
+}
 
 /** 失败分类，渲染端据此给出可操作引导（去设置 / 重试 / 重新绑定会话） */
 export type ChatErrorCode =

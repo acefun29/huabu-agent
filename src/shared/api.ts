@@ -18,6 +18,8 @@ import type {
   ChatPromptRequest,
   ChatResult,
   ChatRuntimeInfo,
+  ProjectSnapshot,
+  ProjectSnapshotRequest,
   ChatSetModelRequest,
   ChatSetModelResult,
   ChatSetThinkingRequest,
@@ -78,6 +80,14 @@ export interface HuabuApi {
 
   /** 窗口控制能力（自绘标题栏）：无边框窗口的最小化/最大化/关闭 */
   window: WindowApi
+
+  /**
+   * 项目结构（原型 index-projects.html）：层级 / 节点 / 状态 / 提示词继承。
+   *
+   * 层级由数据定义（levels），渲染端不写死"剧集/场景/镜头"；素材库仍与工作区
+   * 最上层对齐，叶子节点只通过 assetId 引用已有素材。
+   */
+  project: ProjectApi
 
   /** Agent 会话能力（M3，M9 扩展模型切换与历史回放） */
   chat: ChatApi
@@ -384,5 +394,24 @@ export interface AssetApi {
   renameAsset(relPath: string, newName: string): Promise<ChatResult<AssetRenameResult>>
 
   /** 订阅素材库目录变更（导入/建库/删库后广播） */
+  onChanged(listener: () => void): () => void
+}
+
+/** 项目结构接口（window.huabu.project） */
+export interface ProjectApi {
+  /** 一次取全：项目列表 + 当前项目 schema + scope 子节点 + 面包屑 + 提示词链 */
+  snapshot(request?: ProjectSnapshotRequest): Promise<ChatResult<ProjectSnapshot>> | Promise<{
+    ok: true
+    value: ProjectSnapshot
+  }>
+  create(request: { name: string; kind?: string; id?: string }): Promise<unknown>
+  activate(projectId: string): Promise<unknown>
+  delete(projectId: string): Promise<unknown>
+  update(projectId: string, patch: Record<string, unknown>): Promise<unknown>
+  addNode(projectId: string, node: Record<string, unknown>): Promise<unknown>
+  patchNode(projectId: string, nodeId: string, patch: Record<string, unknown>): Promise<unknown>
+  removeNode(projectId: string, nodeId: string): Promise<unknown>
+  reorder(projectId: string, parentId: string | null, orderedIds: string[]): Promise<unknown>
+  /** 结构变更订阅，返回取消函数 */
   onChanged(listener: () => void): () => void
 }

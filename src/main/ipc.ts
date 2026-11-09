@@ -4,6 +4,7 @@ import { McpManager } from './mcp/manager'
 import {
   broadcastAssetChanged,
   broadcastChatEvent,
+  broadcastProjectChangedEvent,
   broadcastMediaJob,
   broadcastMcpStatus,
   type IpcContext
@@ -13,6 +14,7 @@ import { registerWorkspaceIpc } from './ipc/workspace'
 import { registerAssetIpc } from './ipc/asset'
 import { registerMediaIpc, createMediaRuntime, requestMediaApproval } from './ipc/media'
 import { registerChatIpc } from './ipc/chat'
+import { registerProjectIpc } from './ipc/project'
 import { registerSettingsIpc } from './ipc/settings'
 
 /**
@@ -82,6 +84,7 @@ export function registerIpcHandlers(): void {
     host,
     currentDir,
     broadcastAssetChanged,
+    broadcastProjectChanged: broadcastProjectChangedEvent,
     mediaManager,
     mediaContext,
     requestMediaApproval,
@@ -93,5 +96,6 @@ export function registerIpcHandlers(): void {
   registerAssetIpc(ctx)
   registerMediaIpc(ctx)
   registerChatIpc(ctx)
+  registerProjectIpc(ctx)
   registerSettingsIpc(ctx)
 }

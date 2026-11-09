@@ -95,6 +95,19 @@ export function broadcastTaskEvent(event: TaskEvent): void {
   }
 }
 
+/** project:changed 广播：项目结构变更后渲染端刷新（层级/状态/进度） */
+export function broadcastProjectChangedEvent(): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    const contents = window.webContents
+    if (contents.isDestroyed()) continue
+    try {
+      contents.send(IpcChannel.ProjectChanged, { at: Date.now() })
+    } catch (error) {
+      console.error(`[ipc] project:changed 广播失败：${String(error)}`)
+    }
+  }
+}
+
 /** 素材目录变更广播（import/建库/删库后渲染端刷新素材库面板与目录约定） */
 export function broadcastAssetChanged(): void {
   for (const window of BrowserWindow.getAllWindows()) {
@@ -142,6 +155,8 @@ export interface IpcContext {
   host: AgentHost
   currentDir: () => string | null
   broadcastAssetChanged: () => void
+  /** 项目结构变更广播（project:changed）：渲染端刷新层级视图 */
+  broadcastProjectChanged: () => void
   mediaManager: MediaJobManager
   mediaContext: () => MediaContextReturnType
   requestMediaApproval: (

@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
 import type { HuabuApi } from '../shared/api'
-import type { ChatEvent, MediaConfirmPayload, MediaJobStatus, WindowStateInfo } from '../shared/ipc'
+import type { ChatEvent, MediaConfirmPayload, MediaJobStatus, ProjectSnapshotRequest, WindowStateInfo } from '../shared/ipc'
 import { IpcChannel } from '../shared/ipc'
 
 /**
@@ -160,6 +160,32 @@ const api: HuabuApi = {
     loadCanvas: () => ipcRenderer.invoke(IpcChannel.WorkspaceCanvasLoad),
 
     setDefaultModel: (modelId) => ipcRenderer.invoke(IpcChannel.WorkspaceSetDefaultModel, { modelId })
+  },
+
+  /** 项目结构（原型 index-projects.html）：层级 / 节点 / 状态 / 提示词继承 */
+  project: {
+    snapshot: (request?: ProjectSnapshotRequest) =>
+      ipcRenderer.invoke(IpcChannel.ProjectSnapshot, request ?? {}),
+    create: (request: { name: string; kind?: string; id?: string }) =>
+      ipcRenderer.invoke(IpcChannel.ProjectCreate, request),
+    activate: (projectId: string) => ipcRenderer.invoke(IpcChannel.ProjectActivate, { projectId }),
+    delete: (projectId: string) => ipcRenderer.invoke(IpcChannel.ProjectDelete, { projectId }),
+    update: (projectId: string, patch: Record<string, unknown>) =>
+      ipcRenderer.invoke(IpcChannel.ProjectUpdate, { projectId, patch }),
+    addNode: (projectId: string, node: Record<string, unknown>) =>
+      ipcRenderer.invoke(IpcChannel.ProjectAddNode, { projectId, node }),
+    patchNode: (projectId: string, nodeId: string, patch: Record<string, unknown>) =>
+      ipcRenderer.invoke(IpcChannel.ProjectPatchNode, { projectId, nodeId, patch }),
+    removeNode: (projectId: string, nodeId: string) =>
+      ipcRenderer.invoke(IpcChannel.ProjectRemoveNode, { projectId, nodeId }),
+    reorder: (projectId: string, parentId: string | null, orderedIds: string[]) =>
+      ipcRenderer.invoke(IpcChannel.ProjectReorder, { projectId, parentId, orderedIds }),
+    /** 结构变更订阅（返回取消函数） */
+    onChanged: (listener: () => void) => {
+      const handler = (): void => listener()
+      ipcRenderer.on(IpcChannel.ProjectChanged, handler)
+      return () => ipcRenderer.removeListener(IpcChannel.ProjectChanged, handler)
+    }
   },
 
   settings: {
