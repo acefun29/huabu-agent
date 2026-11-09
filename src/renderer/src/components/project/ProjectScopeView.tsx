@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ProjectNodeView, ProjectSnapshot } from '@shared/ipc'
+import { ContextMenu, type ContextMenuItem } from '../ContextMenu'
 
 type LevelDef = {
   label: string
@@ -62,16 +63,20 @@ export interface ProjectScopeViewProps {
   onOpenSchema?: () => void
   viewMode: 'canvas' | 'list'
   onViewModeChange: (mode: 'canvas' | 'list') => void
+  /** 切换到平铺画布（自由摆放模式，不能分层的工作区用） */
+  onSwitchToFlat?: () => void
   /** 上报当前范围标题（供右栏「当前范围」chip 与 Agent 回执使用） */
   onScopeTitleChange?: (title: string) => void
 }
 
 export function ProjectScopeView(props: ProjectScopeViewProps) {
-  const { scopeId, onScopeChange, selectedId, onSelect, onAddToChat, onOpenSchema, viewMode, onViewModeChange, onScopeTitleChange } = props
+  const { scopeId, onScopeChange, selectedId, onSelect, onAddToChat, onOpenSchema, viewMode, onViewModeChange, onScopeTitleChange, onSwitchToFlat } = props
   const [snapshot, setSnapshot] = useState<ProjectSnapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [filter, setFilter] = useState<FilterKey>('all')
   const [loading, setLoading] = useState(true)
+  /** 右键菜单（画布级操作：以此生成 / 详情 / 加入对话 / 删除） */
+  const [menu, setMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null)
   const alive = useRef(true)
 
   const load = useCallback(async (scope: string | null) => {
@@ -132,6 +137,41 @@ export function ProjectScopeView(props: ProjectScopeViewProps) {
   }, [snapshot])
 
   // 根看板标题是项目名（面包屑根项存的是 rootLabel，不是项目名）
+  /** 卡片右键菜单：与画布卡片同语义（生成 / 详情 / 会话引用 / 删除） */
+  const nodeMenu = (node: ProjectNodeView): ContextMenuItem[] => {
+    const isContainer = node.stats !== undefined
+    const items: ContextMenuItem[] = []
+    items.push({
+      label: isContainer ? `打开${levelDef?.label ?? '容器'}` : '查看详情',
+      onClick: () => (isContainer ? onScopeChange(node.id) : onSelect(node.id)),
+    })
+    if (onAddToChat) {
+      items.push({ label: '加入对话上下文', onClick: () => onAddToChat(node) })
+    }
+    if (!isContainer && !node.assetId) {
+      items.push({
+        label: '以此生成…',
+        onClick: () => {
+          // 占位：真实生成接 mediaManager（Phase 4 剩余项）
+          window.alert('生成链路：该节点尚无产物，接入 mediaManager 后在此发起')
+        },
+      })
+    }
+    if (!isContainer) {
+      items.push({
+        label: '从结构中移除',
+        danger: true,
+        onClick: async () => {
+          const api = window.huabu?.project
+          if (!api || !snapshot?.activeProjectId) return
+          await api.removeNode(snapshot.activeProjectId, node.id)
+          await load(scopeId)
+        },
+      })
+    }
+    return items
+  }
+
   const currentTitle = isRootPath(snapshot) ? (project?.name ?? '') : (snapshot?.breadcrumb.at(-1)?.title ?? project?.name ?? '')
   // 上报范围标题（右栏 chip / Agent 回执用）
   useEffect(() => {
@@ -255,6 +295,16 @@ export function ProjectScopeView(props: ProjectScopeViewProps) {
             结构
           </button>
         ) : null}
+        {onSwitchToFlat ? (
+          <button
+            type="button"
+            className="shrink-0 rounded-full border border-(--outline-soft) bg-(--surface-card) px-2.5 py-[3px] text-[10.5px] text-(--on-surface-muted) hover:text-(--on-surface-variant)"
+            onClick={onSwitchToFlat}
+            title="切换到自由摆放的平铺画布（适合不分层的工作区）"
+          >
+            平铺
+          </button>
+        ) : null}
       </div>
 
       {/* 标题区（原型 scope-head） */}
@@ -302,6 +352,9 @@ export function ProjectScopeView(props: ProjectScopeViewProps) {
         </div>
       </div>
 
+      {/* 右键菜单（与自由画布同一套菜单组件） */}
+      {menu ? <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} /> : null}
+
       {/* 内容区：卡片看板 / 列表 */}
       <div className="min-h-0 flex-1 overflow-y-auto pb-16 pl-[76px] pr-5 pt-4">
         <div className="mx-auto w-full max-w-[900px]">
@@ -327,6 +380,11 @@ export function ProjectScopeView(props: ProjectScopeViewProps) {
                   onOpen={() => (node.stats ? onScopeChange(node.id) : onSelect(node.id))}
                   onSelect={() => onSelect(node.id)}
                   {...(onAddToChat ? { onAddToChat: () => onAddToChat(node) } : {})}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    onSelect(node.id)
+                    setMenu({ x: e.clientX, y: e.clientY, items: nodeMenu(node) })
+                  }}
                 />
               ))}
             </div>
@@ -353,6 +411,7 @@ function NodeCard({
   onOpen,
   onSelect,
   onAddToChat,
+  onContextMenu,
 }: {
   node: ProjectNodeView
   levelLabel: string
@@ -360,6 +419,7 @@ function NodeCard({
   onOpen: () => void
   onSelect: () => void
   onAddToChat?: () => void
+  onContextMenu?: (e: React.MouseEvent) => void
 }) {
   const st = STATUS[node.status]
   const isContainer = node.stats !== undefined
@@ -378,6 +438,7 @@ function NodeCard({
       }`}
       onClick={onSelect}
       onDoubleClick={onOpen}
+      onContextMenu={onContextMenu}
       onKeyDown={(e) => {
         if (e.key === 'Enter') onOpen()
       }}

@@ -3,7 +3,6 @@ import {
   Eraser,
   FolderOpen,
   GitBranch,
-  Layers,
   MessageSquare,
   MousePointer2,
   Sparkles,
@@ -659,32 +658,20 @@ export function CanvasWorkspace() {
   if (workspaceView === 'structure') {
     return (
       <div className="absolute inset-0 flex bg-(--surface)">
-        {/* 左：项目结构（自适应） */}
+        {/* 层级画布（工作区唯一画布形态）：当前 scope 的节点就是卡片 */}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-9 shrink-0 items-center gap-2 border-b border-(--outline-soft) px-4">
-            <span className="text-[11.5px] font-medium text-(--on-surface-variant)">项目结构</span>
-            <span className="text-[10px] text-(--on-surface-muted)">层级骨架 · 素材库不受影响</span>
-            <button
-              type="button"
-              className="ml-auto rounded-full border border-(--outline-soft) bg-(--surface-card) px-2.5 py-[3px] text-[10.5px] text-(--on-surface-muted) hover:text-(--on-surface-variant)"
-              onClick={() => setWorkspaceView('canvas')}
-            >
-              返回画布
-            </button>
-          </div>
-          <div className="min-h-0 flex-1">
-            <ProjectScopeView
-              scopeId={scopeId}
-              onScopeChange={setScopeId}
-              selectedId={structureSelectedId}
-              onSelect={setStructureSelectedId}
-              viewMode={structureViewMode}
-              onViewModeChange={setStructureViewMode}
-              onAddToChat={(node) => {
-                useCanvasStore.getState().showToast(`已把「${node.title}」加入对话上下文`)
-              }}
-            />
-          </div>
+          <ProjectScopeView
+            scopeId={scopeId}
+            onScopeChange={setScopeId}
+            selectedId={structureSelectedId}
+            onSelect={setStructureSelectedId}
+            viewMode={structureViewMode}
+            onViewModeChange={setStructureViewMode}
+            onSwitchToFlat={() => setWorkspaceView('canvas')}
+            onAddToChat={(node) => {
+              useCanvasStore.getState().showToast(`已把「${node.title}」加入对话上下文`)
+            }}
+          />
         </div>
       </div>
     )
@@ -749,19 +736,6 @@ export function CanvasWorkspace() {
 
         {/* 框选矩形：常驻 DOM，几何由手势直写；盖在卡片之上、不拦截事件 */}
         <div ref={marqueeRef} className="canvas-marquee" style={{ display: 'none' }} />
-      </div>
-
-      {/* 视图切换：进入项目结构（层级视图）。放在左下角，避免与划选条/标签条重叠 */}
-      <div className="absolute bottom-3 left-3 z-20" data-canvas-ui="true">
-        <button
-          type="button"
-          className="flex items-center gap-1.5 rounded-xl bg-(--chrome-bg) px-2.5 py-1.5 text-[11.5px] text-(--on-surface-variant) shadow-(--chrome-shadow) ring-1 ring-(--outline-soft) hover:text-(--on-surface)"
-          onClick={() => setWorkspaceView('structure')}
-          title="按项目层级浏览（剧集 → 场景 → 镜头）"
-        >
-          <Layers size={13} />
-          项目结构
-        </button>
       </div>
 
       {/* 标签筛选条：聚合画布卡片标签，点击只亮带该标签的卡片 */}
