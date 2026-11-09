@@ -11,13 +11,12 @@ import {
   X,
 } from 'lucide-react'
 import { LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
-import { ProjectScopeView } from './project/ProjectScopeView'
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
 import { type CanvasNode, type MediaKind, type ViewState } from '../types'
 import type { NodeGestureApi } from './NodeFrame'
-import { NodeLayer } from './canvas/NodeLayer'
+import { NodeLayer, EMPTY_FILTER, hasActiveFilter, type CanvasFilter } from './canvas/NodeLayer'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ReferenceEdgeLayer, type ReferenceEdgeSync } from './canvas/ReferenceEdgeLayer'
 import { GenerationPopover } from './canvas/GenerationPopover'
@@ -30,50 +29,148 @@ interface MenuState {
 }
 
 /**
- * 画布标签筛选条（右上角浮层）：聚合画布卡片全部标签，点击标签 = 只亮带该标签的
- * 卡片（其余降透明度），再点一次取消。标签的增删在卡片选中后的胶囊行上做（TagRow）。
+ * 画布属性筛选条（右上角浮层）：按素材自身属性分类，不引入层级。
+ *
+ * 四个维度可叠加（AND）：类型 / 生成状态 / 标签 / 素材库。
+ * 不匹配的卡片降透明度而非隐藏——保留空间记忆（用户仍能看到卡片在哪）。
  */
-function TagFilterBar({ active, onChange }: { active: string | null; onChange: (tag: string | null) => void }) {
+const KIND_FILTERS = [
+  { key: 'image', label: '图片' },
+  { key: 'video', label: '视频' },
+  { key: 'audio', label: '音频' },
+  { key: 'doc', label: '文档' },
+] as const
+
+const STATUS_FILTERS = [
+  { key: 'pending', label: '待生成' },
+  { key: 'generating', label: '生成中' },
+  { key: 'done', label: '已生成' },
+] as const
+
+function CanvasFilterBar({
+  filter,
+  onChange,
+}: {
+  filter: CanvasFilter
+  onChange: (next: CanvasFilter) => void
+}) {
   const nodes = useCanvasStore((s) => s.nodes)
+  const libraries = useCanvasStore((s) => s.libraries)
+
   const tags = useMemo(
     () => Array.from(new Set(nodes.flatMap((n) => n.data.tags ?? []))).sort((a, b) => a.localeCompare(b)),
     [nodes]
   )
-  if (tags.length === 0) return null
+  const kinds = useMemo(() => {
+    const present = new Set(nodes.map((n) => n.data.kind))
+    return KIND_FILTERS.filter((k) => present.has(k.key))
+  }, [nodes])
+  const libs = useMemo(() => {
+    const present = new Set(nodes.map((n) => n.data.libraryId).filter(Boolean) as string[])
+    return (libraries ?? []).filter((l) => present.has(l.id))
+  }, [nodes, libraries])
+  const active = hasActiveFilter(filter)
+  const set = (patch: Partial<CanvasFilter>): void => onChange({ ...filter, ...patch })
+
+  if (nodes.length === 0) return null
+
   return (
     <div
       data-canvas-ui="true"
-      data-tour="tag-filter"
-      className="absolute right-3 top-[60px] z-20 flex max-w-[440px] flex-wrap items-center gap-1 rounded-2xl bg-(--chrome-bg) px-2.5 py-1.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
+      data-tour="canvas-filter"
+      className="absolute right-3 top-3 z-20 flex max-w-[calc(100%-88px)] flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl bg-(--chrome-bg) px-2.5 py-1.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
     >
-      <TagIcon size={11} className="mr-0.5 shrink-0 text-(--on-surface-muted)" />
-      {tags.map((t) => (
+      {/* 类型 */}
+      {kinds.length > 1 ? (
+        <div className="flex items-center gap-1">
+          <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">类型</span>
+          {kinds.map((k) => (
+            <button
+              key={k.key}
+              onClick={() => set({ kind: filter.kind === k.key ? null : k.key })}
+              className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+                filter.kind === k.key
+                  ? 'bg-(--accent) text-white'
+                  : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
+              }`}
+            >
+              {k.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {/* 状态 */}
+      <div className="flex items-center gap-1">
+        <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">状态</span>
+        {STATUS_FILTERS.map((st) => (
+          <button
+            key={st.key}
+            onClick={() => set({ status: filter.status === st.key ? null : st.key })}
+            className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+              filter.status === st.key
+                ? 'bg-(--accent) text-white'
+                : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
+            }`}
+          >
+            {st.label}
+          </button>
+        ))}
+      </div>
+
+      {/* 标签 */}
+      {tags.length > 0 ? (
+        <div className="flex items-center gap-1">
+          <TagIcon size={10} className="shrink-0 text-(--on-surface-muted)" />
+          {tags.map((t) => (
+            <button
+              key={t}
+              onClick={() => set({ tag: filter.tag === t ? null : t })}
+              className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+                filter.tag === t
+                  ? 'bg-(--accent) text-white'
+                  : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
+              }`}
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {/* 素材库 */}
+      {libs.length > 1 ? (
+        <div className="flex items-center gap-1">
+          <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">库</span>
+          {libs.map((l) => (
+            <button
+              key={l.id}
+              onClick={() => set({ libraryId: filter.libraryId === l.id ? null : l.id })}
+              className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+                filter.libraryId === l.id
+                  ? 'bg-(--accent) text-white'
+                  : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
+              }`}
+            >
+              {l.name}
+            </button>
+          ))}
+        </div>
+      ) : null}
+
+      {/* 清除 */}
+      {active ? (
         <button
-          key={t}
-          onClick={() => onChange(active === t ? null : t)}
-          className={`rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
-            active === t
-              ? 'bg-(--accent) text-white'
-              : 'bg-(--surface-chip) text-(--on-surface-variant) hover:bg-(--outline-soft)'
-          }`}
-          title={active === t ? '点击取消筛选' : '只显示带此标签的卡片'}
-        >
-          {t}
-        </button>
-      ))}
-      {active && (
-        <button
-          onClick={() => onChange(null)}
+          onClick={() => onChange(EMPTY_FILTER)}
           className="ml-0.5 flex h-5 w-5 items-center justify-center rounded-full text-(--on-surface-muted) transition-colors hover:bg-(--outline-soft)"
-          title="清除筛选"
+          title="清除全部筛选"
         >
           <X size={11} />
         </button>
-      )}
+      ) : null}
     </div>
   )
 }
-
 const SCALE_MIN = 0.4
 const SCALE_MAX = 1.6
 /** 缩放手势停止多久后把 view 提交进 store（落盘/缩放指示从此恢复同步） */
@@ -138,16 +235,13 @@ export function CanvasWorkspace() {
   /** 画布 / 结构 两种视图：结构视图是项目层级骨架（原型 index-projects.html），
    *  与自由画布并行，互不替换——切换只影响当前显示 */
   // 默认进入项目结构（原型主界面）；自由画布作为可切换的次要视图
-  const [workspaceView, setWorkspaceView] = useState<'canvas' | 'structure'>('structure')
-  const [structureViewMode, setStructureViewMode] = useState<'canvas' | 'list'>('canvas')
-  const [scopeId, setScopeId] = useState<string | null>(null)
-  const [structureSelectedId, setStructureSelectedId] = useState<string | null>(null)
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
   const { appearance, setAppearance } = useSettings()
   const [menu, setMenu] = useState<MenuState | null>(null)
   /** 标签筛选：非 null 时只亮带该标签的卡片（其余降透明度） */
-  const [activeTag, setActiveTag] = useState<string | null>(null)
+  /** 画布属性筛选（类型/状态/标签/素材库，AND 叠加；不匹配卡片降透明） */
+  const [filter, setFilter] = useState<CanvasFilter>(EMPTY_FILTER)
   const [osDragOver, setOsDragOver] = useState(false)
   /** 空格按住时左键拖动 = 平移（Figma 式；平时左键拖动 = 框选） */
   const [spaceDown, setSpaceDown] = useState(false)
@@ -655,27 +749,6 @@ export function CanvasWorkspace() {
    * z-40 全屏覆盖（遮住底部 ChatDock），内部再分「左画布 | 右对话栏」两栏。
    * 这样自由画布与结构视图互不干扰，自由画布的所有交互保持原样。
    */
-  if (workspaceView === 'structure') {
-    return (
-      <div className="absolute inset-0 flex bg-(--surface)">
-        {/* 层级画布（工作区唯一画布形态）：当前 scope 的节点就是卡片 */}
-        <div className="flex min-w-0 flex-1 flex-col">
-          <ProjectScopeView
-            scopeId={scopeId}
-            onScopeChange={setScopeId}
-            selectedId={structureSelectedId}
-            onSelect={setStructureSelectedId}
-            viewMode={structureViewMode}
-            onViewModeChange={setStructureViewMode}
-            onSwitchToFlat={() => setWorkspaceView('canvas')}
-            onAddToChat={(node) => {
-              useCanvasStore.getState().showToast(`已把「${node.title}」加入对话上下文`)
-            }}
-          />
-        </div>
-      </div>
-    )
-  }
 
   return (
     <div
@@ -732,14 +805,14 @@ export function CanvasWorkspace() {
             SVG 根不拦截事件。置于卡片之下，边不遮卡面；显隐跟随外观设置（Shift+E） */}
         <ReferenceEdgeLayer syncRef={edgeSyncRef} visible={appearance.showReferenceEdges} />
         {/* 节点层：唯一的 nodes 订阅者（单节点变化只重渲这一层，不再波及主组件） */}
-        <NodeLayer api={nodeGestureApi} activeTag={activeTag} />
+        <NodeLayer api={nodeGestureApi} filter={filter} />
 
         {/* 框选矩形：常驻 DOM，几何由手势直写；盖在卡片之上、不拦截事件 */}
         <div ref={marqueeRef} className="canvas-marquee" style={{ display: 'none' }} />
       </div>
 
       {/* 标签筛选条：聚合画布卡片标签，点击只亮带该标签的卡片 */}
-      <TagFilterBar active={activeTag} onChange={setActiveTag} />
+      <CanvasFilterBar filter={filter} onChange={setFilter} />
 
       {/* 空画布引导：不拦截任何鼠标事件（显隐由 hasNodes 布尔订阅驱动） */}
       {!hasNodes && (

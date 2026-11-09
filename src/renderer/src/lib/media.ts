@@ -19,6 +19,14 @@ export const CARD_THUMB_SIZE = 512
 /** 由卡片数据得到可播放/可显示的 src；给 size 时走缩略图管线；无文件时返回 null */
 export function assetSrc(data: Pick<AssetData, 'storage' | 'path' | 'pathRoot'>, size?: number): string | null {
   if (!data.path || !data.storage) return null
+  // Web 预览：huabu-media:// 是 Electron 自定义协议，浏览器解析不了。
+  // harness 会把 demo 素材映射到 public/demo 下的真实图片，这里直接返回该地址。
+  const webPreview = (globalThis as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__
+  if (webPreview) {
+    const demo = (globalThis as { __HUABU_DEMO_SRC__?: Record<string, string> }).__HUABU_DEMO_SRC__
+    const hit = demo?.[data.path]
+    if (hit) return hit
+  }
   // 三条路按"path 相对哪个根"分派，别再判当前配置：
   // - ws：path 已经是相对工作区根的完整路径（pathRoot 不参与，拼上去就是双前缀）
   // - media 且有 pathRoot：位置完全确定，走 ws 根 + 落盘当时的根，与引用契约同一口径

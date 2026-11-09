@@ -379,6 +379,84 @@ class WebProjectHarness {
 }
 
 /** 浏览器下最小可用的 workspace 快照（让 App 过 WorkspaceGate） */
+
+/** 演示素材（覆盖 类型/状态/标签/素材库 四类属性，用于验证画布分类筛选） */
+function demoCanvasSnapshot(): unknown {
+  const mk = (
+    id: string,
+    x: number,
+    y: number,
+    data: Record<string, unknown>
+  ): Record<string, unknown> => ({
+    id,
+    type: 'asset',
+    x,
+    y,
+    width: 260,
+    height: 250,
+    zIndex: 1,
+    data,
+  })
+  return {
+    version: 3,
+    savedAt: new Date().toISOString(),
+    meta: { activeSessionId: null, sessions: [] },
+    nodes: [
+      mk('n1', 80, 80, {
+        name: '对峙-首帧-16x9.png',
+        kind: 'image',
+        storage: 'workspace',
+        path: 'assets/images/对峙-首帧-16x9.png',
+        libraryId: 'lib-images',
+        tags: ['主视觉', '已定稿'],
+        mime: 'image/png',
+        bytes: 1153000,
+        meta: './demo/drama-01.jpg',
+      }),
+      mk('n2', 380, 80, {
+        name: '对峙-高位-16x9.png',
+        kind: 'image',
+        storage: 'workspace',
+        path: 'assets/images/对峙-高位-16x9.png',
+        libraryId: 'lib-images',
+        tags: ['主视觉'],
+        mime: 'image/png',
+        bytes: 1048000,
+        meta: './demo/drama-02.jpg',
+      }),
+      mk('n3', 680, 80, {
+        name: '双兽对峙-01.mp4',
+        kind: 'video',
+        storage: 'workspace',
+        path: 'assets/video/双兽对峙-01.mp4',
+        libraryId: 'lib-video',
+        tags: ['成片'],
+        mime: 'video/mp4',
+        bytes: 4613000,
+        meta: './demo/drama-03.jpg',
+      }),
+      mk('n4', 80, 380, {
+        name: 'tiger-cub-poster-猫版.png',
+        kind: 'image',
+        storage: 'workspace',
+        path: 'assets/images/tiger-cub-poster-猫版.png',
+        libraryId: 'lib-images',
+        tags: ['海报'],
+        mime: 'image/png',
+        bytes: 1022000,
+        meta: './demo/still-01.jpg',
+      }),
+      // 无产物（待生成）：状态筛选用
+      mk('n5', 380, 380, {
+        name: '待生成 · 第 3 场分镜',
+        kind: 'image',
+        libraryId: 'lib-images',
+        tags: ['待办'],
+      }),
+    ],
+  }
+}
+
 /** workspace:state 的真实形状是 { workspace, recents }（不是 ChatResult 包装） */
 const webWorkspaceState = {
   workspace: { path: '/web-preview/brand-campaign', name: 'brand-campaign' },
@@ -430,7 +508,7 @@ export function installWebHarness(): void {
     state: async () => webWorkspaceState,
     files: async () => ({ ok: true, value: [] }),
     saveCanvas: async () => ({ ok: true, value: undefined }),
-    loadCanvas: async () => ({ ok: true, value: null }),
+    loadCanvas: async () => ({ ok: true, value: demoCanvasSnapshot() }),
     reveal: async () => undefined,
     setDefaultModel: async () => ({ ok: true, value: undefined }),
     deleteWorkspaces: async () => ({ ok: true, value: undefined }),
@@ -438,7 +516,16 @@ export function installWebHarness(): void {
 
   /** 其余域：按真实返回形状给空值（否则页面各 store 读 .libraries/.providers 会崩） */
   const assetApi = {
-    libraries: async () => ({ ok: true, value: { libraries: [], inboxDir: 'assets/inbox' } }),
+    libraries: async () => ({
+      ok: true,
+      value: {
+        libraries: [
+          { id: 'lib-images', name: '图片素材', relPath: 'assets/images' },
+          { id: 'lib-video', name: '视频素材', relPath: 'assets/video' },
+        ],
+        inboxDir: 'assets/inbox',
+      },
+    }),
     list: async () => ({ ok: true, value: { entries: [] } }),
     tags: async () => ({ ok: true, value: { tags: {} } }),
     import: async () => ({ ok: true, value: { imported: [], skipped: [] } }),
@@ -535,6 +622,13 @@ export function installWebHarness(): void {
 
   // 标记浏览器预览（App 据此跳过依赖真实主进程数据的浮层）
   ;(globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__ = true
+  // 素材路径 → demo 图片（浏览器无 huabu-media:// 协议）
+  ;(globalThis as unknown as { __HUABU_DEMO_SRC__?: Record<string, string> }).__HUABU_DEMO_SRC__ = {
+    'assets/images/对峙-首帧-16x9.png': './demo/drama-01.jpg',
+    'assets/images/对峙-高位-16x9.png': './demo/drama-02.jpg',
+    'assets/video/双兽对峙-01.mp4': './demo/drama-03.jpg',
+    'assets/images/tiger-cub-poster-猫版.png': './demo/still-01.jpg',
+  }
   global.huabu = huabuProxy as Record<string, unknown>
   console.info('[web-harness] 浏览器预览模式：project 域走内存 demo 数据，其余能力受限')
 }
