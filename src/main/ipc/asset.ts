@@ -30,11 +30,13 @@ export function registerAssetIpc(ctx: IpcContext): void {
   const broadcastAssetChanged = ctx.broadcastAssetChanged
 
   /**
-   * 当前工作区启用的分级 schema。
-   * 阶段一固定取内置短剧三级（最常见场景）；schema 的选择 UI 与 workspace.json
-   * 持久化留在后续迭代——数据格式（facet.schemaId）已经预留，切换不需要迁移数据。
+   * 当前工作区启用的分级 schema（决定层级叫 集/场/镜 还是 话/页/格）。
+   * 读取顺序：workspace.json facets.schemaId → 内置默认（短剧）。
+   * 写入时的 facet 会盖上这个 schema 的 id，所以之后切换 schema 不影响老数据。
    */
-  const currentFacetSchema = (): FacetSchema => findFacetSchema(BUILTIN_FACET_SCHEMAS, null)!
+  const currentFacetSchema = (): FacetSchema =>
+    findFacetSchema(BUILTIN_FACET_SCHEMAS, store.facetSchemaId()) ??
+    findFacetSchema(BUILTIN_FACET_SCHEMAS, null)!
 
   const asImportFiles = (payload: unknown): unknown[] | null => {
     const files = (payload as { files?: unknown } | null)?.files
@@ -123,7 +125,25 @@ export function registerAssetIpc(ctx: IpcContext): void {
     })
   })
 
-  /** @backend(asset:set-facet)：文件分级写 .huabu/facets.json 并广播（卡片/库面板同源刷新） */
+  /**
+   * @backend(asset:set-facet-schema)：切换工作区分级 schema。
+   * 只写 workspace.json 的 facets 段并广播；已写入的分级各自带 schemaId，
+   * 切回来仍按原语义显示（不迁移数据、不丢信息）。
+   */
+  ipcMain.handle(IpcChannel.AssetSetFacetSchema, (_event, payload: unknown) => {
+    const schemaId = (payload as { schemaId?: unknown } | null)?.schemaId
+    if (!isNonEmptyString(schemaId)) return invalidPayload('asset:set-facet-schema 需要 schemaId')
+    if (!BUILTIN_FACET_SCHEMAS.some((s) => s.id === schemaId)) {
+      return invalidPayload(`未知的分级 schema：${schemaId}（可选：${BUILTIN_FACET_SCHEMAS.map((s) => s.id).join(' / ')}）`)
+    }
+    return guardSync(() => {
+      store.setFacetSchemaId(schemaId as string)
+      broadcastAssetChanged()
+      return { schemaId }
+    })
+  })
+
+
   ipcMain.handle(IpcChannel.AssetSetFacet, (_event, payload: unknown) => {
     const request = payload as { relPath?: unknown; facet?: unknown } | null
     if (!isNonEmptyString(request?.relPath)) return invalidPayload('asset:set-facet 需要 relPath')

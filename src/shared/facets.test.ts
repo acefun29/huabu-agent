@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   BUILTIN_FACET_SCHEMAS,
   FACET_SCHEMA_DRAMA,
+  FACET_SCHEMA_MANGA,
   FACET_SCHEMA_PROMO,
   coerceFacet,
   collectFacetValues,
@@ -9,7 +10,9 @@ import {
   facetMatchesPrefix,
   facetPath,
   findFacetSchema,
-  normalizeFacetKey
+  normalizeFacetKey,
+  schemaForFacet,
+  stampFacetSchema
 } from './facets'
 
 describe('coerceFacet', () => {
@@ -136,5 +139,51 @@ describe('schema 自身的形状约束', () => {
   it('套图是两层、短剧是三层（用于文档与 UI 预期）', () => {
     expect(FACET_SCHEMA_PROMO.levels.length).toBe(2)
     expect(FACET_SCHEMA_DRAMA.levels.length).toBe(3)
+  })
+})
+
+describe('schemaForFacet（切换 schema 后按写入时语义显示）', () => {
+  it('优先用 facet 自己的 schemaId', () => {
+    const facet = { chain: ['第01集', '第2场'], schemaId: 'drama' }
+    // 工作区已切成漫画，但这条分级仍应按短剧解释
+    expect(schemaForFacet(facet, FACET_SCHEMA_MANGA)?.id).toBe('drama')
+  })
+
+  it('没有 schemaId 时回落工作区 schema', () => {
+    expect(schemaForFacet({ chain: ['a'] }, FACET_SCHEMA_MANGA)?.id).toBe('manga')
+  })
+
+  it('schemaId 不认识时回落工作区 schema', () => {
+    expect(schemaForFacet({ chain: ['a'], schemaId: 'ghost' }, FACET_SCHEMA_MANGA)?.id).toBe('manga')
+  })
+
+  it('facet 为空且无 fallback 时回落内置默认', () => {
+    expect(schemaForFacet(null, null)?.id).toBe('drama')
+  })
+})
+
+describe('stampFacetSchema（写入盖章）', () => {
+  it('没有 schemaId 时补上写入用的 schema', () => {
+    expect(stampFacetSchema({ chain: ['a'] }, FACET_SCHEMA_MANGA)).toEqual({
+      chain: ['a'],
+      schemaId: 'manga'
+    })
+  })
+
+  it('已有合法 schemaId 时保持原样（跨 schema 迁移不抹来源）', () => {
+    const facet = { chain: ['a'], schemaId: 'drama' }
+    expect(stampFacetSchema(facet, FACET_SCHEMA_MANGA)).toEqual(facet)
+  })
+
+  it('schemaId 非法时用写入 schema 覆盖', () => {
+    expect(stampFacetSchema({ chain: ['a'], schemaId: 'ghost' }, FACET_SCHEMA_DRAMA)).toEqual({
+      chain: ['a'],
+      schemaId: 'drama'
+    })
+  })
+
+  it('facet 为 null 或没有 schema 时原样返回', () => {
+    expect(stampFacetSchema(null, FACET_SCHEMA_DRAMA)).toBeNull()
+    expect(stampFacetSchema({ chain: ['a'] }, null)).toEqual({ chain: ['a'] })
   })
 })

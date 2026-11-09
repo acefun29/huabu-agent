@@ -22,6 +22,7 @@ import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { ReferenceEdgeLayer, type ReferenceEdgeSync } from './canvas/ReferenceEdgeLayer'
 import { GenerationPopover } from './canvas/GenerationPopover'
 import { CardInspector } from './canvas/CardInspector'
+import { FacetPicker } from './canvas/FacetPicker'
 
 interface MenuState {
   x: number
@@ -900,6 +901,8 @@ export function CanvasWorkspace() {
             <MessageSquare size={13} />
             引用进会话
           </button>
+          {/* 批量分级：给选中集盖同一个位置（集/场/镜 等，层级由 schema 决定） */}
+          <FacetPicker nodeIds={selectedAssetIds} />
           <button
             data-testid="selection-remove"
             onClick={() => {

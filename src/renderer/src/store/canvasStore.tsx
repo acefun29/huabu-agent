@@ -204,6 +204,10 @@ export interface CanvasState {
   setNodeTags: (nodeId: string, tags: string[]) => Promise<void>
   /** 设置卡片分级（写 .huabu/facets.json，同一文件的多张卡同步；null = 清除） */
   setNodeFacet: (nodeId: string, facet: Facet | null) => Promise<void>
+  /** 批量设置分级（划选多张后一次写入；chain 为 null = 清除） */
+  setNodesFacet: (nodeIds: string[], chain: string[] | null) => Promise<void>
+  /** 切换工作区分级 schema（层级名/深度随之改变；已有分级按各自 schemaId 解释） */
+  setFacetSchema: (schemaId: string) => Promise<void>
   /** 新建 md 笔记：落公共素材库并钉到画布（返回卡片 id；失败 null） */
   createNote: (title?: string) => Promise<string | null>
 

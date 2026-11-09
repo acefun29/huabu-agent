@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { schemaForFacet } from '@shared/facets'
 import {
   Check,
   FileCode,
@@ -280,18 +281,25 @@ function FacetRow({
   tone?: 'dark' | 'light'
 }) {
   const setNodeFacet = useCanvasStore((s) => s.setNodeFacet)
-  const schema = useCanvasStore((s) => s.facetSchema)
+  const workspaceSchema = useCanvasStore((s) => s.facetSchema)
   const [editing, setEditing] = useState(false)
   /** 编辑中的草稿（长度对齐 schema 深度） */
   const [draft, setDraft] = useState<string[]>([])
   const facet = data.facet
   const dark = tone === 'dark'
+  /**
+   * 显示用 schema：优先该分级自己的 schemaId。
+   * 工作区从「短剧」切到「漫画」后，老分级仍按 集/场/镜 解释，不会被错标成 话/页/格。
+   * 编辑时用当前工作区 schema（新值要按新语义写）。
+   */
+  const schema = schemaForFacet(facet, workspaceSchema)
+  const editSchema = workspaceSchema ?? schema
 
-  if (!schema) return null
+  if (!workspaceSchema || !schema || !editSchema) return null
 
   const openEditor = () => {
     // 预填现有值，多余层留空
-    const next = schema.levels.map((_, i) => facet?.chain[i] ?? '')
+    const next = editSchema.levels.map((_, i) => facet?.chain[i] ?? '')
     setDraft(next)
     setEditing(true)
   }
@@ -344,7 +352,7 @@ function FacetRow({
                   ? 'border-white/50 text-white/85 hover:border-white hover:text-white'
                   : 'border-(--outline) text-(--on-surface-muted) hover:border-(--accent) hover:text-(--accent)'
               }`}
-              title={`设置分级（${schema.label}）`}
+              title={`设置分级（${editSchema.label}）`}
             >
               <Plus size={9} />
               {facet ? '改' : '分级'}
@@ -353,7 +361,7 @@ function FacetRow({
         </>
       ) : (
         <>
-          {schema.levels.map((level, index) => (
+          {editSchema.levels.map((level, index) => (
             <input
               key={level.key}
               autoFocus={index === 0}

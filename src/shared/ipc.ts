@@ -251,6 +251,8 @@ export const IpcChannel = {
   AssetSetFacet: 'asset:set-facet',
   /** 批量设置文件分级（Agent 标注整个场景时一次写完） */
   AssetSetFacetsBulk: 'asset:set-facets',
+  /** 选择工作区的分级 schema（决定层级叫 集/场/镜 还是 话/页/格） */
+  AssetSetFacetSchema: 'asset:set-facet-schema',
   /** 事件类：素材库目录变更广播（导入/建库/删库后；未来的本地索引挂在这条链路上） */
   AssetChanged: 'asset:changed'
 } as const

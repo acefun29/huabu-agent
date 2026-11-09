@@ -199,6 +199,39 @@ export function findFacetSchema(
 }
 
 /**
+ * 某个 facet 该用哪套 schema 解释。
+ *
+ * 为什么优先用 facet 自己的 schemaId：工作区切换 schema（短剧 → 漫画）后，
+ * 老数据的 `chain` 值本身没变，但层名含义完全不同。存了 schemaId 就能
+ * 「按写入时的语义显示」，不会把「第01集」错标成「第01话」。
+ *
+ * 回退顺序：facet.schemaId → 工作区 fallback → 内置默认。
+ */
+export function schemaForFacet(
+  facet: Facet | null | undefined,
+  fallback: FacetSchema | null
+): FacetSchema | null {
+  if (facet?.schemaId) {
+    const own = findFacetSchema(BUILTIN_FACET_SCHEMAS, facet.schemaId)
+    if (own) return own
+  }
+  return fallback ?? findFacetSchema(BUILTIN_FACET_SCHEMAS, null)
+}
+
+/**
+ * 写入前盖章：把 facet 的 schemaId 补成写入时用的 schema。
+ * 已有合法 schemaId 的保持原样（跨 schema 迁移时不抹掉来源）。
+ */
+export function stampFacetSchema(
+  facet: Facet | null,
+  schema: FacetSchema | null | undefined
+): Facet | null {
+  if (!facet || !schema) return facet
+  if (facet.schemaId && findFacetSchema(BUILTIN_FACET_SCHEMAS, facet.schemaId)) return facet
+  return { ...facet, schemaId: schema.id }
+}
+
+/**
  * facet 的展示路径（「第03集 / 第2场 / 第12镜」）。
  * 值多于层数时多出来的部分用 `+` 前缀原样显示（schema 换过时不至于丢信息）。
  */

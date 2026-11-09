@@ -23,6 +23,7 @@ import { resolve } from 'path'
 import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
 import {
   coerceFacet,
+  stampFacetSchema,
   type Facet,
   type FacetSchema,
   normalizeFacetKey
@@ -75,8 +76,10 @@ function saveFacetsIndex(workspaceDir: string, facets: Record<string, Facet>): v
 /**
  * 设置单个文件的分级。`facet` 为 null / 空链 = 删除该条目。
  *
- * `schema` 只用来做**栅栏校正**（层数截断到 schema 深度）与键名规范化；
- * 传 null 表示不校正（用于迁移、批量导入等没有 schema 上下文的场景）。
+ * `schema` 做两件事：**栅栏校正**（层数截断到 schema 深度）与**盖章**
+ * （落盘前把 facet.schemaId 补成写入时用的 schema）。盖章是为了让
+ * 工作区切换 schema 后老数据仍按写入时的语义显示层名。
+ * 传 null 表示不校正也不盖章（迁移、批量导入等无 schema 上下文的场景）。
  * 返回实际落盘的 facet（可能被截断），没有则返回 null。
  */
 export function setFileFacet(
@@ -86,7 +89,7 @@ export function setFileFacet(
   schema?: FacetSchema | null
 ): Facet | null {
   const key = normalizeFacetKey(relPath)
-  const coerced = coerceFacet(facet, schema)
+  const coerced = stampFacetSchema(coerceFacet(facet, schema), schema)
   const facets = loadFacetsIndex(workspaceDir)
   if (!coerced) delete facets[key]
   else facets[key] = coerced
@@ -108,7 +111,7 @@ export function setFileFacetsBulk(
   let removed = 0
   for (const entry of entries) {
     const key = normalizeFacetKey(entry.relPath)
-    const coerced = coerceFacet(entry.facet, schema)
+    const coerced = stampFacetSchema(coerceFacet(entry.facet, schema), schema)
     if (!coerced) {
       if (key in facets) {
         delete facets[key]

@@ -16,6 +16,7 @@ import type {
 import type { MediaProviderType, MediaRatio, ModelCapabilities } from '../../shared/media'
 import { MEDIA_RATIOS } from '../../shared/media'
 import { MEDIA_ROOT_REL } from '../../shared/assets'
+import { BUILTIN_FACET_SCHEMAS } from '../../shared/facets'
 import type {
   ChatMigrationInput,
   ChatMigrationPlan,
@@ -210,8 +211,16 @@ interface WorkspaceMetaFile {
   skills?: WorkspaceSkillsConfig
   /** Agent 运行时 feature flag（Mastra 迁移计划 v1.2 §14.1）：缺省 = pi */
   agent?: WorkspaceAgentConfig
+  /** 素材分级 schema 选择（决定层级叫什么：集/场/镜 vs 话/页/格） */
+  facets?: WorkspaceFacetsConfig
   /** 素材库映射（新原型同步）：名字 → 工作区内相对路径。公共库首个建库时播种 */
   libraries?: WorkspaceLibrary[]
+}
+
+/** workspace.json 的 facets 段：分级 schema 选择 */
+export interface WorkspaceFacetsConfig {
+  /** 内置 schema id（drama / manga / promo / flat）；缺省 = 内置默认（短剧） */
+  schemaId?: string
 }
 
 /** workspace.json 的 skills 段 */
@@ -408,6 +417,7 @@ export class WorkspaceStore {
       ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
       ...(raw.skills !== undefined ? { skills: normalizeSkillsSegment(raw.skills) } : {}),
       ...(raw.agent !== undefined ? { agent: normalizeAgentSegment(raw.agent) } : {}),
+      ...(raw.facets !== undefined ? { facets: normalizeFacetsSegment(raw.facets) } : {}),
       ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
     }
     metaCache.set(dir, { mtimeMs, value: meta })
@@ -508,6 +518,25 @@ export class WorkspaceStore {
   agentRuntime(): AgentRuntimeKind {
     const dir = this.current?.path
     return dir ? normalizeAgentRuntime(this.readMeta(dir).agent?.runtime) : 'pi'
+  }
+
+  /**
+   * 当前工作区的分级 schema id（未打开工作区 / 未设置 = null，调用方回落内置默认）。
+   * schema 决定层级叫什么（集/场/镜 vs 话/页/格），只影响显示与校验深度；
+   * 已写入的分级各自带 schemaId，切换不会改变老数据的语义。
+   */
+  facetSchemaId(): string | null {
+    const dir = this.current?.path
+    return dir ? (this.readMeta(dir).facets?.schemaId ?? null) : null
+  }
+
+  /** 设置分级 schema（写 workspace.json facets 段；只影响之后的显示与写入） */
+  setFacetSchemaId(schemaId: string): void {
+    if (!this.current) throw new Error('尚未打开工作区')
+    const dir = this.current.path
+    const meta = this.readMeta(dir)
+    meta.facets = { schemaId }
+    this.writeMeta(dir, meta)
   }
 
   /** 设置运行时 flag（工作区级；只影响之后新建的会话，已绑定会话保持原运行时） */
@@ -695,6 +724,18 @@ function normalizeAgentSegment(raw: unknown): WorkspaceAgentConfig {
   return runtime === 'pi' || runtime === 'mastra' ? { runtime } : {}
 }
 
+/**
+ * facets 段读入清洗：只认内置 schema id，未知值丢弃（读取侧回落内置默认）。
+ * 用白名单而不是「非空字符串就收」——schema id 拼错时宁可回默认，
+ * 也不要让整个 UI 因为找不到 schema 而停止渲染分级。
+ */
+function normalizeFacetsSegment(raw: unknown): WorkspaceFacetsConfig {
+  const schemaId = (raw as { schemaId?: unknown } | null)?.schemaId
+  return typeof schemaId === 'string' && BUILTIN_FACET_SCHEMAS.some((s) => s.id === schemaId)
+    ? { schemaId }
+    : {}
+}
+
 /* -------------------------------------------------------------------------- */
 /* chat 段（模型清单覆盖层）：清洗 + 旧三处一次性迁移                            */
 /* -------------------------------------------------------------------------- */
@@ -778,6 +819,9 @@ export function writeChatSegment(dir: string, chat: WorkspaceChatConfig): void {
     version: 1,
     chat: normalizeChatSegment(chat),
     ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
+    ...(raw.skills !== undefined ? { skills: normalizeSkillsSegment(raw.skills) } : {}),
+    ...(raw.agent !== undefined ? { agent: normalizeAgentSegment(raw.agent) } : {}),
+    ...(raw.facets !== undefined ? { facets: normalizeFacetsSegment(raw.facets) } : {}),
     ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
   }
   // 本文件对 workspace.json 的另一条写路径：同样写前失效 metaCache。mtime 兜底在

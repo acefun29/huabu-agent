@@ -402,6 +402,12 @@ export interface AssetApi {
     entries: Array<{ relPath: string; facet: Facet | null }>
   ): Promise<ChatResult<{ updated: number; removed: number }>>
 
+  /**
+   * 切换工作区的分级 schema（决定层级叫 集/场/镜 还是 话/页/格）。
+   * 只写 workspace.json 的 facets 段；已有分级各自带 schemaId，切换不改数据。
+   */
+  setFacetSchema(schemaId: string): Promise<ChatResult<{ schemaId: string }>>
+
   /** 真删素材文件（破坏性，渲染端二次确认；广播 asset:changed） */
   deleteAsset(relPath: string): Promise<ChatResult>
 

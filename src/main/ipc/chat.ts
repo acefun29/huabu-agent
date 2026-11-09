@@ -10,9 +10,10 @@
  * chat:dispose 成功后经 media.ts 的 settleApprovalsForNode 把该节点的挂起确认按拒绝 settle。
  */
 import { ipcMain } from './ipcMainBridge'
-import { broadcastChatEvent } from './shared'
+import { broadcastChatEvent, broadcastAssetChanged } from './shared'
 import { assembleBlockoutTool } from '../agent/blockoutTools'
 import { assembleNoteTool } from '../agent/noteTool'
+import { assembleFacetTools } from '../agent/facetTools'
 import { assembleMediaTools } from '../agent/mediaToolAssembly'
 import { MastraAgentRuntime } from '../agent/mastra/runtime'
 import { PiAgentRuntime } from '../agent/piRuntime'
@@ -63,7 +64,13 @@ export function registerChatIpc(ctx: IpcContext): void {
       const blockoutTool = assembleBlockoutTool({ currentDir })
       // 文本卡创建工具：文本上画布的唯一通道（write 落盘的文本不上画布，见 noteTool 头注）
       const noteTool = assembleNoteTool({ currentDir })
-      return [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool, noteTool]
+      // 分级工具：Agent 读写素材位置（第几集/第几场/第几镜，层名由工作区 schema 决定）
+      const facetTools = assembleFacetTools({
+        currentDir,
+        schemaId: () => store.facetSchemaId(),
+        notifyChanged: broadcastAssetChanged
+      })
+      return [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool, noteTool, ...facetTools]
     }
   })
   // Mastra 运行时（迁移 Phase 1）：会话/记忆走 LibSQL（.huabu/mastra.db），模型只经
@@ -89,7 +96,12 @@ export function registerChatIpc(ctx: IpcContext): void {
         inboxRoot
       })
       const noteTool = assembleNoteTool({ currentDir })
-      return [...mediaTools, readMediaTool, ...videoTools, noteTool]
+      const facetTools = assembleFacetTools({
+        currentDir,
+        schemaId: () => store.facetSchemaId(),
+        notifyChanged: broadcastAssetChanged
+      })
+      return [...mediaTools, readMediaTool, ...videoTools, noteTool, ...facetTools]
     }
   })
 

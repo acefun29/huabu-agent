@@ -247,8 +247,8 @@ export async function listLibraries(store: WorkspaceStore): Promise<AssetLibrari
     workspaceDir: dir ? normalizePath(dir) : null,
     inboxDir: normalizePath(inboxRoot()),
     libraries,
-    /** 当前 schema（阶段一固定内置短剧三级；facet.schemaId 已预留，切换不迁移数据） */
-    facetSchema: findFacetSchema(BUILTIN_FACET_SCHEMAS, null) ?? undefined
+    /** 当前 schema（读 workspace.json facets 段；未设置/非法值回落内置默认） */
+    facetSchema: findFacetSchema(BUILTIN_FACET_SCHEMAS, store.facetSchemaId()) ?? undefined
   }
 }
 

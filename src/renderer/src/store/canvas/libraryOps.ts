@@ -44,6 +44,20 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     syncCardFacets(result.value.libraries)
   }
 
+  /**
+   * 切换工作区分级 schema：写 workspace.json facets 段，随后刷新清单拿回新 schema。
+   * 已有分级的 chain 值不动——它们各自带 schemaId，仍按写入时的语义显示。
+   */
+  const setFacetSchema = async (schemaId: string) => {
+    if (!BRIDGE_AVAILABLE) return
+    const result = await window.huabu.asset.setFacetSchema(schemaId)
+    if (!result.ok) {
+      showToast(`切换分级 schema 失败：${result.error}`)
+      return
+    }
+    await refreshLibraries()
+  }
+
   const refreshDirFiles = async () => {
     if (!BRIDGE_AVAILABLE || !get().workspace) return
     const result = await window.huabu.workspace.files()
@@ -465,6 +479,42 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   /**
+   * 批量设置分级（划选多张卡后一次写入）：走 asset:set-facets 单次读-改-写。
+   * `chain` 为 null = 清除这些卡的分级。无落盘文件的卡片跳过（无法定位）。
+   */
+  const setNodesFacet = async (nodeIds: string[], chain: string[] | null) => {
+    if (!BRIDGE_AVAILABLE) return
+    const nodes = get().nodes
+    const byRel = new Map<string, string[]>()
+    for (const id of nodeIds) {
+      const node = nodes.find((n) => n.id === id)
+      const relPath = node?.data ? nodeRelPath(node.data) : null
+      if (relPath) byRel.set(relPath, [...(byRel.get(relPath) ?? []), id])
+    }
+    if (byRel.size === 0) {
+      showToast('选中的卡片都没有落盘文件，无法设置分级')
+      return
+    }
+    const entries = [...byRel.keys()].map((relPath) => ({
+      relPath,
+      facet: chain ? { chain } : null
+    }))
+    const result = await window.huabu.asset.setFacets(entries)
+    if (!result.ok) {
+      showToast(`批量设置分级失败：${result.error}`)
+      return
+    }
+    const { updated, removed } = result.value
+    // 本地先按输入回显（主进程会做 schema 截断，随后 refreshLibraries 以磁盘为准对齐）
+    await refreshLibraries()
+    showToast(
+      chain
+        ? `已为 ${updated} 个文件设置分级（${chain.join(' / ')}）`
+        : `已清除 ${removed} 个文件的分级`
+    )
+  }
+
+  /**
    * 设置卡片分级：写主进程 .huabu/facets.json（schema 深度截断后的坐标为准备份），
    * 同文件的多张卡同步更新。
    */
@@ -651,6 +701,8 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     dropFilesToLibrary,
     setNodeTags,
     setNodeFacet,
+    setNodesFacet,
+    setFacetSchema,
     createNote,
     deleteAsset,
     renameAsset

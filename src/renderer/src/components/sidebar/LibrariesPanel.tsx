@@ -1,6 +1,7 @@
 import { memo, useCallback, useMemo } from 'react'
 import { create } from 'zustand'
-import { Plus, Search, StickyNote, Tag as TagIcon, X } from 'lucide-react'
+import { Layers, Plus, Search, StickyNote, Tag as TagIcon, X } from 'lucide-react'
+import { BUILTIN_FACET_SCHEMAS } from '@shared/facets'
 import type { MaterialLibrary } from '../../types'
 import { useCanvasStore } from '../../store/canvasStore'
 import {
@@ -94,7 +95,9 @@ export const isTransferDrag = (e: React.DragEvent): boolean => {
 export const LibrariesPanel = memo(function LibrariesPanel({ onClose }: { onClose: () => void }) {
   // 低频面板：素材库精确订阅；actions 恒定引用
   const libraries = useCanvasStore((s) => s.libraries)
-  const { createLibrary, removeLibrary, importFromLibrary, createNote, renameAsset } = useCanvasStore.getState()
+  const facetSchema = useCanvasStore((s) => s.facetSchema)
+  const { createLibrary, removeLibrary, importFromLibrary, createNote, renameAsset, setFacetSchema } =
+    useCanvasStore.getState()
   const query = useLibrariesPanelStore((s) => s.query)
   const tagFilter = useLibrariesPanelStore((s) => s.tagFilter)
   const renaming = useLibrariesPanelStore((s) => s.renaming)
@@ -272,6 +275,26 @@ export const LibrariesPanel = memo(function LibrariesPanel({ onClose }: { onClos
                 {t}
               </button>
             ))}
+          </div>
+        )}
+        {/* 分级 schema：决定层级叫 集/场/镜 还是 话/页/格。切换不改已有分级数据。 */}
+        {facetSchema && (
+          <div className="mt-1.5 flex items-center gap-1 px-0.5">
+            <Layers size={10} className="shrink-0 text-(--on-surface-muted)" />
+            <span className="shrink-0 text-[9.5px] text-(--on-surface-muted)">分级</span>
+            <select
+              value={facetSchema.id}
+              onChange={(e) => void setFacetSchema(e.target.value)}
+              onMouseDown={(e) => e.stopPropagation()}
+              title="层级定义（集/场/镜、话/页/格…）；切换只改变层名与可选深度，已有分级仍按写入时的语义显示"
+              className="min-w-0 flex-1 cursor-pointer rounded-md bg-(--surface-chip) px-1.5 py-0.5 text-[10px] text-(--on-surface-variant) outline-none hover:bg-(--outline-soft)"
+            >
+              {BUILTIN_FACET_SCHEMAS.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.label}（{s.levels.map((l) => l.label).join('/')}）
+                </option>
+              ))}
+            </select>
           </div>
         )}
       </div>
