@@ -38,12 +38,15 @@ export function StructureChatRail({ scopeTitle, onBack }: StructureChatRailProps
 
   // 范围变化时，Agent 记一条「已切到某范围」的结构回执（同范围只播一次）
   useEffect(() => {
+    // 占位值不播报（首帧 scopeTitle 还是默认值）
+    if (!scopeTitle || scopeTitle === '项目') return
     if (announced.current.has(scopeTitle)) return
     announced.current.add(scopeTitle)
+    // 只保留最新一条范围回执（切范围时移除旧的，避免刷屏）
     setMessages((prev) => [
-      ...prev,
+      ...prev.filter((m) => !m.id.startsWith('scope-')),
       {
-        id: `scope-${Date.now().toString(36)}`,
+        id: `scope-${scopeTitle}`,
         role: 'agent',
         text: `当前范围已切到「${scopeTitle}」。这个范围下的节点会作为上下文；需要对某一层做什么，直接说。`,
         meta: ['范围随面包屑同步', '生成前会先做上下文预检'],

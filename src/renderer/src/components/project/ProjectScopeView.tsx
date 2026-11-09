@@ -180,6 +180,25 @@ export function ProjectScopeView(props: ProjectScopeViewProps) {
     <div className="flex h-full w-full min-w-0 flex-col bg-(--surface)">
       {/* 顶部工具条：面包屑 + 双视图 + 状态筛选 + 结构入口 */}
       <div className="flex shrink-0 items-center gap-2 border-b border-(--outline-soft) px-5 py-2">
+        {/* 项目 pill 切换（原型顶部下拉） */}
+        <div className="relative shrink-0">
+          <select
+            className="appearance-none rounded-full border border-(--outline-soft) bg-(--surface-card) py-[3px] pl-2.5 pr-6 text-[11px] font-medium text-(--on-surface-variant) outline-none hover:border-(--outline)"
+            value={snapshot.activeProjectId ?? ''}
+            onChange={async (e) => {
+              await window.huabu?.project.activate(e.target.value)
+              onScopeChange(null)
+              await load(null)
+            }}
+          >
+            {snapshot.projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}（{p.kind}）{p.summary ? ` · ${p.summary}` : ''}
+              </option>
+            ))}
+          </select>
+          <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[8px] text-(--on-surface-muted)">▼</span>
+        </div>
         <nav className="flex min-w-0 flex-1 items-center gap-1.5 text-[11px]">
           {snapshot.breadcrumb.map((crumb, i) => (
             <span key={crumb.id ?? 'root'} className="flex min-w-0 items-center gap-1.5">
