@@ -488,12 +488,18 @@ export const useCanvasStore = create<CanvasState>()(
         set({ booted: true })
         return
       }
-      const state = await window.huabu.workspace.state()
-      set({ recents: state.recents.map((r) => ({ path: r.path, name: r.name })) })
-      if (state.workspace) {
-        await switchToWorkspace(state.workspace)
+      try {
+        const state = await window.huabu.workspace.state()
+        set({ recents: (state.recents ?? []).map((r) => ({ path: r.path, name: r.name })) })
+        if (state.workspace) {
+          await switchToWorkspace(state.workspace)
+        }
+      } catch (error) {
+        // 启动期任何一步失败都不该让应用停在「正在恢复」——记录并继续（画布/面板各自降级）
+        console.error('[canvas] 恢复工作区失败：', error)
+      } finally {
+        set({ booted: true })
       }
-      set({ booted: true })
     }
 
     /* ---------------- 视口与工作区入口 ---------------- */

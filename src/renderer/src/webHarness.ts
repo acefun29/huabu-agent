@@ -436,10 +436,72 @@ export function installWebHarness(): void {
     deleteWorkspaces: async () => ({ ok: true, value: undefined }),
   }
 
+  /** 其余域：按真实返回形状给空值（否则页面各 store 读 .libraries/.providers 会崩） */
+  const assetApi = {
+    libraries: async () => ({ ok: true, value: { libraries: [], inboxDir: 'assets/inbox' } }),
+    list: async () => ({ ok: true, value: { entries: [] } }),
+    tags: async () => ({ ok: true, value: { tags: {} } }),
+    import: async () => ({ ok: true, value: { imported: [], skipped: [] } }),
+    'import-canvas': async () => ({ ok: true, value: { imported: [], skipped: [] } }),
+    'import-temp': async () => ({ ok: true, value: { imported: [], skipped: [] } }),
+    transfer: async () => ({ ok: true, value: undefined }),
+    rename: async () => ({ ok: true, value: undefined }),
+    remove: async () => ({ ok: true, value: undefined }),
+    onChanged: () => () => undefined,
+  }
+
+  const settingsApi = {
+    modelsList: async () => ({ ok: true, value: { models: [], configuredProviders: [] } }),
+    chatProviders: async () => ({ ok: true, value: { providers: [], credentialsHint: '' } }),
+    mediaStatus: async () => ({
+      ok: true,
+      value: {
+        accessMode: 'full' as const,
+        config: { providers: {}, defaultModels: {}, accessMode: 'full' },
+        confirmVideo: false,
+      },
+    }),
+    mcpStatus: async () => ({ ok: true, value: { servers: [] } }),
+    skillsList: async () => ({ ok: true, value: { skills: [] } }),
+    onMcpStatus: () => () => undefined,
+  }
+
+  const mediaApi = {
+    providers: async () => ({ ok: true, value: { providers: [], config: {} } }),
+    adapterKinds: async () => ({ ok: true, value: { kinds: [] } }),
+    jobs: async () => ({ ok: true, value: { jobs: [] } }),
+    'jobs-status': async () => ({ ok: true, value: { jobs: [] } }),
+    pathForFile: async () => null,
+    onJobEvent: () => () => undefined,
+    onConfirmRequest: () => () => undefined,
+    onConfirmResolved: () => () => undefined,
+    generate: async () => ({ ok: false, code: 'unknown', error: 'Web 预览不生成媒体' }),
+  }
+
+  const chatApi = {
+    runtime: async () => ({
+      ok: true,
+      value: { ready: false, error: 'Web 预览不连 Agent', models: [], configuredProviders: [] },
+    }),
+    history: async () => ({ ok: true, value: { nodeId: '', sessionFile: '', messages: [] } }),
+    contextUsage: async () => ({ ok: true, value: { tokens: null, contextWindow: null, percent: null } }),
+    dispose: async () => ({ ok: true, value: undefined }),
+    onEvent: () => () => undefined,
+    create: async () => ({ ok: false, code: 'host_not_ready', error: 'Web 预览不连 Agent' }),
+    prompt: async () => ({ ok: false, code: 'host_not_ready', error: 'Web 预览不连 Agent' }),
+    steer: async () => ({ ok: false, code: 'host_not_ready', error: 'Web 预览不连 Agent' }),
+    abort: async () => ({ ok: true, value: undefined }),
+    compact: async () => ({ ok: false, code: 'unknown', error: 'Web 预览不压缩' }),
+    fork: async () => ({ ok: false, code: 'unknown', error: 'Web 预览不 fork' }),
+  }
+
   const domainOverrides: Record<string, Record<string, unknown>> = {
     project: projectApi as unknown as Record<string, unknown>,
     workspace: workspaceApi as unknown as Record<string, unknown>,
-    ping: { __fn: async () => 'pong' } as unknown as Record<string, unknown>,
+    asset: assetApi as unknown as Record<string, unknown>,
+    settings: settingsApi as unknown as Record<string, unknown>,
+    media: mediaApi as unknown as Record<string, unknown>,
+    chat: chatApi as unknown as Record<string, unknown>,
   }
 
   /** 一层域级 Proxy：已知方法取 override，未知方法走 safeDefault */
