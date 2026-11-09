@@ -2,6 +2,17 @@ import { resolve } from 'path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
+import { readOrCreateDevToken, devBridgePort } from './src/main/devBridgeToken'
+
+/**
+ * 开发期 Web 桥参数注入 renderer。
+ *
+ * 与主进程读**同一个 token 文件**（src/shared/devBridgeToken），所以浏览器地址
+ * 固定为 http://localhost:5173/ —— 不用带 ?token=，重启也不失效。
+ * 生产构建下这两个值不会被主进程使用（桥只在 dev/headless 启用）。
+ */
+const DEV_BRIDGE_TOKEN = readOrCreateDevToken()
+const DEV_BRIDGE_PORT = devBridgePort()
 
 export default defineConfig({
   main: {
@@ -28,6 +39,11 @@ export default defineConfig({
       }
     },
     plugins: [react(), tailwindcss()],
+    define: {
+      __HUABU_DEV_BRIDGE__: JSON.stringify(
+        DEV_BRIDGE_TOKEN ? { port: DEV_BRIDGE_PORT, token: DEV_BRIDGE_TOKEN } : null
+      )
+    },
     build: {
       rollupOptions: {
         output: {

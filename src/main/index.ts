@@ -1,12 +1,11 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
-import { randomUUID } from 'crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'fs'
-import { dirname, join } from 'path'
+import { join } from 'path'
 import { getAgentHost, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
 import { startWebBridge, setActiveBridge } from './webBridge/server'
 import { IpcChannel } from '../shared/ipc'
 import { initMediaProtocol, registerMediaSchemePrivileged } from './media/protocol'
 import { inboxRoot } from './assets/manager'
+import { readOrCreateDevToken, devBridgePort } from './devBridgeToken'
 
 /**
  * 主进程入口。
@@ -34,26 +33,10 @@ if (!app.isPackaged && process.env['REMOTE_DEBUGGING_PORT'] && !HEADLESS) {
 }
 
 /**
- * 开发期桥 token 持久化：否则每次重启都要重新复制带 token 的 URL。
- * 只写本机 userData；打包态不启用桥，也就不读这个文件。
+ * 开发期桥 token：与 renderer 编译期读到的**同一个文件**（src/shared/devBridgeToken）。
+ * 这样浏览器地址固定为 http://localhost:5173/，不需要 ?token=，重启也不失效。
  */
-function devBridgeToken(): string {
-  const file = join(app.getPath('userData'), 'web-bridge-token')
-  try {
-    const cached = readFileSync(file, 'utf8').trim()
-    if (cached.length >= 16) return cached
-  } catch {
-    // 首次启动没有文件
-  }
-  const token = randomUUID()
-  try {
-    mkdirSync(dirname(file), { recursive: true })
-    writeFileSync(file, token, 'utf8')
-  } catch {
-    // 写不进去就本次会话用临时 token
-  }
-  return token
-}
+const DEV_BRIDGE_TOKEN = readOrCreateDevToken()
 
 function createMainWindow(): BrowserWindow {
   const mainWindow = new BrowserWindow({
@@ -140,16 +123,12 @@ void app.whenReady().then(() => {
   Menu.setApplicationMenu(null)
   registerIpcHandlers()
   // Web 后端桥（默认关闭）：HUABU_WEB_BRIDGE=1 / --headless 时监听 127.0.0.1，供浏览器里的
-  // renderer 调同一批 IPC handler（复用业务逻辑，不重写）。token 打印到控制台，
-  // 浏览器用 ?token= 接入。仅本地开发用途，生产不启用。
+  // renderer 调同一批 IPC handler（复用业务逻辑，不重写）。仅本地开发用途，生产不启用。
   const bridgeEnabled = HEADLESS || process.env.HUABU_WEB_BRIDGE === '1'
   if (bridgeEnabled) {
-    // 前端地址：dev 下是 electron-vite 的 renderer dev server；缺省退回 5174
-    const rendererUrl = process.env['ELECTRON_RENDERER_URL'] ?? 'http://localhost:5174'
-    void startWebBridge({
-      port: Number(process.env.HUABU_WEB_BRIDGE_PORT ?? 4788),
-      token: devBridgeToken()
-    })
+    // 前端地址：dev 下是 electron-vite 的 renderer dev server；缺省退回 5173
+    const rendererUrl = process.env['ELECTRON_RENDERER_URL'] ?? 'http://localhost:5173'
+    void startWebBridge({ port: devBridgePort(), token: DEV_BRIDGE_TOKEN })
       .then((bridge) => {
         setActiveBridge(bridge)
         const entry = `${rendererUrl}/?bridge=${bridge.port}&token=${bridge.token}`
