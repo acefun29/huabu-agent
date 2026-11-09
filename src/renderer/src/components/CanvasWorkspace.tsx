@@ -13,6 +13,7 @@ import {
 } from 'lucide-react'
 import { LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
 import { ProjectScopeView } from './project/ProjectScopeView'
+import { createPortal } from 'react-dom'
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
@@ -652,8 +653,8 @@ export function CanvasWorkspace() {
 
   // 结构视图：独立渲染整块区域（含自己的头部/筛选），不复用自由画布的鼠标手势
   if (workspaceView === 'structure') {
-    return (
-      <div className="absolute inset-0 flex flex-col bg-(--surface)">
+    return createPortal(
+      <div className="fixed inset-x-0 bottom-0 top-11 z-40 grid grid-rows-[auto_1fr] overflow-hidden bg-(--surface)">
         <div className="flex items-center gap-1 border-b border-(--outline-variant) px-3 py-1.5">
           <span className="text-[12px] font-medium text-(--on-surface)">项目结构</span>
           <span className="text-[10.5px] text-(--on-surface-variant)">层级骨架 · 素材库不受影响</span>
@@ -665,7 +666,7 @@ export function CanvasWorkspace() {
             返回画布
           </button>
         </div>
-        <div className="min-h-0 flex-1">
+        <div className="min-h-0 w-full">
           <ProjectScopeView
             scopeId={scopeId}
             onScopeChange={setScopeId}
@@ -678,7 +679,8 @@ export function CanvasWorkspace() {
             }}
           />
         </div>
-      </div>
+      </div>,
+      document.body
     )
   }
 

@@ -159,10 +159,10 @@ export function ProjectScopeView({
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div data-project-scope className="flex h-full w-full min-w-0 flex-1 flex-col">
       {/* 头部：面包屑 + 视图切换 + 结构入口 */}
-      <div className="flex items-center gap-2 border-b border-(--outline-variant) px-3 py-2">
-        <nav className="flex min-w-0 items-center gap-1 text-[11.5px]">
+      <div className="flex w-full items-center gap-2 border-b border-(--outline-variant) px-3 py-2">
+        <nav className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden text-[11.5px]">
           {snapshot.breadcrumb.map((crumb, index) => (
             <span key={crumb.id ?? 'root'} className="flex items-center gap-1">
               {index > 0 ? <span className="text-(--on-surface-variant)/50">/</span> : null}
@@ -210,7 +210,7 @@ export function ProjectScopeView({
       </div>
 
       {/* 状态筛选（四态，无"待审"） */}
-      <div className="flex items-center gap-1 overflow-x-auto border-b border-(--outline-variant) px-3 py-1.5">
+      <div className="flex w-full items-center gap-1 overflow-x-auto border-b border-(--outline-variant) px-3 py-1.5">
         {STATUS_FILTERS.map((item) => (
           <button
             key={item.key}
@@ -230,7 +230,7 @@ export function ProjectScopeView({
       </div>
 
       {/* 内容：画布网格 / 列表 */}
-      <div className="min-h-0 flex-1 overflow-auto p-3">
+      <div className="min-h-0 w-full flex-1 overflow-auto p-3 text-left">
         {visible.length === 0 ? (
           <div className="flex h-full items-center justify-center text-[12px] text-(--on-surface-variant)">
             {snapshot.nodes.length === 0
@@ -238,10 +238,10 @@ export function ProjectScopeView({
               : '当前筛选下没有节点'}
           </div>
         ) : viewMode === 'canvas' ? (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-3">
+          <div className="flex flex-wrap content-start items-start gap-3">
             {visible.map((node) => (
+              <div key={node.id} className="w-[220px] shrink-0">
               <ScopeCard
-                key={node.id}
                 node={node}
                 isContainer={node.stats !== undefined}
                 selected={selectedId === node.id}
@@ -252,6 +252,7 @@ export function ProjectScopeView({
                 onSelect={() => onSelect(node.id)}
                 {...(onAddToChat ? { onAddToChat: () => onAddToChat(node) } : {})}
               />
+              </div>
             ))}
           </div>
         ) : (
