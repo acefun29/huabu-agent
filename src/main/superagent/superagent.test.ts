@@ -419,3 +419,140 @@ describe('runTask 编排闭环', () => {
     expect(parseArtifactFromReceipt('{"artifactId":"a1"}', envelope)).toBeNull()
   })
 })
+
+describe('task:event 事件总线（渲染端未接时静默）', () => {
+  it('通过验收：status(active) → validation(passed) → activated → status(done)', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const seen: string[] = []
+    await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080 }]),
+      options: { onTaskEvent: (e) => seen.push(e.type + (e.type === 'task.status' ? ':' + e.status : '')) },
+    })
+    expect(seen).toEqual(['task.status:active', 'task.validation', 'task.activated', 'task.status:done'])
+  })
+
+  it('shadow：不产生 task.activated', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const seen: string[] = []
+    await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080 }]),
+      options: { shadow: true, onTaskEvent: (e) => seen.push(e.type) },
+    })
+    expect(seen).not.toContain('task.activated')
+    expect(seen).toContain('task.validation')
+  })
+
+  it('事件出口抛错不影响编排（journal 是事实源）', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const result = await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080 }]),
+      options: {
+        onTaskEvent: () => {
+          throw new Error('renderer 未就绪')
+        },
+      },
+    })
+    expect(result.status).toBe('done')
+    expect((await service.events()).some((e) => e.type === 'version.activated')).toBe(true)
+  })
+})
+
+/* ------------------------------------- Phase 4 真模型专家 E2E（无凭据跳过） */
+
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY
+
+describe.skipIf(!DEEPSEEK_KEY)('runTask × 真模型专家（DeepSeek）', () => {
+  it(
+    '专家按信封产出候选产物 → 结构验收通过 → 版本激活（非 shadow）',
+    async () => {
+      const { InMemoryCredentialStore } = await import('@earendil-works/pi-ai')
+      const { ChatModelManager } = await import('../models/manager')
+      const { createModelGateway } = await import('../agent/mastra/modelGateway')
+      const { mastraMemoryFor } = await import('../agent/mastra/memory')
+      const { createLlmExpertRunner } = await import('./orchestrator')
+      const ws = tmpWs()
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const gateway = createModelGateway({ registrations: () => manager.registrations() })
+      const service = new SuperAgentService(ws)
+
+      const result = await runTask({
+        service,
+        intent: {
+          taskId: 'e2e-task-1',
+          scope: 'scenes/s3',
+          prompt:
+            '你只需产出一条回执（不要真的生成图片）。回执必须包含一行 JSON：' +
+            '{"artifactId":"art-e2e-1","assetId":"asset-e2e-1","version":"staging-1","kind":"image",' +
+            '"width":1920,"height":1080,"path":"scenes/s3/shot1.png","format":"png","bytes":204800}，' +
+            '除这行 JSON 外只回一句"完成"。',
+          accept: ['16:9'],
+        },
+        expert: createLlmExpertRunner({
+          gateway,
+          modelRef: { providerId: 'deepseek', modelId: 'deepseek-flash' },
+          memory: await mastraMemoryFor(ws),
+        }),
+      })
+
+      expect(result.status).toBe('done')
+      expect(result.activated).toBe(true)
+      expect(result.artifact).toMatchObject({ artifactId: 'art-e2e-1', width: 1920 })
+      const active = await service.activeVersion('asset-e2e-1')
+      expect(active?.version).toBe('staging-1')
+      expect(active?.accept?.contextHash).toBeTruthy()
+    },
+    240_000
+  )
+
+  it(
+    'shadow 模式真模型：journal 有 artifact.ready 但无 version.activated',
+    async () => {
+      const { InMemoryCredentialStore } = await import('@earendil-works/pi-ai')
+      const { ChatModelManager } = await import('../models/manager')
+      const { createModelGateway } = await import('../agent/mastra/modelGateway')
+      const { mastraMemoryFor } = await import('../agent/mastra/memory')
+      const { createLlmExpertRunner } = await import('./orchestrator')
+      const ws = tmpWs()
+      const credentials = new InMemoryCredentialStore()
+      await credentials.modify('deepseek', async () => ({ type: 'api_key' as const, key: DEEPSEEK_KEY! }))
+      const manager = new ChatModelManager({ credentials, config: {} })
+      const gateway = createModelGateway({ registrations: () => manager.registrations() })
+      const service = new SuperAgentService(ws)
+
+      const result = await runTask({
+        service,
+        intent: {
+          taskId: 'e2e-task-shadow',
+          scope: 'scenes/s4',
+          prompt:
+            '只产出回执（不要真的生成图片）：一行 JSON ' +
+            '{"artifactId":"art-shadow","assetId":"asset-shadow","version":"staging-s","kind":"image",' +
+            '"width":1280,"height":720,"path":"scenes/s4/a.png","format":"png","bytes":1024}',
+          accept: ['16:9'],
+        },
+        expert: createLlmExpertRunner({
+          gateway,
+          modelRef: { providerId: 'deepseek', modelId: 'deepseek-flash' },
+          memory: await mastraMemoryFor(ws),
+        }),
+        options: { shadow: true },
+      })
+
+      expect(result.status).toBe('done')
+      expect(result.activated).toBe(false)
+      expect(await service.activeVersion('asset-shadow')).toBeUndefined()
+      const types = (await service.events()).map((e) => e.type)
+      expect(types).toContain('artifact.ready')
+      expect(types).not.toContain('version.activated')
+    },
+    240_000
+  )
+})

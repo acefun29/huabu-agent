@@ -24,6 +24,7 @@ import { buildEnvelope, envelopeToInstructions, isPathAllowed, type TaskIntent }
 import type { ClampResult } from './envelope'
 import { validateArtifact, type ArtifactCandidate, type ValidationResult } from './validator'
 import type { SuperAgentService } from './index'
+import type { TaskEvent } from '../../shared/ipc'
 
 /** 专家执行器：跑一轮专家 Agent，返回候选产物（staging，未验收） */
 export interface ExpertRunner {
@@ -55,6 +56,8 @@ export interface RunTaskOptions {
   maxValidationAttempts?: number
   /** 专家线程 id 前缀（默认 taskId） */
   threadId?: string
+  /** 事件出口（task:event 通道；渲染端未接时忽略，计划 §9.7） */
+  onTaskEvent?: (event: TaskEvent) => void
 }
 
 export interface RunTaskResult {
@@ -87,6 +90,13 @@ export async function runTask(params: {
   const maxAttempts = options.maxValidationAttempts ?? 2
   const shadow = options.shadow ?? false
   const threadId = options.threadId ?? `expert-${intent.taskId}`
+  const emit = (event: TaskEvent): void => {
+    try {
+      options.onTaskEvent?.(event)
+    } catch {
+      // 事件出口故障不得影响编排（journal 才是事实源）
+    }
+  }
 
   // 信封预检 + 裁剪（stale/pending 拒注入、超预算裁剪，原因记录）
   const clamp = buildEnvelope(intent)
@@ -105,6 +115,7 @@ export async function runTask(params: {
       reason: '缺参考：全部资产引用均为 stale/pending，未进入生成',
       rejected: clamp.rejected,
     })
+    emit({ type: 'task.status', taskId: intent.taskId, status: 'blocked', attempts: 0, reason: '缺参考' })
     return {
       taskId: intent.taskId,
       status: 'blocked',
@@ -119,6 +130,7 @@ export async function runTask(params: {
     lane: clamp.envelope.lane.join(','),
   })
 
+  emit({ type: 'task.status', taskId: intent.taskId, status: 'active', attempts: 0 })
   const failures: string[] = []
   let lastValidation: ValidationResult | undefined
   let lastArtifact: ArtifactCandidate | undefined
@@ -136,6 +148,7 @@ export async function runTask(params: {
       const reason = error instanceof Error ? error.message : String(error)
       failures.push(`专家执行失败（第 ${attempt} 次）：${reason}`)
       await service.append('artifact.rejected', intent.taskId, 'expert', { reason, attempt })
+      emit({ type: 'task.status', taskId: intent.taskId, status: 'attention', attempts: attempt, reason })
       break
     }
 
@@ -161,6 +174,13 @@ export async function runTask(params: {
     const validation = validateArtifact(clamp.envelope, run.artifact, run.contextHash)
     lastValidation = validation
 
+    emit({
+      type: 'task.validation',
+      taskId: intent.taskId,
+      passed: validation.passed,
+      artifactId: run.artifact.artifactId,
+      ...(validation.evidence.reason ? { reason: validation.evidence.reason } : {}),
+    })
     if (validation.passed) {
       await service.append('validation.passed', intent.taskId, 'validator', { ...validation.evidence })
       if (!shadow) {
@@ -170,7 +190,15 @@ export async function runTask(params: {
           version: run.artifact.version,
           artifactId: run.artifact.artifactId,
         })
+        emit({
+          type: 'task.activated',
+          taskId: intent.taskId,
+          assetId: run.artifact.assetId,
+          version: run.artifact.version,
+          artifactId: run.artifact.artifactId,
+        })
       }
+      emit({ type: 'task.status', taskId: intent.taskId, status: 'done', attempts: attempt })
       return {
         taskId: intent.taskId,
         status: 'done',
@@ -185,6 +213,7 @@ export async function runTask(params: {
     const reason = validation.evidence.reason ?? '结构验收未通过'
     failures.push(reason)
     await service.append('validation.failed', intent.taskId, 'validator', { ...validation.evidence, reason, attempt })
+    emit({ type: 'task.status', taskId: intent.taskId, status: 'attention', attempts: attempt, reason })
   }
 
   return {

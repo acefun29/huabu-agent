@@ -16,13 +16,13 @@ import type { MediaJobManager } from '../media/manager'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
 import type { McpManager } from '../mcp/manager'
 import type { MediaContextReturnType } from './media'
-import {
+import { 
   IpcChannel,
   type ChatEvent,
   type ChatNodeRequest,
   type ChatResult,
   type MediaJobStatus
-} from '../../shared/ipc'
+, type TaskEvent } from '../../shared/ipc'
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
@@ -78,6 +78,19 @@ export function broadcastChatEvent(event: ChatEvent): void {
     } catch (error) {
       // 广播失败不能打断事件链，否则一个坏窗口会让所有会话都收不到后续增量
       console.error(`[ipc] chat:event 广播失败：${String(error)}`)
+    }
+  }
+}
+
+/** task:event 广播：SuperAgent 任务/验收进度（计划 §9.7 新增可选事件，渲染端未接时忽略） */
+export function broadcastTaskEvent(event: TaskEvent): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    const contents = window.webContents
+    if (contents.isDestroyed()) continue
+    try {
+      contents.send(IpcChannel.TaskEvent, event)
+    } catch (error) {
+      console.error(`[ipc] task:event 广播失败：${String(error)}`)
     }
   }
 }

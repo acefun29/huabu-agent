@@ -35,6 +35,8 @@ export const IpcChannel = {
   ChatPrompt: 'chat:prompt',
   /** 生成中插话引导 */
   ChatSteer: 'chat:steer',
+  /** 事件类：SuperAgent 任务/验收状态推送（主进程 -> 渲染进程，可选事件） */
+  TaskEvent: 'task:event',
   /** 中止当前生成 */
   ChatAbort: 'chat:abort',
   /** 会话与画布节点解绑并释放资源 */
@@ -390,6 +392,40 @@ export type ChatEvent =
     }
   /** 桥接层自身的故障（会话不存在、pi 加载失败等），与模型调用失败区分开 */
   | { nodeId: string; type: 'host_error'; code: ChatErrorCode; message: string }
+
+/**
+ * SuperAgent 任务事件（计划 v1.2 §9.7「新增可选 task 事件」）。
+ *
+ * 独立于 ChatEvent：迁移期 ChatEvent 契约冻结，任务/验收进度走新通道，
+ * 渲染端未接时静默忽略即可（向后兼容）。
+ */
+export type TaskEvent =
+  /** 任务在 board 上的状态变化（含 todo/active/validating/done/attention/blocked） */
+  | {
+      type: 'task.status'
+      taskId: string
+      status: 'todo' | 'active' | 'validating' | 'done' | 'attention' | 'blocked'
+      title?: string
+      /** 验收轮次（失败重试计数） */
+      attempts: number
+      reason?: string
+    }
+  /** 验收结论（含 diff 摘要；完整证据在 journal，可回放） */
+  | {
+      type: 'task.validation'
+      taskId: string
+      passed: boolean
+      artifactId: string
+      reason?: string
+    }
+  /** 版本激活（shadow 模式不产生此事件） */
+  | {
+      type: 'task.activated'
+      taskId: string
+      assetId: string
+      version: string
+      artifactId: string
+    }
 
 /** 失败分类，渲染端据此给出可操作引导（去设置 / 重试 / 重新绑定会话） */
 export type ChatErrorCode =
