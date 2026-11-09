@@ -16,6 +16,8 @@ export interface ArtifactCandidate {
   assetId: string
   version: string
   kind: 'image' | 'video' | 'audio' | 'text'
+  /** 产物工作区相对路径（lane 白名单校验用；缺省时跳过越界检查） */
+  path?: string
   width?: number
   height?: number
   durationS?: number

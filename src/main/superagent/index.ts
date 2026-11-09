@@ -21,6 +21,10 @@ export { clampEnvelope } from './envelope'
 export type { Envelope, EnvelopeAssetRef, ClampResult } from './envelope'
 export { validateArtifact } from './validator'
 export type { ArtifactCandidate, ValidationResult, ValidationCheck } from './validator'
+export { buildEnvelope, envelopeToInstructions, isPathAllowed } from './dispatch'
+export type { TaskIntent } from './dispatch'
+export { runTask, createLlmExpertRunner, parseArtifactFromReceipt } from './orchestrator'
+export type { ExpertRunner, ExpertRunResult, RunTaskOptions, RunTaskResult } from './orchestrator'
 
 /** 工作区 journal 落点（计划 §7.6 存储布局） */
 export function journalFileFor(workspaceDir: string): string {

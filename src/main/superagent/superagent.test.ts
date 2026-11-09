@@ -245,3 +245,177 @@ describe('验收器（确定性结构检查）', () => {
     expect(consistency?.expected).toContain('结构检查不适用')
   })
 })
+
+/* ------------------------------------------------ Phase 4 编排闭环（runTask） */
+
+import { buildEnvelope, envelopeToInstructions, isPathAllowed } from './dispatch'
+import { runTask, parseArtifactFromReceipt, type ExpertRunner } from './orchestrator'
+
+/** 造一个按脚本返回产物的假专家（不调模型，只验编排不变量） */
+function scriptedExpert(artifacts: Array<Partial<import('.').ArtifactCandidate> & { kind: 'image' | 'video' | 'audio' | 'text' }>): ExpertRunner {
+  let i = 0
+  return {
+    async run() {
+      const spec = artifacts[Math.min(i, artifacts.length - 1)]!
+      i += 1
+      return {
+        artifact: {
+          artifactId: spec.artifactId ?? 'art-1',
+          assetId: spec.assetId ?? 'asset-1',
+          version: spec.version ?? 'staging-1',
+          kind: spec.kind,
+          ...(spec.path ? { path: spec.path } : {}),
+          ...(typeof spec.width === 'number' ? { width: spec.width } : {}),
+          ...(typeof spec.height === 'number' ? { height: spec.height } : {}),
+          ...(typeof spec.durationS === 'number' ? { durationS: spec.durationS } : {}),
+          ...(spec.format ? { format: spec.format } : {}),
+          ...(typeof spec.bytes === 'number' ? { bytes: spec.bytes } : {}),
+        },
+        receipt: 'done',
+        contextHash: 'ctx-hash',
+      }
+    },
+  }
+}
+
+const goodIntent = (_ws: string) => ({
+  taskId: 'task-run-1',
+  scope: 'scenes/s3',
+  prompt: '画一张 16:9 的分镜图',
+  accept: ['16:9'],
+})
+
+describe('信封生成与 lane 约束', () => {
+  it('intent → envelope：lane 从 scope 派生，任务层追加到 promptLayers 末尾', () => {
+    const { envelope, dropped, rejected } = buildEnvelope({
+      taskId: 't',
+      scope: 'scenes/s3',
+      prompt: '画分镜',
+      accept: ['16:9'],
+    })
+    expect(envelope.lane).toEqual(['scenes/s3/'])
+    expect(envelope.promptLayers.at(-1)).toEqual({ level: 'task', prompt: '画分镜' })
+    expect(dropped).toEqual([])
+    expect(rejected).toEqual([])
+  })
+
+  it('instructions 含任务/验收/写区/资产，且不含主会话内容', () => {
+    const { envelope } = buildEnvelope({
+      taskId: 't',
+      scope: 's',
+      prompt: 'P',
+      accept: ['16:9'],
+      entities: [{ assetId: 'a1', path: 'assets/a1.png', version: 'v1', kind: 'image', role: 'character', status: 'active' }],
+    })
+    const text = envelopeToInstructions(envelope)
+    expect(text).toContain('任务')
+    expect(text).toContain('16:9')
+    expect(text).toContain('scenes/s/'.replace('scenes/s/', 's/'))
+    expect(text).toContain('a1')
+  })
+
+  it('lane 白名单：前缀内放行，越界拒绝', () => {
+    const { envelope } = buildEnvelope({ taskId: 't', scope: 'scenes/s3', prompt: 'p', accept: [] })
+    expect(isPathAllowed(envelope, 'scenes/s3/shot1.png')).toBe(true)
+    expect(isPathAllowed(envelope, 'scenes' + String.fromCharCode(92) + 's3' + String.fromCharCode(92) + 'shot1.png')).toBe(true)
+    expect(isPathAllowed(envelope, 'scenes/s4/shot1.png')).toBe(false)
+    expect(isPathAllowed(envelope, '../etc/passwd')).toBe(false)
+  })
+})
+
+describe('runTask 编排闭环', () => {
+  it('通过验收：journal 全生命周期 + 版本激活', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const result = await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080, path: 'scenes/s3/a.png', bytes: 1024 }]),
+    })
+    expect(result.status).toBe('done')
+    expect(result.activated).toBe(true)
+    const types = (await service.events()).map((e) => e.type)
+    expect(types).toEqual([
+      'task.created', 'task.assigned', 'task.started', 'artifact.ready',
+      'validation.passed', 'version.activated',
+    ])
+    const board = await service.board()
+    expect(board[0]).toMatchObject({ taskId: 'task-run-1', status: 'done' })
+    const active = await service.activeVersion('asset-1')
+    expect(active).toMatchObject({ version: 'staging-1' })
+    expect(active?.accept?.contextHash).toBe('ctx-hash')
+  })
+
+  it('shadow 模式：不写 version.activated，版本不 active', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const result = await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080 }]),
+      options: { shadow: true },
+    })
+    expect(result.status).toBe('done')
+    expect(result.activated).toBe(false)
+    const types = (await service.events()).map((e) => e.type)
+    expect(types).not.toContain('version.activated')
+    expect(await service.activeVersion('asset-1')).toBeUndefined()
+    const slots = await service.versionSlots()
+    expect(slots['asset-1']?.staging).toHaveLength(1)
+  })
+
+  it('验收失败：带 diff 转 attention，重试达上限后停止', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const result = await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1000, height: 1000 }]),
+      options: { maxValidationAttempts: 2 },
+    })
+    expect(result.status).toBe('attention')
+    expect(result.failures.length).toBeGreaterThan(0)
+    const events = await service.events()
+    expect(events.filter((e) => e.type === 'validation.failed')).toHaveLength(2)
+    expect(events.some((e) => e.type === 'version.activated')).toBe(false)
+    const board = await service.board()
+    expect(board[0]).toMatchObject({ status: 'attention', attempts: 2 })
+  })
+
+  it('缺参考：全部引用 stale → 不生成，转 blocked', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const result = await runTask({
+      service,
+      intent: {
+        ...goodIntent('ws'),
+        entities: [{ assetId: 'old', path: 'a', version: 'v0', kind: 'image', role: 'character', status: 'stale' }],
+      },
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080 }]),
+    })
+    expect(result.status).toBe('blocked')
+    expect(result.failures[0]).toContain('缺参考')
+    const types = (await service.events()).map((e) => e.type)
+    expect(types).toEqual(['task.created', 'artifact.rejected'])
+    expect((await service.board())[0]?.status).toBe('blocked')
+  })
+
+  it('产物越出 lane 写区 → 拒绝并停止', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const result = await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080, path: 'secrets/leak.png' }]),
+    })
+    expect(result.status).toBe('attention')
+    expect(result.failures[0]).toContain('lane')
+    expect((await service.events()).some((e) => e.type === 'version.activated')).toBe(false)
+  })
+
+  it('回执解析：从文本里提取 artifact JSON，缺字段返回 null', () => {
+    const { envelope } = buildEnvelope({ taskId: 't', scope: 's', prompt: 'p', accept: [] })
+    const ok = parseArtifactFromReceipt(
+      '完成。{"artifactId":"a1","assetId":"as1","version":"v1","kind":"image","width":1920,"height":1080}',
+      envelope
+    )
+    expect(ok).toMatchObject({ artifactId: 'a1', width: 1920 })
+    expect(parseArtifactFromReceipt('完成，没有 JSON', envelope)).toBeNull()
+    expect(parseArtifactFromReceipt('{"artifactId":"a1"}', envelope)).toBeNull()
+  })
+})
