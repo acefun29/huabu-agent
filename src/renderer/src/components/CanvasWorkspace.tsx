@@ -13,7 +13,7 @@ import {
 } from 'lucide-react'
 import { LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
 import { ProjectScopeView } from './project/ProjectScopeView'
-import { createPortal } from 'react-dom'
+import { StructureChatRail } from './project/StructureChatRail'
 import { useSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
@@ -143,6 +143,8 @@ export function CanvasWorkspace() {
   const [structureViewMode, setStructureViewMode] = useState<'canvas' | 'list'>('canvas')
   const [scopeId, setScopeId] = useState<string | null>(null)
   const [structureSelectedId, setStructureSelectedId] = useState<string | null>(null)
+  /** 结构视图右栏展示的「当前范围」标题（由 ProjectScopeView 上报面包屑） */
+  const [structureScopeTitle, setStructureScopeTitle] = useState('项目')
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
   const { appearance, setAppearance } = useSettings()
@@ -651,36 +653,48 @@ export function CanvasWorkspace() {
 
   const selectedCount = selectedAssetIds.length
 
-  // 结构视图：独立渲染整块区域（含自己的头部/筛选），不复用自由画布的鼠标手势
+  /**
+   * 结构视图（原型 index-projects.html 的完整布局）：
+   * z-40 全屏覆盖（遮住底部 ChatDock），内部再分「左画布 | 右对话栏」两栏。
+   * 这样自由画布与结构视图互不干扰，自由画布的所有交互保持原样。
+   */
   if (workspaceView === 'structure') {
-    return createPortal(
-      <div className="fixed inset-x-0 bottom-0 top-11 z-40 grid grid-rows-[auto_1fr] overflow-hidden bg-(--surface)">
-        <div className="flex items-center gap-1 border-b border-(--outline-variant) px-3 py-1.5">
-          <span className="text-[12px] font-medium text-(--on-surface)">项目结构</span>
-          <span className="text-[10.5px] text-(--on-surface-variant)">层级骨架 · 素材库不受影响</span>
-          <button
-            type="button"
-            className="ml-auto rounded-lg border border-(--outline-variant) px-2 py-0.5 text-[11px] text-(--on-surface-variant) hover:text-(--on-surface)"
-            onClick={() => setWorkspaceView('canvas')}
-          >
-            返回画布
-          </button>
+    return (
+      <div className="absolute inset-0 z-40 flex bg-(--surface)">
+        {/* 左：项目结构（自适应） */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex h-9 shrink-0 items-center gap-2 border-b border-(--outline-soft) px-4">
+            <span className="text-[11.5px] font-medium text-(--on-surface-variant)">项目结构</span>
+            <span className="text-[10px] text-(--on-surface-muted)">层级骨架 · 素材库不受影响</span>
+            <button
+              type="button"
+              className="ml-auto rounded-full border border-(--outline-soft) bg-(--surface-card) px-2.5 py-[3px] text-[10.5px] text-(--on-surface-muted) hover:text-(--on-surface-variant)"
+              onClick={() => setWorkspaceView('canvas')}
+            >
+              返回画布
+            </button>
+          </div>
+          <div className="min-h-0 flex-1">
+            <ProjectScopeView
+              scopeId={scopeId}
+              onScopeChange={setScopeId}
+              selectedId={structureSelectedId}
+              onSelect={setStructureSelectedId}
+              viewMode={structureViewMode}
+              onViewModeChange={setStructureViewMode}
+              onScopeTitleChange={setStructureScopeTitle}
+              onAddToChat={(node) => {
+                useCanvasStore.getState().showToast(`已把「${node.title}」加入对话上下文`)
+              }}
+            />
+          </div>
         </div>
-        <div className="min-h-0 w-full">
-          <ProjectScopeView
-            scopeId={scopeId}
-            onScopeChange={setScopeId}
-            selectedId={structureSelectedId}
-            onSelect={setStructureSelectedId}
-            viewMode={structureViewMode}
-            onViewModeChange={setStructureViewMode}
-            onAddToChat={(node) => {
-              useCanvasStore.getState().showToast(`已把「${node.title}」加入对话上下文`)
-            }}
-          />
-        </div>
-      </div>,
-      document.body
+        {/* 右：对话面板（原型 chat-panel：400px，含头部/消息/输入区） */}
+        <StructureChatRail
+          scopeTitle={structureScopeTitle}
+          onBack={() => setWorkspaceView('canvas')}
+        />
+      </div>
     )
   }
 

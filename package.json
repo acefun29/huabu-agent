@@ -62,7 +62,8 @@
     "bench": "node scripts/perf-bench.mjs",
     "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p src/renderer/tsconfig.json",
     "dist": "electron-vite build && electron-builder",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "electron-builder install-app-deps",
+    "web:dev": "vite --config vite.web.config.ts"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
