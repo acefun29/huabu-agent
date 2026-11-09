@@ -472,11 +472,14 @@ export function installWebHarness(): void {
   const global = window as unknown as { huabu?: Record<string, unknown> }
   if (global.huabu) return
 
-  // 优先：真后端桥（main 以 HUABU_WEB_BRIDGE=1 启动时，URL 带 ?bridge=&token=）
+  // 浏览器环境标记（不含 Electron 窗口 chrome）：标题栏据此隐藏窗口控制按钮，
+  // 无论连真后端还是跑 demo 都一样——最小化/关闭在浏览器里没有意义。
+  ;(globalThis as unknown as { __HUABU_BROWSER__?: boolean }).__HUABU_BROWSER__ = true
+
+  // 优先：真后端桥（main 以 HUABU_WEB_BRIDGE=1 / --headless 启动时，URL 带 ?bridge=&token=）
   // 此时 window.huabu 与 Electron preload 同形状，业务代码零改动，操作的是真实数据。
   const bridgeConfig = resolveBridgeConfig()
   if (bridgeConfig) {
-    ;(globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__ = true
     global.huabu = createWebBridgeApi(bridgeConfig) as unknown as Record<string, unknown>
     console.info(
       `[web-bridge] 已连接真后端 http://127.0.0.1:${bridgeConfig.port}（对话/模型/素材库均为真实数据）`
@@ -485,6 +488,8 @@ export function installWebHarness(): void {
   }
 
   console.info('[web-harness] 未检测到 ?bridge= 参数：使用内置 demo 数据（仅画布样式可看）')
+  // 只有 demo 模式才是「预览」：真后端模式下设置面板等应当正常工作
+  ;(globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__ = true
 
   const project = new WebProjectHarness()
 
@@ -635,8 +640,6 @@ export function installWebHarness(): void {
     }
   )
 
-  // 标记浏览器预览（App 据此跳过依赖真实主进程数据的浮层）
-  ;(globalThis as unknown as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__ = true
   // 素材路径 → demo 图片（浏览器无 huabu-media:// 协议）
   ;(globalThis as unknown as { __HUABU_DEMO_SRC__?: Record<string, string> }).__HUABU_DEMO_SRC__ = {
     'assets/images/对峙-首帧-16x9.png': './demo/drama-01.jpg',

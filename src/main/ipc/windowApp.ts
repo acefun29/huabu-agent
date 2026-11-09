@@ -29,8 +29,19 @@ export function registerWindowAppIpc(_ctx: IpcContext): void {
 
   // ---------------------------------------------------------------- window 域（自绘标题栏）
 
+  /** 浏览器（Web 桥）调用时 event 是 stub，没有 sender；取不到窗口按「无窗口」处理 */
+  const windowOf = (event: unknown): BrowserWindow | null => {
+    const sender = (event as { sender?: unknown } | null)?.sender
+    if (!sender) return null
+    try {
+      return BrowserWindow.fromWebContents(sender as never)
+    } catch {
+      return null
+    }
+  }
+
   ipcMain.handle(IpcChannel.WindowControl, (event, action: WindowControlAction) => {
-    const window = BrowserWindow.fromWebContents(event.sender)
+    const window = windowOf(event)
     if (!window) return
     if (action === 'minimize') window.minimize()
     else if (action === 'toggle-maximize') {
@@ -40,7 +51,7 @@ export function registerWindowAppIpc(_ctx: IpcContext): void {
   })
 
   ipcMain.handle(IpcChannel.WindowState, (event): WindowStateInfo => {
-    const window = BrowserWindow.fromWebContents(event.sender)
+    const window = windowOf(event)
     return { maximized: window?.isMaximized() ?? false }
   })
 }

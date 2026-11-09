@@ -2,6 +2,11 @@ import { Copy, Minus, Square, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { WorkspaceSwitcher } from './WorkspaceSwitcher'
 
+/** 浏览器里没有 Electron 窗口：最小化/最大化/关闭按钮无处可施，隐藏掉 */
+const isBrowser =
+  typeof globalThis !== 'undefined' &&
+  Boolean((globalThis as unknown as { __HUABU_BROWSER__?: boolean }).__HUABU_BROWSER__)
+
 /**
  * 自绘标题栏：frame:false 之后替代 Windows 原生标题栏。
  * 整条是拖拽区（.titlebar-drag，双击最大化/还原由系统处理），
@@ -12,6 +17,7 @@ export function TitleBar() {
   const [maximized, setMaximized] = useState(false)
 
   useEffect(() => {
+    if (isBrowser) return
     let alive = true
     void window.huabu.window.isMaximized().then((value) => {
       if (alive) setMaximized(value)
@@ -38,32 +44,36 @@ export function TitleBar() {
 
       <div className="flex-1" />
 
-      <div className="flex items-center gap-0.5 pr-2">
-        <button
-          type="button"
-          aria-label="最小化"
-          className={`${winBtn} hover:bg-(--surface-hover) hover:text-(--on-surface)`}
-          onClick={() => void window.huabu.window.minimize()}
-        >
-          <Minus size={15} strokeWidth={1.75} />
-        </button>
-        <button
-          type="button"
-          aria-label={maximized ? '还原' : '最大化'}
-          className={`${winBtn} hover:bg-(--surface-hover) hover:text-(--on-surface)`}
-          onClick={() => void window.huabu.window.toggleMaximize()}
-        >
-          {maximized ? <Copy size={12} strokeWidth={1.75} /> : <Square size={12} strokeWidth={1.75} />}
-        </button>
-        <button
-          type="button"
-          aria-label="关闭"
-          className={`${winBtn} hover:bg-(--danger) hover:text-(--surface-card)`}
-          onClick={() => void window.huabu.window.close()}
-        >
-          <X size={15} strokeWidth={1.75} />
-        </button>
-      </div>
+      {isBrowser ? (
+        <span className="titlebar-nodrag pr-3 text-[10.5px] text-(--on-surface-muted)">浏览器 · Web 模式</span>
+      ) : (
+        <div className="flex items-center gap-0.5 pr-2">
+          <button
+            type="button"
+            aria-label="最小化"
+            className={`${winBtn} hover:bg-(--surface-hover) hover:text-(--on-surface)`}
+            onClick={() => void window.huabu.window.minimize()}
+          >
+            <Minus size={15} strokeWidth={1.75} />
+          </button>
+          <button
+            type="button"
+            aria-label={maximized ? '还原' : '最大化'}
+            className={`${winBtn} hover:bg-(--surface-hover) hover:text-(--on-surface)`}
+            onClick={() => void window.huabu.window.toggleMaximize()}
+          >
+            {maximized ? <Copy size={12} strokeWidth={1.75} /> : <Square size={12} strokeWidth={1.75} />}
+          </button>
+          <button
+            type="button"
+            aria-label="关闭"
+            className={`${winBtn} hover:bg-(--danger) hover:text-(--surface-card)`}
+            onClick={() => void window.huabu.window.close()}
+          >
+            <X size={15} strokeWidth={1.75} />
+          </button>
+        </div>
+      )}
     </header>
   )
 }

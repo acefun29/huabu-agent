@@ -63,7 +63,9 @@
     "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p src/renderer/tsconfig.json",
     "dist": "electron-vite build && electron-builder",
     "postinstall": "electron-builder install-app-deps",
-    "web:dev": "vite --config vite.web.config.ts"
+    "web": "electron-vite dev -- --huabu-headless",
+    "web:dev": "electron-vite dev -- --huabu-headless",
+    "web:mock": "vite --config vite.web.config.ts"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

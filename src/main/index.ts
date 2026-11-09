@@ -1,5 +1,7 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
-import { join } from 'path'
+import { randomUUID } from 'crypto'
+import { mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { dirname, join } from 'path'
 import { getAgentHost, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
 import { startWebBridge, setActiveBridge } from './webBridge/server'
 import { IpcChannel } from '../shared/ipc'
@@ -14,9 +16,43 @@ import { inboxRoot } from './assets/manager'
  * huabu-media:// 特权协议必须在 app ready 前注册 scheme，ready 后绑定处理器。
  */
 
+/**
+ * 无窗口（headless）模式：主进程只当后端跑，不创建 BrowserWindow。
+ *
+ * 为什么需要：真数据/真模型都在主进程里，而调试前端时用浏览器更顺手。
+ * `pnpm web` 即 `electron-vite dev -- --huabu-headless`：dev server 提供 renderer，
+ * 主进程起 Web 桥并自动打开浏览器——不需要再弹 Electron 窗口。
+ *
+ * 开关名带 huabu 前缀：避开 Chromium 自己的 `--headless`。
+ */
+const HEADLESS =
+  process.argv.includes('--huabu-headless') || process.env['HUABU_HEADLESS'] === '1'
+
 // README 约定的调试端口环境变量：显式接线（appendSwitch 必须在 app ready 之前）
-if (!app.isPackaged && process.env['REMOTE_DEBUGGING_PORT']) {
+if (!app.isPackaged && process.env['REMOTE_DEBUGGING_PORT'] && !HEADLESS) {
   app.commandLine.appendSwitch('remote-debugging-port', process.env['REMOTE_DEBUGGING_PORT'])
+}
+
+/**
+ * 开发期桥 token 持久化：否则每次重启都要重新复制带 token 的 URL。
+ * 只写本机 userData；打包态不启用桥，也就不读这个文件。
+ */
+function devBridgeToken(): string {
+  const file = join(app.getPath('userData'), 'web-bridge-token')
+  try {
+    const cached = readFileSync(file, 'utf8').trim()
+    if (cached.length >= 16) return cached
+  } catch {
+    // 首次启动没有文件
+  }
+  const token = randomUUID()
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, token, 'utf8')
+  } catch {
+    // 写不进去就本次会话用临时 token
+  }
+  return token
 }
 
 function createMainWindow(): BrowserWindow {
@@ -103,14 +139,23 @@ void app.whenReady().then(() => {
   // 自绘标题栏替代原生菜单栏（File/Edit/View/Window 是 Electron 默认菜单）
   Menu.setApplicationMenu(null)
   registerIpcHandlers()
-  // Web 后端桥（默认关闭）：HUABU_WEB_BRIDGE=1 时监听 127.0.0.1，供浏览器里的
+  // Web 后端桥（默认关闭）：HUABU_WEB_BRIDGE=1 / --headless 时监听 127.0.0.1，供浏览器里的
   // renderer 调同一批 IPC handler（复用业务逻辑，不重写）。token 打印到控制台，
   // 浏览器用 ?token= 接入。仅本地开发用途，生产不启用。
-  if (process.env.HUABU_WEB_BRIDGE === '1') {
-    void startWebBridge({ port: Number(process.env.HUABU_WEB_BRIDGE_PORT ?? 4788) })
+  const bridgeEnabled = HEADLESS || process.env.HUABU_WEB_BRIDGE === '1'
+  if (bridgeEnabled) {
+    // 前端地址：dev 下是 electron-vite 的 renderer dev server；缺省退回 5174
+    const rendererUrl = process.env['ELECTRON_RENDERER_URL'] ?? 'http://localhost:5174'
+    void startWebBridge({
+      port: Number(process.env.HUABU_WEB_BRIDGE_PORT ?? 4788),
+      token: devBridgeToken()
+    })
       .then((bridge) => {
         setActiveBridge(bridge)
-        console.log(`[web-bridge] 浏览器接入：http://localhost:5174/?bridge=${bridge.port}&token=${bridge.token}`)
+        const entry = `${rendererUrl}/?bridge=${bridge.port}&token=${bridge.token}`
+        console.log(`[web-bridge] 浏览器接入：${entry}`)
+        // headless 下没有窗口可看，直接把浏览器打开到真实后端
+        if (HEADLESS) void shell.openExternal(entry)
       })
       .catch((error) => console.error('[web-bridge] 启动失败：', error))
   }
@@ -124,16 +169,21 @@ void app.whenReady().then(() => {
       thumbsDir: store?.currentDir ? join(store.currentDir, '.huabu', 'thumbs') : null
     }
   })
-  createMainWindow()
+  // headless：不建窗口，进程常驻只服务 Web 桥
+  if (!HEADLESS) {
+    createMainWindow()
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createMainWindow()
-    }
-  })
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createMainWindow()
+      }
+    })
+  }
 })
 
 app.on('window-all-closed', () => {
+  // headless 没有窗口，不能因为「窗口都关了」退出（否则桥刚起来就停）
+  if (HEADLESS) return
   if (process.platform !== 'darwin') {
     app.quit()
   }

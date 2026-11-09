@@ -8,9 +8,10 @@
  *
  * 因此 renderer 业务代码一行都不用改（store / 组件只认 window.huabu）。
  *
- * 接入：main 以 HUABU_WEB_BRIDGE=1 启动后会打印
- *   http://localhost:5174/?bridge=4788&token=xxxx
- * 打开该地址即可（token 记在 localStorage，后续免带）。
+ * 接入：`pnpm web` 会以 headless 模式起主进程（不建 Electron 窗口），
+ * 并把浏览器直接打开到带 token 的地址：
+ *   http://localhost:5173/?bridge=4788&token=xxxx
+ * token 在开发期持久化到 userData（web-bridge-token），重启后地址仍然有效。
  */
 
 import type { HuabuApi } from '../../shared/api'
@@ -19,7 +20,7 @@ import { createHuabuApi } from '../../shared/apiFactory'
 export interface WebBridgeConfig {
   /** 桥端口（main 侧打印） */
   port: number
-  /** 一次性 token */
+  /** 桥 token（开发期持久化，重启后仍有效） */
   token: string
 }
 

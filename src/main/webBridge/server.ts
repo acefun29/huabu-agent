@@ -8,8 +8,8 @@
  * - **事件走 WS**：主进程已有 broadcastXxx 系列广播函数（chat:event /
  *   media:job / asset:changed / task:event / project:changed / mcp:status）。
  *   桥把它们统一转发到 WS，浏览器按 channel 订阅——与 preload 的 onEvent 语义一致。
- * - **默认关闭**：只有显式 `HUABU_WEB_BRIDGE=1`（或 --web-bridge）才监听，
- *   不改变 Electron 默认行为、不额外开端口。
+ * - **默认关闭**：只有显式 `HUABU_WEB_BRIDGE=1` / `HUABU_HEADLESS=1`（`pnpm web`，
+ *   主进程不建窗口）才监听，不改变 Electron 默认行为、不额外开端口。
  *
  * 安全（本地开发通道，不是公网服务）：
  * - 仅监听 127.0.0.1；
@@ -39,6 +39,8 @@ export function registeredChannels(): string[] {
 
 export interface WebBridgeOptions {
   port?: number
+  /** 固定 token（开发期从 userData 读，重启后浏览器地址仍有效）；缺省每次随机 */
+  token?: string
   /** 允许的来源（浏览器 dev server）；缺省只允许同源 + localhost */
   allowedOrigins?: string[]
 }
@@ -70,7 +72,7 @@ const EVENT_CHANNELS = new Set([
  */
 export async function startWebBridge(options: WebBridgeOptions = {}): Promise<WebBridgeHandle> {
   const port = options.port ?? 4788
-  const token = randomUUID()
+  const token = options.token ?? randomUUID()
   const clients = new Set<WebSocket>()
 
   const server: Server = createServer(async (req, res) => {
