@@ -19,10 +19,13 @@ export const CARD_THUMB_SIZE = 512
 /** 由卡片数据得到可播放/可显示的 src；给 size 时走缩略图管线；无文件时返回 null */
 export function assetSrc(data: Pick<AssetData, 'storage' | 'path' | 'pathRoot'>, size?: number): string | null {
   if (!data.path || !data.storage) return null
-  // Web 预览：huabu-media:// 是 Electron 自定义协议，浏览器解析不了。
-  // harness 会把 demo 素材映射到 public/demo 下的真实图片，这里直接返回该地址。
-  const webPreview = (globalThis as { __HUABU_WEB_PREVIEW__?: boolean }).__HUABU_WEB_PREVIEW__
-  if (webPreview) {
+  // Web 模式：huabu-media:// 是 Electron 自定义协议，浏览器解析不了。
+  // 走真后端桥时改写成 http://127.0.0.1:<port>/media/<host>/<path>?token=...，
+  // 由主进程复用同一套 handleMediaRequest（根目录解析 + 越界防护 + 缩略图缓存）。
+  const bridge = (globalThis as { __HUABU_MEDIA_BRIDGE__?: { port: number; token: string } })
+    .__HUABU_MEDIA_BRIDGE__
+  if (bridge) {
+    // demo 数据优先（无 bridge 时才有；有 bridge 说明是真实工作区）
     const demo = (globalThis as { __HUABU_DEMO_SRC__?: Record<string, string> }).__HUABU_DEMO_SRC__
     const hit = demo?.[data.path]
     if (hit) return hit
@@ -39,6 +42,11 @@ export function assetSrc(data: Pick<AssetData, 'storage' | 'path' | 'pathRoot'>,
     .split('/')
     .map(encodeURIComponent)
     .join('/')
+  if (bridge) {
+    const q = `?token=${encodeURIComponent(bridge.token)}`
+    if (size) return `http://127.0.0.1:${bridge.port}/media/thumb/${size}/${host}/${encoded}${q}`
+    return `http://127.0.0.1:${bridge.port}/media/${host}/${encoded}${q}`
+  }
   if (size) return `huabu-media://thumb/${size}/${host}/${encoded}`
   return `huabu-media://${host}/${encoded}`
 }

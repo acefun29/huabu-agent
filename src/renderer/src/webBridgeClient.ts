@@ -55,6 +55,8 @@ export function resolveBridgeConfig(): WebBridgeConfig | null {
 
 /** 构造 window.huabu：底层走 HTTP + WS，形状与 preload 完全一致 */
 export function createWebBridgeApi(config: WebBridgeConfig): HuabuApi {
+  // 供 assetSrc 把 huabu-media:// 改写成 HTTP（图片/视频元素无法带 Authorization 头）
+  ;(globalThis as unknown as { __HUABU_MEDIA_BRIDGE__?: WebBridgeConfig }).__HUABU_MEDIA_BRIDGE__ = config
   const base = `http://127.0.0.1:${config.port}`
   const listeners = new Map<string, Set<(payload: unknown) => void>>()
   let socket: WebSocket | null = null

@@ -21,6 +21,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import type { WebSocket } from 'ws'
+import { handleMediaRequest } from '../media/protocol'
 
 /** channel → handler（由 IPC 注册层登记） */
 export type ChannelHandler = (payload: unknown) => unknown
@@ -86,13 +87,46 @@ export async function startWebBridge(options: WebBridgeOptions = {}): Promise<We
       return
     }
 
-    // 鉴权：token 走 Authorization 头（query 仅用于 WS 握手）
+    const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`)
+
+    /**
+     * 媒体路由：GET /media/<host>/<relPath>
+     * `<img src>` / `<video src>` 无法带 Authorization 头，所以这里用 query token 鉴权；
+     * 路径解析、越界拒绝、缩略图缓存全部复用 Electron 侧的 handleMediaRequest
+     * （同一套根目录与安全边界，不另写一份）。
+     */
+    if (req.method === 'GET' && url.pathname.startsWith('/media/')) {
+      if (url.searchParams.get('token') !== token) {
+        res.writeHead(401).end('unauthorized')
+        return
+      }
+      // 还原成 huabu-media:// 形态交给既有 handler（它按 url.host + pathname 解析）
+      const rest = url.pathname.slice('/media/'.length)
+      const slash = rest.indexOf('/')
+      const host = slash === -1 ? rest : rest.slice(0, slash)
+      const mediaUrl = new URL(`huabu-media://${host}/${slash === -1 ? '' : rest.slice(slash + 1)}`)
+      try {
+        const mediaResponse = await handleMediaRequest(new Request(mediaUrl.toString()))
+        const headers: Record<string, string> = {}
+        mediaResponse.headers.forEach((value, key) => {
+          headers[key] = value
+        })
+        // 浏览器里同源是 5174，图片请求来自 4788 —— 需要放行
+        if (allowed) headers['access-control-allow-origin'] = origin!
+        const buffer = Buffer.from(await mediaResponse.arrayBuffer())
+        res.writeHead(mediaResponse.status, headers)
+        res.end(buffer)
+      } catch (error) {
+        res.writeHead(500).end(String(error))
+      }
+      return
+    }
+
+    // 鉴权：token 走 Authorization 头（query 仅用于 WS 握手 / 媒体直取）
     if (!checkAuth(req, token)) {
       json(res, 401, { ok: false, code: 'unauthorized', error: 'token 无效' })
       return
     }
-
-    const url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`)
     // GET /channels：调试/自检用，列出可调用的 channel
     if (req.method === 'GET' && url.pathname === '/channels') {
       json(res, 200, { channels: registeredChannels() })

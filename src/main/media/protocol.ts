@@ -60,7 +60,8 @@ export function initMediaProtocol(getRoots: () => MediaRoots): void {
   protocol.handle(MEDIA_SCHEME, (request) => handleMediaRequest(request))
 }
 
-async function handleMediaRequest(request: Request): Promise<Response> {
+/** 媒体请求处理（也供 Web 桥复用：同一套根目录解析 + 越界防护 + 缩略图缓存） */
+export async function handleMediaRequest(request: Request): Promise<Response> {
   const url = new URL(request.url)
   const roots = rootProvider()
   let host = url.host || url.hostname
