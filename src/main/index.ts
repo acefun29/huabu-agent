@@ -33,7 +33,7 @@ if (!app.isPackaged && process.env['REMOTE_DEBUGGING_PORT'] && !HEADLESS) {
 }
 
 /**
- * 开发期桥 token：与 renderer 编译期读到的**同一个文件**（src/shared/devBridgeToken）。
+ * 开发期桥 token：与 renderer 编译期读到的**同一个文件**（src/main/devBridgeToken）。
  * 这样浏览器地址固定为 http://localhost:5173/，不需要 ?token=，重启也不失效。
  */
 const DEV_BRIDGE_TOKEN = readOrCreateDevToken()

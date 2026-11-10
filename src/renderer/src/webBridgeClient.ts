@@ -10,7 +10,7 @@
  *
  * 接入：`pnpm web` 会以 headless 模式起主进程（不建 Electron 窗口），并自动打开浏览器。
  * 地址里**不需要 token**：dev 期 token 由 electron.vite.config 在编译期注入
- * （见 src/shared/devBridgeToken，与主进程读同一个文件），所以
+ * （见 src/main/devBridgeToken，与主进程读同一个文件），所以
  *   http://localhost:5173/
  * 即可，重启也不会失效。URL 上仍可显式带 ?bridge=&token=（临时换桥/排查用）。
  */

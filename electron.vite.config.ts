@@ -7,7 +7,7 @@ import { readOrCreateDevToken, devBridgePort } from './src/main/devBridgeToken'
 /**
  * 开发期 Web 桥参数注入 renderer。
  *
- * 与主进程读**同一个 token 文件**（src/shared/devBridgeToken），所以浏览器地址
+ * 与主进程读**同一个 token 文件**（src/main/devBridgeToken），所以浏览器地址
  * 固定为 http://localhost:5173/ —— 不用带 ?token=，重启也不失效。
  * 生产构建下这两个值不会被主进程使用（桥只在 dev/headless 启用）。
  */
