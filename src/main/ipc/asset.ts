@@ -18,8 +18,14 @@ import {
   transferToLibrary
 } from '../assets/manager'
 import { setFileTags } from '../assets/tagsIndex'
-import { setFileFacet, setFileFacetsBulk } from '../assets/facetsIndex'
-import { BUILTIN_FACET_SCHEMAS, findFacetSchema, type Facet, type FacetSchema } from '../../shared/facets'
+import { loadFacetsIndex, setFileFacet, setFileFacetsBulk } from '../assets/facetsIndex'
+import {
+  activeFacetSchema,
+  MAX_FACET_SCHEMAS,
+  sanitizeFacetSchema,
+  type Facet,
+  type FacetSchema
+} from '../../shared/facets'
 import type { IpcContext } from './shared'
 import { guardAsync, guardSync, invalidPayload, isNonEmptyString } from './shared'
 import { consumeSourcePath } from './workspace'
@@ -30,13 +36,12 @@ export function registerAssetIpc(ctx: IpcContext): void {
   const broadcastAssetChanged = ctx.broadcastAssetChanged
 
   /**
-   * 当前工作区启用的分级 schema（决定层级叫 集/场/镜 还是 话/页/格）。
-   * 读取顺序：workspace.json facets.schemaId → 内置默认（短剧）。
-   * 写入时的 facet 会盖上这个 schema 的 id，所以之后切换 schema 不影响老数据。
+   * 当前工作区生效的分级结构（决定层级叫什么）。
+   * 结构是工作区数据：没有就是 null（各写入路径据此提示先建结构）。
+   * 写入时的 facet 会盖上这个结构的 id，所以之后切换结构不影响老数据。
    */
-  const currentFacetSchema = (): FacetSchema =>
-    findFacetSchema(BUILTIN_FACET_SCHEMAS, store.facetSchemaId()) ??
-    findFacetSchema(BUILTIN_FACET_SCHEMAS, null)!
+  const currentFacetSchema = (): FacetSchema | null =>
+    activeFacetSchema(store.facetSchemas(), store.facetSchemaId())
 
   const asImportFiles = (payload: unknown): unknown[] | null => {
     const files = (payload as { files?: unknown } | null)?.files
@@ -126,20 +131,61 @@ export function registerAssetIpc(ctx: IpcContext): void {
   })
 
   /**
-   * @backend(asset:set-facet-schema)：切换工作区分级 schema。
+   * @backend(asset:set-facet-schema)：切换工作区当前生效的分级结构。
    * 只写 workspace.json 的 facets 段并广播；已写入的分级各自带 schemaId，
    * 切回来仍按原语义显示（不迁移数据、不丢信息）。
    */
   ipcMain.handle(IpcChannel.AssetSetFacetSchema, (_event, payload: unknown) => {
     const schemaId = (payload as { schemaId?: unknown } | null)?.schemaId
     if (!isNonEmptyString(schemaId)) return invalidPayload('asset:set-facet-schema 需要 schemaId')
-    if (!BUILTIN_FACET_SCHEMAS.some((s) => s.id === schemaId)) {
-      return invalidPayload(`未知的分级 schema：${schemaId}（可选：${BUILTIN_FACET_SCHEMAS.map((s) => s.id).join(' / ')}）`)
+    if (!store.facetSchemas().some((s) => s.id === schemaId)) {
+      return invalidPayload(`未知的分级结构：${schemaId}（这个工作区还没有这套结构）`)
     }
     return guardSync(() => {
       store.setFacetSchemaId(schemaId as string)
       broadcastAssetChanged()
       return { schemaId }
+    })
+  })
+
+  /**
+   * @backend(asset:save-facet-schema)：新建/更新一套分级结构（工作区级）。
+   * 结构由用户或 Agent 定义，产品不内置任何方案：payload 就是一份层定义，
+   * 清洗后 upsert；`activate` 默认 true（建完即用）。
+   */
+  ipcMain.handle(IpcChannel.AssetSaveFacetSchema, (_event, payload: unknown) => {
+    const request = payload as { schema?: unknown; activate?: unknown } | null
+    const schema = sanitizeFacetSchema(request?.schema)
+    if (!schema) {
+      return invalidPayload('asset:save-facet-schema 需要合法的 schema：id、label 与至少一层 levels[].label')
+    }
+    if (store.facetSchemas().length >= MAX_FACET_SCHEMAS && !store.facetSchemas().some((s) => s.id === schema.id)) {
+      return invalidPayload(`一个工作区最多 ${MAX_FACET_SCHEMAS} 套分级结构`)
+    }
+    return guardSync(() => {
+      const activate = request?.activate !== false
+      store.saveFacetSchema(schema, activate)
+      broadcastAssetChanged()
+      return { schema, schemaId: store.facetSchemaId() }
+    })
+  })
+
+  /**
+   * @backend(asset:delete-facet-schema)：删除一套分级结构。
+   * facets.json 里指向它的分级数据不删（值仍有意义，只是层名不可解析），
+   * 返回受影响文件数让 UI 能如实告知用户。
+   */
+  ipcMain.handle(IpcChannel.AssetDeleteFacetSchema, (_event, payload: unknown) => {
+    const schemaId = (payload as { schemaId?: unknown } | null)?.schemaId
+    if (!isNonEmptyString(schemaId)) return invalidPayload('asset:delete-facet-schema 需要 schemaId')
+    return guardSync(() => {
+      const dir = currentDir()
+      if (!dir) throw new Error('尚未打开工作区')
+      const affected = Object.values(loadFacetsIndex(dir)).filter((facet) => facet.schemaId === schemaId).length
+      const removed = store.deleteFacetSchema(schemaId as string)
+      if (!removed) throw new Error(`没有这个分级结构：${schemaId}`)
+      broadcastAssetChanged()
+      return { schemaId, affected, schemaIdAfter: store.facetSchemaId() }
     })
   })
 
@@ -150,12 +196,15 @@ export function registerAssetIpc(ctx: IpcContext): void {
     return guardSync(() => {
       const dir = currentDir()
       if (!dir) throw new Error('尚未打开工作区')
+      const schema = currentFacetSchema()
+      // 没有结构就没有层名可写：先让用户/Agent 定义一套（产品不内置方案）
+      if (!schema) throw new Error('这个工作区还没有分级结构：请先在素材库页新建一套层级定义')
       const target = resolve(dir, request!.relPath as string)
       if (target !== dir && !target.startsWith(dir + sep)) {
         throw new Error(`路径越出工作区：${request!.relPath}`)
       }
       const relPath = normalizePath(relative(dir, target))
-      const saved = setFileFacet(dir, relPath, request!.facet as Facet | null, currentFacetSchema())
+      const saved = setFileFacet(dir, relPath, request!.facet as Facet | null, schema)
       broadcastAssetChanged()
       return { relPath, facet: saved }
     })
@@ -173,6 +222,8 @@ export function registerAssetIpc(ctx: IpcContext): void {
     return guardSync(() => {
       const dir = currentDir()
       if (!dir) throw new Error('尚未打开工作区')
+      const schema = currentFacetSchema()
+      if (!schema) throw new Error('这个工作区还没有分级结构：请先在素材库页新建一套层级定义')
       const normalized: Array<{ relPath: string; facet: Facet | null }> = []
       for (const entry of entries) {
         if (!isNonEmptyString(entry.relPath)) continue
@@ -184,7 +235,7 @@ export function registerAssetIpc(ctx: IpcContext): void {
           facet: (entry.facet ?? null) as Facet | null
         })
       }
-      const result = setFileFacetsBulk(dir, normalized, currentFacetSchema())
+      const result = setFileFacetsBulk(dir, normalized, schema)
       if (result.updated > 0 || result.removed > 0) broadcastAssetChanged()
       return result
     })

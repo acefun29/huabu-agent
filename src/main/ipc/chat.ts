@@ -64,10 +64,13 @@ export function registerChatIpc(ctx: IpcContext): void {
       const blockoutTool = assembleBlockoutTool({ currentDir })
       // 文本卡创建工具：文本上画布的唯一通道（write 落盘的文本不上画布，见 noteTool 头注）
       const noteTool = assembleNoteTool({ currentDir })
-      // 分级工具：Agent 读写素材位置（第几集/第几场/第几镜，层名由工作区 schema 决定）
+      // 分级工具：Agent 读写素材位置（层名由工作区自定义的分级结构决定，不内置方案）
       const facetTools = assembleFacetTools({
         currentDir,
-        schemaId: () => store.facetSchemaId(),
+        schemas: () => store.facetSchemas(),
+        activeSchemaId: () => store.facetSchemaId(),
+        saveSchema: (schema, activate) => store.saveFacetSchema(schema, activate),
+        deleteSchema: (id) => store.deleteFacetSchema(id),
         notifyChanged: broadcastAssetChanged
       })
       return [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool, noteTool, ...facetTools]
@@ -98,7 +101,10 @@ export function registerChatIpc(ctx: IpcContext): void {
       const noteTool = assembleNoteTool({ currentDir })
       const facetTools = assembleFacetTools({
         currentDir,
-        schemaId: () => store.facetSchemaId(),
+        schemas: () => store.facetSchemas(),
+        activeSchemaId: () => store.facetSchemaId(),
+        saveSchema: (schema, activate) => store.saveFacetSchema(schema, activate),
+        deleteSchema: (id) => store.deleteFacetSchema(id),
         notifyChanged: broadcastAssetChanged
       })
       return [...mediaTools, readMediaTool, ...videoTools, noteTool, ...facetTools]

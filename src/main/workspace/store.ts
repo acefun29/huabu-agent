@@ -16,7 +16,7 @@ import type {
 import type { MediaProviderType, MediaRatio, ModelCapabilities } from '../../shared/media'
 import { MEDIA_RATIOS } from '../../shared/media'
 import { MEDIA_ROOT_REL } from '../../shared/assets'
-import { BUILTIN_FACET_SCHEMAS } from '../../shared/facets'
+import { sanitizeFacetSchemas, type FacetSchema } from '../../shared/facets'
 import type {
   ChatMigrationInput,
   ChatMigrationPlan,
@@ -211,16 +211,21 @@ interface WorkspaceMetaFile {
   skills?: WorkspaceSkillsConfig
   /** Agent 运行时 feature flag（Mastra 迁移计划 v1.2 §14.1）：缺省 = pi */
   agent?: WorkspaceAgentConfig
-  /** 素材分级 schema 选择（决定层级叫什么：集/场/镜 vs 话/页/格） */
+  /** 素材分级结构（工作区自定义；决定层级叫什么：集/场/镜 还是任何别的） */
   facets?: WorkspaceFacetsConfig
   /** 素材库映射（新原型同步）：名字 → 工作区内相对路径。公共库首个建库时播种 */
   libraries?: WorkspaceLibrary[]
 }
 
-/** workspace.json 的 facets 段：分级 schema 选择 */
+/**
+ * workspace.json 的 facets 段：分级结构（工作区自定义，产品不内置任何方案）
+ * 与当前生效的那一套。
+ */
 export interface WorkspaceFacetsConfig {
-  /** 内置 schema id（drama / manga / promo / flat）；缺省 = 内置默认（短剧） */
+  /** 当前生效的 schema id；缺省/失效 = 列表第一套 */
   schemaId?: string
+  /** 这个工作区定义的全部分级结构（由用户或 Agent 创建） */
+  schemas?: FacetSchema[]
 }
 
 /** workspace.json 的 skills 段 */
@@ -521,22 +526,74 @@ export class WorkspaceStore {
   }
 
   /**
-   * 当前工作区的分级 schema id（未打开工作区 / 未设置 = null，调用方回落内置默认）。
-   * schema 决定层级叫什么（集/场/镜 vs 话/页/格），只影响显示与校验深度；
-   * 已写入的分级各自带 schemaId，切换不会改变老数据的语义。
+   * 当前工作区定义的全部分级结构（未打开工作区 = 空数组）。
+   * 结构是工作区数据，不是内置模板：空数组 = 这个项目还没定义过分级维度。
+   */
+  facetSchemas(): FacetSchema[] {
+    const dir = this.current?.path
+    return dir ? (this.readMeta(dir).facets?.schemas ?? []) : []
+  }
+
+  /**
+   * 当前生效的分级 schema id（未打开工作区 / 未设置 = null，调用方回落第一套）。
+   * schema 决定层级叫什么，只影响显示与校验深度；已写入的分级各自带 schemaId，
+   * 切换不会改变老数据的语义。
    */
   facetSchemaId(): string | null {
     const dir = this.current?.path
     return dir ? (this.readMeta(dir).facets?.schemaId ?? null) : null
   }
 
-  /** 设置分级 schema（写 workspace.json facets 段；只影响之后的显示与写入） */
+  /** 设置生效 schema（只影响之后的显示与写入）；id 必须在已有结构里 */
   setFacetSchemaId(schemaId: string): void {
     if (!this.current) throw new Error('尚未打开工作区')
     const dir = this.current.path
     const meta = this.readMeta(dir)
-    meta.facets = { schemaId }
+    const schemas = meta.facets?.schemas ?? []
+    if (!schemas.some((s) => s.id === schemaId)) throw new Error(`没有这个分级结构：${schemaId}`)
+    meta.facets = { ...meta.facets, schemaId, schemas }
     this.writeMeta(dir, meta)
+  }
+
+  /**
+   * 新建或更新一套分级结构（按 id upsert）。
+   * `activate` 为 true 时同时设为生效结构；工作区第一套结构自动生效。
+   * 调用方（IPC/Agent）负责先做 sanitizeFacetSchema，这里只做存在性与上限校验。
+   */
+  saveFacetSchema(schema: FacetSchema, activate = true): void {
+    if (!this.current) throw new Error('尚未打开工作区')
+    const dir = this.current.path
+    const meta = this.readMeta(dir)
+    const schemas = [...(meta.facets?.schemas ?? [])]
+    const index = schemas.findIndex((s) => s.id === schema.id)
+    if (index >= 0) schemas[index] = schema
+    else schemas.push(schema)
+    const isFirst = schemas.length === 1
+    const activeId = activate || isFirst ? schema.id : (meta.facets?.schemaId ?? schema.id)
+    meta.facets = { schemaId: activeId, schemas }
+    this.writeMeta(dir, meta)
+  }
+
+  /**
+   * 删除一套分级结构；删掉的正好是生效结构时回落到第一套（没有结构则清空段）。
+   * 返回是否真的删掉了（id 不存在时 false）。
+   * 注意：facets.json 里指向该 id 的分级数据不动——值仍有意义，只是层名不可解析。
+   */
+  deleteFacetSchema(id: string): boolean {
+    if (!this.current) throw new Error('尚未打开工作区')
+    const dir = this.current.path
+    const meta = this.readMeta(dir)
+    const schemas = meta.facets?.schemas ?? []
+    const next = schemas.filter((s) => s.id !== id)
+    if (next.length === schemas.length) return false
+    if (next.length === 0) {
+      delete meta.facets
+    } else {
+      const activeId = meta.facets?.schemaId && meta.facets.schemaId !== id ? meta.facets.schemaId : next[0].id
+      meta.facets = { schemaId: activeId, schemas: next }
+    }
+    this.writeMeta(dir, meta)
+    return true
   }
 
   /** 设置运行时 flag（工作区级；只影响之后新建的会话，已绑定会话保持原运行时） */
@@ -725,15 +782,18 @@ function normalizeAgentSegment(raw: unknown): WorkspaceAgentConfig {
 }
 
 /**
- * facets 段读入清洗：只认内置 schema id，未知值丢弃（读取侧回落内置默认）。
- * 用白名单而不是「非空字符串就收」——schema id 拼错时宁可回默认，
- * 也不要让整个 UI 因为找不到 schema 而停止渲染分级。
+ * facets 段读入清洗：结构定义逐套收敛（sanitizeFacetSchemas），生效 id 必须
+ * 在列表里真实存在，否则丢弃（读取侧回落第一套）。
+ * 用「存在性校验」而不是形状校验：id 拼错时宁可回落到第一套，也不要让整个
+ * UI 因为找不到 schema 而停止渲染分级。
  */
 function normalizeFacetsSegment(raw: unknown): WorkspaceFacetsConfig {
-  const schemaId = (raw as { schemaId?: unknown } | null)?.schemaId
-  return typeof schemaId === 'string' && BUILTIN_FACET_SCHEMAS.some((s) => s.id === schemaId)
-    ? { schemaId }
-    : {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const rec = raw as { schemaId?: unknown; schemas?: unknown }
+  const schemas = sanitizeFacetSchemas(rec.schemas)
+  if (schemas.length === 0) return {}
+  const schemaId = typeof rec.schemaId === 'string' && schemas.some((s) => s.id === rec.schemaId) ? rec.schemaId : undefined
+  return { ...(schemaId ? { schemaId } : {}), schemas }
 }
 
 /* -------------------------------------------------------------------------- */

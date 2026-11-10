@@ -251,8 +251,12 @@ export const IpcChannel = {
   AssetSetFacet: 'asset:set-facet',
   /** 批量设置文件分级（Agent 标注整个场景时一次写完） */
   AssetSetFacetsBulk: 'asset:set-facets',
-  /** 选择工作区的分级 schema（决定层级叫 集/场/镜 还是 话/页/格） */
+  /** 切换工作区当前生效的分级结构（层级名跟着结构走） */
   AssetSetFacetSchema: 'asset:set-facet-schema',
+  /** 新建/更新一套分级结构（工作区级；由用户或 Agent 定义，产品不内置） */
+  AssetSaveFacetSchema: 'asset:save-facet-schema',
+  /** 删除一套分级结构（已有分级数据保留，只是层名不可解析） */
+  AssetDeleteFacetSchema: 'asset:delete-facet-schema',
   /** 事件类：素材库目录变更广播（导入/建库/删库后；未来的本地索引挂在这条链路上） */
   AssetChanged: 'asset:changed'
 } as const
@@ -1244,8 +1248,10 @@ export interface AssetLibrariesInfo {
   workspaceDir: string | null
   /** 临时收件箱绝对路径（import-temp 的落点，工作区之外） */
   inboxDir: string
-  /** 当前工作区启用的分级 schema（缺省 = 内置短剧三级）；渲染端据此渲染层级选择器 */
+  /** 当前工作区生效的分级结构（工作区自定义；没有结构 = undefined，渲染端隐藏分级入口） */
   facetSchema?: FacetSchema
+  /** 工作区定义的全部分级结构（用户/Agent 创建，界面据此渲染结构与编辑） */
+  facetSchemas?: FacetSchema[]
   libraries: AssetLibrary[]
 }
 

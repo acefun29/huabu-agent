@@ -1,32 +1,36 @@
 /**
  * 素材分级的通用 schema（单一事实来源）。
  *
- * 要解决的问题：短剧制作里一张图属于「第3集 / 第2场 / 第12镜」，漫画里一格属于
- * 「第5话 / 第3页 / 第2格」，套图里一张属于「春季系列 / 主视觉」。它们的**形状完全一样**
- * ——一条从粗到细的路径——只是每层叫什么不同。
+ * 「分级」回答的是**位置**问题：这张图在项目的哪个位置。短剧里是「第3集 / 第2场 /
+ * 第12镜」，漫画里是「第5话 / 第3页 / 第2格」，套图里是「春季系列 / 主视觉」——
+ * 它们的**形状完全一样**：一条从粗到细的路径，只是每层叫什么不同。
  *
- * 所以这里不定义任何具体业务层级，只定义「怎么描述一套层级」：
+ * 所以这里**不定义任何具体业务层级**，只定义「怎么描述一套层级」：
  *
  * ```ts
- * const DRAMA: FacetSchema = {
- *   id: 'drama',
+ * const schema: FacetSchema = {
+ *   id: 'facet-m3k1',
  *   label: '短剧',
  *   levels: [
  *     { key: 'episode', label: '集', hint: '第01集' },
- *     { key: 'scene',   label: '场', hint: 'EP01-S02' },
- *     { key: 'shot',    label: '镜', hint: 'EP01-S02-C03' }
+ *     { key: 'scene',   label: '场', hint: '第2场' },
+ *     { key: 'shot',    label: '镜', hint: '第12镜' }
  *   ]
  * }
  * ```
  *
+ * 层级定义本身也是**工作区数据**（workspace.json 的 facets.schemas），由使用者
+ * 在界面里创建、或由 Agent 按对话创建。本文件只提供数据结构、清洗与解析工具，
+ * 不内置任何方案——一份方案值不值得内置，取决于具体项目，不该由产品决定。
+ *
  * 数据侧只存值数组，**不存层名**（层名随 schema 变，值不变）：
  * ```json
- * { "facets": { "assets/images/a.png": { "schemaId": "drama",
+ * { "facets": { "assets/images/a.png": { "schemaId": "facet-m3k1",
  *     "chain": ["第03集", "第2场", "第12镜"] } } }
  * ```
  *
- * 这样换 schema（短剧 ↔ 漫画）不需要迁移已有值；同一工作区也可以并存多套
- * schema（比如同时做短剧和产品套图），靠 `schemaId` 区分。
+ * 这样换 schema 不需要迁移已有值；同一工作区可以并存多套 schema（同时做短剧和
+ * 产品套图），靠 `schemaId` 区分；换掉 schema 后老数据仍按写入时的语义显示。
  *
  * 与标签的区别（刻意分开）：
  * - 标签 tags：扁平、可多值、用于交叉检索（「主视觉」「风格参考」）
@@ -62,9 +66,9 @@ export interface FacetLevel {
  * `levels.length` 即深度；`levels[0]` 最粗。
  */
 export interface FacetSchema {
-  /** 稳定 id（落盘进 facet.schemaId）：drama / manga / promo / custom-* */
+  /** 稳定 id（落盘进 facet.schemaId）；由 newFacetSchemaId 生成 */
   id: string
-  /** 展示名（「短剧」「漫画」「产品套图」） */
+  /** 展示名（用户自己起，如「短剧」「分镜表」） */
   label: string
   /** 从粗到细的层定义 */
   levels: FacetLevel[]
@@ -74,7 +78,7 @@ export interface FacetSchema {
 
 /** 一个文件的分级坐标 */
 export interface Facet {
-  /** 使用哪套 schema；缺省 = 工作区当前默认 schema */
+  /** 使用哪套 schema；缺省 = 工作区当前生效 schema */
   schemaId?: string
   /**
    * 从粗到细的值，长度 <= schema.levels.length。
@@ -88,58 +92,18 @@ export interface Facet {
   order?: number
 }
 
-/* ------------------------------------------------------------ 内置 schema */
+/* ------------------------------------------------------------ 约束常量 */
 
-export const FACET_SCHEMA_DRAMA: FacetSchema = {
-  id: 'drama',
-  label: '短剧',
-  description: '按 集 → 场 → 镜 三级定位，适合真人短剧/AI 短剧的分镜管理。',
-  levels: [
-    { key: 'episode', label: '集', title: '剧集', hint: '第01集' },
-    { key: 'scene', label: '场', title: '场景', hint: '第2场' },
-    { key: 'shot', label: '镜', title: '镜头', hint: '第12镜' }
-  ]
-}
+/** 一条分级链最多几层（schema 深度上限，也是无 schema 时的收敛深度） */
+export const MAX_FACET_DEPTH = 6
+/** 一个工作区最多存几套 schema */
+export const MAX_FACET_SCHEMAS = 20
+/** schema id 的合法形态（落盘键，保持窄字符集） */
+const SCHEMA_ID_RE = /^[a-z0-9_-]{1,32}$/i
+/** 层名最长多少字（紧凑展示用，过长会撑坏筛选条） */
+const LEVEL_LABEL_MAX = 12
 
-export const FACET_SCHEMA_MANGA: FacetSchema = {
-  id: 'manga',
-  label: '漫画',
-  description: '按 话 → 页 → 格 三级定位，适合条漫/页漫。',
-  levels: [
-    { key: 'chapter', label: '话', title: '话', hint: '第05话' },
-    { key: 'page', label: '页', title: '页', hint: '第3页' },
-    { key: 'panel', label: '格', title: '格', hint: '第2格' }
-  ]
-}
-
-export const FACET_SCHEMA_PROMO: FacetSchema = {
-  id: 'promo',
-  label: '产品套图',
-  description: '按 组 → 图 两级定位，适合电商/V 视觉的成套产出。',
-  levels: [
-    { key: 'set', label: '组', title: '套图组', hint: '春季系列' },
-    { key: 'image', label: '图', title: '单图', hint: '主视觉' }
-  ]
-}
-
-export const FACET_SCHEMA_FLAT: FacetSchema = {
-  id: 'flat',
-  label: '单层分类',
-  description: '只有一层（如「章节」「批次」），适合想分个组但不需要多级的场景。',
-  levels: [{ key: 'group', label: '组', title: '分组', hint: '第1组' }]
-}
-
-export const BUILTIN_FACET_SCHEMAS: FacetSchema[] = [
-  FACET_SCHEMA_DRAMA,
-  FACET_SCHEMA_MANGA,
-  FACET_SCHEMA_PROMO,
-  FACET_SCHEMA_FLAT
-]
-
-/** 工作区未指定 schema 时的缺省（与「短剧」一致，最常见场景） */
-export const DEFAULT_FACET_SCHEMA_ID = FACET_SCHEMA_DRAMA.id
-
-/* ------------------------------------------------------------ 工具函数 */
+/* ------------------------------------------------------------ 清洗 */
 
 /** 路径键规范化：反斜杠转正斜杠、去前导斜杠（与 tags.json 的键约定一致） */
 export function normalizeFacetKey(relPath: string): string {
@@ -152,6 +116,142 @@ export function cleanFacetValue(raw: unknown): string {
   return raw.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 60)
 }
 
+/** 短文本清洗（label / title / hint 共用） */
+function cleanText(raw: unknown, max: number): string {
+  if (typeof raw !== 'string') return ''
+  return raw.replace(/[\r\n\t]+/g, ' ').trim().slice(0, max)
+}
+
+/**
+ * 把任意输入收敛成合法 FacetLevel；层级名缺失时返回 null（丢弃该层）。
+ * key 不合法时按 `level-N` 派生，重复由 sanitizeFacetSchema 统一去重。
+ */
+function sanitizeFacetLevel(raw: unknown, index: number): FacetLevel | null {
+  if (!raw || typeof raw !== 'object') return null
+  const rec = raw as Record<string, unknown>
+  const label = cleanText(rec.label, LEVEL_LABEL_MAX)
+  if (!label) return null
+  const key = typeof rec.key === 'string' && /^[a-z0-9_-]{1,32}$/i.test(rec.key) ? rec.key : `level-${index + 1}`
+  const title = cleanText(rec.title, 40)
+  const hint = cleanText(rec.hint, 40)
+  return {
+    key,
+    label,
+    ...(title ? { title } : {}),
+    ...(hint ? { hint } : {}),
+    ...(rec.optional === true ? { optional: true } : {})
+  }
+}
+
+/**
+ * 把任意输入收敛成合法 FacetSchema；结构不成立时返回 null。
+ *
+ * 渲染端与主进程的载荷都按不可信处理（Agent 也会写），所以这里不抛错：
+ * 坏层丢弃、坏 id 丢弃、超深截断，只要求「至少一层且每层有名字」。
+ */
+export function sanitizeFacetSchema(raw: unknown): FacetSchema | null {
+  if (!raw || typeof raw !== 'object') return null
+  const rec = raw as Record<string, unknown>
+  const id = typeof rec.id === 'string' && SCHEMA_ID_RE.test(rec.id) ? rec.id : ''
+  const label = cleanText(rec.label, 40)
+  if (!id || !label) return null
+  if (!Array.isArray(rec.levels)) return null
+
+  const levels: FacetLevel[] = []
+  const usedKeys = new Set<string>()
+  for (const item of rec.levels.slice(0, MAX_FACET_DEPTH)) {
+    const level = sanitizeFacetLevel(item, levels.length)
+    if (!level) continue
+    // key 去重：第二层同名时退化成 level-N，避免 React key / datalist id 撞车
+    let key = level.key
+    for (let n = 2; usedKeys.has(key); n += 1) key = `${level.key}-${n}`
+    usedKeys.add(key)
+    levels.push({ ...level, key })
+  }
+  if (levels.length === 0) return null
+
+  const description = cleanText(rec.description, 200)
+  return { id, label, levels, ...(description ? { description } : {}) }
+}
+
+/** 一批 schema 的清洗：按 id 去重（后者覆盖前者）、上限 MAX_FACET_SCHEMAS */
+export function sanitizeFacetSchemas(raw: unknown): FacetSchema[] {
+  if (!Array.isArray(raw)) return []
+  const byId = new Map<string, FacetSchema>()
+  for (const item of raw) {
+    const schema = sanitizeFacetSchema(item)
+    if (!schema) continue
+    byId.delete(schema.id) // 后出现的覆盖先出现的，同时移到末尾
+    byId.set(schema.id, schema)
+    if (byId.size > MAX_FACET_SCHEMAS) {
+      const oldest = byId.keys().next().value
+      if (oldest !== undefined) byId.delete(oldest)
+    }
+  }
+  return [...byId.values()]
+}
+
+/** 生成一个新的 schema id，避开已有 id（短、稳定、不与人工输入冲突） */
+export function newFacetSchemaId(existing: readonly string[] = []): string {
+  const taken = new Set(existing)
+  for (;;) {
+    const id = `facet-${Math.random().toString(36).slice(2, 8)}`
+    if (!taken.has(id)) return id
+  }
+}
+
+/* ------------------------------------------------------------ 解析 */
+
+/** 按 id 找 schema；找不到返回 null（不再有内置默认回落） */
+export function findFacetSchema(schemas: readonly FacetSchema[], id?: string | null): FacetSchema | null {
+  if (!id) return null
+  return schemas.find((s) => s.id === id) ?? null
+}
+
+/**
+ * 工作区当前生效的 schema：命中 activeId → 第一套 → null。
+ * null 表示「这个工作区还没有建过任何分级结构」，各 UI 据此隐藏分级入口。
+ */
+export function activeFacetSchema(
+  schemas: readonly FacetSchema[],
+  activeId?: string | null
+): FacetSchema | null {
+  return findFacetSchema(schemas, activeId) ?? schemas[0] ?? null
+}
+
+/**
+ * 某个 facet 该用哪套 schema 解释。
+ *
+ * 为什么优先用 facet 自己的 schemaId：工作区切到另一套结构后，老数据的 `chain`
+ * 值本身没变，但层名含义完全不同。存了 schemaId 就能「按写入时的语义显示」，
+ * 不会把「第01集」错标成「第01话」。
+ *
+ * 回退顺序：facet.schemaId → 当前生效结构 → null（层名未知，按「第N层」显示）。
+ */
+export function schemaForFacet(
+  facet: Facet | null | undefined,
+  schemas: readonly FacetSchema[],
+  fallback: FacetSchema | null
+): FacetSchema | null {
+  if (facet?.schemaId) {
+    const own = findFacetSchema(schemas, facet.schemaId)
+    if (own) return own
+  }
+  return fallback
+}
+
+/**
+ * 写入前盖章：把 facet 的 schemaId 记成写入时用的那套结构。
+ *
+ * 总是覆盖（而不是「已知 id 就保留」）：写入时的语义就是当前的语义，让数据能
+ * 自解释。跨结构搬迁请显式调用两次写入，不要靠保留旧 id 表达。
+ */
+export function stampFacetSchema(facet: Facet | null, schema: FacetSchema | null | undefined): Facet | null {
+  if (!facet || !schema) return facet
+  if (facet.schemaId === schema.id) return facet
+  return { ...facet, schemaId: schema.id }
+}
+
 /**
  * 把任意输入收敛成合法 Facet（渲染端/Agent 的载荷都按不可信处理）。
  *
@@ -161,8 +261,6 @@ export function cleanFacetValue(raw: unknown): string {
  * - 清洗后为空返回 null（= 删除该文件的分级）
  * - schemaId 只保留合法 id 形态（字母数字、-、_），否则丢弃
  */
-export const MAX_FACET_DEPTH = 6
-
 export function coerceFacet(input: unknown, schema?: FacetSchema | null): Facet | null {
   if (!input || typeof input !== 'object') return null
   const raw = input as { schemaId?: unknown; chain?: unknown; order?: unknown }
@@ -180,7 +278,7 @@ export function coerceFacet(input: unknown, schema?: FacetSchema | null): Facet 
   if (chain.length === 0) return null
 
   const out: Facet = { chain }
-  if (typeof raw.schemaId === 'string' && /^[a-z0-9_-]{1,32}$/i.test(raw.schemaId)) {
+  if (typeof raw.schemaId === 'string' && SCHEMA_ID_RE.test(raw.schemaId)) {
     out.schemaId = raw.schemaId
   }
   if (typeof raw.order === 'number' && Number.isFinite(raw.order)) {
@@ -189,51 +287,9 @@ export function coerceFacet(input: unknown, schema?: FacetSchema | null): Facet 
   return out
 }
 
-/** 按 id 找 schema；id 缺省时返回默认 schema；找不到返回 null（调用方决定回退） */
-export function findFacetSchema(
-  schemas: FacetSchema[],
-  id?: string | null
-): FacetSchema | null {
-  if (!id) return schemas.find((s) => s.id === DEFAULT_FACET_SCHEMA_ID) ?? schemas[0] ?? null
-  return schemas.find((s) => s.id === id) ?? null
-}
-
-/**
- * 某个 facet 该用哪套 schema 解释。
- *
- * 为什么优先用 facet 自己的 schemaId：工作区切换 schema（短剧 → 漫画）后，
- * 老数据的 `chain` 值本身没变，但层名含义完全不同。存了 schemaId 就能
- * 「按写入时的语义显示」，不会把「第01集」错标成「第01话」。
- *
- * 回退顺序：facet.schemaId → 工作区 fallback → 内置默认。
- */
-export function schemaForFacet(
-  facet: Facet | null | undefined,
-  fallback: FacetSchema | null
-): FacetSchema | null {
-  if (facet?.schemaId) {
-    const own = findFacetSchema(BUILTIN_FACET_SCHEMAS, facet.schemaId)
-    if (own) return own
-  }
-  return fallback ?? findFacetSchema(BUILTIN_FACET_SCHEMAS, null)
-}
-
-/**
- * 写入前盖章：把 facet 的 schemaId 补成写入时用的 schema。
- * 已有合法 schemaId 的保持原样（跨 schema 迁移时不抹掉来源）。
- */
-export function stampFacetSchema(
-  facet: Facet | null,
-  schema: FacetSchema | null | undefined
-): Facet | null {
-  if (!facet || !schema) return facet
-  if (facet.schemaId && findFacetSchema(BUILTIN_FACET_SCHEMAS, facet.schemaId)) return facet
-  return { ...facet, schemaId: schema.id }
-}
-
 /**
  * facet 的展示路径（「第03集 / 第2场 / 第12镜」）。
- * 值多于层数时多出来的部分用 `+` 前缀原样显示（schema 换过时不至于丢信息）。
+ * 值多于层数时原样显示（schema 换过时不至于丢信息）。
  */
 export function facetPath(facet: Facet | null | undefined, schema: FacetSchema | null): string {
   if (!facet || facet.chain.length === 0) return ''

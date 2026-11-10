@@ -29,7 +29,7 @@ import type {
 import { copyIntoDir, WorkspaceStore } from '../workspace/store'
 import { loadTagsIndex, setFileTags } from './tagsIndex'
 import { loadFacetsIndex, migrateFacetKey, removeFacetKey } from './facetsIndex'
-import { BUILTIN_FACET_SCHEMAS, findFacetSchema, type Facet } from '../../shared/facets'
+import { activeFacetSchema, type Facet } from '../../shared/facets'
 
 /**
  * 素材域（asset）主进程模块。
@@ -243,12 +243,15 @@ export async function listLibraries(store: WorkspaceStore): Promise<AssetLibrari
       })
     }
   }
+  const schemas = store.facetSchemas()
   return {
     workspaceDir: dir ? normalizePath(dir) : null,
     inboxDir: normalizePath(inboxRoot()),
     libraries,
-    /** 当前 schema（读 workspace.json facets 段；未设置/非法值回落内置默认） */
-    facetSchema: findFacetSchema(BUILTIN_FACET_SCHEMAS, store.facetSchemaId()) ?? undefined
+    /** 当前生效结构（工作区自定义；没有结构 = undefined，渲染端隐藏分级入口） */
+    facetSchema: activeFacetSchema(schemas, store.facetSchemaId()) ?? undefined,
+    /** 工作区定义的全部分级结构（界面据此渲染结构下拉与编辑） */
+    facetSchemas: schemas
   }
 }
 

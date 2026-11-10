@@ -263,6 +263,10 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
 
       setFacetSchema: (schemaId) => invoke(IpcChannel.AssetSetFacetSchema, { schemaId }),
 
+      saveFacetSchema: (schema, activate) => invoke(IpcChannel.AssetSaveFacetSchema, { schema, activate }),
+
+      deleteFacetSchema: (schemaId) => invoke(IpcChannel.AssetDeleteFacetSchema, { schemaId }),
+
       deleteAsset: (relPath) => invoke(IpcChannel.AssetDelete, { relPath }),
 
       renameAsset: (relPath, newName) => invoke(IpcChannel.AssetRename, { relPath, newName }),

@@ -7,6 +7,7 @@ import { SessionSidebar } from './components/SessionSidebar'
 import { ChatPanel, type RightPage } from './components/ChatPanel'
 import { Toast } from './components/Toast'
 import { ConfirmDialog } from './components/ConfirmDialog'
+import { useFacetSchemaUi } from './store/facetSchemaUi'
 import { WorkspaceGate } from './components/WorkspaceGate'
 import { MediaConfigGate } from './components/MediaConfigGate'
 
@@ -14,6 +15,9 @@ import { MediaConfigGate } from './components/MediaConfigGate'
 // lazy 化后首屏不必解析这些模块（内部 perfProbe 计数不受影响）
 const SettingsPanel = lazy(() => import('./components/SettingsPanel').then((m) => ({ default: m.SettingsPanel })))
 const MediaViewer = lazy(() => import('./components/MediaViewer').then((m) => ({ default: m.MediaViewer })))
+const FacetSchemaEditor = lazy(() =>
+  import('./components/canvas/FacetSchemaEditor').then((m) => ({ default: m.FacetSchemaEditor }))
+)
 
 /**
  * 应用根组件：设置 Provider → 画布 Provider → 自绘标题栏 + 满屏画布 + 悬浮 chrome。
@@ -88,6 +92,20 @@ function WorkspaceBody() {
   )
 }
 
+/** 分级结构编辑弹窗的挂载点：面板内的滚动容器会裁切弹窗，所以放在根节点 */
+function FacetSchemaEditorHost() {
+  const editor = useFacetSchemaUi((s) => s.editor)
+  if (!editor) return null
+  return (
+    <Suspense fallback={null}>
+      <FacetSchemaEditor
+        schema={editor.schema}
+        onClose={() => useFacetSchemaUi.getState().closeEditor()}
+      />
+    </Suspense>
+  )
+}
+
 export default function App() {
   return (
     <SettingsProvider>
@@ -104,6 +122,7 @@ export default function App() {
           </Suspense>
         )}
         <ConfirmDialog />
+        <FacetSchemaEditorHost />
         <Suspense fallback={null}>
           <MediaViewer />
         </Suspense>

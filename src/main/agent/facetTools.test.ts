@@ -4,14 +4,33 @@ import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { assembleFacetTools } from './facetTools'
 import { loadFacetsIndex, setFileFacet } from '../assets/facetsIndex'
-import { FACET_SCHEMA_DRAMA } from '../../shared/facets'
+import type { FacetSchema } from '../../shared/facets'
 
 /**
  * Agent 分级工具的行为（临时工作区，不碰真实数据）。
- * 重点：路径守卫、空 chain 清除、schema 截断、坏条目跳过而不整单失败。
+ *
+ * 重点：产品不内置分级方案——工具必须能「先按用户说的层名定义结构，再写位置」，
+ * 以及没结构时给出指引而不是瞎猜层名。其余：路径守卫、空 chain 清除、
+ * 结构深度截断、坏条目跳过而不整单失败。
  */
 let dir = ''
 let tools: ReturnType<typeof assembleFacetTools>
+
+/** 内存里的工作区结构表（模拟 store 的 facets 段） */
+let schemas: FacetSchema[]
+let activeId: string | null
+/** 每次 notifyChanged 计数（验证写入后确实通知了渲染端） */
+let notified: number
+
+const DRAMA: FacetSchema = {
+  id: 'test-drama',
+  label: '短剧',
+  levels: [
+    { key: 'episode', label: '集', title: '剧集', hint: '第01集' },
+    { key: 'scene', label: '场', title: '场景', hint: '第2场' },
+    { key: 'shot', label: '镜', title: '镜头', hint: '第12镜' }
+  ]
+}
 
 /** 直接调工具 execute（Pi 的 ToolDefinition.execute 是 5 参：id / params / signal / onUpdate / ctx） */
 const run = async (name: string, params: unknown) => {
@@ -26,10 +45,35 @@ const run = async (name: string, params: unknown) => {
 const textOf = (result: { content: Array<{ type: string; text?: string }> }): string =>
   result.content.map((c) => c.text ?? '').join('\n')
 
+const buildTools = () =>
+  assembleFacetTools({
+    currentDir: () => dir,
+    schemas: () => schemas,
+    activeSchemaId: () => activeId,
+    saveSchema: (schema, activate) => {
+      const index = schemas.findIndex((s) => s.id === schema.id)
+      if (index >= 0) schemas[index] = schema
+      else schemas.push(schema)
+      if (activate || schemas.length === 1) activeId = schema.id
+    },
+    deleteSchema: (id) => {
+      const before = schemas.length
+      schemas = schemas.filter((s) => s.id !== id)
+      if (activeId === id) activeId = schemas[0]?.id ?? null
+      return schemas.length !== before
+    },
+    notifyChanged: () => {
+      notified += 1
+    }
+  })
+
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'huabu-facet-tools-'))
   mkdirSync(join(dir, '.huabu'), { recursive: true })
-  tools = assembleFacetTools({ currentDir: () => dir, schemaId: () => null, notifyChanged: () => {} })
+  schemas = [DRAMA]
+  activeId = DRAMA.id
+  notified = 0
+  tools = buildTools()
 })
 
 afterEach(() => {
@@ -37,27 +81,28 @@ afterEach(() => {
 })
 
 describe('set_facets', () => {
-  it('给多个文件设同一位置，并盖章 schemaId', async () => {
+  it('给多个文件设同一位置，并盖章当前结构 id', async () => {
     const result = await run('set_facets', {
       entries: [
         { relPath: 'assets/images/a.png', chain: ['第02集', '第1场'] },
         { relPath: 'assets/images/b.png', chain: ['第02集', '第1场'] }
       ]
     })
-    expect(result.details).toMatchObject({ ok: true, updated: 2, removed: 0, schemaId: 'drama' })
+    expect(result.details).toMatchObject({ ok: true, updated: 2, removed: 0, schemaId: 'test-drama' })
     const facets = loadFacetsIndex(dir)
-    expect(facets['assets/images/a.png']).toEqual({ chain: ['第02集', '第1场'], schemaId: 'drama' })
-    expect(facets['assets/images/b.png']).toEqual({ chain: ['第02集', '第1场'], schemaId: 'drama' })
+    expect(facets['assets/images/a.png']).toEqual({ chain: ['第02集', '第1场'], schemaId: 'test-drama' })
+    expect(facets['assets/images/b.png']).toEqual({ chain: ['第02集', '第1场'], schemaId: 'test-drama' })
+    expect(notified).toBe(1)
   })
 
   it('chain: null 清除分级', async () => {
-    setFileFacet(dir, 'assets/images/a.png', { chain: ['第01集'] }, FACET_SCHEMA_DRAMA)
+    setFileFacet(dir, 'assets/images/a.png', { chain: ['第01集'] }, DRAMA)
     const result = await run('set_facets', { entries: [{ relPath: 'assets/images/a.png', chain: null }] })
     expect(result.details).toMatchObject({ ok: true, updated: 0, removed: 1 })
     expect(loadFacetsIndex(dir)['assets/images/a.png']).toBeUndefined()
   })
 
-  it('超出 schema 深度的层被截断', async () => {
+  it('超出结构深度的层被截断', async () => {
     await run('set_facets', {
       entries: [{ relPath: 'a.png', chain: ['第01集', '第2场', '第12镜', '溢出层'] }]
     })
@@ -99,21 +144,49 @@ describe('set_facets', () => {
     expect(result.details.ok).toBe(false)
     expect(Object.keys(loadFacetsIndex(dir))).toEqual([])
   })
+
+  it('可以用 schemaId 指定按哪套结构写（并盖那套的 id）', async () => {
+    schemas.push({
+      id: 'test-manga',
+      label: '漫画',
+      levels: [
+        { key: 'chapter', label: '话' },
+        { key: 'page', label: '页' }
+      ]
+    })
+    const result = await run('set_facets', {
+      schemaId: 'test-manga',
+      entries: [{ relPath: 'a.png', chain: ['第05话', '第3页'] }]
+    })
+    expect(result.details).toMatchObject({ ok: true, schemaId: 'test-manga' })
+    expect(loadFacetsIndex(dir)['a.png']).toEqual({ chain: ['第05话', '第3页'], schemaId: 'test-manga' })
+  })
+
+  it('schemaId 不存在时返回指引，不写入', async () => {
+    const result = await run('set_facets', {
+      schemaId: 'ghost',
+      entries: [{ relPath: 'a.png', chain: ['x'] }]
+    })
+    expect(result.details.ok).toBe(false)
+    expect(textOf(result)).toContain('没有这个分级结构')
+    expect(loadFacetsIndex(dir)).toEqual({})
+  })
 })
 
 describe('list_facets', () => {
-  it('返回 schema 层定义与已分级条目', async () => {
-    setFileFacet(dir, 'a.png', { chain: ['第01集', '第2场'] }, FACET_SCHEMA_DRAMA)
+  it('返回结构定义与已分级条目', async () => {
+    setFileFacet(dir, 'a.png', { chain: ['第01集', '第2场'] }, DRAMA)
     const result = await run('list_facets', {})
     const text = textOf(result)
     expect(text).toContain('第01集 / 第2场')
     expect(text).toContain('短剧')
-    expect(result.details).toMatchObject({ ok: true, graded: 1 })
+    expect(text).toContain('当前生效')
+    expect(result.details).toMatchObject({ ok: true, graded: 1, schemaId: 'test-drama' })
   })
 
   it('prefix 只列出该位置下的文件', async () => {
-    setFileFacet(dir, 'ep1.png', { chain: ['第01集', '第2场'] }, FACET_SCHEMA_DRAMA)
-    setFileFacet(dir, 'ep2.png', { chain: ['第02集', '第1场'] }, FACET_SCHEMA_DRAMA)
+    setFileFacet(dir, 'ep1.png', { chain: ['第01集', '第2场'] }, DRAMA)
+    setFileFacet(dir, 'ep2.png', { chain: ['第02集', '第1场'] }, DRAMA)
     const result = await run('list_facets', { prefix: ['第02集'] })
     expect(result.details).toMatchObject({ ok: true, graded: 1 })
     expect(textOf(result)).toContain('ep2.png')
@@ -124,16 +197,120 @@ describe('list_facets', () => {
     const result = await run('list_facets', {})
     expect(textOf(result)).toContain('还没有文件分级')
   })
+
+  it('工作区没有结构时明确提示先建结构，不假设层名', async () => {
+    schemas = []
+    activeId = null
+    tools = buildTools()
+    const result = await run('list_facets', {})
+    const text = textOf(result)
+    expect(result.details).toMatchObject({ ok: true, schemaId: null, schemas: [] })
+    expect(text).toContain('还没有任何分级结构')
+    expect(text).toContain('define_facet_schema')
+  })
+})
+
+describe('define_facet_schema', () => {
+  it('新建一套结构并置为生效', async () => {
+    const result = await run('define_facet_schema', {
+      label: '章节',
+      levels: [{ label: '卷' }, { label: '章' }]
+    })
+    expect(result.details).toMatchObject({ ok: true, created: true, active: true })
+    expect(schemas).toHaveLength(2)
+    const created = schemas[1]
+    expect(created.label).toBe('章节')
+    expect(created.levels.map((l) => l.label)).toEqual(['卷', '章'])
+    expect(activeId).toBe(created.id)
+    expect(notified).toBeGreaterThan(0)
+  })
+
+  it('传 id 时更新已有结构而不是新建', async () => {
+    const result = await run('define_facet_schema', {
+      id: DRAMA.id,
+      label: '短剧（改）',
+      levels: [{ label: '集' }, { label: '场' }]
+    })
+    expect(result.details).toMatchObject({ ok: true, created: false })
+    expect(schemas).toHaveLength(1)
+    expect(schemas[0].label).toBe('短剧（改）')
+    expect(schemas[0].levels).toHaveLength(2)
+  })
+
+  it('activate: false 时不改当前生效结构', async () => {
+    await run('define_facet_schema', {
+      label: '备用',
+      levels: [{ label: '组' }],
+      activate: false
+    })
+    expect(schemas).toHaveLength(2)
+    expect(activeId).toBe(DRAMA.id)
+  })
+
+  it('缺少层名时拒绝并给出原因', async () => {
+    const result = await run('define_facet_schema', { label: '空的', levels: [{ label: '' }] })
+    expect(result.details.ok).toBe(false)
+    expect(textOf(result)).toContain('不合法')
+    expect(schemas).toHaveLength(1)
+  })
+
+  it('定义后 set_facets 按新层名工作（端到端：用户口述 → Agent 建结构 → 写位置）', async () => {
+    await run('define_facet_schema', {
+      label: '章节',
+      levels: [{ label: '卷', hint: '第1卷' }, { label: '章', hint: '第3章' }]
+    })
+    await run('set_facets', { entries: [{ relPath: 'a.png', chain: ['第1卷', '第3章'] }] })
+    const saved = loadFacetsIndex(dir)['a.png']
+    expect(saved.chain).toEqual(['第1卷', '第3章'])
+    expect(saved.schemaId).toBe(schemas[1].id)
+  })
+})
+
+describe('delete_facet_schema', () => {
+  it('删除结构并报告受影响文件数', async () => {
+    setFileFacet(dir, 'a.png', { chain: ['第01集'] }, DRAMA)
+    setFileFacet(dir, 'b.png', { chain: ['第02集'] }, DRAMA)
+    const result = await run('delete_facet_schema', { id: DRAMA.id })
+    expect(result.details).toMatchObject({ ok: true, affected: 2, schemaIdAfter: null })
+    expect(schemas).toHaveLength(0)
+    expect(activeId).toBeNull()
+    // 分级数据保留（层名不再可解析，但值还在）
+    expect(loadFacetsIndex(dir)['a.png'].chain).toEqual(['第01集'])
+  })
+
+  it('删掉生效结构后回落到下一套', async () => {
+    schemas.push({
+      id: 'test-manga',
+      label: '漫画',
+      levels: [{ key: 'chapter', label: '话' }]
+    })
+    const result = await run('delete_facet_schema', { id: DRAMA.id })
+    expect(result.details).toMatchObject({ ok: true, schemaIdAfter: 'test-manga' })
+    expect(activeId).toBe('test-manga')
+  })
+
+  it('id 不存在时返回指引，不误删', async () => {
+    const result = await run('delete_facet_schema', { id: 'ghost' })
+    expect(result.details.ok).toBe(false)
+    expect(schemas).toHaveLength(1)
+  })
 })
 
 describe('未打开工作区', () => {
-  it('两个工具都返回指引文本而不是抛错', async () => {
-    const noWorkspace = assembleFacetTools({ currentDir: () => null, schemaId: () => null, notifyChanged: () => {} })
-    for (const name of ['list_facets', 'set_facets']) {
+  it('四个工具都返回指引文本而不是抛错', async () => {
+    const noWorkspace = assembleFacetTools({
+      currentDir: () => null,
+      schemas: () => [],
+      activeSchemaId: () => null,
+      saveSchema: () => {},
+      deleteSchema: () => false,
+      notifyChanged: () => {}
+    })
+    for (const name of ['list_facets', 'set_facets', 'define_facet_schema', 'delete_facet_schema']) {
       const tool = noWorkspace.find((t) => t.name === name)!
       const result = (await tool.execute(
         'c',
-        { entries: [{ relPath: 'a.png', chain: ['x'] }] },
+        { entries: [{ relPath: 'a.png', chain: ['x'] }], id: 'x', label: 'x', levels: [{ label: 'x' }] },
         undefined,
         undefined,
         {} as never
@@ -144,15 +321,5 @@ describe('未打开工作区', () => {
       expect(result.details.ok).toBe(false)
       expect(result.content[0]?.text).toContain('尚未打开工作区')
     }
-  })
-})
-
-describe('工作区 schema 切换', () => {
-  it('用工作区选定的 schema 盖章（漫画 → 话/页/格，两层深度不受限）', async () => {
-    const mangaTools = assembleFacetTools({ currentDir: () => dir, schemaId: () => 'manga', notifyChanged: () => {} })
-    const tool = mangaTools.find((t) => t.name === 'set_facets')!
-    await tool.execute('c', { entries: [{ relPath: 'a.png', chain: ['第05话', '第3页'] }] }, undefined, undefined, {} as never)
-    const saved = loadFacetsIndex(dir)['a.png']
-    expect(saved).toEqual({ chain: ['第05话', '第3页'], schemaId: 'manga' })
   })
 })

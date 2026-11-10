@@ -57,7 +57,7 @@ import type {
   CanvasSnapshot,
   WindowStateInfo
 } from './ipc'
-import type { Facet } from './facets'
+import type { Facet, FacetSchema } from './facets'
 
 /**
  * 渲染进程可用的全部能力（window.huabu）。
@@ -403,10 +403,27 @@ export interface AssetApi {
   ): Promise<ChatResult<{ updated: number; removed: number }>>
 
   /**
-   * 切换工作区的分级 schema（决定层级叫 集/场/镜 还是 话/页/格）。
+   * 切换工作区当前生效的分级结构（层级名跟着结构走）。
    * 只写 workspace.json 的 facets 段；已有分级各自带 schemaId，切换不改数据。
    */
   setFacetSchema(schemaId: string): Promise<ChatResult<{ schemaId: string }>>
+
+  /**
+   * 新建/更新一套分级结构（工作区级，按 id upsert）。
+   * `activate` 默认 true（保存后即设为当前）；工作区第一套结构自动生效。
+   */
+  saveFacetSchema(
+    schema: FacetSchema,
+    activate?: boolean
+  ): Promise<ChatResult<{ schema: FacetSchema; schemaId: string | null }>>
+
+  /**
+   * 删除一套分级结构。已写入的分级数据保留（值仍有意义，只是层名不可解析），
+   * 返回受影响文件数供界面如实告知。
+   */
+  deleteFacetSchema(
+    schemaId: string
+  ): Promise<ChatResult<{ schemaId: string; affected: number; schemaIdAfter: string | null }>>
 
   /** 真删素材文件（破坏性，渲染端二次确认；广播 asset:changed） */
   deleteAsset(relPath: string): Promise<ChatResult>

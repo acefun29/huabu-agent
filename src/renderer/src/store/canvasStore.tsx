@@ -173,8 +173,10 @@ export interface CanvasState {
   libraries: MaterialLibrary[]
   /** 临时收件箱绝对路径（素材库清单顺带返回；临时附件预览/ reveal 用） */
   inboxDir: string | null
-  /** 当前工作区的分级 schema（层级名为 集/场/镜 还是 话/页/格，由它决定） */
+  /** 当前工作区生效的分级结构（层级名与深度由它决定；null = 还没定义过结构） */
   facetSchema: FacetSchema | null
+  /** 工作区定义的全部分级结构（用户在界面上建、或 Agent 按对话建出来） */
+  facetSchemas: FacetSchema[]
   refreshLibraries: () => Promise<void>
   createLibrary: (name: string) => Promise<void>
   removeLibrary: (id: string) => Promise<void>
@@ -206,8 +208,12 @@ export interface CanvasState {
   setNodeFacet: (nodeId: string, facet: Facet | null) => Promise<void>
   /** 批量设置分级（划选多张后一次写入；chain 为 null = 清除） */
   setNodesFacet: (nodeIds: string[], chain: string[] | null) => Promise<void>
-  /** 切换工作区分级 schema（层级名/深度随之改变；已有分级按各自 schemaId 解释） */
+  /** 切换工作区生效的分级结构（层级名/深度随之改变；已有分级按各自 schemaId 解释） */
   setFacetSchema: (schemaId: string) => Promise<void>
+  /** 新建/更新一套分级结构（activate 默认 true = 保存后即生效） */
+  saveFacetSchema: (schema: FacetSchema, activate?: boolean) => Promise<boolean>
+  /** 删除一套分级结构（已有分级数据保留，只是层名不可解析） */
+  deleteFacetSchema: (schemaId: string) => Promise<void>
   /** 新建 md 笔记：落公共素材库并钉到画布（返回卡片 id；失败 null） */
   createNote: (title?: string) => Promise<string | null>
 
@@ -592,6 +598,7 @@ export const useCanvasStore = create<CanvasState>()(
       libraries: [],
       inboxDir: null,
       facetSchema: null,
+      facetSchemas: [],
       dirFiles: [],
       sessions: [],
       chatsMap: {},

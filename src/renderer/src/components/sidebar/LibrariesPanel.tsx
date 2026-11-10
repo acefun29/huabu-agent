@@ -1,9 +1,9 @@
 import { memo, useCallback, useMemo } from 'react'
 import { create } from 'zustand'
 import { Layers, Plus, Search, StickyNote, Tag as TagIcon, X } from 'lucide-react'
-import { BUILTIN_FACET_SCHEMAS } from '@shared/facets'
 import type { MaterialLibrary } from '../../types'
 import { useCanvasStore } from '../../store/canvasStore'
+import { useFacetSchemaUi } from '../../store/facetSchemaUi'
 import {
   dragSourceTypes,
   parseAssetIdsPayload,
@@ -96,6 +96,7 @@ export const LibrariesPanel = memo(function LibrariesPanel({ onClose }: { onClos
   // 低频面板：素材库精确订阅；actions 恒定引用
   const libraries = useCanvasStore((s) => s.libraries)
   const facetSchema = useCanvasStore((s) => s.facetSchema)
+  const facetSchemas = useCanvasStore((s) => s.facetSchemas)
   const { createLibrary, removeLibrary, importFromLibrary, createNote, renameAsset, setFacetSchema } =
     useCanvasStore.getState()
   const query = useLibrariesPanelStore((s) => s.query)
@@ -277,26 +278,61 @@ export const LibrariesPanel = memo(function LibrariesPanel({ onClose }: { onClos
             ))}
           </div>
         )}
-        {/* 分级 schema：决定层级叫 集/场/镜 还是 话/页/格。切换不改已有分级数据。 */}
-        {facetSchema && (
-          <div className="mt-1.5 flex items-center gap-1 px-0.5">
-            <Layers size={10} className="shrink-0 text-(--on-surface-muted)" />
-            <span className="shrink-0 text-[9.5px] text-(--on-surface-muted)">分级</span>
-            <select
-              value={facetSchema.id}
-              onChange={(e) => void setFacetSchema(e.target.value)}
-              onMouseDown={(e) => e.stopPropagation()}
-              title="层级定义（集/场/镜、话/页/格…）；切换只改变层名与可选深度，已有分级仍按写入时的语义显示"
-              className="min-w-0 flex-1 cursor-pointer rounded-md bg-(--surface-chip) px-1.5 py-0.5 text-[10px] text-(--on-surface-variant) outline-none hover:bg-(--outline-soft)"
-            >
-              {BUILTIN_FACET_SCHEMAS.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.label}（{s.levels.map((l) => l.label).join('/')}）
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+        {/*
+          分级结构区：结构本身是工作区数据（用户/Agent 建的），产品不内置任何方案。
+          - 没有结构：只显示「新建」，其余分级入口（卡片行/批量/筛选条）都不出现
+          - 有结构：下拉切换生效结构 + 编辑当前 + 新建
+        */}
+        <div className="mt-1.5 flex items-center gap-1 px-0.5">
+          <Layers size={10} className="shrink-0 text-(--on-surface-muted)" />
+          <span className="shrink-0 text-[9.5px] text-(--on-surface-muted)">分级</span>
+          {facetSchema ? (
+            <>
+              <select
+                value={facetSchema.id}
+                onChange={(e) => void setFacetSchema(e.target.value)}
+                onMouseDown={(e) => e.stopPropagation()}
+                title="当前生效的分级结构；切换只改变层名与可选深度，已有分级仍按写入时的结构显示"
+                className="min-w-0 flex-1 cursor-pointer rounded-md bg-(--surface-chip) px-1.5 py-0.5 text-[10px] text-(--on-surface-variant) outline-none hover:bg-(--outline-soft)"
+              >
+                {facetSchemas.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.label}（{s.levels.map((l) => l.label).join('/')}）
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={() => useFacetSchemaUi.getState().openEditor(facetSchema)}
+                className="shrink-0 rounded-md px-1 py-0.5 text-[9.5px] text-(--on-surface-muted) transition-colors hover:bg-(--outline-soft) hover:text-(--on-surface)"
+                title={`编辑「${facetSchema.label}」的层级定义`}
+              >
+                编辑
+              </button>
+              <button
+                onClick={() => useFacetSchemaUi.getState().openEditor(null)}
+                className="shrink-0 rounded-md p-0.5 text-(--on-surface-muted) transition-colors hover:bg-(--outline-soft) hover:text-(--accent)"
+                title="新建另一套分级结构"
+                aria-label="新建分级结构"
+              >
+                <Plus size={10} />
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="min-w-0 flex-1 truncate text-[10px] text-(--on-surface-muted)">
+                还没有分级结构
+              </span>
+              <button
+                onClick={() => useFacetSchemaUi.getState().openEditor(null)}
+                className="flex shrink-0 items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium text-(--accent) transition-colors hover:bg-(--active-tint)"
+                title="定义层级（如 集 / 场 / 镜），之后就能给素材标位置"
+              >
+                <Plus size={10} />
+                新建
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {filteredLibraries.length === 0 && (

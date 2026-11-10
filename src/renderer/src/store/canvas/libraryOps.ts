@@ -1,5 +1,5 @@
 import type { AssetLibraryFile } from '@shared/ipc'
-import type { Facet } from '@shared/facets'
+import type { Facet, FacetSchema } from '@shared/facets'
 import { assetDirForKind, MEDIA_ROOT_REL } from '@shared/assets'
 import { KIND_LABEL, type AssetData, type CanvasNode, type DirEntry, type MaterialLibrary, type MediaKind, type MessageAttachment } from '../../types'
 import type { CanvasState } from '../canvasStore'
@@ -36,7 +36,8 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     set({
       libraries: result.value.libraries,
       inboxDir: result.value.inboxDir,
-      facetSchema: result.value.facetSchema ?? null
+      facetSchema: result.value.facetSchema ?? null,
+      facetSchemas: result.value.facetSchemas ?? []
     })
     // 清单里带着每个文件的最新标签与分级（主进程现扫 tags.json / facets.json），
     // 顺手对齐画布卡片：钉卡时漏带的旧卡片、跨端改动都在这里补齐
@@ -45,17 +46,52 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   /**
-   * 切换工作区分级 schema：写 workspace.json facets 段，随后刷新清单拿回新 schema。
+   * 切换工作区生效的分级结构：写 workspace.json facets 段，随后刷新清单拿回新结构。
    * 已有分级的 chain 值不动——它们各自带 schemaId，仍按写入时的语义显示。
    */
   const setFacetSchema = async (schemaId: string) => {
     if (!BRIDGE_AVAILABLE) return
     const result = await window.huabu.asset.setFacetSchema(schemaId)
     if (!result.ok) {
-      showToast(`切换分级 schema 失败：${result.error}`)
+      showToast(`切换分级结构失败：${result.error}`)
       return
     }
     await refreshLibraries()
+  }
+
+  /**
+   * 新建/更新一套分级结构（工作区级）。
+   * 返回是否成功：编辑弹窗据此决定关闭还是留着让用户改。
+   */
+  const saveFacetSchema = async (schema: FacetSchema, activate = true): Promise<boolean> => {
+    if (!BRIDGE_AVAILABLE) return false
+    const result = await window.huabu.asset.saveFacetSchema(schema, activate)
+    if (!result.ok) {
+      showToast(`保存分级结构失败：${result.error}`)
+      return false
+    }
+    await refreshLibraries()
+    showToast(`已保存分级结构「${result.value.schema.label}」`)
+    return true
+  }
+
+  /**
+   * 删除一套分级结构。已写入的分级不删（主进程会返回受影响文件数，这里据实提示）。
+   */
+  const deleteFacetSchema = async (schemaId: string) => {
+    if (!BRIDGE_AVAILABLE) return
+    const result = await window.huabu.asset.deleteFacetSchema(schemaId)
+    if (!result.ok) {
+      showToast(`删除分级结构失败：${result.error}`)
+      return
+    }
+    await refreshLibraries()
+    const { affected } = result.value
+    showToast(
+      affected > 0
+        ? `已删除结构；${affected} 个文件的分级保留，层名需重新定义后才能解释`
+        : '已删除该分级结构'
+    )
   }
 
   const refreshDirFiles = async () => {
@@ -703,6 +739,8 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
     setNodeFacet,
     setNodesFacet,
     setFacetSchema,
+    saveFacetSchema,
+    deleteFacetSchema,
     createNote,
     deleteAsset,
     renameAsset
