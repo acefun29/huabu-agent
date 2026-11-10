@@ -1,6 +1,8 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  ArrowLeft,
   AudioLines,
+  Check,
   ChevronDown,
   ChevronRight,
   FileCode,
@@ -9,6 +11,7 @@ import {
   Image as ImageIcon,
   ListChecks,
   MessageSquare,
+  MoreHorizontal,
   Plus,
   Trash2,
   Video,
@@ -19,8 +22,11 @@ import { useCanvasStore } from '../store/canvasStore'
 import { bumpRender } from '../lib/perfProbe'
 import { compactTokens } from '../lib/format'
 import { ChatMessageBlocks } from './chat/ChatMessageBlocks'
+import { ExpertAvatar } from './chat/ExpertAvatar'
+import { ExpertConversationView } from './chat/ExpertConversationView'
 import { ExpertStrip } from './chat/ExpertStrip'
 import { TeamPopover } from './chat/TeamPopover'
+import { TASK_STATUS_META, relativeTime } from './chat/taskBoardMeta'
 import { Composer } from './Composer'
 import { SessionsPanel } from './sidebar/SessionsPanel'
 
@@ -195,12 +201,20 @@ export function ChatDock() {
   const activeChat = useCanvasStore((s) => (s.activeSessionId ? (s.chatsMap[s.activeSessionId] ?? null) : null))
   const session = useCanvasStore((s) => s.sessions.find((x) => x.id === s.activeSessionId) ?? null)
   const sessions = useCanvasStore((s) => s.sessions)
+  const workspace = useCanvasStore((s) => s.workspace)
+  const expertEntries = useCanvasStore((s) => s.superAgentTasks)
+  const experts = useCanvasStore((s) => s.superAgentExperts)
   // 压缩/fork 走输入框 / 命令（用户裁决）；头部只留 + 新建对话、删除；停止在 Composer 的发送按钮上
   const { createSession, requestRemoveSession, requestRemoveSessions, switchSession } = useCanvasStore.getState()
   /** 会话切换菜单（原型 .session-menu）：点了标题才展开，选完即收 */
   const [menuOpen, setMenuOpen] = useState(false)
   /** 专家团任务板浮层：从底部状态条向上展开 */
   const [teamOpen, setTeamOpen] = useState(false)
+  /**
+   * 当前对话坞展示的是哪条专家对话（null = 主对话）。
+   * 进入后整块对话坞变成专家的只读历史，头部面包屑负责切回主对话或换一个专家。
+   */
+  const [expertTaskId, setExpertTaskId] = useState<string | null>(null)
   /** 菜单内的批量管理模式：点行 = 勾选（不进菜单即不存在选中集） */
   const [manageMode, setManageMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set())
@@ -219,11 +233,40 @@ export function ChatDock() {
   // 折叠态只渲染尾部几条（DOM 里不再挂着全部历史靠 CSS 裁剪）；展开态才全量
   const history = fullHistory
 
-  // 新消息 / 流式回填自动滚到底部
+  const expertEntry = expertTaskId
+    ? (expertEntries.find((entry) => entry.task.taskId === expertTaskId) ?? null)
+    : null
+  const expertTask = expertEntry?.task ?? null
+  const expertRunning = expertEntry?.running ?? false
+  const expertLabelOf = useMemo(() => {
+    const labels = new Map(experts.map((expert) => [expert.id, expert.label]))
+    return (id: string | undefined): string => (id ? (labels.get(id) ?? id) : '专家')
+  }, [experts])
+  const expertLabel = expertTask ? expertLabelOf(expertTask.expert) : ''
+  const expertMeta = expertTask ? TASK_STATUS_META[expertTask.status] : null
+  const workspaceName = workspace?.name ?? '工作区'
+  const workspaceInitial = workspaceName.trim().slice(0, 1).toUpperCase() || 'H'
+
+  // 工作区切换后任务板会被清空：旧专家视图必须一起退出，不能把上一个工作区的线程留在画面上
   useEffect(() => {
+    setExpertTaskId(null)
+    setTeamOpen(false)
+  }, [workspace?.path])
+
+  // 任务从 board 投影里消失（理论上只在切换工作区/清理时发生）：退回主对话
+  useEffect(() => {
+    if (!expertTaskId) return
+    if (expertEntries.length > 0 && !expertEntries.some((entry) => entry.task.taskId === expertTaskId)) {
+      setExpertTaskId(null)
+    }
+  }, [expertTaskId, expertEntries])
+
+  // 新消息 / 流式回填自动滚到底部（专家视图打开时主对话隐藏，不抢滚动位置）
+  useEffect(() => {
+    if (expertTask) return
     const el = bodyRef.current
     if (el) el.scrollTop = el.scrollHeight
-  }, [history])
+  }, [history, expertTask])
 
   const usageTitle = usage
     ? usage.tokens === null
@@ -268,33 +311,97 @@ export function ChatDock() {
         // 与素材库页头部同高（56px）：切换页面时内容起点不跳
         className="relative flex min-h-14 shrink-0 items-center gap-2.5 border-b border-(--outline-soft) px-3 py-2.5"
       >
+        <div className="flex min-w-0 shrink items-center gap-1 self-start text-[11px] leading-none text-(--on-surface-muted)">
+          <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-[5px] bg-(--on-surface) text-[9.5px] font-semibold text-(--surface-card)">
+            {workspaceInitial}
+          </span>
+          {expertTask ? (
+            <button
+              onClick={() => {
+                setExpertTaskId(null)
+                closeMenu()
+              }}
+              className="max-w-[88px] truncate rounded px-0.5 transition-colors hover:text-(--on-surface)"
+              title="返回主对话"
+            >
+              {workspaceName}
+            </button>
+          ) : (
+            <span className="max-w-[88px] truncate">{workspaceName}</span>
+          )}
+          <span className="shrink-0 text-(--outline)">/</span>
+        </div>
+
         <div ref={menuRef} className="min-w-0 flex-1">
-          <button
-            onClick={() => (menuOpen ? closeMenu() : setMenuOpen(true))}
-            aria-expanded={menuOpen}
-            aria-haspopup="menu"
-            data-testid="session-menu-trigger"
-            title={session ? `会话 ID：${session.id}${session.sessionFile ? `
+          {!expertTask ? (
+            <>
+              <button
+                onClick={() => (menuOpen ? closeMenu() : setMenuOpen(true))}
+                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                data-testid="session-menu-trigger"
+                title={session ? `会话 ID：${session.id}${session.sessionFile ? `
 会话文件：${session.sessionFile}` : ''}\n点击切换会话` : '切换会话'}
-            className="flex max-w-full items-center gap-1 text-left"
-          >
-            <span className="truncate text-[13px] font-semibold leading-tight text-(--on-surface)">
-              {session?.title ?? '对话'}
-            </span>
-            <ChevronDown
-              size={11}
-              className={`shrink-0 text-(--on-surface-muted) transition-transform ${menuOpen ? 'rotate-180' : ''}`}
-            />
-          </button>
-          <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-(--on-surface-muted)">
-            <span>{fullHistory.length} 条</span>
-            {session ? <span className="font-mono text-[9.5px] opacity-70">#{session.id.slice(0, 6)}</span> : null}
-            {running ? <span className="text-(--accent)">· 生成中…</span> : null}
-            {compacting ? <span className="text-(--accent)">· 压缩中…</span> : null}
-          </div>
+                className="flex max-w-full items-center gap-1 text-left"
+              >
+                <span className="truncate text-[13px] font-semibold leading-tight text-(--on-surface)">
+                  {session?.title ?? '对话'}
+                </span>
+                <ChevronDown
+                  size={11}
+                  className={`shrink-0 text-(--on-surface-muted) transition-transform ${menuOpen ? 'rotate-180' : ''}`}
+                />
+              </button>
+              <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-(--on-surface-muted)">
+                <span>{fullHistory.length} 条</span>
+                {session ? <span className="font-mono text-[9.5px] opacity-70">#{session.id.slice(0, 6)}</span> : null}
+                {running ? <span className="text-(--accent)">· 生成中…</span> : null}
+                {compacting ? <span className="text-(--accent)">· 压缩中…</span> : null}
+              </div>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => (menuOpen ? closeMenu() : setMenuOpen(true))}
+                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                data-testid="expert-menu-trigger"
+                title="切换主对话 / 专家对话"
+                className="flex max-w-full items-center gap-1.5 text-left"
+              >
+                <ExpertAvatar
+                  seed={expertTask.expert ?? 'expert-visual'}
+                  size={16}
+                  radius="30%"
+                  status={expertRunning ? 'running' : (expertMeta?.dot ?? 'idle')}
+                  label={expertLabel}
+                />
+                <span className="truncate text-[13px] font-semibold leading-tight text-(--on-surface)">
+                  {expertLabel}
+                </span>
+                {expertMeta ? (
+                  <span
+                    className={`shrink-0 rounded-full px-1.5 py-[1px] text-[9.5px] font-medium ${expertMeta.className}`}
+                  >
+                    {expertRunning && expertTask.status !== 'done' ? '在跑' : expertMeta.label}
+                  </span>
+                ) : null}
+                <ChevronDown
+                  size={11}
+                  className={`shrink-0 text-(--on-surface-muted) transition-transform ${menuOpen ? 'rotate-180' : ''}`}
+                />
+              </button>
+              <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[10.5px] text-(--on-surface-muted)">
+                <span className="min-w-0 truncate">
+                  {expertTask.scope || expertTask.title || expertTask.taskId}
+                </span>
+                <span className="shrink-0">· {relativeTime(expertTask.updatedAt)}</span>
+              </div>
+            </>
+          )}
 
           {/* 会话切换浮层（原型 .session-menu）：贴着头部下沿，绝对定位盖住消息流 */}
-          {menuOpen && (
+          {menuOpen && (!expertTask ? (
             <div
               role="menu"
               data-testid="session-menu"
@@ -369,40 +476,151 @@ export function ChatDock() {
                 }}
               />
             </div>
-          )}
+          ) : (
+            <div
+              role="menu"
+              data-testid="expert-switch-menu"
+              className="absolute left-3 right-3 top-[calc(100%-2px)] z-50 max-h-[min(420px,62vh)] overflow-y-auto rounded-2xl bg-(--surface-card) p-1.5 shadow-[0_16px_40px_rgba(0,0,0,.16)] ring-1 ring-(--outline-soft)"
+              data-scrollable=""
+            >
+              <div className="px-2 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-(--on-surface-muted)">
+                切换对话
+              </div>
+
+              {/* 主对话：回到当前会话（会话之间的切换仍在主对话头部） */}
+              <button
+                onClick={() => {
+                  setExpertTaskId(null)
+                  closeMenu()
+                }}
+                className={`flex w-full items-center gap-2 rounded-xl px-2 py-1.5 text-left transition-colors ${
+                  !expertTaskId ? 'bg-(--surface-chip)' : 'hover:bg-(--surface-chip)'
+                }`}
+              >
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-(--surface-chip) text-(--on-surface-muted)">
+                  <MessageSquare size={12} />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[12px] font-medium text-(--on-surface)">主对话</span>
+                  <span className="mt-0.5 block truncate text-[10px] text-(--on-surface-muted)">
+                    {session?.title ?? '当前会话'}
+                  </span>
+                </span>
+                {!expertTaskId ? <Check size={12} className="shrink-0 text-(--accent)" /> : null}
+              </button>
+
+              <div className="mt-1 border-t border-(--outline-soft) px-2 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wide text-(--on-surface-muted)">
+                专家对话
+              </div>
+              {expertEntries.length === 0 ? (
+                <div className="px-2 pb-2 text-[11px] leading-relaxed text-(--on-surface-muted)">
+                  还没有派过单。在对话里描述要产出的镜头，Agent 会派给专家团执行。
+                </div>
+              ) : (
+                expertEntries.map(({ task, running: taskRunning }) => {
+                  const meta = TASK_STATUS_META[task.status]
+                  const selected = task.taskId === expertTaskId
+                  return (
+                    <button
+                      key={task.taskId}
+                      onClick={() => {
+                        setExpertTaskId(task.taskId)
+                        closeMenu()
+                      }}
+                      className={`flex w-full items-center gap-2 rounded-xl px-2 py-1.5 text-left transition-colors ${
+                        selected ? 'bg-(--surface-chip)' : 'hover:bg-(--surface-chip)'
+                      }`}
+                    >
+                      <ExpertAvatar
+                        seed={task.expert ?? 'expert-visual'}
+                        size={24}
+                        radius="30%"
+                        status={taskRunning ? 'running' : meta.dot}
+                        label={expertLabelOf(task.expert)}
+                      />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-1.5">
+                          <span className="truncate text-[12px] font-medium text-(--on-surface)">
+                            {expertLabelOf(task.expert)}
+                          </span>
+                          <span className={`shrink-0 rounded-full px-1.5 py-[1px] text-[9px] font-medium ${meta.className}`}>
+                            {taskRunning && task.status !== 'done' ? '在跑' : meta.label}
+                          </span>
+                        </span>
+                        <span className="mt-0.5 block truncate text-[10px] text-(--on-surface-muted)">
+                          {task.scope || task.title || task.taskId}
+                          <span className="ml-1 font-mono opacity-70">· {task.taskId}</span>
+                        </span>
+                      </span>
+                      {selected ? <Check size={12} className="shrink-0 text-(--accent)" /> : null}
+                    </button>
+                  )
+                })
+              )}
+            </div>
+          ))}
         </div>
-        {usage?.contextWindow ? (
-          <span
-            data-testid="context-usage"
-            className={`shrink-0 font-mono text-[10px] ${
-              usageCritical ? 'font-medium text-(--danger)' : 'text-(--on-surface-muted)'
-            }`}
-            title={usageTitle}
-          >
-            {usage.tokens === null ? '—' : `${Math.round(usage.percent ?? 0)}%`}
-          </span>
-        ) : null}
-        {session && (
+        {expertTask ? (
           <span className="flex shrink-0 items-center gap-0.5">
             <button
-              onClick={() => createSession()}
+              onClick={() => {
+                setExpertTaskId(null)
+                closeMenu()
+              }}
               className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--on-surface)"
-              title="新建对话（画布与素材不受影响）"
-              data-testid="new-session-button"
+              title="返回主对话"
+              data-testid="expert-back-button"
             >
-              <Plus size={13} />
+              <ArrowLeft size={14} />
             </button>
             <button
-              onClick={() => requestRemoveSession(session.id)}
-              className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"
-              title="删除会话（不删除素材文件）"
+              onClick={() => (menuOpen ? closeMenu() : setMenuOpen(true))}
+              onMouseDown={(event) => event.stopPropagation()}
+              className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--on-surface)"
+              title="切换主对话 / 专家对话"
+              data-testid="expert-more-button"
             >
-              <Trash2 size={13} />
+              <MoreHorizontal size={14} />
             </button>
           </span>
+        ) : (
+          <>
+            {usage?.contextWindow ? (
+              <span
+                data-testid="context-usage"
+                className={`shrink-0 font-mono text-[10px] ${
+                  usageCritical ? 'font-medium text-(--danger)' : 'text-(--on-surface-muted)'
+                }`}
+                title={usageTitle}
+              >
+                {usage.tokens === null ? '—' : `${Math.round(usage.percent ?? 0)}%`}
+              </span>
+            ) : null}
+            {session && (
+              <span className="flex shrink-0 items-center gap-0.5">
+                <button
+                  onClick={() => createSession()}
+                  className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--on-surface)"
+                  title="新建对话（画布与素材不受影响）"
+                  data-testid="new-session-button"
+                >
+                  <Plus size={13} />
+                </button>
+                <button
+                  onClick={() => requestRemoveSession(session.id)}
+                  className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"
+                  title="删除会话（不删除素材文件）"
+                >
+                  <Trash2 size={13} />
+                </button>
+              </span>
+            )}
+          </>
         )}
       </div>
 
+      {/* 主对话视图：专家视图打开时只隐藏不卸载（Composer 草稿/滚动位置都要保留） */}
+      <div className={expertTask ? 'hidden' : 'flex min-h-0 flex-1 flex-col'}>
       {/* 消息流（原型 .chat-scroll）：全高、独立滚动，不做折叠 */}
       <div ref={bodyRef} data-scrollable="" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3.5">
         <div ref={contentRef} className="flex min-h-full flex-col gap-2.5">
@@ -427,11 +645,29 @@ export function ChatDock() {
           任务板浮层从状态条向上展开（absolute bottom-full），不挤压消息流。 */}
       <div className="relative shrink-0 border-t border-(--outline-soft) px-3 pb-3 pt-2.5">
         <div className="relative">
-          {teamOpen && <TeamPopover onClose={() => setTeamOpen(false)} />}
+          {teamOpen && (
+            <TeamPopover
+              onClose={() => setTeamOpen(false)}
+              onOpenConversation={(taskId) => {
+                setExpertTaskId(taskId)
+                setTeamOpen(false)
+                setMenuOpen(false)
+              }}
+            />
+          )}
           <ExpertStrip expanded={teamOpen} onToggle={() => setTeamOpen((v) => !v)} />
         </div>
         <Composer />
       </div>
+      </div>
+
+      {expertTask ? (
+        <ExpertConversationView
+          key={expertTask.taskId}
+          task={expertTask}
+          running={expertRunning}
+        />
+      ) : null}
     </div>
   )
 }

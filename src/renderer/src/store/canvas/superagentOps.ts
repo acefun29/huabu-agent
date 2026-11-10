@@ -1,7 +1,10 @@
 import type {
+  ChatResult,
   SuperAgentBoardSnapshot,
   SuperAgentExpertInfo,
-  SuperAgentTaskView
+  SuperAgentTaskConversation,
+  SuperAgentTaskView,
+  TaskEvent
 } from '@shared/ipc'
 import type { CanvasState } from '../canvasStore'
 import type { StoreSet } from './chatRuntime'
@@ -86,8 +89,35 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
   }
 
   /** 任务事件 → 重拉投影（事件本身只是「有变化」的信号，不参与状态推导） */
-  const handleTaskEvent = (): void => {
+  const handleTaskEvent = (event: TaskEvent): void => {
+    // 专家流式片段只供详情页实时渲染，不触发 board 全量重拉
+    if (event.type.startsWith('task.expert_')) return
     void refreshSuperAgent()
+  }
+
+  /**
+   * 读取某个任务的专家内部对话（只读回放）。
+   * 不在 store 里缓存：任务板详情是短生命周期视图，打开/轮询时现拉最新，
+   * 避免与主进程的 memory 落库产生第二份可能过期的投影。
+   */
+  const loadSuperAgentConversation = async (
+    taskId: string
+  ): Promise<ChatResult<SuperAgentTaskConversation>> => {
+    if (!BRIDGE_AVAILABLE || !get().workspace) {
+      return { ok: false, code: 'cwd_rejected', error: '尚未打开工作区' }
+    }
+    try {
+      return await window.huabu.superagent.conversation(taskId)
+    } catch (error) {
+      // Web 桥在 channel 未注册/连接断开时是 reject 而不是 {ok:false}：
+      // 统一折成 ChatResult，详情弹窗才能展示错误而不是留下未处理的 rejection。
+      const message = error instanceof Error ? error.message : String(error)
+      return {
+        ok: false,
+        code: 'unknown',
+        error: message.length > 500 ? `${message.slice(0, 500)}…` : message
+      }
+    }
   }
 
   /**
@@ -124,6 +154,7 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
     cancelSuperAgentTask,
     redispatchSuperAgentTask,
     appendSuperAgentUserChange,
+    loadSuperAgentConversation,
     handleTaskEvent,
     /** @internal 供工作区切换清理用 */
     resetSuperAgent: (): void => set({ superAgentTasks: [], superAgentRunning: [] })

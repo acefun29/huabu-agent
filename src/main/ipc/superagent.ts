@@ -2,7 +2,7 @@
  * superagent 域 IPC（架构图 to-be ② 的「事件总线 + 任务板 + 专家池」落地层）。
  *
  * 覆盖通道：superagent:board / run-task / cancel-task / journal /
- * append-user-change / experts；任务进度经 shared.ts 的 broadcastTaskEvent 推送。
+ * append-user-change / experts / conversation；任务进度经 shared.ts 的 broadcastTaskEvent 推送。
  *
  * 本层只做载荷校验与形态转换：编排、模型解析、工具装配、AbortController 全在
  * `SuperAgentRunner` 里（Agent 工具 `delegate_tasks` 走同一个 runner，两条入口不分叉）。
@@ -223,4 +223,13 @@ export function registerSuperAgentIpc(ctx: IpcContext): void {
     }))
     return { ok: true, value: experts } as ChatResult<SuperAgentExpertInfo[]>
   })
+
+  ipcMain.handle(IpcChannel.SuperAgentConversation, (_event, payload: unknown) =>
+    withDir(async (dir) => {
+      const taskId = (payload as { taskId?: unknown } | null)?.taskId
+      if (!isNonEmptyString(taskId)) return invalidPayload('superagent:conversation 需要 taskId')
+      const conversation = await runner.conversation(dir, String(taskId))
+      return { ok: true, value: conversation }
+    })
+  )
 }

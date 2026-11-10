@@ -12,10 +12,11 @@ import type { SuperAgentRunner } from '../superagent/runner'
 import type { BoardTask } from '../superagent/board'
 import type { VersionSlots } from '../superagent/versions'
 
-/** 假 runner：记录 start 调用，返回可预测的 taskId */
-function fakeRunner(options?: { failStart?: boolean }) {
+/** 假 runner：记录 start/waitFor 调用，返回可预测的 taskId 与最终状态 */
+function fakeRunner(options?: { failStart?: boolean; finishStatus?: BoardTask['status'] }) {
   const started: Array<Record<string, unknown>> = []
   const cancelled: string[] = []
+  const waited: string[] = []
   const boardTasks: BoardTask[] = [
     {
       taskId: 'task-old-done',
@@ -49,7 +50,7 @@ function fakeRunner(options?: { failStart?: boolean }) {
     cancel: (dir: string, taskId: string) => {
       void dir
       cancelled.push(taskId)
-      return taskId === 'task-live'
+      return taskId === 'task-live' || taskId.startsWith('task-new-')
     },
     appendUserChange: async () => {
       throw new Error('本测试不覆盖 user.changed')
@@ -61,14 +62,27 @@ function fakeRunner(options?: { failStart?: boolean }) {
         return { ok: false as const, error: { code: 'model_unavailable' as const, message: '没有可用的对话模型' } }
       }
       seq += 1
+      const taskId = `task-new-${seq}`
+      const status = options?.finishStatus ?? 'done'
+      boardTasks.push({
+        taskId,
+        status,
+        scope: String(request.scope ?? ''),
+        expert: String(request.expert ?? 'expert-visual'),
+        attempts: 0,
+        ...(status === 'attention' || status === 'blocked' ? { lastReason: '验收未通过' } : { lastArtifactId: 'art-new' }),
+        updatedAt: '2026-03-01T00:02:00Z'
+      })
       return {
         ok: true as const,
-        value: { taskId: `task-new-${seq}`, expert: String(request.expert ?? 'expert-visual'), rejected: [], dropped: [] }
+        value: { taskId, expert: String(request.expert ?? 'expert-visual'), rejected: [], dropped: [] }
       }
     },
-    waitFor: async () => undefined
+    waitFor: async (_dir: string, taskId: string) => {
+      waited.push(taskId)
+    }
   } as unknown as SuperAgentRunner
-  return { runner, started, cancelled }
+  return { runner, started, cancelled, waited }
 }
 
 type ToolResult = {
@@ -135,8 +149,8 @@ describe('list_tasks', () => {
 })
 
 describe('delegate_tasks', () => {
-  it('受理多个任务并返回 taskId 列表；字段透传', async () => {
-    const { runner, started } = fakeRunner()
+  it('委派多个任务并等待返回；字段透传、最终状态可见', async () => {
+    const { runner, started, waited } = fakeRunner()
     const tools = assembleSuperAgentTools({ currentDir: () => 'E:/ws', runner })
     const result = await runTool(tools, 'delegate_tasks', {
       tasks: [
@@ -151,13 +165,28 @@ describe('delegate_tasks', () => {
       ]
     })
     const text = textOf(result)
-    expect(text).toContain('已派单 2 个任务')
+    expect(text).toContain('专家团已返回：2 个任务结束')
     expect(text).toContain('task-new-1')
     expect(text).toContain('task-new-2')
+    expect(text).toContain('已完成')
     expect(started).toHaveLength(2)
+    expect(waited).toEqual(['task-new-1', 'task-new-2'])
     expect(started[0]).toMatchObject({ scope: '第03集/第2场', accept: ['16:9'] })
     expect((started[1] as { entities: unknown[] }).entities).toHaveLength(1)
     expect(result.details.ok).toBe(true)
+    expect(result.details.allDone).toBe(true)
+  })
+
+  it('子任务验收失败时等待后把最终状态与原因带回模型', async () => {
+    const { runner } = fakeRunner({ finishStatus: 'attention' })
+    const tools = assembleSuperAgentTools({ currentDir: () => 'E:/ws', runner })
+    const result = await runTool(tools, 'delegate_tasks', {
+      tasks: [{ scope: '第03集/第2场', prompt: '夜巷', accept: ['16:9'] }]
+    })
+    const text = textOf(result)
+    expect(text).toContain('待重派')
+    expect(text).toContain('验收未通过')
+    expect(result.details.allDone).toBe(false)
   })
 
   it('超过上限的条目被丢弃（只派前 20 个），并如实报告', async () => {
@@ -170,7 +199,7 @@ describe('delegate_tasks', () => {
     }))
     const result = await runTool(tools, 'delegate_tasks', { tasks })
     expect(started).toHaveLength(20)
-    expect(textOf(result)).toContain('已派单 20 个任务')
+    expect(textOf(result)).toContain('专家团已返回：20 个任务结束')
   })
 
   it('缺 scope/prompt 或 accept 为空的条目逐条拒绝，其余照常受理', async () => {
@@ -185,7 +214,7 @@ describe('delegate_tasks', () => {
     })
     expect(started).toHaveLength(1)
     const text = textOf(result)
-    expect(text).toContain('已派单 1 个任务')
+    expect(text).toContain('专家团已返回：1 个任务结束')
     expect(text).toContain('2 个未受理')
   })
 

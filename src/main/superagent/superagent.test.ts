@@ -261,6 +261,7 @@ describe('验收器（确定性结构检查）', () => {
 
 import { buildEnvelope, envelopeToInstructions, isPathAllowed } from './dispatch'
 import { runTask, parseArtifactFromReceipt, type ExpertRunner } from './orchestrator'
+import type { TaskEvent } from '../../shared/ipc'
 
 /** 造一个按脚本返回产物的假专家（不调模型，只验编排不变量） */
 function scriptedExpert(artifacts: Array<Partial<import('.').ArtifactCandidate> & { kind: 'image' | 'video' | 'audio' | 'text' }>): ExpertRunner {
@@ -335,6 +336,51 @@ describe('信封生成与 lane 约束', () => {
 })
 
 describe('runTask 编排闭环', () => {
+  it('专家流式事件带上 taskId/attempt 转发（详情页实时显示的依据）', async () => {
+    const service = new SuperAgentService(tmpWs())
+    const seen: TaskEvent[] = []
+    const expert: ExpertRunner = {
+      async run({ broadcast }) {
+        broadcast?.({ type: 'task.expert_start', expert: 'expert-visual' })
+        broadcast?.({ type: 'task.expert_delta', channel: 'text', text: '实时内容' })
+        broadcast?.({ type: 'task.expert_end' })
+        return {
+          artifact: {
+            artifactId: 'art-live',
+            assetId: 'asset-live',
+            version: 'staging-1',
+            kind: 'image',
+            width: 1920,
+            height: 1080,
+            path: 'scenes/s3/a.png',
+            bytes: 1024
+          },
+          receipt: 'done',
+          contextHash: 'ctx-hash'
+        }
+      }
+    }
+    await runTask({
+      service,
+      intent: goodIntent('ws'),
+      expert,
+      options: { onTaskEvent: (event) => seen.push(event) }
+    })
+    expect(seen).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'task.expert_start', taskId: 'task-run-1', attempt: 1 }),
+        expect.objectContaining({
+          type: 'task.expert_delta',
+          taskId: 'task-run-1',
+          attempt: 1,
+          channel: 'text',
+          text: '实时内容'
+        }),
+        expect.objectContaining({ type: 'task.expert_end', taskId: 'task-run-1', attempt: 1 })
+      ])
+    )
+  })
+
   it('通过验收：journal 全生命周期 + 版本激活', async () => {
     const service = new SuperAgentService(tmpWs())
     const result = await runTask({

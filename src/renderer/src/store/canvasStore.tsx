@@ -3,11 +3,14 @@ import { create } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import type {
   AssetLibraryFile,
+  ChatResult,
   MediaConfirmPayload,
   MediaJobStatus,
   ProjectSnapshot,
   SuperAgentExpertInfo,
+  SuperAgentTaskConversation,
   SuperAgentTaskView,
+  TaskEvent,
   WorkspaceDeleteResult,
   WorkspaceInfo
 } from '@shared/ipc'
@@ -291,8 +294,10 @@ export interface CanvasState {
   redispatchSuperAgentTask: (task: SuperAgentTaskView) => Promise<void>
   /** 用户直连专家改需求（追加 user.changed 事实） */
   appendSuperAgentUserChange: (taskId: string, prompt: string) => Promise<boolean>
-  /** task:event 出口（订阅层转调） */
-  handleTaskEvent: () => void
+  /** 某个任务的专家内部对话（只读回放；失败时返回 ChatResult 由调用方展示） */
+  loadSuperAgentConversation: (taskId: string) => Promise<ChatResult<SuperAgentTaskConversation>>
+  /** task:event 出口（订阅层转调；流式片段在这里被忽略，详情页单独订阅） */
+  handleTaskEvent: (event: TaskEvent) => void
 
   /* 项目结构（project.json 的渲染端投影：上下文常驻段/轮换段的数据来源） */
   /** 当前 scope 的完整快照（null = 无项目/未打开工作区） */
@@ -943,8 +948,10 @@ function useCanvasBootstrap() {
     const unsubConfirmResolved = window.huabu.media.onConfirmResolved(({ requestId }) =>
       useCanvasStore.setState((s) => ({ pendingApprovals: s.pendingApprovals.filter((p) => p.requestId !== requestId) }))
     )
-    // SuperAgent 任务事件：只是「有变化」的信号，收到就重拉任务板投影（不自己推演状态）
-    const unsubTask = window.huabu.superagent.onTaskEvent(() => useCanvasStore.getState().handleTaskEvent())
+    // SuperAgent 任务事件：状态变化重拉任务板；专家流式片段由详情页自己消费
+    const unsubTask = window.huabu.superagent.onTaskEvent((event) =>
+      useCanvasStore.getState().handleTaskEvent(event)
+    )
     return () => {
       unsubJob()
       unsubAsset()

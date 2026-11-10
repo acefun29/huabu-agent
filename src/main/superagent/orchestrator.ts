@@ -27,6 +27,7 @@ import { resolveExpert, type ExpertDefinition } from './experts'
 import { validateArtifact, type ArtifactCandidate, type ValidationResult } from './validator'
 import type { SuperAgentService } from './index'
 import type { TaskEvent } from '../../shared/ipc'
+import { toToolArgs, toToolResultText } from './conversation'
 
 /** 专家执行器：跑一轮专家 Agent，返回候选产物（staging，未验收） */
 export interface ExpertRunner {
@@ -171,6 +172,11 @@ export async function runTask(params: {
         threadId: attempt === 1 ? threadId : `${threadId}-r${attempt}`,
         expert: resolved.expert,
         ...(signal ? { signal } : {}),
+        // 流式事件与任务状态共用一个出口；taskId/attempt 由编排层补齐，
+        // 专家执行器只管发 text/thinking/tool 片段。
+        broadcast: (event) => {
+          emit({ ...event, taskId: intent.taskId, attempt } as unknown as TaskEvent)
+        }
       })
     } catch (error) {
       const cancelled = signal?.aborted === true
@@ -310,7 +316,7 @@ export function createLlmExpertRunner(deps: {
   parseArtifact?: (receipt: string, envelope: ClampResult['envelope']) => ArtifactCandidate | null
 }): ExpertRunner {
   return {
-    async run({ envelope, threadId, expert, signal }) {
+    async run({ envelope, threadId, expert, signal, broadcast }) {
       const instructions = [envelopeToInstructions(envelope), '', '## 专家规则', expert.instructions]
         .filter(Boolean)
         .join(String.fromCharCode(10))
@@ -323,16 +329,65 @@ export function createLlmExpertRunner(deps: {
         memory: deps.memory,
         ...(Object.keys(tools).length > 0 ? { tools: tools as never } : {}),
       })
-      const events = await agent.stream(envelope.promptLayers.at(-1)?.prompt ?? '执行任务', {
-        // threadId 真正生效：重试换新线程，不复用上一轮失败的上下文
-        memory: { thread: threadId, resource: MEMORY_RESOURCE },
-        ...(signal ? { abortSignal: signal } : {}),
-        // 专家一轮内允许多次工具调用（参考读取 → 生成 → 校验），但不无限转
-        maxSteps: 12,
-      })
+      broadcast?.({ type: 'task.expert_start', expert: expert.id })
       let receipt = ''
-      for await (const chunk of events.fullStream) {
-        if (chunk.type === 'text-delta') receipt += chunk.payload.text
+      try {
+        const events = await agent.stream(envelope.promptLayers.at(-1)?.prompt ?? '执行任务', {
+          // threadId 真正生效：重试换新线程，不复用上一轮失败的上下文
+          memory: { thread: threadId, resource: MEMORY_RESOURCE },
+          ...(signal ? { abortSignal: signal } : {}),
+          // 专家一轮内允许多次工具调用（参考读取 → 生成 → 校验），但不无限转
+          maxSteps: 12,
+        })
+        for await (const chunk of events.fullStream) {
+          if (chunk.type === 'text-delta') {
+            receipt += chunk.payload.text
+            broadcast?.({ type: 'task.expert_delta', channel: 'text', text: chunk.payload.text })
+          } else if (chunk.type === 'reasoning-delta') {
+            broadcast?.({
+              type: 'task.expert_delta',
+              channel: 'thinking',
+              text: chunk.payload.text
+            })
+          } else if (chunk.type === 'tool-call') {
+            broadcast?.({
+              type: 'task.expert_tool_start',
+              toolCallId: chunk.payload.toolCallId,
+              toolName: chunk.payload.toolName,
+              args: toToolArgs(chunk.payload.args)
+            })
+          } else if (chunk.type === 'tool-result') {
+            broadcast?.({
+              type: 'task.expert_tool_end',
+              toolCallId: chunk.payload.toolCallId,
+              toolName: chunk.payload.toolName,
+              ...(toToolResultText(chunk.payload.result)
+                ? { resultText: toToolResultText(chunk.payload.result) }
+                : {}),
+              ...(chunk.payload.isError ? { isError: true } : {})
+            })
+          } else if (chunk.type === 'tool-error') {
+            broadcast?.({
+              type: 'task.expert_tool_end',
+              toolCallId: chunk.payload.toolCallId,
+              toolName: chunk.payload.toolName,
+              resultText: errorText(chunk.payload.error),
+              isError: true
+            })
+          } else if (chunk.type === 'tool-output-denied') {
+            broadcast?.({
+              type: 'task.expert_tool_end',
+              toolCallId: chunk.payload.toolCallId,
+              toolName: chunk.payload.toolName,
+              resultText: '用户拒绝了本次工具调用',
+              isError: true
+            })
+          } else if (chunk.type === 'error') {
+            broadcast?.({ type: 'task.expert_error', message: errorText(chunk.payload.error) })
+          }
+        }
+      } finally {
+        broadcast?.({ type: 'task.expert_end' })
       }
       const artifact =
         deps.parseArtifact?.(receipt, envelope) ?? parseArtifactFromReceipt(receipt, envelope)
@@ -340,6 +395,22 @@ export function createLlmExpertRunner(deps: {
       return { artifact, receipt, contextHash: `envelope:${envelope.taskId}:${envelope.scope}` }
     },
   }
+}
+
+/** 流式错误统一转成可读文本（Error / 字符串 / 结构化错误对象） */
+function errorText(value: unknown): string {
+  if (value instanceof Error) return value.message
+  if (typeof value === 'string') return value
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    if (typeof record.message === 'string' && record.message.trim()) return record.message
+    try {
+      return JSON.stringify(value)
+    } catch {
+      return String(value)
+    }
+  }
+  return String(value ?? '未知错误')
 }
 
 /**

@@ -80,6 +80,8 @@ export const IpcChannel = {
   SuperAgentAppendUserChange: 'superagent:append-user-change',
   /** 专家池清单（id / 名称 / 角色 / 是否常驻） */
   SuperAgentExperts: 'superagent:experts',
+  /** 某个任务的专家内部对话历史（只读回放；Mastra memory 是消息落点） */
+  SuperAgentConversation: 'superagent:conversation',
 
   /** 中止当前生成 */
   ChatAbort: 'chat:abort',
@@ -480,6 +482,51 @@ export type TaskEvent =
       version: string
       artifactId: string
     }
+  /**
+   * 专家流式输出（任务板详情实时显示；Mastra memory 按轮落库，不能等落库后才可见）。
+   * 这些事件与任务状态事件共用 task:event 通道，渲染端按 taskId 过滤即可。
+   */
+  | {
+      type: 'task.expert_start'
+      taskId: string
+      attempt: number
+      expert: string
+    }
+  | {
+      type: 'task.expert_delta'
+      taskId: string
+      attempt: number
+      channel: 'text' | 'thinking'
+      text: string
+    }
+  | {
+      type: 'task.expert_tool_start'
+      taskId: string
+      attempt: number
+      toolCallId: string
+      toolName: string
+      args: ChatToolArgs
+    }
+  | {
+      type: 'task.expert_tool_end'
+      taskId: string
+      attempt: number
+      toolCallId: string
+      toolName: string
+      resultText?: string
+      isError?: boolean
+    }
+  | {
+      type: 'task.expert_error'
+      taskId: string
+      attempt: number
+      message: string
+    }
+  | {
+      type: 'task.expert_end'
+      taskId: string
+      attempt: number
+    }
 
 /* ---------------------------- SuperAgent 协作（架构图 to-be ②） ---------------------------- */
 
@@ -580,6 +627,46 @@ export interface SuperAgentExpertInfo {
   role: string
   /** 常驻 = 独立 session；否则按需创建、完事归档 */
   resident: boolean
+}
+
+/** 专家会话里的一条消息（块结构与 chat:history 同构，渲染端复用同一套消息块） */
+export interface SuperAgentConversationMessage {
+  role: 'user' | 'model'
+  /** 文本消息正文；只有思考/工具块时为空串 */
+  text: string
+  blocks?: ChatHistoryBlock[]
+  /** 落库时间（ISO；线程里没有可读时间时省略） */
+  at?: string
+}
+
+/** 专家线程的一次尝试（验收失败重试会换新线程，避免复用失败上下文） */
+export interface SuperAgentConversationAttempt {
+  attempt: number
+  threadId: string
+  messages: SuperAgentConversationMessage[]
+}
+
+/** 某个任务的专家内部对话历史（任务元数据来自 journal，消息来自 Mastra memory） */
+export interface SuperAgentTaskConversation {
+  taskId: string
+  /** 实际承接任务的专家（回落后的 id，与 board 一致） */
+  expert: string
+  scope?: string
+  status: SuperAgentTaskStatus
+  prompt?: string
+  accept?: string[]
+  /** 最近一次失败/取消原因（没有对话时用来解释发生了什么） */
+  lastReason?: string
+  /** 按尝试次数升序；没有任务开始事件时为空 */
+  attempts: SuperAgentConversationAttempt[]
+  /** 当前正在跑的那次尝试的流式快照（memory 尚未落库时打开详情也能看到） */
+  live?: ExpertLiveTranscript
+}
+
+/** 专家流式输出的当前快照（主进程保留，渲染端再用 task.expert_* 事件续写） */
+export interface ExpertLiveTranscript {
+  attempt: number
+  blocks: ChatHistoryBlock[]
 }
 
 /** 原始 journal 事件（可传输形态） */
@@ -834,12 +921,13 @@ export interface ChatHistoryImage {
   label?: string
 }
 
-/** 回放工具卡（与流式 ChatToolCallView 同构，status 只会是终态） */
+/** 回放工具卡（与流式 ChatToolCallView 同构，status 只会是终态）
+ *  专家实时快照里也复用此结构，status 可能是 running（工具仍在执行）。 */
 export interface ChatHistoryToolCall {
   id: string
   name: string
   args: ChatToolArgs
-  status: 'done' | 'error'
+  status: 'running' | 'done' | 'error'
   /** 工具结果文本（沿用流式 8000 截断） */
   resultText?: string
   /** 结果里的图片缩略（toolResult 的 image 块） */

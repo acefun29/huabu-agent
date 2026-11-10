@@ -60,6 +60,7 @@ import type {
   SuperAgentJournalEntry,
   SuperAgentRunTaskAccepted,
   SuperAgentRunTaskRequest,
+  SuperAgentTaskConversation,
   TaskEvent,
   WindowStateInfo
 } from './ipc'
@@ -496,6 +497,9 @@ export interface SuperAgentApi {
 
   /** 专家池清单（id / 名称 / 角色 / 是否常驻） */
   experts(): Promise<ChatResult<SuperAgentExpertInfo[]>>
+
+  /** 某个任务的专家内部对话历史（只读；任务尚未开始时 attempts 为空） */
+  conversation(taskId: string): Promise<ChatResult<SuperAgentTaskConversation>>
 
   /** 订阅任务事件（board 变化的最小信号），返回取消订阅函数 */
   onTaskEvent(listener: (event: TaskEvent) => void): () => void

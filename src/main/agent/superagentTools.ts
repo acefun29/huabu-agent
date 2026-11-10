@@ -7,7 +7,8 @@
  *
  * 设计约束（与项目其它工具一致）：
  * - 不可修复的错误（未打开工作区 / 没有可用模型）返回指引文本而不是抛错，避免打断整轮；
- * - 派单是异步受理：工具返回 taskId 列表，进度经 task:event 推给界面，模型不必轮询；
+ * - 派单等待终态（对齐 Mastra 原生 subagent 工具）：工具阻塞到专家任务结束再返回最终状态，
+ *   不是「受理即返回、让模型自己轮询」；进度仍经 task:event 实时推给任务板；
  * - 一次派单有上限（批量镜头是主要场景，但一次几十个会挤占生成配额）。
  */
 
@@ -130,13 +131,13 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
     name: 'delegate_tasks',
     label: '派单给专家',
     description:
-      '把生成任务派给专家团异步执行（真正的图片/视频生成，不是文字描述）。' +
+      '把生成任务派给专家团执行（真正的图片/视频生成，不是文字描述），并等待专家返回最终结果。' +
       '每个任务给 scope（范围标识，同时决定专家可写的目录前缀）、prompt（画面描述）、' +
       'accept（机器可判定的验收标准，如「16:9」「时长 5 秒」「1920x1080」）。' +
       '可选：entities/adjacent 给角色/场景/上一版资产引用（path 用工作区相对路径；status 缺省 active，' +
       'stale/pending 会被预检拒绝）、lane 覆盖写区、expert 指定专家（expert-visual 视觉 / expert-exec 文本）。' +
-      '派单是异步的：工具立即返回 taskId，专家在后台跑，进度显示在界面任务板；' +
-      '不要轮询等待，也不要自己再调生成工具做同一个任务。派完用一句话告诉用户派了几个任务即可。',
+      '这个工具会像原生 subagent 一样阻塞到每个专家任务结束，然后返回每个 taskId 的最终状态、' +
+      '失败原因和产物；不要自己再调生成工具做同一个任务，也不要轮询 list_tasks。',
     parameters: Type.Object({
       tasks: Type.Array(
         Type.Object({
@@ -170,7 +171,7 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
         Type.Boolean({ description: 'true = 只产出候选版本不激活（默认 false，验收通过即激活）' })
       )
     }),
-    execute: async (_toolCallId, params) => {
+    execute: async (_toolCallId, params, signal) => {
       const dir = deps.currentDir()
       if (!dir) return { content: [{ type: 'text' as const, text: NO_WORKSPACE_TEXT }], details: { ok: false } }
       const raw = (params ?? {}) as { tasks?: unknown; shadow?: unknown }
@@ -244,18 +245,56 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
           details: { ok: false, failures }
         }
       }
+
+      // 与 Mastra 原生 subagent 工具一致：等每个子任务跑完再返回，而不是受理即收工。
+      // 主对话中止时同步取消专家任务，等待链立即释放。
+      const cancelAccepted = (): void => {
+        for (const entry of accepted) deps.runner.cancel(dir, entry.taskId)
+      }
+      if (signal?.aborted) cancelAccepted()
+      signal?.addEventListener('abort', cancelAccepted, { once: true })
+      try {
+        await Promise.all(
+          accepted.map((entry) => deps.runner.waitFor(dir, entry.taskId, signal))
+        )
+      } finally {
+        signal?.removeEventListener('abort', cancelAccepted)
+      }
+
+      const board = await deps.runner.board(dir)
+      const byId = new Map(board.tasks.map((task) => [task.taskId, task]))
+      const results = accepted.map((entry) => {
+        const task = byId.get(entry.taskId)
+        return {
+          ...entry,
+          status: task?.status ?? 'blocked',
+          ...(task?.lastReason ? { reason: task.lastReason } : {}),
+          ...(task?.lastArtifactId ? { artifactId: task.lastArtifactId } : {})
+        }
+      })
+      const unfinished = results.filter((result) => result.status !== 'done')
       const lines = [
-        `已派单 ${accepted.length} 个任务（后台执行，进度显示在任务板）：`,
-        ...accepted.map((entry) => `- ${entry.taskId} → ${entry.scope}（${entry.expert}）`),
+        `专家团已返回：${results.length} 个任务结束。`,
+        ...results.map((result) => {
+          const parts = [
+            `- ${result.taskId}`,
+            result.scope,
+            `→ ${STATUS_LABEL[result.status] ?? result.status}`,
+            result.artifactId ? `产物 ${result.artifactId}` : '',
+            result.reason ? `原因：${result.reason}` : ''
+          ].filter(Boolean)
+          return parts.join(' · ')
+        }),
         ...(failures.length > 0 ? [`${failures.length} 个未受理：${failures.slice(0, 5).join('；')}`] : []),
-        shadow
-          ? '本次为 shadow 模式：只产出候选版本，不激活。'
-          : '验收通过后版本会自动激活。',
-        '不要等待生成完成；用户问进度时用 list_tasks 查看。'
-      ]
+        shadow ? '本次为 shadow 模式：只产出候选版本，不激活。' : '',
+        signal?.aborted ? '主对话已中止：未完成的专家任务已取消。' : '',
+        unfinished.length > 0
+          ? '有任务未通过验收；如需重试，用相同 scope/prompt 再调 delegate_tasks。'
+          : '全部任务通过验收并激活版本。'
+      ].filter(Boolean)
       return {
         content: [{ type: 'text' as const, text: lines.join('\n') }],
-        details: { ok: true, accepted, failures, shadow }
+        details: { ok: true, accepted: results, failures, shadow, allDone: unfinished.length === 0 }
       }
     }
   }

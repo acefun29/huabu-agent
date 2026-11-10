@@ -288,6 +288,8 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
 
       experts: () => invoke(IpcChannel.SuperAgentExperts),
 
+      conversation: (taskId) => invoke(IpcChannel.SuperAgentConversation, { taskId }),
+
       onTaskEvent: (listener) =>
         subscribe(IpcChannel.TaskEvent, (payload) => listener(payload as TaskEvent))
     }

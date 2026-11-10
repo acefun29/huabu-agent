@@ -15,7 +15,8 @@
  * 运行时工厂 createMediaRuntime（编排器在 chat 域注册前调用）、
  * MediaImport 专用的四个纯函数工具（guessKind/mimeFromExt/defaultMime/sanitizeName）。
  */
-import { BrowserWindow, ipcMain } from 'electron'
+import { BrowserWindow } from 'electron'
+import { ipcMain } from './ipcMainBridge'
 import { randomUUID } from 'crypto'
 import { mkdirSync, statSync } from 'fs'
 import { writeFile } from 'fs/promises'
