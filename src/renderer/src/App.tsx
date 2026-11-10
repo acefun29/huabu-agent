@@ -1,10 +1,10 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { SettingsProvider } from './store/settingsStore'
 import { CanvasProvider, useCanvasStore } from './store/canvasStore'
 import { TitleBar } from './components/TitleBar'
 import { CanvasWorkspace } from './components/CanvasWorkspace'
 import { SessionSidebar } from './components/SessionSidebar'
-import { ChatPanel } from './components/ChatPanel'
+import { ChatPanel, type RightPage } from './components/ChatPanel'
 import { Toast } from './components/Toast'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { WorkspaceGate } from './components/WorkspaceGate'
@@ -17,8 +17,8 @@ const MediaViewer = lazy(() => import('./components/MediaViewer').then((m) => ({
 
 /**
  * 应用根组件：设置 Provider → 画布 Provider → 自绘标题栏 + 满屏画布 + 悬浮 chrome。
- * 标题栏（窗口控制 + 工作区切换）常驻所有页面；左侧图标栏（会话/素材库/清空画布/设置）
- * 与底部对话坞都是浮层，画布属于整个工作区；未打开工作区时显示工作区选择页。
+ * 标题栏（窗口控制 + 工作区切换）常驻所有页面；右侧面板（对话 / 素材库两个互斥页面）
+ * 与最右侧图标栏都是浮层，画布属于整个工作区；未打开工作区时显示工作区选择页。
  */
 /** 是否为浏览器预览（webHarness 打的标记；Electron 内不存在） */
 const isWebPreview =
@@ -28,6 +28,34 @@ const isWebPreview =
 function WorkspaceBody() {
   const booted = useCanvasStore((s) => s.booted)
   const workspace = useCanvasStore((s) => s.workspace)
+  /** 右侧栏当前页（对话 / 素材库，互斥，原型 .right-page）；记在 localStorage */
+  const [rightPage, setRightPage] = useState<RightPage>(() => {
+    try {
+      return localStorage.getItem('huabu.rightPage') === 'library' ? 'library' : 'chat'
+    } catch {
+      return 'chat'
+    }
+  })
+  /** 右侧栏收起态（原型 right-collapsed）：图标栏再点当前页 = 收起，画布全宽 */
+  const [collapsed, setCollapsed] = useState(false)
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('huabu.rightPage', rightPage)
+    } catch {
+      // 隐私模式：本次会话有效即可
+    }
+  }, [rightPage])
+
+  /** 图标栏点击：同页 = 开合切换，异页 = 切页并展开（原型 toggleRightPage） */
+  const onPageChange = (next: RightPage): void => {
+    if (next === rightPage) {
+      setCollapsed((v) => !v)
+      return
+    }
+    setRightPage(next)
+    setCollapsed(false)
+  }
 
   if (!booted) {
     return (
@@ -43,19 +71,19 @@ function WorkspaceBody() {
   if (!workspace) return <WorkspaceGate />
 
   /**
-   * 布局（原型 index-projects.html）：画布**占满整个工作区**，右侧对话栏与图标栏
-   * 都是覆盖在画布之上的浮层 —— 打开/调宽对话栏不改变画布视口，卡片位置不会漂。
-   *   - 对话栏：右侧，左边缘可拖拽调宽（ChatPanel 自己管宽度）
-   *   - 图标栏：最右侧 48px 竖条（素材库/会话/清空/设置），浮层面板向左展开
+   * 布局（原型 index-projects.html）：画布**占满整个工作区**，右侧面板与图标栏
+   * 都是覆盖在画布之上的浮层 —— 切换/调宽右侧栏不改变画布视口，卡片位置不会漂。
+   *   - 右侧面板：对话 / 素材库两个互斥页面，左边缘可拖拽调宽；点图标栏当前页可收起
+   *   - 图标栏：最右侧 48px 通栏，切换页面 + 清空画布 + 设置
    *
-   * 定位：不用 padding 让位（absolute 子元素会相对 border box 定位而钻到标题栏底下），
-   * 改成子元素各自 top-11，画布本身也用 top-11 起算。
+   * 定位：容器不用 padding 让位（absolute 子元素会相对 border box 定位而钻到
+   * 标题栏底下），改成各子元素自己 top-11。
    */
   return (
     <div className="relative h-full w-full overflow-hidden">
       <CanvasWorkspace />
-      <ChatPanel />
-      <SessionSidebar />
+      <ChatPanel page={rightPage} collapsed={collapsed} />
+      <SessionSidebar page={rightPage} collapsed={collapsed} onPageChange={onPageChange} />
     </div>
   )
 }

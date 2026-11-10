@@ -1,11 +1,13 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 import {
   AudioLines,
+  ChevronDown,
   ChevronRight,
   FileCode,
   FileText,
   FoldVertical,
   Image as ImageIcon,
+  ListChecks,
   MessageSquare,
   Plus,
   Trash2,
@@ -18,6 +20,7 @@ import { bumpRender } from '../lib/perfProbe'
 import { compactTokens } from '../lib/format'
 import { ChatMessageBlocks } from './chat/ChatMessageBlocks'
 import { Composer } from './Composer'
+import { SessionsPanel } from './sidebar/SessionsPanel'
 
 function assetIcon(kind: AssetKind) {
   if (kind === 'image') return <ImageIcon size={11} />
@@ -189,9 +192,15 @@ export function ChatDock() {
   // 流式热路径：只订当前会话的 ChatData；会话头只订当前 meta（对象身份稳定）
   const activeChat = useCanvasStore((s) => (s.activeSessionId ? (s.chatsMap[s.activeSessionId] ?? null) : null))
   const session = useCanvasStore((s) => s.sessions.find((x) => x.id === s.activeSessionId) ?? null)
-  const activeSessionId = useCanvasStore((s) => s.activeSessionId)
+  const sessions = useCanvasStore((s) => s.sessions)
   // 压缩/fork 走输入框 / 命令（用户裁决）；头部只留 + 新建对话、删除；停止在 Composer 的发送按钮上
-  const { createSession, requestRemoveSession } = useCanvasStore.getState()
+  const { createSession, requestRemoveSession, requestRemoveSessions, switchSession } = useCanvasStore.getState()
+  /** 会话切换菜单（原型 .session-menu）：点了标题才展开，选完即收 */
+  const [menuOpen, setMenuOpen] = useState(false)
+  /** 菜单内的批量管理模式：点行 = 勾选（不进菜单即不存在选中集） */
+  const [manageMode, setManageMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set())
+  const menuRef = useRef<HTMLDivElement>(null)
   /** 右栏常驻展开（折叠语义在结构视图里由外层控制） */
   const expanded = true
   const bodyRef = useRef<HTMLDivElement>(null)
@@ -212,36 +221,151 @@ export function ChatDock() {
     if (el) el.scrollTop = el.scrollHeight
   }, [history])
 
-  void activeSessionId
-
   const usageTitle = usage
     ? usage.tokens === null
       ? '上下文水位待更新（压缩后需一轮新响应）'
       : `上下文约占 ${Math.round(usage.percent ?? 0)}%（${usage.tokens}/${usage.contextWindow} tokens）`
     : undefined
 
+  const allSelected = sessions.length > 0 && selectedIds.size >= sessions.length
+
+  /** 关菜单即退出管理态：选中集只在菜单可见时有意义 */
+  const closeMenu = useCallback(() => {
+    setMenuOpen(false)
+    setManageMode(false)
+    setSelectedIds(new Set())
+  }, [])
+
+  // 会话菜单：点外部 / Esc 收起（与 Dropdown chip 同一交互语言）
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (menuRef.current?.contains(e.target as Node)) return
+      closeMenu()
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeMenu()
+    }
+    document.addEventListener('mousedown', onDown)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDown)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [menuOpen, closeMenu])
+
   return (
     <div className="pointer-events-auto flex h-full min-h-0 w-full flex-col">
-      {/* 头部（原型 .chat-head）：头像 + 会话名/Agent 身份 + 水位 + 新建/删除。
-          右栏常驻，没有折叠态，所以不再有"把手行"。 */}
+      {/* 头部（原型 .chat-head）：会话名/Agent 身份 + 水位 + 新建/删除。
+          右栏常驻，没有折叠态，所以不再有"把手行"。
+          会话名兼作会话列表入口（原来的浮层已随「素材库改页面」一并移除）。 */}
       <div
         data-testid="chat-dock"
-        className="flex shrink-0 items-center gap-2.5 border-b border-(--outline-soft) px-3 py-2.5"
+        // 与素材库页头部同高（56px）：切换页面时内容起点不跳
+        className="relative flex min-h-14 shrink-0 items-center gap-2.5 border-b border-(--outline-soft) px-3 py-2.5"
       >
-        <div className="min-w-0 flex-1">
-          <div
-            className="truncate text-[13px] font-semibold leading-tight text-(--on-surface)"
+        <div ref={menuRef} className="min-w-0 flex-1">
+          <button
+            onClick={() => (menuOpen ? closeMenu() : setMenuOpen(true))}
+            aria-expanded={menuOpen}
+            aria-haspopup="menu"
+            data-testid="session-menu-trigger"
             title={session ? `会话 ID：${session.id}${session.sessionFile ? `
-会话文件：${session.sessionFile}` : ''}` : undefined}
+会话文件：${session.sessionFile}` : ''}\n点击切换会话` : '切换会话'}
+            className="flex max-w-full items-center gap-1 text-left"
           >
-            {session?.title ?? '对话'}
-          </div>
+            <span className="truncate text-[13px] font-semibold leading-tight text-(--on-surface)">
+              {session?.title ?? '对话'}
+            </span>
+            <ChevronDown
+              size={11}
+              className={`shrink-0 text-(--on-surface-muted) transition-transform ${menuOpen ? 'rotate-180' : ''}`}
+            />
+          </button>
           <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-(--on-surface-muted)">
             <span>{fullHistory.length} 条</span>
             {session ? <span className="font-mono text-[9.5px] opacity-70">#{session.id.slice(0, 6)}</span> : null}
             {running ? <span className="text-(--accent)">· 生成中…</span> : null}
             {compacting ? <span className="text-(--accent)">· 压缩中…</span> : null}
           </div>
+
+          {/* 会话切换浮层（原型 .session-menu）：贴着头部下沿，绝对定位盖住消息流 */}
+          {menuOpen && (
+            <div
+              role="menu"
+              data-testid="session-menu"
+              className="absolute left-3 right-3 top-[calc(100%-2px)] z-50 max-h-[min(400px,60vh)] overflow-y-auto rounded-2xl bg-(--surface-card) p-1.5 shadow-[0_16px_40px_rgba(0,0,0,.16)] ring-1 ring-(--outline-soft)"
+              data-scrollable=""
+            >
+              <div className="flex items-center justify-between px-2 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-(--on-surface-muted)">
+                <span>会话</span>
+                <span className="flex items-center gap-1.5 font-normal normal-case">
+                  <span>{sessions.length} 个</span>
+                  {/* 批量删除：进入管理态后点行 = 勾选（原有浮层面的能力，入口一并搬到这里） */}
+                  <button
+                    onClick={() => {
+                      setManageMode((v) => !v)
+                      setSelectedIds(new Set())
+                    }}
+                    className={`rounded-md px-1.5 py-0.5 text-[10px] transition-colors ${
+                      manageMode
+                        ? 'bg-(--accent) text-white'
+                        : 'text-(--on-surface-variant) hover:bg-(--outline-soft) hover:text-(--on-surface)'
+                    }`}
+                    title={manageMode ? '退出批量管理' : '批量删除会话（不删除素材文件）'}
+                  >
+                    {manageMode ? '完成' : '管理'}
+                  </button>
+                </span>
+              </div>
+              {manageMode && (
+                <div className="flex items-center gap-1 px-1.5 pb-1">
+                  <button
+                    onClick={() => setSelectedIds(allSelected ? new Set() : new Set(sessions.map((s) => s.id)))}
+                    className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft)"
+                  >
+                    <ListChecks size={11} />
+                    {allSelected ? '取消全选' : '全选'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (selectedIds.size === 0) return
+                      // 确认弹窗由 store 接管；成功后退出管理态，取消则保留多选
+                      requestRemoveSessions(
+                        [...selectedIds],
+                        () => {
+                          setManageMode(false)
+                          setSelectedIds(new Set())
+                        }
+                      )
+                    }}
+                    disabled={selectedIds.size === 0}
+                    className="ml-auto flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] text-(--on-surface-variant) transition-colors hover:bg-(--danger)/10 hover:text-(--danger) disabled:cursor-default disabled:opacity-40"
+                    title="删除所选会话（对话历史移除；画布与素材文件不受影响）"
+                  >
+                    <Trash2 size={11} />
+                    删除 {selectedIds.size > 0 ? selectedIds.size : ''}
+                  </button>
+                </div>
+              )}
+              <SessionsPanel
+                manageMode={manageMode}
+                selectedIds={selectedIds}
+                onToggleSelect={(id) =>
+                  setSelectedIds((prev) => {
+                    const next = new Set(prev)
+                    if (next.has(id)) next.delete(id)
+                    else next.add(id)
+                    return next
+                  })
+                }
+                onSwitch={(id) => {
+                  switchSession(id)
+                  setMenuOpen(false)
+                }}
+              />
+            </div>
+          )}
         </div>
         {usage?.contextWindow ? (
           <span

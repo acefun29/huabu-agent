@@ -561,8 +561,8 @@ const UnifiedAssetCard = memo(function UnifiedAssetCard({ node, data }: { node: 
           batchIds={selected ? useCanvasStore.getState().selectedAssetIds : [node.id]}
           title={
             selected && selectedCount > 1
-              ? '拖到对话框整批作为上下文；拖到左侧素材库 = 整批归档'
-              : '拖到对话框作为上下文；拖到左侧素材库 = 移动归档'
+              ? '拖到对话框整批作为上下文；拖到右侧素材库 = 整批归档'
+              : '拖到对话框作为上下文；拖到右侧素材库 = 移动归档'
           }
         />
       </div>

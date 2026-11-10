@@ -867,7 +867,7 @@ export function CanvasWorkspace() {
             <div className="text-[12px] leading-relaxed text-(--on-surface-muted)">
               右键画布直接生成，或选中卡片后右键「以此生成…」；
               <br />
-              从左侧素材库点击 / 拖拽钉入素材；把电脑里的文件直接拖进来 = 自动归档（assets/&lt;分类&gt;/）；
+              从右侧素材库点击 / 拖拽钉入素材；把电脑里的文件直接拖进来 = 自动归档（assets/&lt;分类&gt;/）；
               <br />
               也可以在底部输入框描述需求，产物会自动落到这里并形成引用链。
             </div>
