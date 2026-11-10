@@ -90,22 +90,33 @@ export function ChatPanel() {
     <aside
       style={{ width }}
       data-testid="chat-panel"
-      className="absolute bottom-0 right-[60px] top-0 z-40 flex flex-col border-l border-(--outline-soft) bg-(--surface-card) shadow-[-8px_0_24px_rgba(0,0,0,0.05)]"
+      // 贴着右侧图标栏左边（rail 宽 48），与原型一致：画布 | 对话栏 | 图标栏。
+      // top-11 = 让出自绘标题栏（容器不用 padding 让位）
+      className="absolute bottom-0 right-12 top-11 z-40 flex flex-col border-l border-(--outline) bg-(--surface-card)"
     >
-      {/* 左边缘拖拽把手：悬停显细线，拖动时高亮 */}
+      {/*
+        左边缘拖拽把手（原型 .chat-resize）：
+        - 命中区宽 6px（好点），但**视觉只有 1px 线**，绝不铺整条高亮底
+        - 悬停/拖拽时：1px 线变强调色，中段浮出一小截 3px 把手
+      */}
       <div
         role="separator"
         aria-orientation="vertical"
         aria-label="拖动调整对话栏宽度（双击恢复默认）"
         onPointerDown={onPointerDown}
         onDoubleClick={onDoubleClick}
-        className={`group absolute bottom-0 left-0 top-0 z-10 w-2 -translate-x-1/2 cursor-col-resize touch-none ${
-          dragging ? 'bg-(--accent)/20' : ''
-        }`}
+        className="group absolute bottom-0 left-0 top-0 z-10 w-1.5 -translate-x-1/2 cursor-col-resize touch-none"
       >
+        {/* 1px 竖线：静默透明，悬停/拖拽才显色 */}
         <span
-          className={`absolute left-1/2 top-1/2 h-9 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full transition-opacity ${
-            dragging ? 'bg-(--accent) opacity-100' : 'bg-(--outline) opacity-0 group-hover:opacity-100'
+          className={`absolute left-1/2 top-0 bottom-0 w-px -translate-x-1/2 transition-colors ${
+            dragging ? 'bg-(--accent)' : 'bg-transparent group-hover:bg-(--outline)'
+          }`}
+        />
+        {/* 中段小把手：只有悬停/拖拽时出现 */}
+        <span
+          className={`absolute left-1/2 top-1/2 h-[34px] w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-(--outline) transition-opacity ${
+            dragging ? 'bg-(--accent) opacity-100' : 'opacity-0 group-hover:opacity-100'
           }`}
         />
       </div>

@@ -133,11 +133,13 @@ export function SessionSidebar() {
 
   return (
     <>
-      {/* 图标栏：常驻浮层，竖向排列；上半是会话/素材库面板入口，下半是清空画布快捷工具与设置入口。
-          位置在**右侧**（原型 rail），与右侧对话栏并排：对话栏在它左边。 */}
+      {/* 图标栏：贴右边缘的通栏（原型 .rail）——48px 竖条，左侧一条分隔线，浅色底，
+          不是悬浮卡片。与对话栏并排：画布 | 对话栏 | 图标栏。
+          top-11 = 让出自绘标题栏（容器不用 padding 让位）。 */}
       <aside
         ref={railRef}
-        className="absolute right-1.5 top-[56px] z-50 flex w-12 flex-col items-center gap-1.5 rounded-2xl bg-(--chrome-bg) py-2.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
+        // justify-start 与原型一致（按钮贴顶排布）；底部留白是画布伸展区，不放控件
+        className="absolute bottom-0 right-0 top-11 z-50 flex w-12 flex-col items-center justify-start gap-1.5 border-l border-(--outline) bg-(--chrome-bg) py-3"
       >
         {SIDE_TABS.map((t) => {
           const active = openTab === t.key
@@ -220,7 +222,8 @@ export function SessionSidebar() {
             exit={{ opacity: 0, x: 12, scale: 0.97, transition: { duration: 0.14, ease: [0.4, 0, 1, 1] } }}
             transition={{ type: 'spring', stiffness: 420, damping: 34, mass: 0.85 }}
             style={{ transformOrigin: 'right center', willChange: 'transform, opacity' }}
-            className="absolute right-[68px] top-[56px] z-50 flex max-h-[min(620px,calc(100%-68px))] w-[304px] flex-col overflow-hidden rounded-3xl bg-(--panel-float) shadow-[0_18px_50px_rgba(0,0,0,0.16)] ring-1 ring-(--outline) backdrop-blur-2xl"
+            // 贴着图标栏向左展开：right 让出 48px 图标栏 + 12px 间隙；top 与图标栏同高
+            className="absolute right-[60px] top-3 z-50 flex max-h-[min(620px,calc(100%-24px))] w-[304px] flex-col overflow-hidden rounded-3xl bg-(--panel-float) shadow-[0_18px_50px_rgba(0,0,0,0.16)] ring-1 ring-(--outline) backdrop-blur-2xl"
           >
             {/* 面板头部（会话页在批量管理态换成：已选计数 + 全选/删除/完成） */}
             <div className="flex shrink-0 items-center gap-2 px-4 pb-2.5 pt-3.5">

@@ -1,9 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import {
   AudioLines,
-  ChevronDown,
   ChevronRight,
-  ChevronUp,
   FileCode,
   FileText,
   FoldVertical,
@@ -13,7 +11,6 @@ import {
   Trash2,
   Video,
 } from 'lucide-react'
-import { motion } from 'motion/react'
 import type { AssetKind, ChatMessage } from '../types'
 import type { ChatContextUsage, ChatHistoryImage } from '@shared/ipc'
 import { useCanvasStore } from '../store/canvasStore'
@@ -216,7 +213,6 @@ export function ChatDock() {
   }, [history])
 
   void activeSessionId
-  const clipped = false
 
   const usageTitle = usage
     ? usage.tokens === null
@@ -225,108 +221,84 @@ export function ChatDock() {
     : undefined
 
   return (
-    <div className="pointer-events-auto flex h-full min-h-0 w-full flex-col gap-2 px-3 pb-3 pt-2">
+    <div className="pointer-events-auto flex h-full min-h-0 w-full flex-col">
+      {/* 头部（原型 .chat-head）：头像 + 会话名/Agent 身份 + 水位 + 新建/删除。
+          右栏常驻，没有折叠态，所以不再有"把手行"。 */}
       <div
-          data-testid="chat-dock"
-          className="flex min-h-0 w-full flex-1 flex-col overflow-hidden"
-        >
-          {/* 把手行：点击或上下拖动切换展开态；折叠态细到一条 */}
-          <motion.div
-            className="relative flex h-[34px] shrink-0 select-none items-center gap-2 px-3"
-          >
-            <span className="absolute left-1/2 top-[5px] h-1 w-9 -translate-x-1/2 rounded-full bg-(--outline)" />
-            <MessageSquare size={12} className="mt-1 shrink-0 text-(--accent)" />
-            <span
-              className="mt-1 min-w-0 flex-1 truncate text-[11px] font-medium text-(--on-surface-muted)"
-              title={session ? `会话 ID：${session.id}${session.sessionFile ? `\n会话文件：${session.sessionFile}` : ''}` : undefined}
-            >
-              {session?.title ?? '对话'} · {fullHistory.length} 条
-              {session ? (
-                <span className="ml-1 font-mono text-[9.5px] font-normal tracking-tight opacity-70">#{session.id.slice(0, 6)}</span>
-              ) : null}
-              {running ? ' · 生成中…' : ''}
-              {compacting ? ' · 正在压缩上下文…' : ''}
-            </span>
-            {/* 水位段（T1）：percent + tokens/window；≥80% 变色提示（接近 pi 自动压缩触发线） */}
-            {usage?.contextWindow ? (
-              <span
-                data-testid="context-usage"
-                className={`mt-1 flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 font-mono text-[10.5px] ${
-                  usageCritical ? 'bg-(--danger)/10 font-medium text-(--danger)' : 'text-(--on-surface-muted)'
-                }`}
-                title={usageTitle}
-              >
-                {usage.tokens === null ? (
-                  <span>— 待更新</span>
-                ) : (
-                  <>
-                    <span>{Math.round(usage.percent ?? 0)}%</span>
-                    <span className="opacity-70">
-                      {formatTokens(usage.tokens ?? 0)}/{formatTokens(usage.contextWindow)}
-                    </span>
-                  </>
-                )}
-              </span>
-            ) : null}
-            {expanded && session && (
-              <span className="mt-1 flex shrink-0 items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
-                <button
-                  onClick={() => createSession()}
-                  className="rounded-full p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft)"
-                  title="新建对话（画布与素材不受影响）"
-                  data-testid="new-session-button"
-                >
-                  <Plus size={12} />
-                </button>
-                <button
-                  onClick={() => requestRemoveSession(session.id)}
-                  className="rounded-full p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"
-                  title="删除会话（不删除素材文件）"
-                >
-                  <Trash2 size={12} />
-                </button>
-              </span>
-            )}
-            <span className="mt-1 shrink-0 text-(--on-surface-muted)">
-              {expanded ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
-            </span>
-          </motion.div>
-
-          {/* 消息体：折叠态底部对齐（流式输出照常可见），内容被裁掉时才加顶部渐隐 */}
+        data-testid="chat-dock"
+        className="flex shrink-0 items-center gap-2.5 border-b border-(--outline-soft) px-3 py-2.5"
+      >
+        <div className="min-w-0 flex-1">
           <div
-            ref={bodyRef}
-            data-scrollable=""
-            className={`min-h-0 flex-1 px-4 pb-2 ${
-              expanded ? 'overflow-y-auto' : 'flex flex-col justify-end overflow-hidden'
-            }`}
-            style={
-              !expanded && clipped
-                ? {
-                    maskImage: 'linear-gradient(to bottom, transparent, black 26px)',
-                    WebkitMaskImage: 'linear-gradient(to bottom, transparent, black 26px)',
-                  }
-                : undefined
-            }
+            className="truncate text-[13px] font-semibold leading-tight text-(--on-surface)"
+            title={session ? `会话 ID：${session.id}${session.sessionFile ? `
+会话文件：${session.sessionFile}` : ''}` : undefined}
           >
-            <div ref={contentRef} className="space-y-1.5 py-1">
-              {history.length === 0 ? (
-                <div className="flex flex-col items-center justify-center gap-2 px-4 py-16 text-center">
-                  <div className="grid h-10 w-10 place-items-center rounded-xl bg-(--surface-chip) text-(--on-surface-muted)">
-                    <MessageSquare size={17} />
-                  </div>
-                  <div className="text-[12px] font-medium text-(--on-surface-variant)">开始一轮对话</div>
-                  <div className="max-w-[260px] text-[11px] leading-relaxed text-(--on-surface-muted)">
-                    选中画布资源、拖入文件（临时引用）或直接描述需求；当前层级的节点会作为上下文。
-                  </div>
-                </div>
-              ) : null}
-              {history.map((m) => (
-                <MessageBubble key={m.id} m={m} expanded={expanded} />
-              ))}
-            </div>
+            {session?.title ?? '对话'}
           </div>
+          <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-(--on-surface-muted)">
+            <span>{fullHistory.length} 条</span>
+            {session ? <span className="font-mono text-[9.5px] opacity-70">#{session.id.slice(0, 6)}</span> : null}
+            {running ? <span className="text-(--accent)">· 生成中…</span> : null}
+            {compacting ? <span className="text-(--accent)">· 压缩中…</span> : null}
+          </div>
+        </div>
+        {usage?.contextWindow ? (
+          <span
+            data-testid="context-usage"
+            className={`shrink-0 font-mono text-[10px] ${
+              usageCritical ? 'font-medium text-(--danger)' : 'text-(--on-surface-muted)'
+            }`}
+            title={usageTitle}
+          >
+            {usage.tokens === null ? '—' : `${Math.round(usage.percent ?? 0)}%`}
+          </span>
+        ) : null}
+        {session && (
+          <span className="flex shrink-0 items-center gap-0.5">
+            <button
+              onClick={() => createSession()}
+              className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--on-surface)"
+              title="新建对话（画布与素材不受影响）"
+              data-testid="new-session-button"
+            >
+              <Plus size={13} />
+            </button>
+            <button
+              onClick={() => requestRemoveSession(session.id)}
+              className="rounded-lg p-1.5 text-(--on-surface-variant) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"
+              title="删除会话（不删除素材文件）"
+            >
+              <Trash2 size={13} />
+            </button>
+          </span>
+        )}
       </div>
-      <Composer />
+
+      {/* 消息流（原型 .chat-scroll）：全高、独立滚动，不做折叠 */}
+      <div ref={bodyRef} data-scrollable="" className="min-h-0 flex-1 overflow-y-auto px-4 pb-4 pt-3.5">
+        <div ref={contentRef} className="flex min-h-full flex-col gap-2.5">
+          {history.length === 0 ? (
+            <div className="flex flex-1 flex-col items-center justify-center gap-1.5 px-4 py-10 text-center">
+              <div className="mb-1 grid h-10 w-10 place-items-center rounded-xl bg-(--surface-chip) text-(--on-surface-muted)">
+                <MessageSquare size={18} />
+              </div>
+              <div className="text-[13px] font-semibold text-(--on-surface)">开始一轮对话</div>
+              <div className="max-w-[260px] text-[12px] leading-relaxed text-(--on-surface-muted)">
+                选中画布资源、拖入文件（临时引用）或直接描述需求；当前层级的节点会作为上下文。
+              </div>
+            </div>
+          ) : null}
+          {history.map((m) => (
+            <MessageBubble key={m.id} m={m} expanded={expanded} />
+          ))}
+        </div>
+      </div>
+
+      {/* 底部输入区（原型 .chat-footer）：一条分隔线 + Composer */}
+      <div className="shrink-0 border-t border-(--outline-soft) px-3 pb-3 pt-2.5">
+        <Composer />
+      </div>
     </div>
   )
 }

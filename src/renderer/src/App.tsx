@@ -47,10 +47,12 @@ function WorkspaceBody() {
    * 都是覆盖在画布之上的浮层 —— 打开/调宽对话栏不改变画布视口，卡片位置不会漂。
    *   - 对话栏：右侧，左边缘可拖拽调宽（ChatPanel 自己管宽度）
    *   - 图标栏：最右侧 48px 竖条（素材库/会话/清空/设置），浮层面板向左展开
-   * 画布顶部让出自绘标题栏（pt-11）。
+   *
+   * 定位：不用 padding 让位（absolute 子元素会相对 border box 定位而钻到标题栏底下），
+   * 改成子元素各自 top-11，画布本身也用 top-11 起算。
    */
   return (
-    <div className="relative h-full w-full overflow-hidden pt-11">
+    <div className="relative h-full w-full overflow-hidden">
       <CanvasWorkspace />
       <ChatPanel />
       <SessionSidebar />

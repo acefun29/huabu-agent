@@ -797,7 +797,9 @@ export function CanvasWorkspace() {
       ref={rootRef}
       data-testid="canvas"
       data-canvas-bg="true"
-      className={`absolute inset-0 select-none overflow-hidden bg-(--surface) active:cursor-grabbing ${
+      // top-11 = 让出自绘标题栏（44px）；容器不再用 padding 让位，
+      // 否则 absolute 子元素相对 border box 定位会钻到标题栏底下
+      className={`absolute inset-x-0 bottom-0 top-11 select-none overflow-hidden bg-(--surface) active:cursor-grabbing ${
         spaceDown ? 'cursor-grab' : 'cursor-default'
       }`}
       onMouseDownCapture={() => {
