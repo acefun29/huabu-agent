@@ -102,7 +102,9 @@ function CanvasFilterBar({
     <div
       data-canvas-ui="true"
       data-tour="canvas-filter"
-      className="absolute right-3 top-3 z-20 flex max-w-[calc(100%-88px)] flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl bg-(--chrome-bg) px-2.5 py-1.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
+      // 右移避开图标栏(48)与对话栏（宽度由 --chat-w 注入，未设时退回 400）
+      style={{ right: 'calc(var(--chat-w, 400px) + 60px)' }}
+      className="absolute top-3 z-20 flex max-w-[calc(100%-88px)] flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl bg-(--chrome-bg) px-2.5 py-1.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
     >
       {/* 类型 */}
       {kinds.length > 1 ? (
@@ -877,7 +879,12 @@ export function CanvasWorkspace() {
           data-canvas-ui="true"
           data-tour="selection-bar"
           data-testid="selection-bar"
-          className="absolute left-1/2 top-3 z-20 flex h-11 -translate-x-1/2 items-center gap-1.5 rounded-2xl bg-(--chrome-bg) px-3 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
+          // 居中于「画布可见区」（扣掉右侧图标栏与对话栏），而不是整窗居中
+          style={{
+            left: 'calc((100% - var(--chat-w, 400px) - 60px) / 2)',
+            transform: 'translateX(-50%)'
+          }}
+          className="absolute top-3 z-20 flex h-11 items-center gap-1.5 rounded-2xl bg-(--chrome-bg) px-3 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
         >
           <span className="shrink-0 pl-1 text-[12px] font-medium text-(--on-surface-variant)">已选 {selectedCount} 项</span>
           <button

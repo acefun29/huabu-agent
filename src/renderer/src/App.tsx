@@ -4,7 +4,7 @@ import { CanvasProvider, useCanvasStore } from './store/canvasStore'
 import { TitleBar } from './components/TitleBar'
 import { CanvasWorkspace } from './components/CanvasWorkspace'
 import { SessionSidebar } from './components/SessionSidebar'
-import { ChatDock } from './components/ChatDock'
+import { ChatPanel } from './components/ChatPanel'
 import { Toast } from './components/Toast'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { WorkspaceGate } from './components/WorkspaceGate'
@@ -43,19 +43,17 @@ function WorkspaceBody() {
   if (!workspace) return <WorkspaceGate />
 
   /**
-   * 双栏骨架（原型 index-projects.html）：
-   *   左：画布区（默认渲染项目结构视图）| 右：对话面板 400px
-   * 画布顶部让出自绘标题栏（pt-11），右栏占满剩余高度。
+   * 布局（原型 index-projects.html）：画布**占满整个工作区**，右侧对话栏与图标栏
+   * 都是覆盖在画布之上的浮层 —— 打开/调宽对话栏不改变画布视口，卡片位置不会漂。
+   *   - 对话栏：右侧，左边缘可拖拽调宽（ChatPanel 自己管宽度）
+   *   - 图标栏：最右侧 48px 竖条（素材库/会话/清空/设置），浮层面板向左展开
+   * 画布顶部让出自绘标题栏（pt-11）。
    */
   return (
-    <div className="relative flex h-full w-full overflow-hidden pt-11">
-      <div className="relative min-w-0 flex-1">
-        <CanvasWorkspace />
-        <SessionSidebar />
-      </div>
-      <aside className="flex w-[400px] shrink-0 flex-col border-l border-(--outline-soft) bg-(--surface-card)">
-        <ChatDock />
-      </aside>
+    <div className="relative h-full w-full overflow-hidden pt-11">
+      <CanvasWorkspace />
+      <ChatPanel />
+      <SessionSidebar />
     </div>
   )
 }

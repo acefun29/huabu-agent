@@ -133,10 +133,11 @@ export function SessionSidebar() {
 
   return (
     <>
-      {/* 图标栏：常驻浮层，竖向排列；上半是会话/素材库面板入口，下半是清空画布快捷工具与设置入口 */}
+      {/* 图标栏：常驻浮层，竖向排列；上半是会话/素材库面板入口，下半是清空画布快捷工具与设置入口。
+          位置在**右侧**（原型 rail），与右侧对话栏并排：对话栏在它左边。 */}
       <aside
         ref={railRef}
-        className="absolute left-3 top-[56px] z-20 flex w-12 flex-col items-center gap-1.5 rounded-2xl bg-(--chrome-bg) py-2.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
+        className="absolute right-1.5 top-[56px] z-50 flex w-12 flex-col items-center gap-1.5 rounded-2xl bg-(--chrome-bg) py-2.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
       >
         {SIDE_TABS.map((t) => {
           const active = openTab === t.key
@@ -214,12 +215,12 @@ export function SessionSidebar() {
           <motion.section
             ref={panelRef}
             key="side-panel"
-            initial={{ opacity: 0, x: -16, scale: 0.96 }}
+            initial={{ opacity: 0, x: 16, scale: 0.96 }}
             animate={{ opacity: 1, x: 0, scale: 1 }}
-            exit={{ opacity: 0, x: -12, scale: 0.97, transition: { duration: 0.14, ease: [0.4, 0, 1, 1] } }}
+            exit={{ opacity: 0, x: 12, scale: 0.97, transition: { duration: 0.14, ease: [0.4, 0, 1, 1] } }}
             transition={{ type: 'spring', stiffness: 420, damping: 34, mass: 0.85 }}
-            style={{ transformOrigin: 'left center', willChange: 'transform, opacity' }}
-            className="absolute left-[72px] top-[56px] z-40 flex max-h-[min(620px,calc(100%-68px))] w-[304px] flex-col overflow-hidden rounded-3xl bg-(--panel-float) shadow-[0_18px_50px_rgba(0,0,0,0.16)] ring-1 ring-(--outline) backdrop-blur-2xl"
+            style={{ transformOrigin: 'right center', willChange: 'transform, opacity' }}
+            className="absolute right-[68px] top-[56px] z-50 flex max-h-[min(620px,calc(100%-68px))] w-[304px] flex-col overflow-hidden rounded-3xl bg-(--panel-float) shadow-[0_18px_50px_rgba(0,0,0,0.16)] ring-1 ring-(--outline) backdrop-blur-2xl"
           >
             {/* 面板头部（会话页在批量管理态换成：已选计数 + 全选/删除/完成） */}
             <div className="flex shrink-0 items-center gap-2 px-4 pb-2.5 pt-3.5">
