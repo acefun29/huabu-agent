@@ -55,6 +55,12 @@ import type {
   WorkspaceDeleteResult,
   WorkspaceStateInfo,
   CanvasSnapshot,
+  SuperAgentBoardSnapshot,
+  SuperAgentExpertInfo,
+  SuperAgentJournalEntry,
+  SuperAgentRunTaskAccepted,
+  SuperAgentRunTaskRequest,
+  TaskEvent,
   WindowStateInfo
 } from './ipc'
 import type { Facet, FacetSchema } from './facets'
@@ -104,6 +110,9 @@ export interface HuabuApi {
 
   /** 素材能力（新原型同步）：分类归档、临时 inbox、素材库映射 */
   asset: AssetApi
+
+  /** SuperAgent 协作能力（架构图 to-be ②）：任务板、派单、取消、事实日志、用户直连 */
+  superagent: SuperAgentApi
 }
 
 /**
@@ -452,4 +461,42 @@ export interface ProjectApi {
   reorder(projectId: string, parentId: string | null, orderedIds: string[]): Promise<unknown>
   /** 结构变更订阅，返回取消函数 */
   onChanged(listener: () => void): () => void
+}
+
+/**
+ * SuperAgent 协作接口（window.huabu.superagent）。
+ *
+ * 事实源是工作区 `.huabu/journal.jsonl`（append-only），这里的 board 只是投影：
+ * 渲染端不缓存权威状态，收到 `task:event` 就重新拉一次 board 即可。
+ */
+export interface SuperAgentApi {
+  /** 任务板投影 + 版本槽 + 运行态 */
+  board(): Promise<ChatResult<SuperAgentBoardSnapshot>>
+
+  /**
+   * 派单执行：立即返回 taskId（受理即返回），进度经 task:event 推送。
+   * 预检阶段被拒（缺参考等）也会返回 taskId，并在 rejected 里说明原因。
+   */
+  runTask(request: SuperAgentRunTaskRequest): Promise<ChatResult<SuperAgentRunTaskAccepted>>
+
+  /** 取消运行中的任务（未在跑的任务返回明确失败） */
+  cancelTask(taskId: string): Promise<ChatResult>
+
+  /** 读原始事实日志（审计 / 回放，按顺序返回全部事件） */
+  journal(): Promise<ChatResult<SuperAgentJournalEntry[]>>
+
+  /** 用户直连专家改需求：追加 user.changed 事实（不改任务状态） */
+  appendUserChange(request: {
+    taskId: string
+    /** 新的需求描述 */
+    prompt: string
+    /** 可选：同时调整验收标准 */
+    accept?: string[]
+  }): Promise<ChatResult>
+
+  /** 专家池清单（id / 名称 / 角色 / 是否常驻） */
+  experts(): Promise<ChatResult<SuperAgentExpertInfo[]>>
+
+  /** 订阅任务事件（board 变化的最小信号），返回取消订阅函数 */
+  onTaskEvent(listener: (event: TaskEvent) => void): () => void
 }

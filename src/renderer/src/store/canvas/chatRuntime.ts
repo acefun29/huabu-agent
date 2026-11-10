@@ -37,7 +37,10 @@ const writeToolPaths = new Map<string, { sessionId: string; path: string }>()
 const historyLoaded = new Set<string>()
 /** 逐轮注入去重（token 经济）的上轮摘要全文（key = sessionId）：存 collectRoundContext
  * 返回的 digests **全量全文**（非占位），下轮采集时传入比较——一致则折叠为占位行 */
-const lastRoundDigests = new Map<string, { library?: string; canvas?: string }>()
+const lastRoundDigests = new Map<
+  string,
+  { library?: string; canvas?: string; project?: string; scope?: string; queue?: string }
+>()
 /** 逐轮注入去重的 genSummary 签名表（key = sessionId，卡片 id → 签名）：
  * 签名与上轮一致的生成卡片不再重复携带 genSummary 括注 */
 const genSummarySeen = new Map<string, Record<string, string>>()
@@ -605,6 +608,14 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       workspaceDir: ws.path,
       jobStates: s.jobStates,
       libraries: s.libraries,
+      // 四段装配的数据来源：常驻/轮换段来自项目快照，队列段来自任务板投影
+      project: s.projectSnapshot,
+      taskBoard: s.superAgentTasks.length > 0
+        ? {
+            tasks: s.superAgentTasks.map((entry) => entry.task),
+            runningTaskIds: s.superAgentRunning
+          }
+        : null,
       previousDigests: lastRoundDigests.get(sid),
       genSummarySeen: genSummarySeen.get(sid)
     })

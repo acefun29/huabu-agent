@@ -7,6 +7,7 @@ import {
   broadcastProjectChangedEvent,
   broadcastMediaJob,
   broadcastMcpStatus,
+  broadcastTaskEvent,
   type IpcContext
 } from './ipc/shared'
 import { registerWindowAppIpc } from './ipc/windowApp'
@@ -15,7 +16,10 @@ import { registerAssetIpc } from './ipc/asset'
 import { registerMediaIpc, createMediaRuntime, requestMediaApproval } from './ipc/media'
 import { registerChatIpc } from './ipc/chat'
 import { registerProjectIpc } from './ipc/project'
+import { registerSuperAgentIpc } from './ipc/superagent'
 import { registerSettingsIpc } from './ipc/settings'
+import { SuperAgentRunner } from './superagent/runner'
+import { inboxRoot } from './assets/manager'
 
 /**
  * 注册全部 IPC handler（瘦编排器：各域 handler 分模块注册，见 src/main/ipc/ 目录）。
@@ -79,12 +83,23 @@ export function registerIpcHandlers(): void {
   mcpManagerSingleton = mcpManager
   mcpManager.sync()
 
+  // SuperAgent 运行器：IPC 域与 Agent 派单工具共用（模型解析/工具装配/取消都在这层）
+  const superAgent = new SuperAgentRunner({
+    currentDir,
+    defaultModelId: () => store.currentWorkspace?.defaultModel,
+    modelManagerFor: (dir) => host.chatManagerFor(dir),
+    media: { store, mediaManager, mediaContext, requestApproval: requestMediaApproval, inboxRoot },
+    broadcastTaskEvent
+  })
+
   const ctx: IpcContext = {
     store,
     host,
     currentDir,
     broadcastAssetChanged,
     broadcastProjectChanged: broadcastProjectChangedEvent,
+    broadcastTaskEvent,
+    superAgent,
     mediaManager,
     mediaContext,
     requestMediaApproval,
@@ -97,5 +112,6 @@ export function registerIpcHandlers(): void {
   registerMediaIpc(ctx)
   registerChatIpc(ctx)
   registerProjectIpc(ctx)
+  registerSuperAgentIpc(ctx)
   registerSettingsIpc(ctx)
 }

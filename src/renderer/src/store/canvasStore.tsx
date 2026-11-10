@@ -5,6 +5,9 @@ import type {
   AssetLibraryFile,
   MediaConfirmPayload,
   MediaJobStatus,
+  ProjectSnapshot,
+  SuperAgentExpertInfo,
+  SuperAgentTaskView,
   WorkspaceDeleteResult,
   WorkspaceInfo
 } from '@shared/ipc'
@@ -31,6 +34,8 @@ import { createJobRuntime } from './canvas/jobRuntime'
 import type { GenerationRequest, JobCardRuntime } from './canvas/jobRuntime'
 import { createNodeOps } from './canvas/nodeOps'
 import { createLibraryOps } from './canvas/libraryOps'
+import { createSuperAgentOps } from './canvas/superagentOps'
+import { createProjectOps } from './canvas/projectOps'
 import {
   BRIDGE_AVAILABLE,
   buildJobCardIndex,
@@ -269,6 +274,36 @@ export interface CanvasState {
   /** 确认卡回执：接受/拒绝（调 IPC 后由 onConfirmResolved 撤卡，这里只发回执） */
   resolveApproval: (requestId: string, accepted: boolean) => void
 
+  /* SuperAgent 协作（任务板 / 专家池 / 用户直连改需求；事实源在主进程 journal） */
+  /** 任务板最近投影（新的在前；running 以主进程运行态为准） */
+  superAgentTasks: Array<{ task: SuperAgentTaskView; running: boolean }>
+  /** 专家池（静态注册表，工作区切换后拉一次） */
+  superAgentExperts: SuperAgentExpertInfo[]
+  /** 主进程里正在执行的 taskId */
+  superAgentRunning: string[]
+  /** 重拉任务板投影（task:event 到达 / 浮层打开 / 工作区切换） */
+  refreshSuperAgent: () => Promise<void>
+  /** 拉专家池清单 */
+  refreshSuperAgentExperts: () => Promise<void>
+  /** 取消运行中的任务 */
+  cancelSuperAgentTask: (taskId: string) => Promise<void>
+  /** 用原 scope/prompt/accept 重派 attention/blocked 任务（新 taskId） */
+  redispatchSuperAgentTask: (task: SuperAgentTaskView) => Promise<void>
+  /** 用户直连专家改需求（追加 user.changed 事实） */
+  appendSuperAgentUserChange: (taskId: string, prompt: string) => Promise<boolean>
+  /** task:event 出口（订阅层转调） */
+  handleTaskEvent: () => void
+
+  /* 项目结构（project.json 的渲染端投影：上下文常驻段/轮换段的数据来源） */
+  /** 当前 scope 的完整快照（null = 无项目/未打开工作区） */
+  projectSnapshot: ProjectSnapshot | null
+  /** 当前浏览的容器节点 id（null = 根看板） */
+  projectScopeId: string | null
+  /** 拉取当前 scope 快照 */
+  refreshProject: (scopeId?: string | null) => Promise<void>
+  /** 切换工作集（下钻容器 / 回根） */
+  setProjectScope: (scopeId: string | null) => Promise<void>
+
   /* @internal：Provider 引导 / 自动保存 / 探针用，业务组件不要订阅 */
   refreshWorkspaceState: () => Promise<void>
   handleJobEvent: (job: MediaJobStatus) => void
@@ -383,6 +418,10 @@ export const useCanvasStore = create<CanvasState>()(
 
     const library = createLibraryOps({ set, get, showToast, applyNodes })
 
+    const superagent = createSuperAgentOps({ set, get, showToast })
+
+    const project = createProjectOps({ set, get, showToast })
+
     /* ---------------- 工作区：打开 / 切换 / 载入画布 ---------------- */
 
     const loadWorkspaceCanvas = async () => {
@@ -496,6 +535,12 @@ export const useCanvasStore = create<CanvasState>()(
       await loadWorkspaceCanvas()
       settingsBridgeRef.current?.refreshAll()
       void library.refreshLibraries()
+      // SuperAgent 任务板与专家池跟着工作区走（journal 是工作区文件）
+      superagent.resetSuperAgent()
+      void superagent.refreshSuperAgentExperts()
+      void superagent.refreshSuperAgent()
+      // 项目快照同样按工作区重建（常驻段/轮换段的数据来源）
+      void project.refreshProject(null)
     }
 
     const refreshWorkspaceState = async () => {
@@ -622,6 +667,8 @@ export const useCanvasStore = create<CanvasState>()(
       ...job,
       ...library,
       ...chat,
+      ...superagent,
+      ...project,
       showToast,
       requestConfirm: (request: ConfirmRequest) => set({ confirm: request }),
       dismissConfirm: () => set({ confirm: null }),
@@ -896,11 +943,14 @@ function useCanvasBootstrap() {
     const unsubConfirmResolved = window.huabu.media.onConfirmResolved(({ requestId }) =>
       useCanvasStore.setState((s) => ({ pendingApprovals: s.pendingApprovals.filter((p) => p.requestId !== requestId) }))
     )
+    // SuperAgent 任务事件：只是「有变化」的信号，收到就重拉任务板投影（不自己推演状态）
+    const unsubTask = window.huabu.superagent.onTaskEvent(() => useCanvasStore.getState().handleTaskEvent())
     return () => {
       unsubJob()
       unsubAsset()
       unsubConfirm()
       unsubConfirmResolved()
+      unsubTask()
     }
     // 仅启动时执行一次
     // eslint-disable-next-line react-hooks/exhaustive-deps

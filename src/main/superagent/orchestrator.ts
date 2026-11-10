@@ -20,8 +20,10 @@ import { Agent } from '@mastra/core/agent'
 import type { Memory } from '@mastra/memory'
 import type { ModelGateway, ModelRef } from '../agent/mastra/modelGateway'
 import { aiSdkLanguageModel } from '../agent/mastra/modelGateway'
+import { MEMORY_RESOURCE } from '../agent/mastra/storage'
 import { buildEnvelope, envelopeToInstructions, isPathAllowed, type TaskIntent } from './dispatch'
 import type { ClampResult } from './envelope'
+import { resolveExpert, type ExpertDefinition } from './experts'
 import { validateArtifact, type ArtifactCandidate, type ValidationResult } from './validator'
 import type { SuperAgentService } from './index'
 import type { TaskEvent } from '../../shared/ipc'
@@ -30,12 +32,16 @@ import type { TaskEvent } from '../../shared/ipc'
 export interface ExpertRunner {
   /**
    * @param envelope 已预检裁剪的信封
-   * @param threadId 专家会话线程（与主会话隔离）
+   * @param threadId 专家会话线程（与主会话隔离；重试换新线程）
+   * @param expert 专家定义（指令追加 + 工具面）
+   * @param signal 任务级取消信号（用户点「取消」）
    * @param broadcast 事件出口（可选，供 UI 展示专家进度）
    */
   run(params: {
     envelope: ClampResult['envelope']
     threadId: string
+    expert: ExpertDefinition
+    signal?: AbortSignal
     broadcast?: (event: Record<string, unknown>) => void
   }): Promise<ExpertRunResult>
 }
@@ -54,10 +60,12 @@ export interface RunTaskOptions {
   shadow?: boolean
   /** 最大验收重试次数（计划 §9.6：验收 2 次） */
   maxValidationAttempts?: number
-  /** 专家线程 id 前缀（默认 taskId） */
+  /** 专家线程 id 前缀（默认 `expert-<expertId>-<taskId>`） */
   threadId?: string
   /** 事件出口（task:event 通道；渲染端未接时忽略，计划 §9.7） */
   onTaskEvent?: (event: TaskEvent) => void
+  /** 取消信号：abort 后不再发起新一轮，当前轮由专家执行器自行中断 */
+  signal?: AbortSignal
 }
 
 export interface RunTaskResult {
@@ -89,7 +97,10 @@ export async function runTask(params: {
   const options = params.options ?? {}
   const maxAttempts = options.maxValidationAttempts ?? 2
   const shadow = options.shadow ?? false
-  const threadId = options.threadId ?? `expert-${intent.taskId}`
+  const resolved = resolveExpert(intent.expert)
+  const expertId = resolved.expert.id
+  const threadId = options.threadId ?? `expert-${expertId}-${intent.taskId}`
+  const signal = options.signal
   const emit = (event: TaskEvent): void => {
     try {
       options.onTaskEvent?.(event)
@@ -99,14 +110,18 @@ export async function runTask(params: {
   }
 
   // 信封预检 + 裁剪（stale/pending 拒注入、超预算裁剪，原因记录）
-  const clamp = buildEnvelope(intent)
+  const clamp = buildEnvelope({ ...intent, expert: expertId })
 
   await service.append('task.created', intent.taskId, 'main', {
     title: intent.prompt.slice(0, 200),
+    prompt: intent.prompt,
+    accept: intent.accept,
     lane: clamp.envelope.lane.join(','),
     scope: intent.scope,
+    expert: expertId,
     ...(clamp.rejected.length ? { rejected: clamp.rejected } : {}),
     ...(clamp.dropped.length ? { dropped: clamp.dropped } : {}),
+    ...(resolved.fellBack && intent.expert ? { expertFallbackFrom: intent.expert } : {}),
     shadow,
   })
   if (clamp.rejected.length > 0 && clamp.envelope.entities.length + clamp.envelope.adjacent.length === 0) {
@@ -125,8 +140,14 @@ export async function runTask(params: {
     }
   }
 
+  if (signal?.aborted) {
+    await service.append('artifact.rejected', intent.taskId, 'system', { reason: '任务在派单后立即被取消' })
+    emit({ type: 'task.status', taskId: intent.taskId, status: 'blocked', attempts: 0, reason: '已取消' })
+    return { taskId: intent.taskId, status: 'blocked', clamp, activated: false, failures: ['已取消'] }
+  }
+
   await service.append('task.assigned', intent.taskId, 'main', {
-    expert: 'expert-visual',
+    expert: expertId,
     lane: clamp.envelope.lane.join(','),
   })
 
@@ -136,30 +157,69 @@ export async function runTask(params: {
   let lastArtifact: ArtifactCandidate | undefined
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    await service.append('task.started', intent.taskId, 'expert', { attempt })
+    if (signal?.aborted) {
+      await service.append('artifact.rejected', intent.taskId, 'system', { reason: '任务被取消', attempt })
+      emit({ type: 'task.status', taskId: intent.taskId, status: 'blocked', attempts: attempt, reason: '已取消' })
+      return { taskId: intent.taskId, status: 'blocked', clamp, activated: false, failures: [...failures, '已取消'] }
+    }
+    await service.append('task.started', intent.taskId, 'expert', { attempt, expert: expertId })
 
     let run: ExpertRunResult
     try {
       run = await expert.run({
         envelope: clamp.envelope,
         threadId: attempt === 1 ? threadId : `${threadId}-r${attempt}`,
+        expert: resolved.expert,
+        ...(signal ? { signal } : {}),
       })
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error)
-      failures.push(`专家执行失败（第 ${attempt} 次）：${reason}`)
-      await service.append('artifact.rejected', intent.taskId, 'expert', { reason, attempt })
-      emit({ type: 'task.status', taskId: intent.taskId, status: 'attention', attempts: attempt, reason })
-      break
+      const cancelled = signal?.aborted === true
+      const raw = error instanceof Error ? error.message : String(error)
+      // 取消不是「执行失败」：状态统一为 blocked（与 board 投影一致），不再留 attention 让主 Agent 重派；
+      // 原因文案也按取消写，否则会被读成「专家不会产出回执」
+      const reason = cancelled ? '任务被用户取消' : raw
+      failures.push(`${cancelled ? '专家执行被取消' : '专家执行失败'}（第 ${attempt} 次）：${reason}`)
+      await service.append('artifact.rejected', intent.taskId, 'expert', {
+        reason,
+        attempt,
+        ...(cancelled ? { cancelled: true } : {})
+      })
+      emit({
+        type: 'task.status',
+        taskId: intent.taskId,
+        status: cancelled ? 'blocked' : 'attention',
+        attempts: attempt,
+        reason
+      })
+      return {
+        taskId: intent.taskId,
+        status: cancelled ? 'blocked' : 'attention',
+        ...(lastArtifact ? { artifact: lastArtifact } : {}),
+        ...(lastValidation ? { validation: lastValidation } : {}),
+        activated: false,
+        clamp,
+        failures
+      }
     }
 
     lastArtifact = run.artifact
-    // lane 白名单校验：产物必须落在允许写区（越界视为失败，计划 §9.3）
+    // lane 白名单校验：产物必须落在允许写区（越界视为失败，计划 §9.3）。
+    // 越界是「专家越权」而不是「可重试的验收失败」：状态统一 blocked，
+    // 与 board 投影的 artifact.rejected→blocked 保持一致，并补发事件（此前静默）。
     const artifactPath = (run.artifact as { path?: string }).path
     if (artifactPath && !isPathAllowed(clamp.envelope, artifactPath)) {
       const reason = `产物越出 lane 写区：${artifactPath}`
       failures.push(reason)
-      await service.append('artifact.rejected', intent.taskId, 'expert', { reason, attempt })
-      break
+      await service.append('artifact.rejected', intent.taskId, 'expert', { reason, attempt, lane: clamp.envelope.lane })
+      emit({ type: 'task.status', taskId: intent.taskId, status: 'blocked', attempts: attempt, reason })
+      return {
+        taskId: intent.taskId,
+        status: 'blocked',
+        artifact: run.artifact,
+        activated: false,
+        clamp,
+        failures,
+      }
     }
 
     await service.append('artifact.ready', intent.taskId, 'expert', {
@@ -231,30 +291,44 @@ export async function runTask(params: {
 
 /**
  * 基于 Mastra Agent 的默认专家执行器：独立 thread（memory 与主会话隔离）、
- * 信封 instructions（不含主会话历史）、只暴露 lane 内可写的工具。
+ * 信封 instructions（不含主会话历史）、按专家定义挂工具（媒体专家 = 真实生成能力）。
  *
- * 首版约束：专家用「文本回执」声明产物元数据（JSON 行），由编排层解析成
- * ArtifactCandidate。真正落盘生成（画布/媒体队列）在 Phase 4 后续接
- * mediaManager —— 这里先把「派单 → 产物 → 验收 → 版本」的闭环钉死。
+ * 产物元数据由专家的「回执 JSON 行」声明，编排层解析成 ArtifactCandidate。
+ * 媒体专家的 generate_image / generate_video 真正落盘，回执里的 path 必须是
+ * 工具返回的真实相对路径——回执与落盘不一致时由 lane 校验与后续结构验收暴露。
  */
 export function createLlmExpertRunner(deps: {
   gateway: ModelGateway
   modelRef: ModelRef
   memory: Memory
+  /** 专家工具面（由调用方按 expert.tools 装配；缺省 = 纯文本专家） */
+  toolsForExpert?: (
+    expert: ExpertDefinition,
+    signal?: AbortSignal
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>
   /** 可选的产物解析钩子（默认解析回执里的 JSON 行） */
   parseArtifact?: (receipt: string, envelope: ClampResult['envelope']) => ArtifactCandidate | null
 }): ExpertRunner {
   return {
-    async run({ envelope }) {
+    async run({ envelope, threadId, expert, signal }) {
+      const instructions = [envelopeToInstructions(envelope), '', '## 专家规则', expert.instructions]
+        .filter(Boolean)
+        .join(String.fromCharCode(10))
+      const tools = deps.toolsForExpert ? await deps.toolsForExpert(expert, signal) : {}
       const agent = new Agent({
-        name: `expert-${envelope.taskId}`,
-        id: `expert-${envelope.taskId}`,
-        instructions: envelopeToInstructions(envelope),
+        name: `${expert.id}-${envelope.taskId}`,
+        id: `${expert.id}-${envelope.taskId}`,
+        instructions,
         model: aiSdkLanguageModel(deps.gateway, deps.modelRef),
         memory: deps.memory,
+        ...(Object.keys(tools).length > 0 ? { tools: tools as never } : {}),
       })
       const events = await agent.stream(envelope.promptLayers.at(-1)?.prompt ?? '执行任务', {
-        memory: { thread: `expert-thread-${envelope.taskId}`, resource: 'workspace' },
+        // threadId 真正生效：重试换新线程，不复用上一轮失败的上下文
+        memory: { thread: threadId, resource: MEMORY_RESOURCE },
+        ...(signal ? { abortSignal: signal } : {}),
+        // 专家一轮内允许多次工具调用（参考读取 → 生成 → 校验），但不无限转
+        maxSteps: 12,
       })
       let receipt = ''
       for await (const chunk of events.fullStream) {
@@ -271,33 +345,73 @@ export function createLlmExpertRunner(deps: {
 /**
  * 默认产物解析：回执里找形如 `{"artifactId","assetId","version","kind",...}` 的 JSON。
  * 找不到返回 null（由调用方判定失败）。
+ *
+ * 用「括号配平扫描」而不是单行正则：专家可能把回执包在代码块里或带嵌套字段
+ * （如 params），正则会漏掉；配平扫描能取出完整对象，逐个尝试解析。
  */
 export function parseArtifactFromReceipt(
   receipt: string,
   envelope: ClampResult['envelope']
 ): ArtifactCandidate | null {
-  const matches = receipt.match(/\{[^{}]*"artifactId"[^{}]*\}/g) ?? []
-  for (const raw of matches) {
+  for (const raw of jsonObjectsIn(receipt)) {
+    let parsed: Partial<ArtifactCandidate>
     try {
-      const parsed = JSON.parse(raw) as Partial<ArtifactCandidate>
-      if (!parsed.artifactId || !parsed.assetId || !parsed.version) continue
-      if (!parsed.kind) continue
-      return {
-        artifactId: parsed.artifactId,
-        assetId: parsed.assetId,
-        version: parsed.version,
-        kind: parsed.kind,
-        ...(parsed.path ? { path: parsed.path } : {}),
-        ...(typeof parsed.width === 'number' ? { width: parsed.width } : {}),
-        ...(typeof parsed.height === 'number' ? { height: parsed.height } : {}),
-        ...(typeof parsed.durationS === 'number' ? { durationS: parsed.durationS } : {}),
-        ...(parsed.format ? { format: parsed.format } : {}),
-        ...(typeof parsed.bytes === 'number' ? { bytes: parsed.bytes } : {}),
-      }
+      parsed = JSON.parse(raw) as Partial<ArtifactCandidate>
     } catch {
       continue
+    }
+    if (!parsed || typeof parsed !== 'object') continue
+    if (!parsed.artifactId || !parsed.assetId || !parsed.version || !parsed.kind) continue
+    const path = parsed.path ? String(parsed.path).replace(/\\/g, '/') : undefined
+    const formatFromPath = path?.includes('.') ? path.slice(path.lastIndexOf('.') + 1).toLowerCase() : undefined
+    return {
+      artifactId: String(parsed.artifactId),
+      assetId: String(parsed.assetId),
+      version: String(parsed.version),
+      kind: parsed.kind,
+      ...(path ? { path } : {}),
+      ...(typeof parsed.width === 'number' ? { width: parsed.width } : {}),
+      ...(typeof parsed.height === 'number' ? { height: parsed.height } : {}),
+      ...(typeof parsed.durationS === 'number' ? { durationS: parsed.durationS } : {}),
+      ...(parsed.format ? { format: String(parsed.format).toLowerCase() } : formatFromPath ? { format: formatFromPath } : {}),
+      ...(typeof parsed.bytes === 'number' ? { bytes: parsed.bytes } : {}),
     }
   }
   void envelope
   return null
+}
+
+/** 从文本里按花括号配平抽取所有可解析的顶层 JSON 对象（跳过字符串内的括号） */
+function jsonObjectsIn(text: string): string[] {
+  const found: string[] = []
+  let inString = false
+  let escaped = false
+  let depth = 0
+  let start = -1
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) escaped = false
+      else if (ch === '\\') escaped = true
+      else if (ch === '"') inString = false
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === '{') {
+      if (depth === 0) start = i
+      depth += 1
+    } else if (ch === '}') {
+      if (depth > 0) {
+        depth -= 1
+        if (depth === 0 && start >= 0) {
+          found.push(text.slice(start, i + 1))
+          start = -1
+        }
+      }
+    }
+  }
+  return found
 }

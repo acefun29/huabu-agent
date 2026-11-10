@@ -22,7 +22,11 @@ const EVENT_CHANNEL_ALLOWLIST: readonly string[] = [
   IpcChannel.MediaConfirmResolvedEvent,
   IpcChannel.McpStatusEvent,
   IpcChannel.AssetChanged,
-  IpcChannel.WindowStateChanged
+  IpcChannel.WindowStateChanged,
+  // 项目结构变更（层级/节点增删改）：此前漏登记，Electron 里 project.onChanged 订阅会直接抛错
+  IpcChannel.ProjectChanged,
+  // SuperAgent 任务/验收进度（计划 §9.7 新增事件）
+  IpcChannel.TaskEvent
 ]
 
 function assertChannelAllowed(channel: string): void {

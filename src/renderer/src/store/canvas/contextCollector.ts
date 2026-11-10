@@ -1,8 +1,15 @@
-import type { AssetLibrary } from '@shared/ipc'
+import type { AssetLibrary, ProjectSnapshot } from '@shared/ipc'
 import type { AssetData, CanvasNode, MessageAttachment } from '../../types'
 import { assetAbsPath } from '../../harness/assetCategories'
 import { activeVersionOf, deriveLineage, formatLineageText, getCardReferences } from '../../lib/mediaReferenceGraph'
-import { CANVAS_DIGEST_HEADER, DIGEST_UNCHANGED_NOTE, LIBRARY_DIGEST_HEADER } from '@shared/injection'
+import {
+  CANVAS_DIGEST_HEADER,
+  DIGEST_UNCHANGED_NOTE,
+  LIBRARY_DIGEST_HEADER,
+  PROJECT_DIGEST_HEADER,
+  QUEUE_DIGEST_HEADER,
+  SCOPE_DIGEST_HEADER
+} from '@shared/injection'
 
 /**
  * 每轮发送前的上下文采集（T8 从 sendMessage 抽出；T9/T10/T11 的落点）。
@@ -42,20 +49,51 @@ export interface MessageContextInput {
 export interface RoundContextInput extends MessageContextInput {
   /** 素材库清单（store.libraries 快照；随 asset:changed 即时刷新） */
   libraries: AssetLibrary[]
+  /** 项目结构快照（常驻段/轮换段来源；未打开或没有项目时省略） */
+  project?: ProjectSnapshot | null
+  /** 任务板投影（队列段来源：attention 队列 + 最近任务；没有派过单时省略） */
+  taskBoard?: ContextTaskBoard | null
   /** 上轮注入的完整摘要全文（逐轮去重：与本轮全文一致则折叠为占位行；缺省 = 首轮，发全文） */
-  previousDigests?: { library?: string; canvas?: string }
+  previousDigests?: { library?: string; canvas?: string; project?: string; scope?: string; queue?: string }
   /** 上轮已携带的 genSummary 签名表（卡片 id → 签名；缺省 = 首轮，全部携带） */
   genSummarySeen?: Record<string, string>
+}
+
+/** 队列段输入（只取渲染端需要的字段，避免把 IPC 类型灌进纯函数） */
+export interface ContextTaskBoard {
+  tasks: Array<{
+    taskId: string
+    status: string
+    title?: string
+    scope?: string
+    expert?: string
+    attempts: number
+    lastReason?: string
+  }>
+  runningTaskIds: string[]
+}
+
+export interface ContextSegments {
+  /** 常驻：项目身份 + 层级结构 + 实体索引（变化极少） */
+  resident: string
+  /** 轮换：当前 scope 的子节点 + 面包屑 + 聚合统计 */
+  rotating: string
+  /** 队列：attention 待处理 + 在跑 + 最近完成 */
+  queue: string
+  /** 注入：素材库清单 + 画布态势（原有两段，语义不变） */
+  injected: string
 }
 
 export interface CollectedRoundContext {
   /** 随消息载荷发送的附件（仅路径；顺序 = 工作区素材在前、临时上传在后） */
   attachments: MessageAttachment[]
-  /** T9 素材库摘要 + T10 画布态势，拼进消息尾部；两者皆空时为空串（零冗余注入）。
+  /** 四段装配后的上下文文本（常驻 → 轮换 → 队列 → 注入），拼进消息尾部。
    * 与上轮全文一致的段折叠为「头 + DIGEST_UNCHANGED_NOTE」单行占位（token 经济） */
   contextText: string
-  /** 本轮两段摘要的**完整全文**（供调用方存为下轮的 previousDigests；存全量而非占位） */
-  digests: { library: string; canvas: string }
+  /** 分段结果（调试/自检用；注入了占位行之后的最终形态） */
+  segments: ContextSegments
+  /** 本轮各段的**完整全文**（供调用方存为下轮的 previousDigests；存全量而非占位） */
+  digests: { library: string; canvas: string; project: string; scope: string; queue: string }
   /** 本轮已携带的 genSummary 签名表（卡片 id → 签名；只含当前仍在附件集合里的卡片，
    * 调用方整表存回，离场的卡片自然出局） */
   genSummarySeen: Record<string, string>
@@ -110,25 +148,186 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
   ]
   const libraryDigest = buildLibraryDigest(input.libraries, input.workspaceDir)
   const canvasDigest = buildCanvasDigest(input.nodes, input.selectedAssetIds, input.injectedAssetIds, input.jobStates)
+  // 四段装配（架构图 to-be ①）：常驻 / 轮换 / 队列 / 注入。
+  // 前两段来自项目结构快照（project.json 的投影），第三段来自任务板（journal 的投影），
+  // 第四段是原有的素材库 + 画布两段（语义与逐轮去重机制不变）。
+  const projectDigest = buildProjectDigest(input.project ?? null)
+  const scopeDigest = buildScopeDigest(input.project ?? null)
+  const queueDigest = buildQueueDigest(input.taskBoard ?? null)
   // 摘要逐轮去重（token 经济）：与上轮全文一致的段折叠为「头 + 未变化后缀」单行占位
   // （占位行仍以头前缀开头，isInjectionHeaderLine 按前缀匹配，回放拆分无需感知）；
   // digests 出参始终存本轮全文，供调用方作为下轮的 previousDigests
   const prev = input.previousDigests
-  const libraryPart =
-    libraryDigest !== '' && libraryDigest === prev?.library
-      ? `${LIBRARY_DIGEST_HEADER}${DIGEST_UNCHANGED_NOTE}`
-      : libraryDigest
-  const canvasPart =
-    canvasDigest !== '' && canvasDigest === prev?.canvas
-      ? `${CANVAS_DIGEST_HEADER}${DIGEST_UNCHANGED_NOTE}`
-      : canvasDigest
-  const contextText = [libraryPart, canvasPart].filter(Boolean).join('\n\n')
+  const fold = (digest: string, header: string, previous: string | undefined): string =>
+    digest !== '' && digest === previous ? `${header}${DIGEST_UNCHANGED_NOTE}` : digest
+  const segments: ContextSegments = {
+    resident: fold(projectDigest, PROJECT_DIGEST_HEADER, prev?.project),
+    rotating: fold(scopeDigest, SCOPE_DIGEST_HEADER, prev?.scope),
+    queue: fold(queueDigest, QUEUE_DIGEST_HEADER, prev?.queue),
+    injected: [
+      fold(libraryDigest, LIBRARY_DIGEST_HEADER, prev?.library),
+      fold(canvasDigest, CANVAS_DIGEST_HEADER, prev?.canvas)
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+  }
+  const contextText = [segments.resident, segments.rotating, segments.queue, segments.injected]
+    .filter(Boolean)
+    .join('\n\n')
   return {
     attachments,
     contextText,
-    digests: { library: libraryDigest, canvas: canvasDigest },
+    segments,
+    digests: {
+      library: libraryDigest,
+      canvas: canvasDigest,
+      project: projectDigest,
+      scope: scopeDigest,
+      queue: queueDigest
+    },
     genSummarySeen: carriedGenSigs
   }
+}
+
+/* ---------------- 常驻段：项目身份 + 层级结构 + 实体索引 ---------------- */
+
+/** 常驻段最多列出的实体节点数（只给 title + id，不含正文） */
+export const PROJECT_DIGEST_MAX_ENTITIES = 40
+
+/**
+ * 常驻段（架构图 to-be ①「常驻」）：项目是什么、层级怎么分、有哪些实体。
+ * 这部分变化极少，逐轮去重命中率最高——折叠后每轮只花一行 token。
+ *
+ * 刻意不含节点正文与提示词：那些属于轮换段（当前 scope）与注入段（被引用的卡片），
+ * 常驻段膨胀会让每一轮都为「不在这轮工作集里」的内容付费。
+ */
+export function buildProjectDigest(snapshot: ProjectSnapshot | null): string {
+  if (!snapshot?.project) return ''
+  const project = snapshot.project
+  const lines: string[] = [
+    `${PROJECT_DIGEST_HEADER}（项目「${project.name}」${project.kind ? ` · ${project.kind}` : ''}${project.tagline ? `：${project.tagline}` : ''}）`,
+    `- 层级：${project.levels.map((level, index) => `${index + 1}.${level.label}（${level.plural}）`).join(' → ')}`
+  ]
+  const containers = snapshot.nodes.filter((node) => node.level < project.levels.length)
+  const total = snapshot.projects.length
+  lines.push(
+    `- 项目共 ${total} 个（当前生效「${project.name}」）；当前范围下 ${snapshot.nodes.length} 个节点` +
+      `${containers.length > 0 ? `（其中 ${containers.length} 个可下钻容器）` : ''}`
+  )
+  // 其它项目的名字给出来：Agent 才知道「用户说的另一个项目」是否存在
+  const others = snapshot.projects.filter((entry) => entry.id !== project.id).slice(0, 6)
+  if (others.length > 0) {
+    lines.push(`- 其它项目：${others.map((entry) => `${entry.name}${entry.summary ? `（${entry.summary}）` : ''}`).join('、')}`)
+  }
+  // 实体索引：title + id，供「把第3场那几个镜头…」这类指代落到具体节点
+  const entities = snapshot.nodes.slice(0, PROJECT_DIGEST_MAX_ENTITIES)
+  if (entities.length > 0) {
+    lines.push('- 节点索引（id → 标题 → 状态）：')
+    for (const node of entities) {
+      const levelLabel = project.levels[node.level - 1]?.plural ?? `L${node.level}`
+      const stats = node.stats ? `，完成 ${node.stats.done}/${node.stats.total}` : ''
+      lines.push(`  · ${node.id} → ${node.title}（${levelLabel}，${node.status}${stats}）`)
+    }
+    const rest = snapshot.nodes.length - entities.length
+    if (rest > 0) lines.push(`  ·（另有 ${rest} 个节点未列出）`)
+  }
+  if (snapshot.promptLayers.length > 0) {
+    lines.push(
+      `- 当前生效的提示词层：${snapshot.promptLayers.map((layer) => `${layer.label}${layer.prompt ? '' : '（空）'}`).join(' → ')}`
+    )
+  }
+  return lines.join('\n')
+}
+
+/* ---------------- 轮换段：当前 scope 的子节点 + 聚合 ---------------- */
+
+/** 轮换段最多列出的子节点数，超出折叠 */
+export const SCOPE_DIGEST_MAX_NODES = 24
+
+/**
+ * 轮换段（架构图 to-be ①「轮换」）：当前 scope 下的一层 children + 面包屑。
+ * scope 由调用方（当前浏览/聚焦的容器）决定；切换 scope 即换工作集，
+ * 这就是「轮换」与「常驻」的区别——它按轮次自然变化，不跨轮硬留。
+ */
+export function buildScopeDigest(snapshot: ProjectSnapshot | null): string {
+  if (!snapshot?.project) return ''
+  const breadcrumb = snapshot.breadcrumb.map((crumb) => crumb.title).join(' / ')
+  const depth = snapshot.breadcrumb.length - 1
+  const level = snapshot.project.levels[depth]
+  const lines: string[] = [
+    `${SCOPE_DIGEST_HEADER}（${breadcrumb || snapshot.project.rootLabel}${level ? ` · ${level.label}层` : ''}，共 ${snapshot.nodes.length} 个子节点）`
+  ]
+  if (snapshot.nodes.length === 0) {
+    lines.push('- 这一层还没有节点。')
+    return lines.join('\n')
+  }
+  const shown = snapshot.nodes.slice(0, SCOPE_DIGEST_MAX_NODES)
+  for (const node of shown) {
+    const bits: string[] = [node.title, node.status]
+    if (node.subtitle) bits.push(node.subtitle)
+    const fields = Object.entries(node.fields ?? {})
+      .filter(([, value]) => String(value ?? '').trim())
+      .slice(0, 3)
+      .map(([key, value]) => `${key}=${String(value).slice(0, 24)}`)
+    if (fields.length > 0) bits.push(fields.join(' '))
+    if (node.stats) bits.push(`完成 ${node.stats.done}/${node.stats.total}`)
+    if (node.assetId) bits.push(`素材 ${node.assetId}`)
+    lines.push(`- ${node.id}｜${bits.join('｜')}`)
+  }
+  const rest = snapshot.nodes.length - shown.length
+  if (rest > 0) lines.push(`-（另有 ${rest} 个未列出；用 scope 聚焦到更具体的层级查看）`)
+  // 提示词继承链只给「有哪些层」，正文由 Agent 在需要时通过项目工具读取（避免每轮重发）
+  if (snapshot.promptLayers.length > 0) {
+    lines.push(`- 提示词继承：${snapshot.promptLayers.map((layer) => layer.label).join(' → ')}`)
+  }
+  return lines.join('\n')
+}
+
+/* ---------------- 队列段：任务板投影 ---------------- */
+
+/** 队列段最多列出的任务数 */
+export const QUEUE_DIGEST_MAX_TASKS = 10
+
+/**
+ * 队列段（架构图 to-be ①「队列」）：需要主 Agent 处理的任务与在跑任务。
+ *
+ * 选型：attention（验收失败待重派）/ blocked（缺参考或越权）是「等主 Agent 决策」的，
+ * 必须每轮可见；active 只报数量（具体进度看板上有，不必逐轮塞 token）；
+ * done 只报最近几条，用于「上一批做完了吗」这类追问。
+ */
+export function buildQueueDigest(board: ContextTaskBoard | null): string {
+  if (!board) return ''
+  const running = new Set(board.runningTaskIds)
+  const needsAction = board.tasks.filter((task) => task.status === 'attention' || task.status === 'blocked')
+  const active = board.tasks.filter((task) => task.status === 'active' || task.status === 'validating')
+  const done = board.tasks.filter((task) => task.status === 'done')
+  if (needsAction.length === 0 && active.length === 0 && done.length === 0) return ''
+  const lines: string[] = [
+    `${QUEUE_DIGEST_HEADER}（共 ${board.tasks.length} 个任务${running.size > 0 ? `，${running.size} 个在跑` : ''}）`
+  ]
+  const shownAction = needsAction.slice(-QUEUE_DIGEST_MAX_TASKS)
+  for (const task of shownAction) {
+    const status = task.status === 'attention' ? '待重派' : '受阻'
+    lines.push(
+      `- [${status}] ${task.taskId} ${task.scope ? `· ${task.scope}` : ''}${task.title ? `「${task.title.slice(0, 40)}」` : ''}` +
+        `${task.attempts > 0 ? `，已试 ${task.attempts} 次` : ''}${task.lastReason ? `，原因：${task.lastReason.slice(0, 60)}` : ''}`
+    )
+  }
+  if (needsAction.length > shownAction.length) {
+    lines.push(`-（另有 ${needsAction.length - shownAction.length} 个待处理任务）`)
+  }
+  if (active.length > 0) {
+    const names = active
+      .slice(0, 5)
+      .map((task) => task.scope || task.title || task.taskId)
+      .join('、')
+    lines.push(`- 执行中 ${active.length} 个：${names}${active.length > 5 ? ' …' : ''}（完成后自动验收并激活版本）`)
+  }
+  if (done.length > 0) {
+    const recent = done.slice(-3).map((task) => task.scope || task.title || task.taskId)
+    lines.push(`- 最近完成：${recent.join('、')}`)
+  }
+  return lines.join('\n')
 }
 
 /* ---------------- 生成历史回喂摘要（含血脉链） ---------------- */

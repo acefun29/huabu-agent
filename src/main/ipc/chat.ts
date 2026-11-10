@@ -14,6 +14,7 @@ import { broadcastChatEvent, broadcastAssetChanged } from './shared'
 import { assembleBlockoutTool } from '../agent/blockoutTools'
 import { assembleNoteTool } from '../agent/noteTool'
 import { assembleFacetTools } from '../agent/facetTools'
+import { assembleSuperAgentTools } from '../agent/superagentTools'
 import { assembleMediaTools } from '../agent/mediaToolAssembly'
 import { MastraAgentRuntime } from '../agent/mastra/runtime'
 import { PiAgentRuntime } from '../agent/piRuntime'
@@ -73,7 +74,18 @@ export function registerChatIpc(ctx: IpcContext): void {
         deleteSchema: (id) => store.deleteFacetSchema(id),
         notifyChanged: broadcastAssetChanged
       })
-      return [...mediaTools, readMediaTool, ...videoTools, ...mcpTools, blockoutTool, noteTool, ...facetTools]
+      // 派单工具：主 Agent 指挥专家团（任务板 / 派单 / 取消），与 UI 的 superagent 域同一编排链
+      const superagentTools = assembleSuperAgentTools({ currentDir, runner: ctx.superAgent })
+      return [
+        ...mediaTools,
+        readMediaTool,
+        ...videoTools,
+        ...mcpTools,
+        blockoutTool,
+        noteTool,
+        ...facetTools,
+        ...superagentTools
+      ]
     }
   })
   // Mastra 运行时（迁移 Phase 1）：会话/记忆走 LibSQL（.huabu/mastra.db），模型只经
@@ -107,7 +119,8 @@ export function registerChatIpc(ctx: IpcContext): void {
         deleteSchema: (id) => store.deleteFacetSchema(id),
         notifyChanged: broadcastAssetChanged
       })
-      return [...mediaTools, readMediaTool, ...videoTools, noteTool, ...facetTools]
+      const superagentTools = assembleSuperAgentTools({ currentDir, runner: ctx.superAgent })
+      return [...mediaTools, readMediaTool, ...videoTools, noteTool, ...facetTools, ...superagentTools]
     }
   })
 

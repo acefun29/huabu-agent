@@ -63,6 +63,24 @@ export const IpcChannel = {
   ProjectReorder: 'project:reorder',
   /** 事件类：项目结构变更（主进程 -> 渲染进程，结构刷新用） */
   ProjectChanged: 'project:changed',
+
+  /* ------------------------------------------------------------------ */
+  /* superagent 域（子 Agent 协作：派单 / 任务板 / 事实日志）                 */
+  /* ------------------------------------------------------------------ */
+
+  /** 读取任务板投影 + 版本槽（journal 是事实源，此处给可读投影） */
+  SuperAgentBoard: 'superagent:board',
+  /** 派单执行（异步：立即返回 taskId，进度经 task:event 推送） */
+  SuperAgentRunTask: 'superagent:run-task',
+  /** 取消运行中的任务 */
+  SuperAgentCancelTask: 'superagent:cancel-task',
+  /** 读原始事实日志（审计 / 回放） */
+  SuperAgentJournal: 'superagent:journal',
+  /** 用户直连专家改需求：追加 user.changed 事实（不改任务状态） */
+  SuperAgentAppendUserChange: 'superagent:append-user-change',
+  /** 专家池清单（id / 名称 / 角色 / 是否常驻） */
+  SuperAgentExperts: 'superagent:experts',
+
   /** 中止当前生成 */
   ChatAbort: 'chat:abort',
   /** 会话与画布节点解绑并释放资源 */
@@ -462,6 +480,117 @@ export type TaskEvent =
       version: string
       artifactId: string
     }
+
+/* ---------------------------- SuperAgent 协作（架构图 to-be ②） ---------------------------- */
+
+/** 任务板状态（journal 投影出来，没有 review 态） */
+export type SuperAgentTaskStatus = 'todo' | 'active' | 'validating' | 'blocked' | 'done' | 'attention'
+
+/** 任务板上的一行（= BoardTask 的可传输形态） */
+export interface SuperAgentTaskView {
+  taskId: string
+  status: SuperAgentTaskStatus
+  title?: string
+  /** 派单范围（如「第03集/第2场」；也是 lane 前缀的来源） */
+  scope?: string
+  /** 完整任务描述（重派时原样复用） */
+  prompt?: string
+  /** 验收标准（重派时原样复用） */
+  accept?: string[]
+  /** 承担任务的专家 id */
+  expert?: string
+  attempts: number
+  lastArtifactId?: string
+  lastReason?: string
+  updatedAt: string
+}
+
+/** 某个资产在各版本槽里的形态（staging 待验收 / active 已激活） */
+export interface SuperAgentVersionView {
+  artifactId: string
+  version: string
+  activatedAt?: string
+  accept?: { acceptCriteria: string[]; contextHash: string }
+}
+
+/** 任务板快照：board 投影 + 版本槽 + 运行时态 */
+export interface SuperAgentBoardSnapshot {
+  tasks: SuperAgentTaskView[]
+  /** assetId → { staging, active } */
+  versions: Record<string, { staging: SuperAgentVersionView[]; active: SuperAgentVersionView[] }>
+  /** journal 事件总数（UI 用来判断有没有变化，避免全量重传） */
+  eventCount: number
+  /** 正在执行中的 taskId（进程内状态，journal 里不一定有） */
+  runningTaskIds: string[]
+}
+
+/** 派单请求（主 Agent 工具或 UI 都能发起） */
+export interface SuperAgentRunTaskRequest {
+  /** 派单范围（同时作为 lane 写区前缀：`<scope>/`） */
+  scope: string
+  /** 任务描述（进信封的 task 层提示词） */
+  prompt: string
+  /** 验收标准（机器逐条判定；不可结构化的条目原样记录） */
+  accept: string[]
+  /** 继承的提示词层（项目 → 范围 → 镜头），按从粗到细排列 */
+  promptLayers?: { level: string; prompt: string }[]
+  /** 出场角色/场景/道具等资产引用 */
+  entities?: SuperAgentAssetRef[]
+  /** 邻接镜 / 上一版 */
+  adjacent?: SuperAgentAssetRef[]
+  /** 负面提示词 */
+  negative?: string[]
+  /** 覆盖默认写区（缺省 = `<scope>/`） */
+  lane?: string[]
+  /** 指派给哪个专家（缺省按任务类型自动选） */
+  expert?: string
+  /** shadow：只写 staging + journal，不切 active */
+  shadow?: boolean
+}
+
+/** 派单载荷里的资产引用（= EnvelopeAssetRef 的可传输形态） */
+export interface SuperAgentAssetRef {
+  assetId: string
+  /** 工作区相对路径 */
+  path: string
+  version: string
+  kind: 'image' | 'video' | 'audio' | 'text'
+  role: 'character' | 'location' | 'prop' | 'style' | 'previous_take' | 'reference'
+  /** active = 可用；stale/pending 会在信封预检里被拒绝 */
+  status: 'active' | 'stale' | 'pending'
+  width?: number
+  height?: number
+  durationS?: number
+}
+
+/** 派单受理结果（执行异步进行，进度经 task:event 推送） */
+export interface SuperAgentRunTaskAccepted {
+  taskId: string
+  expert: string
+  /** 预检阶段就被拒时的原因（此时不会真正执行） */
+  rejected?: string[]
+  dropped?: string[]
+}
+
+/** 专家池里的一个专家 */
+export interface SuperAgentExpertInfo {
+  id: string
+  label: string
+  /** 角色说明（给人和 Agent 看的一句话） */
+  role: string
+  /** 常驻 = 独立 session；否则按需创建、完事归档 */
+  resident: boolean
+}
+
+/** 原始 journal 事件（可传输形态） */
+export interface SuperAgentJournalEntry {
+  id: string
+  at: string
+  type: string
+  taskId: string
+  actor: 'main' | 'expert' | 'validator' | 'user' | 'system'
+  payload: Record<string, unknown>
+}
 
 /* ---------------------------- 项目结构（原型 index-projects.html） ---------------------------- */
 

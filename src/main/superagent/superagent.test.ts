@@ -147,6 +147,17 @@ describe('board 投影（无 review 状态）', () => {
     ]
     expect(projectBoard(events)[0]).toMatchObject({ status: 'blocked', lastReason: '缺角色参考' })
   })
+
+  it('user.changed 不改变任务状态；对不存在的任务不凭空建行', () => {
+    const events: JournalEvent[] = [
+      { id: '1', at: '2026-01-01T00:00:01Z', type: 'task.created', taskId: 't', actor: 'main', payload: {}, v: 1 },
+      { id: '2', at: '2026-01-01T00:00:02Z', type: 'user.changed', taskId: 't', actor: 'user', payload: { prompt: '改需求' }, v: 1 },
+      { id: '3', at: '2026-01-01T00:00:03Z', type: 'user.changed', taskId: 'ghost', actor: 'user', payload: { prompt: 'x' }, v: 1 },
+    ]
+    const board = projectBoard(events)
+    expect(board).toHaveLength(1)
+    expect(board[0]).toMatchObject({ taskId: 't', status: 'todo' })
+  })
 })
 
 describe('版本槽（只在 accept 后 active）', () => {
@@ -396,16 +407,34 @@ describe('runTask 编排闭环', () => {
     expect((await service.board())[0]?.status).toBe('blocked')
   })
 
-  it('产物越出 lane 写区 → 拒绝并停止', async () => {
+  it('产物越出 lane 写区 → blocked（越权不是可重试的验收失败），board 与返回值一致', async () => {
     const service = new SuperAgentService(tmpWs())
     const result = await runTask({
       service,
       intent: goodIntent('ws'),
       expert: scriptedExpert([{ kind: 'image', width: 1920, height: 1080, path: 'secrets/leak.png' }]),
     })
-    expect(result.status).toBe('attention')
+    // 越界是「专家越权」，主 Agent 重派同一任务不会解决：状态统一 blocked（此前返回 attention 但
+    // board 投影为 blocked，UI 与返回值不一致）
+    expect(result.status).toBe('blocked')
     expect(result.failures[0]).toContain('lane')
     expect((await service.events()).some((e) => e.type === 'version.activated')).toBe(false)
+    expect((await service.board())[0]?.status).toBe('blocked')
+  })
+
+  it('lane 路径归一化：`..` 段与绝对路径一律拒绝（前缀匹配不能放行穿越）', () => {
+    const { envelope } = buildEnvelope({ taskId: 't', scope: 'scenes/s3', prompt: 'p', accept: [] })
+    expect(isPathAllowed(envelope, 'scenes/s3/sub/a.png')).toBe(true)
+    expect(isPathAllowed(envelope, 'scenes/s3/a.png')).toBe(true)
+    // 穿越到写区之外
+    expect(isPathAllowed(envelope, 'scenes/s3/../../etc/passwd')).toBe(false)
+    // 归一化后仍落在写区内 → 放行（a/../b 不是逃逸）
+    expect(isPathAllowed(envelope, 'scenes/s3/a/../b.png')).toBe(true)
+    // 绝对路径不属于工作区相对路径
+    expect(isPathAllowed(envelope, '/etc/passwd')).toBe(false)
+    expect(isPathAllowed(envelope, 'C:/Windows/System32/x.dll')).toBe(false)
+    // 空路径
+    expect(isPathAllowed(envelope, '   ')).toBe(false)
   })
 
   it('回执解析：从文本里提取 artifact JSON，缺字段返回 null', () => {

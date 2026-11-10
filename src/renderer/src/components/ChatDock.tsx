@@ -19,6 +19,8 @@ import { useCanvasStore } from '../store/canvasStore'
 import { bumpRender } from '../lib/perfProbe'
 import { compactTokens } from '../lib/format'
 import { ChatMessageBlocks } from './chat/ChatMessageBlocks'
+import { ExpertStrip } from './chat/ExpertStrip'
+import { TeamPopover } from './chat/TeamPopover'
 import { Composer } from './Composer'
 import { SessionsPanel } from './sidebar/SessionsPanel'
 
@@ -197,6 +199,8 @@ export function ChatDock() {
   const { createSession, requestRemoveSession, requestRemoveSessions, switchSession } = useCanvasStore.getState()
   /** 会话切换菜单（原型 .session-menu）：点了标题才展开，选完即收 */
   const [menuOpen, setMenuOpen] = useState(false)
+  /** 专家团任务板浮层：从底部状态条向上展开 */
+  const [teamOpen, setTeamOpen] = useState(false)
   /** 菜单内的批量管理模式：点行 = 勾选（不进菜单即不存在选中集） */
   const [manageMode, setManageMode] = useState(false)
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set())
@@ -419,8 +423,13 @@ export function ChatDock() {
         </div>
       </div>
 
-      {/* 底部输入区（原型 .chat-footer）：一条分隔线 + Composer */}
-      <div className="shrink-0 border-t border-(--outline-soft) px-3 pb-3 pt-2.5">
+      {/* 底部输入区（原型 .chat-footer）：专家团状态条 + 一条分隔线 + Composer。
+          任务板浮层从状态条向上展开（absolute bottom-full），不挤压消息流。 */}
+      <div className="relative shrink-0 border-t border-(--outline-soft) px-3 pb-3 pt-2.5">
+        <div className="relative">
+          {teamOpen && <TeamPopover onClose={() => setTeamOpen(false)} />}
+          <ExpertStrip expanded={teamOpen} onToggle={() => setTeamOpen((v) => !v)} />
+        </div>
         <Composer />
       </div>
     </div>

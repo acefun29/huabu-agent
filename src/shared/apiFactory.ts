@@ -13,6 +13,7 @@ import type {
   MediaConfirmPayload,
   MediaJobStatus,
   ProjectSnapshotRequest,
+  TaskEvent,
   WindowStateInfo,
 } from '../shared/ipc'
 import { IpcChannel } from '../shared/ipc'
@@ -272,6 +273,23 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
       renameAsset: (relPath, newName) => invoke(IpcChannel.AssetRename, { relPath, newName }),
 
       onChanged: (listener) => subscribe(IpcChannel.AssetChanged, () => listener())
+    },
+
+    superagent: {
+      board: () => invoke(IpcChannel.SuperAgentBoard),
+
+      runTask: (request) => invoke(IpcChannel.SuperAgentRunTask, request),
+
+      cancelTask: (taskId) => invoke(IpcChannel.SuperAgentCancelTask, { taskId }),
+
+      journal: () => invoke(IpcChannel.SuperAgentJournal),
+
+      appendUserChange: (request) => invoke(IpcChannel.SuperAgentAppendUserChange, request),
+
+      experts: () => invoke(IpcChannel.SuperAgentExperts),
+
+      onTaskEvent: (listener) =>
+        subscribe(IpcChannel.TaskEvent, (payload) => listener(payload as TaskEvent))
     }
   }
 

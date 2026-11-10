@@ -17,6 +17,12 @@ export interface BoardTask {
   status: BoardStatus
   /** 标题/描述（task.created payload.title） */
   title?: string
+  /** 派单范围（task.created payload.scope；UI 上显示「第03集/第2场」） */
+  scope?: string
+  /** 完整任务描述（task.created payload.prompt；重派时原样复用） */
+  prompt?: string
+  /** 验收标准（task.created payload.accept；重派时原样复用） */
+  accept?: string[]
   /** 允许写的路径前缀（task.created/assigned payload.lane，专家写区白名单） */
   lane?: string
   /** 被指派的专家（task.assigned payload.expert） */
@@ -45,6 +51,9 @@ export function projectBoard(events: readonly JournalEvent[]): BoardTask[] {
       tasks.set(event.taskId, created)
       return created
     }
+    // user.changed 只对已存在的任务有语义：用户对一条不存在/已清理的任务改需求，
+    // 不该在任务板上凭空长出一条空 todo 行（投影不做拒绝，但也不该无中生有）
+    if (event.type === 'user.changed' && !tasks.has(event.taskId)) return
     const task = base()
     const payload = event.payload as Record<string, unknown>
     switch (event.type) {
@@ -52,6 +61,9 @@ export function projectBoard(events: readonly JournalEvent[]): BoardTask[] {
         task.status = 'todo'
         if (typeof payload.title === 'string') task.title = payload.title
         if (typeof payload.lane === 'string') task.lane = payload.lane
+        if (typeof payload.scope === 'string') task.scope = payload.scope
+        if (typeof payload.prompt === 'string') task.prompt = payload.prompt
+        if (Array.isArray(payload.accept)) task.accept = payload.accept.map(String)
         break
       }
       case 'task.assigned': {

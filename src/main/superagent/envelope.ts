@@ -22,6 +22,8 @@ export interface EnvelopeAssetRef {
 export interface Envelope {
   taskId: string
   scope: string
+  /** 承担任务的专家 id（board 投影与事件总线按它归组；缺省由编排层回落默认专家） */
+  expert?: string
   promptLayers: { level: string; prompt: string }[]
   /** 出场角色/场景/道具 */
   entities: EnvelopeAssetRef[]

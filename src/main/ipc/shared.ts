@@ -17,6 +17,7 @@ import type { MediaJobManager } from '../media/manager'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
 import type { McpManager } from '../mcp/manager'
 import type { MediaContextReturnType } from './media'
+import type { SuperAgentRunner } from '../superagent/runner'
 import { 
   IpcChannel,
   type ChatEvent,
@@ -166,6 +167,10 @@ export interface IpcContext {
   broadcastAssetChanged: () => void
   /** 项目结构变更广播（project:changed）：渲染端刷新层级视图 */
   broadcastProjectChanged: () => void
+  /** SuperAgent 任务事件广播（task:event）：token 状态推送 */
+  broadcastTaskEvent: (event: TaskEvent) => void
+  /** SuperAgent 运行器（IPC 与 Agent 派单工具共用同一条编排链） */
+  superAgent: SuperAgentRunner
   mediaManager: MediaJobManager
   mediaContext: () => MediaContextReturnType
   requestMediaApproval: (

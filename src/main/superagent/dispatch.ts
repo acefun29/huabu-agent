@@ -30,6 +30,8 @@ export interface TaskIntent {
   lane?: string[]
   /** 预算（缺省给保守值） */
   budget?: { maxRefs: number; maxTokens: number }
+  /** 承担任务的专家 id（缺省由调用方解析为默认专家） */
+  expert?: string
 }
 
 const DEFAULT_BUDGET = { maxRefs: 8, maxTokens: 8_000 }
@@ -50,6 +52,7 @@ export function buildEnvelope(intent: TaskIntent): ClampResult {
     accept: intent.accept,
     lane,
     budget: intent.budget ?? DEFAULT_BUDGET,
+    ...(intent.expert ? { expert: intent.expert } : {}),
   }
   return clampEnvelope(envelope)
 }
@@ -89,12 +92,45 @@ export function envelopeToInstructions(envelope: Envelope): string {
       lines.push(`- [${ref.role}] ${ref.assetId} @ ${ref.version} → ${ref.path}（${ref.kind}）`)
     }
   }
-  lines.push('', '完成产物后，用一句话回执：产出路径 + 关键参数。不要输出无关内容。')
+  lines.push(
+    '',
+    '## 回执（必须遵守的格式）',
+    '产物落到 lane 内之后，最后单独输出一行回执 JSON，字段名不可更改：',
+    '{"artifactId":"<唯一 id>","assetId":"<资产 id，同一镜头复用>","version":"<版本标记，如 v2>",' +
+      '"kind":"image|video|audio|text","path":"<相对工作区的产物路径>","format":"<小写扩展名>",' +
+      '"bytes":<字节数>,"width":<图片/视频宽>,"height":<高>,"durationS":<视频秒数>}',
+    '只有 path 落在 lane 内、且字段齐全的回执才能通过结构验收；不要省略 JSON 行，也不要用代码块包裹。'
+  )
   return lines.join(String.fromCharCode(10))
 }
 
-/** lane 白名单校验：写路径必须落在允许前缀内（专家写区硬约束，计划 §9.3） */
+/**
+ * lane 白名单校验：写路径必须落在允许前缀内（专家写区硬约束，计划 §9.3）。
+ *
+ * 拒绝 `..` 段与绝对路径：此前用裸 `startsWith` 比较，`scenes/s3/../../etc/x` 能通过
+ * 「前缀匹配」而在落盘时逃出写区——路径归一化在比较前完成，逃逸一律 false。
+ */
 export function isPathAllowed(envelope: Envelope, relativePath: string): boolean {
-  const normalized = relativePath.replace(/\\/g, '/').replace(/^\.\//, '')
-  return envelope.lane.some((prefix) => normalized.startsWith(prefix.replace(/\\/g, '/')))
+  const raw = relativePath.replace(/\\/g, '/').trim()
+  if (!raw) return false
+  // 绝对路径（Windows 盘符 / POSIX 根 / UNC）不属于工作区相对路径
+  if (/^[a-zA-Z]:\//.test(raw) || raw.startsWith('/') || raw.startsWith('//')) return false
+  const segments: string[] = []
+  for (const part of raw.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') {
+      // 向上穿越：能抵消的前进段抵消，抵到根就是逃逸
+      if (segments.length === 0) return false
+      segments.pop()
+      continue
+    }
+    segments.push(part)
+  }
+  if (segments.length === 0) return false
+  const normalized = segments.join('/')
+  return envelope.lane.some((prefix) => {
+    const clean = prefix.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
+    if (!clean) return false
+    return normalized === clean || normalized.startsWith(`${clean}/`)
+  })
 }

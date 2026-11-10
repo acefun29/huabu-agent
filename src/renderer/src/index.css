@@ -414,3 +414,91 @@ textarea,
 input[list='huabu-all-tags']::-webkit-calendar-picker-indicator {
   display: none !important;
 }
+
+/* ---------- 专家像素头像（ExpertAvatar）：渐变 + 像素流动 ---------- */
+
+.hb-expert-avatar {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  overflow: hidden;
+  /* 内圈柔光：读起来像徽章而不是色块 */
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.2),
+    inset 0 -1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.hb-expert-avatar-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* 格子脉冲：相位（--phase）由组件按「斜向光带」算好，负延迟错开一轮周期。
+   0%/100% 同值 = 首尾无缝，可无限循环不跳变 */
+.hb-expert-avatar-cell {
+  transform-box: fill-box;
+  transform-origin: center;
+  will-change: opacity, transform;
+  animation: hb-expert-flow 2.2s ease-in-out infinite;
+  animation-delay: calc(var(--phase) * -62ms);
+}
+
+.hb-expert-avatar-lite .hb-expert-avatar-cell {
+  animation-name: hb-expert-flow-lite;
+}
+
+@keyframes hb-expert-flow {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+  38% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes hb-expert-flow-lite {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  38% {
+    opacity: 1;
+  }
+}
+
+.hb-expert-avatar-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  border: 1.5px solid var(--surface-card);
+  z-index: 2;
+}
+
+.hb-expert-avatar-dot.is-running {
+  animation: hb-expert-dot 1.4s ease-in-out infinite;
+}
+
+@keyframes hb-expert-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent);
+  }
+  55% {
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hb-expert-avatar-cell,
+  .hb-expert-avatar-dot.is-running {
+    animation: none !important;
+  }
+}

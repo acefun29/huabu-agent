@@ -19,6 +19,15 @@ export const LIBRARY_DIGEST_HEADER = '[素材库清单]'
 /** 画布态势摘要的头（contextCollector.buildCanvasDigest） */
 export const CANVAS_DIGEST_HEADER = '[画布态势]'
 
+/** 常驻段头：项目身份 + 层级结构 + 分级结构（变化很少，逐轮去重收益最大） */
+export const PROJECT_DIGEST_HEADER = '[项目索引]'
+
+/** 轮换段头：当前 scope 的子节点与聚合统计（切换 scope 即换工作集） */
+export const SCOPE_DIGEST_HEADER = '[当前范围]'
+
+/** 队列段头：待处理任务与最近事件（SuperAgent 任务板投影） */
+export const QUEUE_DIGEST_HEADER = '[任务队列]'
+
 /**
  * 未变化摘要的折叠占位后缀（逐轮注入 token 经济）：上轮注入过且本轮全文未变的
  * 素材库清单/画布态势摘要，contextText 里折叠为「头 + 该后缀」单行占位
@@ -28,7 +37,13 @@ export const CANVAS_DIGEST_HEADER = '[画布态势]'
 export const DIGEST_UNCHANGED_NOTE = '（与上轮一致，未变化）'
 
 /** 全部注入段头的精确前缀（逐行行首匹配） */
-export const INJECTION_HEADERS: readonly string[] = [LIBRARY_DIGEST_HEADER, CANVAS_DIGEST_HEADER]
+export const INJECTION_HEADERS: readonly string[] = [
+  LIBRARY_DIGEST_HEADER,
+  CANVAS_DIGEST_HEADER,
+  PROJECT_DIGEST_HEADER,
+  SCOPE_DIGEST_HEADER,
+  QUEUE_DIGEST_HEADER
+]
 
 /** 引用素材行 = 前缀 + 数字 + ' 项]'（计数可变，按前后缀匹配） */
 export function isReferenceHeaderLine(line: string): boolean {
