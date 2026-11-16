@@ -299,11 +299,11 @@ describe('会话级归属：多会话不串记账', () => {
     resetSessionTasks()
     const { journal, deps } = await workspace()
     await startTask(journal, { id: 'T-A', lane: 'assets/documents', kind: 'text' })
-    bindSessionTask('node-a', 'T-A')
+    bindSessionTask('node-a', 'ws-a', 'T-A')
     await startTask(journal, { id: 'T-B', lane: 'assets/documents', kind: 'text' })
 
     const outcome = await recordToolArtifact(
-      { ...deps, taskId: () => sessionTaskId('node-a') },
+      { ...deps, taskId: () => sessionTaskId('node-a', 'ws-a') },
       { artifact: { path: 'assets/documents/a.md', bytes: 12 } }
     )
     expect(outcome).toMatchObject({ recorded: true, taskId: 'T-A' })
@@ -325,7 +325,7 @@ describe('会话级归属：多会话不串记账', () => {
     await startTask(journal, { id: 'T-B', lane: 'assets/documents', kind: 'text' })
 
     const outcome = await recordToolArtifact(
-      { ...deps, taskId: () => sessionTaskId('node-unbound') },
+      { ...deps, taskId: () => sessionTaskId('node-unbound', 'ws-a') },
       { artifact: { path: 'assets/documents/x.md', bytes: 8 } }
     )
     expect(outcome).toMatchObject({ recorded: false })
@@ -337,14 +337,14 @@ describe('会话级归属：多会话不串记账', () => {
     resetSessionTasks()
     const { journal, deps } = await workspace()
     await startTask(journal, { id: 'T-A', lane: 'assets/documents', kind: 'text' })
-    bindSessionTask('node-a', 'T-A')
+    bindSessionTask('node-a', 'ws-a', 'T-A')
     await startTask(journal, { id: 'T-B', lane: 'assets/documents', kind: 'text' })
     // A 收工：解绑（与 taskTools 的 onTaskClosed 同语义）
     await journal.append('work.finished', 'T-A', 'main')
     unbindSessionTask('node-a', 'T-A')
 
     const outcome = await recordToolArtifact(
-      { ...deps, taskId: () => sessionTaskId('node-a') },
+      { ...deps, taskId: () => sessionTaskId('node-a', 'ws-a') },
       { artifact: { path: 'assets/documents/unowned.md', bytes: 9 } }
     )
     expect(outcome).toMatchObject({ recorded: false })

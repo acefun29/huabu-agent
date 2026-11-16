@@ -112,9 +112,9 @@ describe('chat 工具装配', () => {
     }
     registerChatIpc(baseCtx([mcpTool]))
 
-    const deps = captured.deps as { assembleTools(nodeId: string): Promise<Array<{ name: string }>> }
+    const deps = captured.deps as { assembleTools(nodeId: string, workspaceDir: string): Promise<Array<{ name: string }>> }
     expect(deps).toBeTruthy()
-    const names = (await deps.assembleTools('node-1')).map((tool) => tool.name)
+    const names = (await deps.assembleTools('node-1', process.env.TEMP ?? '.')).map((tool) => tool.name)
     expect(names).toContain('mcp_fixture_review_echo')
     // 内置工具仍在同一份列表里（MCP 是追加，不是替换）
     expect(names).toContain('blockout')
@@ -134,7 +134,7 @@ describe('chat 工具装配', () => {
     await journal.append('work.started', 'V-02', 'main')
     // 归属是会话级的：任务必须绑定到这个会话才会被认作「本会话正在做」
     resetSessionTasks()
-    bindSessionTask('node-2', 'V-02')
+    bindSessionTask('node-2', ws, 'V-02')
 
     registerChatIpc({
       ...(baseCtx([]) as Record<string, unknown>),
@@ -143,8 +143,8 @@ describe('chat 工具装配', () => {
     } as never)
 
     // 装配是惰性的：先走一次 assembleTools，mediaToolAssembly 才拿到 deps
-    const deps = captured.deps as { assembleTools(nodeId: string): Promise<unknown> }
-    await deps.assembleTools('node-2')
+    const deps = captured.deps as { assembleTools(nodeId: string, workspaceDir: string): Promise<unknown> }
+    await deps.assembleTools('node-2', ws)
 
     const mediaDeps = captured.mediaDeps as {
       outputDirFor?: (kind: 'image' | 'video' | 'audio') => Promise<string | undefined>
@@ -153,5 +153,44 @@ describe('chat 工具装配', () => {
     expect(await mediaDeps.outputDirFor!('image')).toBe('scenes/s3')
     // 文本/异类任务不套 lane：参考图仍走默认库，不污染任务版本
     expect(await mediaDeps.outputDirFor!('video')).toBeUndefined()
+  })
+
+  it('跨工作区不继承绑定：同一会话 id 在另一工作区生成走默认库', async () => {
+    const wsA = mkdtempSync(join(tmpdir(), 'huabu-ws-a-'))
+    const wsB = mkdtempSync(join(tmpdir(), 'huabu-ws-b-'))
+    dirs.push(wsA, wsB)
+    const journalA = new WorkspaceJournal(join(wsA, 'journal.jsonl'))
+    const journalB = new WorkspaceJournal(join(wsB, 'journal.jsonl'))
+    // 两个工作区里都有同 id 的任务（复制工作区的情形），B 的任务同样在 doing
+    for (const journal of [journalA, journalB]) {
+      await journal.append('work.created', 'image-review', 'main', {
+        title: '巡检图',
+        brief: 'b',
+        lane: 'scenes/s3',
+        kind: 'image'
+      })
+      await journal.append('work.started', 'image-review', 'main')
+    }
+
+    // A 工作区里这个会话确实绑定了任务
+    resetSessionTasks()
+    bindSessionTask('node-x', wsA, 'image-review')
+
+    registerChatIpc({
+      ...(baseCtx([]) as Record<string, unknown>),
+      currentDir: () => wsB,
+      superAgent: { journalHandle: (dir: string) => (dir === wsA ? journalA : journalB) }
+    } as never)
+
+    // 到了 B 工作区，同一个会话 id 不能继承 A 的绑定
+    const deps = captured.deps as {
+      assembleTools(nodeId: string, workspaceDir: string): Promise<unknown>
+    }
+    await deps.assembleTools('node-x', wsB)
+    const mediaDeps = captured.mediaDeps as {
+      outputDirFor?: (kind: 'image' | 'video' | 'audio') => Promise<string | undefined>
+    }
+    expect(await mediaDeps.outputDirFor!('image')).toBeUndefined()
+    resetSessionTasks()
   })
 })

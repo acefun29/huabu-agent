@@ -20,6 +20,7 @@ import { buildWorkspaceContext, loadWorkState, taskToolDeps } from '../loop/run'
 import { withArtifactRecording } from '../loop/record'
 import {
   bindSessionTask,
+  clearSessionTasksForWorkspace,
   sessionTaskId,
   taskForSession,
   unbindSessionTask
@@ -98,20 +99,15 @@ export function registerChatIpc(ctx: IpcContext): void {
     // + 视频两工具 + create_note + 分级 + 任务四件套 + MCP（设置页接进来的服务器）。
     // vision 已通（toModelOutput content/media）：按会话模型目录 input 声明判定
     // （与 Pi 侧同一份数据），模型不支持时工具内自动降级元数据
-    assembleTools: async (nodeId) => {
+    assembleTools: async (nodeId, workspaceDir) => {
       /*
-       * 工作区在**会话装配时定格**。
-       *
-       * 工具与记账都按这个目录解析路径、读 journal：切工作区后旧会话的在途
-       * 回执只能写回自己的事实源，不能顺着可变的 currentDir 落进新工作区
-       * （那是别人的 journal，会把 A 的产物记成新工作区某任务的东西）。
+       * 工作区来自 runtime create 已捕获的那一份（不是现读 currentDir）：
+       * 会话装配与真正打开的工作区之间没有竞态窗口，切工作区后旧会话的
+       * 迟到回执只会写回自己的事实源。
        */
-      const sessionDir = currentDir()
+      const sessionDir = workspaceDir
       const sessionCurrentDir = () => sessionDir
-      const sessionJournal = () => {
-        if (!sessionDir) throw new Error('尚未打开工作区')
-        return ctx.superAgent.journalHandle(sessionDir)
-      }
+      const sessionJournal = () => ctx.superAgent.journalHandle(sessionDir)
       const { mediaTools, readMediaTool, videoTools } = assembleMediaTools(nodeId, {
         store,
         mediaManager,
@@ -126,8 +122,7 @@ export function registerChatIpc(ctx: IpcContext): void {
          * 生成成功也不会成为任务产物。没有任务（手动/闲聊生成）沿用默认落库链。
          */
         outputDirFor: async (kind) => {
-          if (!sessionDir) return undefined
-          const task = taskForSession(await loadWorkState(sessionJournal()), nodeId)
+          const task = taskForSession(await loadWorkState(sessionJournal()), nodeId, sessionDir)
           // 只认同类任务：文本任务里顺手生成的参考图仍走默认库，不该记成文本任务的版本
           return task && task.kind === kind ? laneOutputDir([task.lane]) : undefined
         }
@@ -160,8 +155,8 @@ export function registerChatIpc(ctx: IpcContext): void {
           journal: sessionJournal,
           newTaskId: () => `task-${randomUUID().slice(0, 8)}`,
           onAppend: broadcastWorkChanged,
-          // 任务归属是会话级的：开工/继续把任务绑到本会话，收工/放弃解绑
-          onTaskStarted: (taskId) => bindSessionTask(nodeId, taskId),
+          // 任务归属是「工作区 + 会话」级的：开工/继续把任务绑到本会话，收工/放弃解绑
+          onTaskStarted: (taskId) => bindSessionTask(nodeId, sessionDir, taskId),
           onTaskClosed: (taskId) => unbindSessionTask(nodeId, taskId)
         })
       )
@@ -200,8 +195,8 @@ export function registerChatIpc(ctx: IpcContext): void {
        */
       return withArtifactRecording(tools, {
         journal: sessionJournal,
-        // 归属跟着会话走：调用开始时取本会话的绑定任务，不回退全局「最近开工」
-        taskId: () => sessionTaskId(nodeId),
+        // 归属跟着会话走：调用开始时取本会话在本工作区的绑定任务，不回退全局
+        taskId: () => sessionTaskId(nodeId, sessionDir),
         // 记账成功即广播：长轮次里产物一落盘，工作项与角标就该刷新，
         // 不能等 finish_task 才有动静（那时可能已经过去几十秒）。
         onRecorded: () => broadcastWorkChanged()
@@ -217,6 +212,8 @@ export function registerChatIpc(ctx: IpcContext): void {
   // Mastra 会话按工作区过滤释放（保住可能已在新工作区建好的会话）
   disposeAllSessions = (workspaceDir?: string) => {
     sessionRuntimes.clear()
+    // 会话生命周期与任务绑定一起收口：只清该工作区的绑定，别的窗口不受影响
+    clearSessionTasksForWorkspace(workspaceDir)
     return mastraRuntime.disposeAll(workspaceDir)
   }
 

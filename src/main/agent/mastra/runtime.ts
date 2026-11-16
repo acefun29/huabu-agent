@@ -55,7 +55,11 @@ export interface MastraRuntimeDeps {
   /** 运行时信息（模型列表/已配置 provider）：与 Pi 侧同一份目录数据 */
   runtimeInfo(dir: string): Promise<ChatResult<ChatRuntimeInfo>>
   /** 工具装配（Phase 3 迁移面）：read_media / generate_* / 视频两工具 / create_note 等框架无关工具 */
-  assembleTools(nodeId: string): Promise<ToolDefinitionLike[]>
+  /**
+   * 装配会话工具。workspaceDir 是 create 时**已捕获**的工作区：工具面/记账/任务归属
+   * 都要钉在这个目录上，不能再去读随时会变的「当前工作区」。
+   */
+  assembleTools(nodeId: string, workspaceDir: string): Promise<ToolDefinitionLike[]>
   /** 工作区 skills.disabled 名单（settings:skills-set-disabled 写入）；这些技能不进新会话系统提示 */
   disabledSkills(): string[]
   /**
@@ -266,7 +270,7 @@ export class MastraAgentRuntime implements AgentRuntime {
     }
 
     const memory = await mastraMemoryFor(dir)
-    const piTools = await this.deps.assembleTools(req.nodeId)
+    const piTools = await this.deps.assembleTools(req.nodeId, dir)
     // 系统提示词 = 工作区/引用约定 + 技能注入（B1 之外的另一处能力缺口：Mastra 侧
     // 原本完全不注入技能，而 blockout 这类内置技能的正文就是它的操作手册）。
     // **项目记忆与当前任务不在这里拼**：它们要每轮现取（见 prompt 里的 composeInstructions），

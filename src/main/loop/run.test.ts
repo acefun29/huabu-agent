@@ -68,7 +68,7 @@ describe('buildWorkspaceContext', () => {
     await journal.append('work.started', 'V-02', 'main')
     // 上下文里的任务跟着会话走：必须显式绑定，不会借用全局「最近开工」
     resetSessionTasks()
-    bindSessionTask('node-1', 'V-02')
+    bindSessionTask('node-1', dir, 'V-02')
 
     const context = await buildWorkspaceContext({ dir, journal: () => journal, nodeId: 'node-1' })
     expect(context.indexOf('项目记忆')).toBeLessThan(context.indexOf('当前任务'))
@@ -93,7 +93,7 @@ describe('buildWorkspaceContext', () => {
       bytes: 2048
     })
     resetSessionTasks()
-    bindSessionTask('node-1', 'V-02')
+    bindSessionTask('node-1', dir, 'V-02')
 
     const context = await buildWorkspaceContext({ dir, journal: () => journal, nodeId: 'node-1' })
     expect(context).toContain('已产出：1 个版本')

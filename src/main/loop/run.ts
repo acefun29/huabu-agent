@@ -56,7 +56,7 @@ export async function buildWorkspaceContext(input: {
   nodeId?: string
 }): Promise<string> {
   const [studio, state] = await Promise.all([readStudioContent(input.dir), loadWorkState(input.journal())])
-  const task = taskForSession(state, input.nodeId)
+  const task = taskForSession(state, input.nodeId, input.dir)
   return buildTurnContext({
     studioContent: studio,
     ...(task ? { task, ...currentArtifactPathOf(state, task) } : {})
