@@ -5,6 +5,11 @@ import openai from './providers/openai'
 import minimax from './providers/minimax'
 import tencent from './providers/tencent'
 import tokenPlan from './providers/tokenPlan'
+import vidu from './providers/vidu'
+import qianfan from './providers/qianfan'
+import pixverse from './providers/pixverse'
+import zhipu from './providers/zhipu'
+import tokenhub from './providers/tokenhub'
 
 /**
  * 内置媒体模型目录（catalog 架构 §2 目录层）。
@@ -17,7 +22,7 @@ import tokenPlan from './providers/tokenPlan'
  * auth.env 命名约定、能力档位升序、逐供应商 dry-run 实例化。
  */
 
-export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [dashscope, volcark, openai, minimax, tencent, tokenPlan]
+export const BUILTIN_PROVIDERS: BuiltinProviderDef[] = [dashscope, volcark, openai, minimax, tencent, tokenPlan, vidu, qianfan, pixverse, zhipu, tokenhub]
 
 export { browseCatalog } from './browse'
 export { mergeCatalog, sanitizeCapabilities, sanitizeUserProvider, PROVIDER_ID_PATTERN, MODEL_ID_PATTERN } from './merge'

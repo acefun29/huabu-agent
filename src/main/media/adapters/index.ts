@@ -11,6 +11,11 @@ import './openaiCompat'
 import './minimax'
 import './tencent'
 import './tokenPlan'
+import './vidu'
+import './qianfan'
+import './pixverse'
+import './zhipu'
+import './tokenhub'
 
 export {
   adapterRefCaps,

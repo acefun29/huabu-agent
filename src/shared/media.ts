@@ -136,6 +136,11 @@ export function mediaKindOfPath(pathOrName: string): { kind: MediaKind; mime: st
  * 不允许出现「声明了类型却没有实现」的幽灵条目。
  */
 export type MediaProviderType =
+  | 'gateway-vidu'
+  | 'gateway-qianfan'
+  | 'gateway-pixverse'
+  | 'gateway-zhipu-media'
+  | 'gateway-tokenhub'
   | 'gateway-dashscope'
   | 'gateway-volcark'
   | 'gateway-openai-compat'

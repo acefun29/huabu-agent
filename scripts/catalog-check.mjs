@@ -482,8 +482,16 @@ async function main() {
     }
   })
 
-  await checkAsync('token-plan 文生图（同步）/文生视频（异步）协议形态（2026-10-25 官方 token-plan-multimodal-gen 核实）', async () => {
+  await checkAsync('token-plan 文生图/HappyHorse 图生视频与参考生视频协议形态（官方接入/API 文档核实）', async () => {
     const effective = mergeCatalog(BUILTIN_PROVIDERS.filter((p) => p.id === 'token-plan'), {})
+    const tokenPlan = effective.find((p) => p.id === 'token-plan')
+    const hhorseI2v = tokenPlan?.models.find((m) => m.id === 'token-plan/happyhorse-1.1-i2v')
+    const hhorseR2v = tokenPlan?.models.find((m) => m.id === 'token-plan/happyhorse-1.1-r2v')
+    assert(hhorseI2v?.capabilities?.refModes?.includes('i2v_first'), 'Token Plan HappyHorse i2v 应开放首帧模式')
+    assert(hhorseR2v?.capabilities?.refQuota?.find((q) => q.role === 'reference_image')?.max === 9, 'Token Plan HappyHorse r2v 应开放最多 9 张参考图')
+    const refCaps = adapters.adapterRefCaps('gateway-token-plan')
+    assert(refCaps.byKind.image?.delivery === 'data_uri' && refCaps.byKind.image.maxBytes === 20 * 1024 * 1024, 'Token Plan 应仅为参考图片开放 20MB data URI')
+    assert(refCaps.byKind.video?.delivery === 'none' && refCaps.byKind.audio?.delivery === 'none', 'Token Plan 不应开放本地参考视频/音频')
     const created = adapters.createAdapters(effective, { mediaDir: () => null, resolveKey: async () => 'sk-dry' })
     const adapter = created.find((a) => a.id === 'token-plan')
     assert(adapter, 'token-plan 适配器未实例化')
@@ -503,6 +511,9 @@ async function main() {
       // GET 轮询：回终态成功
       return new Response(JSON.stringify({ output: { task_status: 'SUCCEEDED', video_url: 'https://cdn/v.mp4' } }), { status: 200 })
     }
+    const refPng = path.join(OUT_DIR, 'token-plan-ref-fixture.png')
+    fs.mkdirSync(path.dirname(refPng), { recursive: true })
+    fs.writeFileSync(refPng, Buffer.from('89504e47', 'hex'))
 
     try {
       // ① 文生图：token-plan 专属同步端点（**不是**标准百炼的 image-generation/generation）、
@@ -540,6 +551,43 @@ async function main() {
       assert(jobVideo === 'tp-task|task-tp-1', `任务 jobId 形态不对：${jobVideo}`)
       const vPoll = await adapter.poll('token-plan/happyhorse-1.1-t2v', jobVideo)
       assert(vPoll.status === 'succeeded' && vPoll.resultUrl === 'https://cdn/v.mp4', `视频 poll 不对：${JSON.stringify(vPoll)}`)
+
+      // ③' Token Plan 官方模型清单列出 i2v/r2v；HappyHorse 官方参考 API 使用 input.media，
+      //   并明确支持 Base64 data URI。i2v 只发 first_frame，r2v 发 reference_image。
+      await adapter.submit('token-plan/happyhorse-1.1-i2v', {
+        prompt: 'p',
+        refs: [refImg(refPng, 'first_frame')]
+      })
+      c = calls.at(-1)
+      assert(c.body.model === 'happyhorse-1.1-i2v', 'Token Plan i2v remote model 不对')
+      assert(c.body.input.media?.length === 1 && c.body.input.media[0].type === 'first_frame', `i2v 应发送 first_frame：${JSON.stringify(c.body.input.media)}`)
+      assert(c.body.input.media[0].url.startsWith('data:image/png;base64,'), 'i2v 本地参考图应编码成官方支持的 Base64 data URI')
+      const beforeMissingRef = calls.length
+      await assertRejects(
+        () => adapter.submit('token-plan/happyhorse-1.1-i2v', { prompt: 'p' }),
+        /需要一张可读取的首帧参考图/,
+        'i2v 缺少首帧参考图时应本地拒绝'
+      )
+      assert(calls.length === beforeMissingRef, 'i2v 缺首帧不应发出请求')
+
+      await adapter.submit('token-plan/happyhorse-1.1-r2v', {
+        prompt: 'p',
+        width: 1280,
+        height: 720,
+        durationSeconds: 8,
+        refs: [refImg(refPng), refImg(refPng)]
+      })
+      c = calls.at(-1)
+      assert(c.body.model === 'happyhorse-1.1-r2v', 'Token Plan r2v remote model 不对')
+      assert(c.body.input.media?.length === 2 && c.body.input.media.every((m) => m.type === 'reference_image'), `r2v 应按顺序发送 reference_image：${JSON.stringify(c.body.input.media)}`)
+      assert(c.body.parameters.duration === 8 && c.body.parameters.ratio === '16:9', `r2v 参数映射不对：${JSON.stringify(c.body.parameters)}`)
+      const beforeMissingR2v = calls.length
+      await assertRejects(
+        () => adapter.submit('token-plan/happyhorse-1.1-r2v', { prompt: 'p' }),
+        /需要至少一张可读取的参考图/,
+        'r2v 缺少参考图时应本地拒绝'
+      )
+      assert(calls.length === beforeMissingR2v, 'r2v 缺参考图不应发出请求')
 
       // ③' ratio 与宽高并存：**像素优先**派生 ratio（与 gateway-dashscope 同端点族同规则；
       //   input.ratio 压过宽高会与成对下发的 resolution 打架）；只给 ratio 时补 720P 缺省档

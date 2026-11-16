@@ -1,8 +1,9 @@
 import type { MediaKind, MediaProviderType, ModelCapabilities } from '../../../shared/media'
-import type { ProviderPollResult, ProviderSubmitInput } from '../provider'
+import { submitRefs, type ProviderPollResult, type ProviderSubmitInput } from '../provider'
 import { registerAdapter, type AdapterDeps } from './registry'
 import { BaseGatewayProvider, buildModelRecord, nearestRatio } from './base'
 import { clamp, videoDurationWindow } from './dashscope'
+import { prepareRefs } from './refImage'
 
 /**
  * 阿里云百炼 Token Plan（订阅制）适配器：与标准百炼**协议同源但端点族不同**，不可复用
@@ -19,14 +20,15 @@ import { clamp, videoDurationWindow } from './dashscope'
  *   时效，编排层 succeeded 后即下载落盘）。size 缺省 1024*1024（官方示例值）。
  *   submit 阻塞到出图，URL 编进 jobId（同 openaiCompat 的 `oc-url|` 双通道思路）。
  * - **视频是异步任务制**，端点与标准百炼同名：POST video-generation/video-synthesis +
- *   header `X-DashScope-Async: enable`，body `{model, input:{prompt}, parameters:
+ *   header `X-DashScope-Async: enable`，body `{model, input:{prompt, media?}, parameters:
  *   {resolution, ratio, duration}}`；轮询 GET /api/v1/tasks/{id} 的 task_status 与
- *   video_url。官方示例只逐字给了 happyhorse 的参数（720P / 16:9 / 5 秒），
- *   wan3.0-video 走同一端点同一参数族（标准百炼文档核实 duration 2~30）。
+ *   video_url。Token Plan 官方接入页现已列出 HappyHorse 1.1 的 t2v/i2v/r2v，并注明
+ *   wan3.0-video 可接收图片或参考素材；HappyHorse R2V 官方 API 明确给出 media 数组、
+ *   reference_image 角色及 Base64 data URI。此处先开放官方列明的 HappyHorse i2v/r2v，
+ *   使用同 endpoint 的公开请求形态；Token Plan 未单独注明的其它 wan3 参考模式仍关闭。
  *
- * 一期范围（用户裁决）：**只做文生图 + 文生视频**。图生图/图生视频/r2v 的参考素材形态
- * （content 追加 {image} / input.media）在 Token Plan 网关上无官方示例，不做；
- * refCaps 全族声明 `none`，编排层闸门会明确拒绝挂参考素材的请求，绝不静默丢。
+ * 图生图仍不支持：Token Plan 图像接口文档尚未证实参考图编辑的请求形态。视频参考只
+ *   允许图片 data URI（上限 20MB），视频和音频类型不开放，避免把本地路径误发到网关。
  * 附加参数（watermark/prompt_extend）文档未记载，不装配——目录也不声明 extraParams，
  * 白名单闸门保证它们永远到不了这里。
  */
@@ -35,6 +37,7 @@ const DEFAULT_BASE_URL = 'https://token-plan.cn-beijing.maas.aliyuncs.com'
 const IMAGE_ENDPOINT = '/api/v1/services/aigc/multimodal-generation/generation'
 const VIDEO_ENDPOINT = '/api/v1/services/aigc/video-generation/video-synthesis'
 const TASK_ENDPOINT = '/api/v1/tasks'
+const MAX_REF_IMAGE_BYTES = 20 * 1024 * 1024
 
 /** jobId 通道：图片同步结果是 URL；视频是异步任务 id（前缀后接 task_id） */
 const URL_PREFIX = 'tp-url|'
@@ -132,6 +135,16 @@ export class TokenPlanProvider extends BaseGatewayProvider<TokenPlanModelConfig>
 
   /** 文生视频（异步）：提交任务拿 task_id，轮询走标准百炼同款任务协议 */
   private async submitVideo(key: string, requestModel: string, input: ProviderSubmitInput): Promise<string> {
+    const referenceMode = /^happyhorse-1\.1-(i2v|r2v)$/i.exec(requestModel)?.[1]
+    const refs = referenceMode
+      ? await prepareRefs(submitRefs(input), { image: MAX_REF_IMAGE_BYTES })
+      : { items: [], skipped: [] }
+    if (referenceMode === 'i2v' && !refs.items.some((ref) => ref.role === 'first_frame')) {
+      throw new Error('Token Plan HappyHorse 图生视频需要一张可读取的首帧参考图（单张不超过 20MB）')
+    }
+    if (referenceMode === 'r2v' && !refs.items.some((ref) => ref.role === 'reference_image')) {
+      throw new Error('Token Plan HappyHorse 参考生视频需要至少一张可读取的参考图（最多 9 张，每张不超过 20MB）')
+    }
     const parameters: Record<string, unknown> = {}
     // resolution 与 ratio 成对下发（官方示例即成对），且 ratio **像素优先**派生：
     // ratio 与 width/height 并存时宽高是事实源（shared/media 的并存契约），
@@ -161,7 +174,12 @@ export class TokenPlanProvider extends BaseGatewayProvider<TokenPlanModelConfig>
       },
       body: JSON.stringify({
         model: requestModel,
-        input: { prompt: input.prompt },
+        input: {
+          prompt: input.prompt,
+          ...(refs.items.length > 0
+            ? { media: refs.items.map((ref) => ({ type: ref.role, url: ref.url })) }
+            : {})
+        },
         ...(Object.keys(parameters).length > 0 ? { parameters } : {})
       }),
       signal: AbortSignal.timeout(30_000)
@@ -265,11 +283,11 @@ registerAdapter(
   {
     defaultAuthEnv: 'TOKEN_PLAN_KEY',
     supportedKinds: ['image', 'video'],
-    // 一期无参考素材形态（文档未证实 data URI 在 token-plan 网关可用）：
-    // 全族 none，闸门在提交前就给出可操作错误，而不是静默丢掉用户的垫图
+    // Token Plan 官方目录确认 HappyHorse i2v/r2v 接受参考图；HappyHorse API 文档明确支持
+    // Base64 data URI。其余图像、视频、音频参考形态仍保守关闭。
     refCaps: {
       byKind: {
-        image: { delivery: 'none' },
+        image: { delivery: 'data_uri', maxBytes: MAX_REF_IMAGE_BYTES },
         video: { delivery: 'none' },
         audio: { delivery: 'none' }
       }

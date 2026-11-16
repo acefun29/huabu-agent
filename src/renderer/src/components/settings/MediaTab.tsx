@@ -38,6 +38,11 @@ import { ModelPickerDialog } from './ModelPickerDialog'
 
 /** 新增供应商可用的适配器类型（与主进程注册表对应；新增类型时两处同步） */
 const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHint?: string }[] = [
+  { value: 'gateway-vidu', label: 'Vidu 生数科技（图片 / 视频）' },
+  { value: 'gateway-qianfan', label: '百度千帆（图片 / 视频）' },
+  { value: 'gateway-pixverse', label: '拍我 AI（视频）' },
+  { value: 'gateway-zhipu-media', label: '智谱（图片 / 视频）' },
+  { value: 'gateway-tokenhub', label: '腾讯 TokenHub（图片 / 视频）' },
   { value: 'gateway-openai-compat', label: 'OpenAI 兼容（图片 / 视频 / 语音合成）', baseUrlHint: 'https://api.openai.com/v1' },
   { value: 'gateway-dashscope', label: '阿里云百炼（异步任务）' },
   { value: 'gateway-token-plan', label: '阿里云 Token Plan（订阅制：文生图同步 / 文生视频异步）', baseUrlHint: 'https://token-plan.cn-beijing.maas.aliyuncs.com' },
@@ -53,6 +58,11 @@ const ADAPTER_TYPE_OPTIONS: { value: MediaProviderType; label: string; baseUrlHi
  * 用户自建的 gateway-* 供应商无固定官网，不在表内也就不显示链接。
  */
 const MEDIA_API_KEY_URLS: Record<string, { url: string; label: string }> = {
+  vidu: { url: 'https://platform.vidu.cn/', label: 'Vidu 开放平台' },
+  qianfan: { url: 'https://console.bce.baidu.com/qianfan/', label: '百度千帆' },
+  pixverse: { url: 'https://platform.pai.video/', label: '拍我 AI 开放平台' },
+  'zhipu-media': { url: 'https://bigmodel.cn/usercenter/proj-mgmt/apikeys', label: '智谱开放平台' },
+  tokenhub: { url: 'https://console.cloud.tencent.com/tokenhub/api-key', label: '腾讯 TokenHub' },
   openai: { url: 'https://platform.openai.com/api-keys', label: 'OpenAI 平台' },
   dashscope: { url: 'https://bailian.console.aliyun.com/?apiKey=1', label: '阿里云百炼' },
   'token-plan': { url: 'https://bailian.console.aliyun.com/cn-beijing/subscription/overview', label: '百炼 Token Plan 订阅页' },
