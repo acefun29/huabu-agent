@@ -1,8 +1,8 @@
 {
   "name": "huabu",
   "productName": "Huabu",
-  "version": "0.4.0",
-  "description": "画布即工作区的桌面 Agent 应用：无限画布管理素材卡片，对话坞承载多个 Pi Agent 会话",
+  "version": "0.5.0",
+  "description": "画布即工作区的桌面 Agent 应用：无限画布管理素材卡片，对话坞承载多个 Agent 会话",
   "author": {
     "name": "acefun29",
     "email": "145213716+acefun29@users.noreply.github.com"
