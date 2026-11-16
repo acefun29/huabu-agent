@@ -1,6 +1,6 @@
 import { app, BrowserWindow, Menu, shell } from 'electron'
 import { join } from 'path'
-import { getAgentHost, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
+import { disposeChatSessions, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
 import { startWebBridge, setActiveBridge } from './webBridge/server'
 import { IpcChannel } from '../shared/ipc'
 import { initMediaProtocol, registerMediaSchemePrivileged } from './media/protocol'
@@ -11,7 +11,7 @@ import { readOrCreateDevToken, devBridgePort } from './devBridgeToken'
  * 主进程入口。
  *
  * 职责：创建窗口、注册 IPC、注册媒体协议、加载渲染进程。
- * AgentHost（Pi SDK 运行时）在 registerIpcHandlers 里创建并预热，见 src/main/agent/host.ts。
+ * 会话运行时（Mastra）在 registerIpcHandlers 里创建，见 src/main/ipc/chat.ts。
  * huabu-media:// 特权协议必须在 app ready 前注册 scheme，ready 后绑定处理器。
  */
 
@@ -168,10 +168,10 @@ app.on('window-all-closed', () => {
   }
 })
 
-// 退出前释放会话监听器。用同步版本：will-quit 里无法阻塞等待，
-// 而 Pi 的 unsubscribe / session.dispose 本身就是同步的（见 AgentHost.disposeAllSync）
+// 退出前释放会话：Mastra 的两张表（sessions + OM bindings）。will-quit 里无法阻塞
+// 等待，所以这里只做同步收口 + 触发异步关停（Pi 侧已随运行时移除）。
 app.on('will-quit', () => {
-  getAgentHost()?.disposeAllSync()
+  disposeChatSessions()
   // MCP 子进程关停（关 stdin → 等 SDK 兜底 kill）；close 异步但触发即算完成职责
   getMcpManager()?.disposeAll()
 })

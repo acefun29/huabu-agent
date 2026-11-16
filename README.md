@@ -11,8 +11,7 @@
 
 **画布即工作区的桌面 Agent 应用**：一块工作区公用的无限画布管理素材文件卡片（引用而非副本），
 右侧栏承载与 Agent 的会话（可新建 / 切换 / fork）与素材库，素材按绝对路径引用进对话。
-Agent 以 SDK 方式嵌入主进程（不走子进程、不依赖 CLI），内置 Pi 与 Mastra 两套运行时，
-按工作区切换。
+Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、不依赖外部 CLI。
 
 ## 核心特性
 
@@ -48,8 +47,9 @@ Agent 以 SDK 方式嵌入主进程（不走子进程、不依赖 CLI），内�
   支持隐藏 / 恢复 / 编辑内置模型，支持按协议（OpenAI / Anthropic / Gemini）自建供应商。
 - **MCP 与技能**：可接入 MCP 服务器（工具以 `mcp_<server>_<tool>` 注入）；工作区技能按
   agentskills.io 规范放在 `.huabu/skills/<name>/SKILL.md`，可按需启用/禁用。
-- **两套 Agent 运行时**：Pi（默认）与 Mastra（LibSQL 记忆），按工作区切换；
-  Mastra 侧 fork / compact / steer 尚未迁移，会显式失败而非静默降级。
+- **Agent 运行时**：Mastra（LibSQL 记忆）。会话、fork、compact、steer 均已可用。
+  运行时、模型目录、凭据与工具装配都不依赖外部 Agent SDK。
+  **旧版 JSONL 会话历史不再恢复**（会话本身可继续用，会以新线程开始）。
 
 ## 下载
 
@@ -84,7 +84,7 @@ Agent 以 SDK 方式嵌入主进程（不走子进程、不依赖 CLI），内�
 
 ### 环境要求
 
-- Node.js >= 22.19（Pi 运行时要求，见 `.nvmrc`）
+- Node.js >= 22.19（见 `.nvmrc`）
 - pnpm >= 10
 
 ```bash
@@ -110,7 +110,7 @@ pnpm lint        # 类型检查（node 侧 + web 侧两套 tsconfig）
 pnpm build       # 构建到 out/
 pnpm dist        # 构建 + electron-builder 打包到 release/（NSIS + portable）
 pnpm selfcheck   # IPC 链路自检：preload → window.huabu → ipcMain.handle
-pnpm test        # vitest 单测（含 Mastra / pi 双运行时、分级、SuperAgent 等）
+pnpm test        # vitest 单测（含运行时端到端 stub、分级、SuperAgent 等）
 ```
 
 诊断与验证工具（纯 Node 自检为主，结果写入 `out/`，不入库）：
@@ -119,6 +119,8 @@ pnpm test        # vitest 单测（含 Mastra / pi 双运行时、分级、Super
 pnpm catalog:check      # 媒体模型内置目录 + 合并层 + 全量浏览目录
 pnpm chat-catalog:check # 聊天模型目录与 wire 复刻断言、管理器、覆盖层写入面
 pnpm asset-path:check   # 素材引用绝对路径解析（引用契约的回归锁）
+pnpm chat-events:check  # 渲染端事件归约与压缩门禁（chatStream/chatCommands）
+pnpm media-reference:check # 生成版本/引用链/任务运行时的跨模块回归
 pnpm test:scenario      # 全场景自检；pnpm test:full 追加 E2E（需 REMOTE_DEBUGGING_PORT=9222 起 dev）
 pnpm bench              # 性能基准
 ```
@@ -126,6 +128,10 @@ pnpm bench              # 性能基准
 > **坑：`electron-vite dev` 不会自动重启主进程。** 渲染端改动有 HMR，但改了
 > `src/main/**` 或 `src/preload/**` 后必须手动重启 dev，否则新的 IPC handler 不存在，
 > 表现为渲染端全部生效、所有 `chat:*` 调用无人应答。
+>
+> **坑：`ELECTRON_RUN_AS_NODE=1` 会让应用起不来。** 该环境变量下 Electron 以纯 Node
+> 运行主进程，`require('electron').ipcMain` 是 undefined，启动即报
+> `Cannot read properties of undefined (reading 'once')`。开发终端里若设过它，起服务前先清掉。
 
 ### 安装注意事项（国内网络）
 
@@ -138,7 +144,6 @@ pnpm bench              # 性能基准
 ## 技术栈
 
 Electron 44 · electron-vite 5 · React 19 · Zustand 5 · Tailwind CSS 4 · TypeScript 5.9 ·
-[Pi SDK](https://github.com/earendil-works/pi) 0.85.1（纯 ESM，主进程 `await import()` 加载）·
 Mastra + LibSQL（会话记忆，vendored 在 `vendor/mastra/`）· TypeBox（工具参数 schema）
 
 ## 目录结构
@@ -149,7 +154,7 @@ huabu/
 │   ├── main/                  # Electron 主进程
 │   │   ├── index.ts           # 窗口与生命周期（--huabu-headless 时只起 Web 桥）
 │   │   ├── ipc.ts             # IPC handler 注册与载荷校验
-│   │   ├── agent/             # 双运行时（piRuntime / mastra）+ 工具装配 + 上下文压缩
+│   │   ├── agent/             # Mastra 运行时 + 工具装配（文件/媒体/技能/分级/派单）
 │   │   │   └── mastra/        # Mastra 运行时：记忆、模型网关、存储、工具桥
 │   │   ├── assets/            # 素材域：导入/归档/素材库/重命名/删除/标签索引/分级索引
 │   │   ├── superagent/        # SuperAgent 领域引擎：journal 事实源 / 任务板投影 / 版本槽 / 专家池 / 编排
@@ -179,8 +184,8 @@ huabu/
   自定义工具必须同时在白名单里列名才会激活。
 - **`cwd` 越界一律拒绝**（错误码 `cwd_rejected`），不做「悄悄纠正到默认目录」。
 - **载荷与日志零密钥**：认证信息只暴露 `{ configured, source, label }`（`label` 是环境变量名，不是值）。
-- **渲染端不 import 任何 pi 类型**：主进程对 pi 只用 `import type`，运行时零 `require`
-  （pi 是纯 ESM，值导入会抛 `ERR_PACKAGE_PATH_NOT_EXPORTED`）。
+- **单一运行时**：主进程只实例化 Mastra，没有运行时开关；模型目录/凭据由
+  `agent/workspaceModels.ts` 自持（不依赖任何外部 Agent SDK）。
 - **Web 桥仅开发期启用**（`--huabu-headless` / `HUABU_WEB_BRIDGE=1`）：只监听 `127.0.0.1`、
   每次启动随机 token、CORS 限本机、事件转发按通道白名单过滤，绝不在生产构建中开启。
 
@@ -189,7 +194,7 @@ huabu/
 Huabu ("canvas" in Chinese) is an Electron desktop app that turns an infinite canvas into your
 agent workspace: asset files live on the canvas as reference cards (not copies), and a right-side
 panel hosts both the chat sessions (create / switch / fork) and the asset library as two mutually
-exclusive pages. Agent runtimes — Pi and Mastra — are embedded as SDKs in the main process.
+exclusive pages. The agent runtime (Mastra) is embedded directly in the main process — no subprocess, no external CLI.
 It ships built-in media-generation providers (Alibaba DashScope, Alibaba Token Plan,
 Volcengine ARK, MiniMax, Tencent, OpenAI-compatible) for text-to-image / image-to-image /
 image-to-video with a confirmation gate, a taggable asset library with a user-defined

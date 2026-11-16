@@ -3,10 +3,8 @@
  *
  * 运行：pnpm chat-events:check
  *
- * 断言对象是两层纯函数（不依赖 electron / pi 运行时）：
- * - main/agent/serialize.ts：compaction_start/end 翻译（三种 reason、aborted、
- *   result=undefined、errorMessage、摘要截 2000）、toContextUsageEvent
- *   （undefined → null、tokens=null 如实透传、contextWindow 无效 → null）；
+ * 断言对象是渲染端两层纯函数（不依赖 electron / 运行时）；Pi 移除后，原先覆盖
+ * main/agent/serialize.ts（pi 事件翻译）的那一半已随实现删除。
  * - renderer/lib/chatStream.ts：context_usage / compaction_* 归约（水位保存、
  *   分隔条只在校成功时进 tail、aborted 不插条、agent_start 保留 tail）、
  *   compactGate（running / compacting 双禁用）。
@@ -50,89 +48,18 @@ function transpileAll(relFiles) {
     fs.writeFileSync(target, outputText, 'utf8')
   }
 }
-
 transpileAll([
-  path.join('src', 'main', 'agent', 'serialize.ts'),
   path.join('src', 'renderer', 'src', 'lib', 'chatStream.ts'),
   path.join('src', 'renderer', 'src', 'lib', 'chatCommands.ts')
 ])
 
-const serialize = await import(pathToFileURL(path.join(OUT_DIR, 'src', 'main', 'agent', 'serialize.js')))
+// Pi 运行时已移除：本脚本原先还验证 main/agent/serialize.ts（pi 事件翻译）。
+// 那一半随实现一起删掉，保留渲染端的归约与门禁断言（chatStream/chatCommands
+// 没有 vitest 覆盖，这里是它们唯一的回归锁）。
 const chatStream = await import(pathToFileURL(path.join(OUT_DIR, 'src', 'renderer', 'src', 'lib', 'chatStream.js')))
 const chatCommands = await import(pathToFileURL(path.join(OUT_DIR, 'src', 'renderer', 'src', 'lib', 'chatCommands.js')))
 
-const translator = new serialize.EventTranslator('node-1')
-
-check('compaction_start 三种 reason 原样翻译', () => {
-  for (const reason of ['manual', 'threshold', 'overflow']) {
-    const events = translator.translate({ type: 'compaction_start', reason })
-    assert(events.length === 1, `应产出 1 个事件，实际 ${events.length}`)
-    assert(events[0].type === 'compaction_start' && events[0].reason === reason, `reason ${reason} 未原样透传`)
-    assert(events[0].nodeId === 'node-1', 'nodeId 应保留')
-  }
-  // 未知 reason 收敛为 threshold（UI 只标注不报错）
-  const fallback = translator.translate({ type: 'compaction_start', reason: 'mystery' })
-  assert(fallback[0].reason === 'threshold', '未知 reason 应回退 threshold')
-})
-
-check('compaction_end 成功形态：摘要截 2000 + tokens 字段', () => {
-  const long = 'x'.repeat(3000)
-  const events = translator.translate({
-    type: 'compaction_end',
-    reason: 'manual',
-    aborted: false,
-    result: { summary: long, firstKeptEntryId: 'e1', tokensBefore: 120000, estimatedTokensAfter: 24000 }
-  })
-  assert(events.length === 1, '应产出 1 个事件')
-  const e = events[0]
-  assert(e.type === 'compaction_end' && e.reason === 'manual' && e.aborted === false, '基础字段不对')
-  assert(e.summary.length === 2001 && e.summary.endsWith('…'), '长摘要应截到 2000 加省略号')
-  assert(e.tokensBefore === 120000 && e.estimatedTokensAfter === 24000, 'token 数字段应透传')
-})
-
-check('compaction_end 失败/中止形态：result 全缺省、aborted/errorMessage 照常', () => {
-  const events = translator.translate({
-    type: 'compaction_end',
-    reason: 'threshold',
-    aborted: true,
-    willRetry: false,
-    errorMessage: 'summarize failed'
-  })
-  const e = events[0]
-  assert(e.aborted === true, 'aborted 应透传')
-  assert(e.summary === undefined && e.tokensBefore === undefined && e.estimatedTokensAfter === undefined, 'result 缺省时字段应全缺省')
-  assert(e.errorMessage === 'summarize failed', 'errorMessage 应透传')
-})
-
-check('agent_end 翻译不变（回归：usage/stopReason 仍在）', () => {
-  const events = translator.translate({
-    type: 'agent_end',
-    messages: [{ role: 'assistant', stopReason: 'stop', usage: { input: 10, output: 5, reasoning: 0, totalTokens: 15 } }]
-  })
-  assert(events[0].type === 'agent_end' && events[0].stopReason === 'stop', 'agent_end 应保持原语义')
-  assert(events[0].usage && events[0].usage.input === 10, 'usage 应保留')
-})
-
-check('toContextUsageEvent：undefined → null（无模型/无窗口时不发假载荷）', () => {
-  assert(serialize.toContextUsageEvent('n', undefined) === null, 'undefined 应返回 null')
-  assert(serialize.toContextUsageEvent('n', null) === null, 'null 应返回 null')
-  assert(serialize.toContextUsageEvent('n', { contextWindow: 0, tokens: 5, percent: 1 }) === null, 'contextWindow<=0 应返回 null')
-})
-
-check('toContextUsageEvent：tokens=null 如实透传（压缩后待下一轮）', () => {
-  const event = serialize.toContextUsageEvent('n', { tokens: null, contextWindow: 128000, percent: null })
-  assert(event && event.type === 'context_usage', '应产出 context_usage 事件')
-  assert(event.tokens === null && event.percent === null, 'tokens/percent null 应如实透传')
-  assert(event.contextWindow === 128000, 'contextWindow 应保留')
-})
-
-check('toContextUsageEvent：有效数字全透传', () => {
-  const event = serialize.toContextUsageEvent('n', { tokens: 32000, contextWindow: 128000, percent: 25 })
-  assert(event.tokens === 32000 && event.contextWindow === 128000 && event.percent === 25, '有效值应透传')
-})
-
 check('compactGate：running 与 compacting 双禁用且说清后果', () => {
-  assert(serialize, 'serialize 已载入')
   const running = chatStream.compactGate(true, false)
   assert(running.disabled === true && /打断/.test(running.reason ?? ''), 'running 应禁用并说明会打断生成')
   const compacting = chatStream.compactGate(false, true)
