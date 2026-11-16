@@ -2,12 +2,10 @@ import { WorkspaceModels } from './agent/workspaceModels'
 import { SafeStorageCredentialStore } from './agent/credentials'
 import { getCredentialsFile } from './workspace/stateDir'
 import { WorkspaceStore } from './workspace/store'
-import { McpManager } from './mcp/manager'
 import {
   broadcastAssetChanged,
   broadcastProjectChangedEvent,
   broadcastMediaJob,
-  broadcastMcpStatus,
   broadcastTaskEvent,
   type IpcContext
 } from './ipc/shared'
@@ -35,21 +33,14 @@ import { inboxRoot } from './assets/manager'
  */
 
 let workspaceStore: WorkspaceStore | null = null
-let mcpManagerSingleton: McpManager | null = null
 
 export function getWorkspaceStore(): WorkspaceStore | null {
   return workspaceStore
 }
 
-/** 退出流程（will-quit）用：全量关停 MCP 子进程 */
-export function getMcpManager(): McpManager | null {
-  return mcpManagerSingleton
-}
-
 /**
  * 退出流程用：收口全部会话运行时（A3）。
- * Pi 侧由 `AgentHost.disposeAllSync` 处理，Mastra 侧的两张表由这里处理，
- * 两者都要调——只调前者会漏掉 `MastraAgentRuntime.sessions` 与 OM bindings。
+ * 释放 `MastraAgentRuntime.sessions` 与 OM bindings。
  */
 export { disposeChatSessions }
 
@@ -82,11 +73,6 @@ export function registerIpcHandlers(): void {
     broadcastMediaJob
   })
 
-  // MCP 桥接池（全局配置，跨工作区共享）：启动即 sync 预热，状态变化推 mcp:status
-  const mcpManager = new McpManager(broadcastMcpStatus)
-  mcpManagerSingleton = mcpManager
-  mcpManager.sync()
-
   // SuperAgent 运行器：媒体任务编排与任务板共用（模型解析/工具装配/取消都在这层）
   const superAgent = new SuperAgentRunner({
     currentDir,
@@ -107,8 +93,7 @@ export function registerIpcHandlers(): void {
     superAgent,
     mediaManager,
     mediaContext,
-    requestMediaApproval,
-    mcpManager
+    requestMediaApproval
   }
 
   registerWindowAppIpc(ctx)

@@ -1,12 +1,11 @@
-// 设置面板其余 tab：Skills、MCP、外观
+// 设置面板其余 tab：Skills、外观
 
-import { useState } from 'react'
-import { Moon, Plus, RotateCw, Sun, Trash2 } from 'lucide-react'
+import { Moon, Sun } from 'lucide-react'
 import { useAppearanceSettings, useSettings } from '../../store/settingsStore'
-import { Field, Row, Toggle, inputCls } from './ui'
+import { Row, Toggle } from './ui'
 
 /* -------------------------------------------------------------------------- */
-/* Skills / MCP / 外观                                                         */
+/* Skills / 外观                                                              */
 /* -------------------------------------------------------------------------- */
 
 const SKILL_EXAMPLE = `---
@@ -78,144 +77,6 @@ export function SkillsTab() {
           ))}
         </div>
       )}
-    </div>
-  )
-}
-
-/** MCP 服务器状态徽章（连接中 / 已连接 N 工具 / 失败） */
-function McpStatusBadge({ status, toolCount }: { status: string; toolCount?: number }) {
-  if (status === 'connected') {
-    return (
-      <span className="rounded-full bg-(--success-bg) px-2 py-0.5 text-[10px] font-medium text-(--success-text)">
-        已连接 · {toolCount ?? 0} 工具
-      </span>
-    )
-  }
-  if (status === 'starting') {
-    return (
-      <span className="rounded-full bg-(--surface-chip) px-2 py-0.5 text-[10px] font-medium text-(--on-surface-variant)">
-        连接中…
-      </span>
-    )
-  }
-  if (status === 'error') {
-    return (
-      <span className="rounded-full bg-(--danger-bg, rgba(0,0,0,0.06)) px-2 py-0.5 text-[10px] font-medium text-(--danger)">
-        连接失败
-      </span>
-    )
-  }
-  return (
-    <span className="rounded-full bg-(--surface-input) px-2 py-0.5 text-[10px] font-medium text-(--on-surface-muted)">
-      未启用
-    </span>
-  )
-}
-
-export function McpTab() {
-  const { mcpServers, toggleMcp, removeMcp, addMcp, refreshMcp } = useSettings()
-  const [name, setName] = useState('')
-  const [command, setCommand] = useState('')
-  const [args, setArgs] = useState('')
-  const [env, setEnv] = useState('')
-  const [error, setError] = useState<string | null>(null)
-
-  const submit = async () => {
-    const message = await addMcp({ name, command, args, env })
-    if (message) {
-      setError(message)
-      return
-    }
-    setError(null)
-    setName('')
-    setCommand('')
-    setArgs('')
-    setEnv('')
-  }
-
-  return (
-    <div className="space-y-3" data-testid="mcp-tab">
-      <p className="text-xs leading-relaxed text-(--on-surface-muted)">
-        MCP 服务器经桥接层接入 Agent：每个 server 的工具以{' '}
-        <code className="rounded bg-(--surface-input) px-1">mcp_&lt;server&gt;_&lt;tool&gt;</code>{' '}
-        的名字随会话注入，<span className="text-(--on-surface)">调用直接执行</span>
-        ——请只添加你信任的服务器。配置全局共享（跨工作区），格式对齐 Claude Desktop。
-      </p>
-      <div className="space-y-2">
-        {mcpServers.map((s) => (
-          <div
-            key={s.id}
-            className="rounded-2xl bg-(--surface-card) px-4 py-3 ring-1 ring-(--outline-soft)"
-          >
-            <div className="flex items-center gap-3">
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="text-[13px] font-medium text-(--on-surface)">{s.name}</span>
-                  <McpStatusBadge status={s.status} toolCount={s.toolCount} />
-                </div>
-                <div className="mt-0.5 truncate font-mono text-[11px] text-(--on-surface-muted)">
-                  {s.command} {s.args.join(' ')}
-                  {s.env && Object.keys(s.env).length > 0 ? `  [env ×${Object.keys(s.env).length}]` : ''}
-                </div>
-              </div>
-              <button
-                onClick={() => refreshMcp()}
-                className="rounded-full p-1.5 text-(--on-surface-muted) transition-colors hover:bg-(--outline-soft)"
-                title="重试连接 / 刷新状态"
-              >
-                <RotateCw size={13} />
-              </button>
-              <button
-                onClick={() => removeMcp(s.name)}
-                className="rounded-full p-1.5 text-(--on-surface-muted) transition-colors hover:bg-(--outline-soft) hover:text-(--danger)"
-                title="删除"
-              >
-                <Trash2 size={13} />
-              </button>
-              <Toggle checked={s.enabled} onChange={() => toggleMcp(s.name)} />
-            </div>
-            {s.error && (
-              <div className="mt-2 whitespace-pre-wrap break-all rounded-xl bg-(--surface-input) px-3 py-2 font-mono text-[10.5px] leading-relaxed text-(--on-surface-muted)">
-                {s.error}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
-      <div className="rounded-2xl bg-(--surface-card) p-4 ring-1 ring-(--outline-soft)">
-        <div className="mb-2 text-[13px] font-medium text-(--on-surface)">添加 MCP 服务器</div>
-        <div className="grid grid-cols-3 gap-2">
-          <Field label="名称（字母/数字/横线）">
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="filesystem" className={inputCls} />
-          </Field>
-          <Field label="命令">
-            <input value={command} onChange={(e) => setCommand(e.target.value)} placeholder="npx" className={inputCls} />
-          </Field>
-          <Field label="参数（空格分隔）">
-            <input value={args} onChange={(e) => setArgs(e.target.value)} placeholder="-y @modelcontextprotocol/server-filesystem ." className={inputCls} />
-          </Field>
-        </div>
-        <div className="mt-2">
-          <Field label="环境变量（可选，每行 KEY=VALUE）">
-            <textarea
-              value={env}
-              onChange={(e) => setEnv(e.target.value)}
-              placeholder={'API_TOKEN=sk-…'}
-              rows={2}
-              className={`${inputCls} resize-y font-mono text-[12px]`}
-            />
-          </Field>
-        </div>
-        {error && <div className="mt-2 text-[11px] text-(--danger)">{error}</div>}
-        <button
-          onClick={() => void submit()}
-          disabled={!name.trim() || !command.trim()}
-          className="mt-3 flex items-center gap-1 rounded-full bg-(--fab-bg) px-3.5 py-1.5 text-[12px] font-medium text-(--fab-text) transition hover:opacity-90 disabled:opacity-30"
-        >
-          <Plus size={13} />
-          添加
-        </button>
-      </div>
     </div>
   )
 }

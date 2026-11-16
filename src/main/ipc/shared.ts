@@ -15,7 +15,6 @@ import type { WorkspaceModels } from '../agent/workspaceModels'
 import type { WorkspaceStore } from '../workspace/store'
 import type { MediaJobManager } from '../media/manager'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
-import type { McpManager } from '../mcp/manager'
 import type { MediaContextReturnType } from '../media/runtime'
 import type { SuperAgentRunner } from '../superagent/runner'
 import {
@@ -121,11 +120,6 @@ export function broadcastMediaJob(job: MediaJobStatus): void {
   broadcastToAll(IpcChannel.MediaJobEvent, 'media:job', job)
 }
 
-/** MCP 服务器状态变化广播（连接中/已连接/失败），设置页徽章实时更新 */
-export function broadcastMcpStatus(): void {
-  broadcastToAll('mcp:status', 'mcp:status', { at: Date.now() }, { at: new Date().toISOString() })
-}
-
 /**
  * 编排器注入各域注册函数的依赖上下文：store/host 为全局单例，
  * media 域运行时（mediaManager/mediaContext）与确认闸门在各域注册前创建。
@@ -154,8 +148,6 @@ export interface IpcContext {
     nodeId: string,
     signal: AbortSignal | undefined
   ) => Promise<boolean>
-  /** MCP 桥接池（全局单例；chat: create 装配工具，settings 域管理配置） */
-  mcpManager: McpManager
 }
 
 export {

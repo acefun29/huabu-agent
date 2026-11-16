@@ -95,8 +95,8 @@ export function registerChatIpc(ctx: IpcContext): void {
         return ''
       }
     },
-    // 工具装配（Phase 3 迁移面）：文件三件套 + blockout + 媒体三件套 + read_media
-    // + 视频两工具 + create_note + 分级 + 任务四件套 + MCP（设置页接进来的服务器）。
+    // 工具装配：文件三件套 + blockout + 媒体三件套 + read_media
+    // + 视频两工具 + create_note + 分级 + 任务四件套。
     // vision 已通（toModelOutput content/media）：按会话模型目录 input 声明判定
     // （与 Pi 侧同一份数据），模型不支持时工具内自动降级元数据
     assembleTools: async (nodeId, workspaceDir) => {
@@ -172,12 +172,6 @@ export function registerChatIpc(ctx: IpcContext): void {
       // write」，渲染端的「写的媒体文件自动上画布」也挂在 write 的工具事件上。
       // 守卫在 fileTools.ts 里（工作区相对路径 + realpath 防符号链接逃逸 + 读写上限）。
       const fileTools = createFileTools({ currentDir: sessionCurrentDir })
-      /*
-       * MCP 工具：设置页接进来的服务器必须真的能进模型手里，否则「已连接」只是个徽章。
-       * 连接状态与启用开关由 manager 自己判定（未连接/未启用/已 disposed → 空数组），
-       * 这里不做二次过滤。名字已由 manager 统一成 mcp_<server>_<tool>，不与内置工具冲突。
-       */
-      const mcpTools = await ctx.mcpManager.assembleTools()
       const tools = [
         ...fileTools,
         blockoutTool,
@@ -186,8 +180,7 @@ export function registerChatIpc(ctx: IpcContext): void {
         ...videoTools,
         noteTool,
         ...facetTools,
-        ...taskTools,
-        ...mcpTools
+        ...taskTools
       ]
       /*
        * 产物记账（施工计划 v4）：工具说它产出了文件，系统就把这条事实记到正在做的任务上。

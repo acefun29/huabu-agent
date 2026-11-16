@@ -568,9 +568,7 @@ export function installWebHarness(): void {
         confirmVideo: false,
       },
     }),
-    mcpStatus: async () => ({ ok: true, value: { servers: [] } }),
     skillsList: async () => ({ ok: true, value: { skills: [] } }),
-    onMcpStatus: () => () => undefined,
   }
 
   const mediaApi = {

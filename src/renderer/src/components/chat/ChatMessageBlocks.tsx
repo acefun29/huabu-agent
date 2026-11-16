@@ -17,7 +17,6 @@ import {
   Loader2,
   Music2,
   Pencil,
-  Plug,
   Wrench
 } from 'lucide-react'
 import type { ChatMessageBlock, ChatToolCallView } from '../../types'
@@ -34,9 +33,8 @@ import { Collapse } from '../Collapse'
 /* 工具行的语义化图标 / 标签 / 摘要                                              */
 /* -------------------------------------------------------------------------- */
 
-/** 工具名 → 行内图标与中文动词标签（mcp_* 统一 Plug，名字去掉前缀） */
+/** 工具名 → 行内图标与中文动词标签 */
 function toolVisual(name: string): { icon: LucideIcon; label: string } {
-  if (name.startsWith('mcp_')) return { icon: Plug, label: name.slice(4) }
   switch (name) {
     case 'ls':
       return { icon: List, label: '列目录' }

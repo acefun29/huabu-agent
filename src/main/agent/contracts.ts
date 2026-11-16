@@ -257,7 +257,7 @@ export interface ToolDefinition<TDetails = unknown> {
   description: string
   /** 默认系统提示词里「可用工具」一行的摘要；本项目大多不提供（说明已并入 description） */
   promptSnippet?: string
-  /** 参数 schema（TypeBox；MCP 工具透传标准 JSON Schema） */
+  /** 参数 schema（TypeBox；外部工具透传标准 JSON Schema） */
   parameters: TSchema
   /**
    * `params` 声明为 unknown 而不是 `Record<string, unknown>`：各工具都在实现里

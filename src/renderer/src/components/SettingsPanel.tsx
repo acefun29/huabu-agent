@@ -1,10 +1,10 @@
 // 设置面板壳：Tab 定义 + 面板骨架与 tab 分派（各 tab 实现见 ./settings/）
 
 import { useEffect, useState, type ReactNode } from 'react'
-import { Boxes, Palette, PlugZap, Sparkles, Wand2, X } from 'lucide-react'
+import { Boxes, Palette, Sparkles, Wand2, X } from 'lucide-react'
 import { useSettingsUi, type SettingsTabKey } from '../store/settingsStore'
 import { useEsc } from '../lib/hooks'
-import { SkillsTab, McpTab, AppearanceTab } from './settings/tabs'
+import { SkillsTab, AppearanceTab } from './settings/tabs'
 import { ProvidersTab } from './settings/ProvidersTab'
 import { MediaTab } from './settings/MediaTab'
 
@@ -12,7 +12,6 @@ const TABS: { key: SettingsTabKey; label: string; icon: ReactNode }[] = [
   { key: 'providers', label: '模型供应商', icon: <Boxes size={15} /> },
   { key: 'media', label: '媒体生成', icon: <Wand2 size={15} /> },
   { key: 'skills', label: 'Skills', icon: <Sparkles size={15} /> },
-  { key: 'mcp', label: 'MCP', icon: <PlugZap size={15} /> },
   { key: 'appearance', label: '外观', icon: <Palette size={15} /> },
 ]
 
@@ -76,7 +75,6 @@ export function SettingsPanel() {
                 {tab === 'providers' && <ProvidersTab />}
                 {tab === 'media' && <MediaTab />}
                 {tab === 'skills' && <SkillsTab />}
-                {tab === 'mcp' && <McpTab />}
                 {tab === 'appearance' && <AppearanceTab />}
               </div>
             </div>

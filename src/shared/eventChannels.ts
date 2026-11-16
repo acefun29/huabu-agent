@@ -23,7 +23,6 @@ export const EVENT_CHANNEL_ALLOWLIST: readonly string[] = [
   IpcChannel.MediaJobEvent,
   IpcChannel.MediaConfirmRequest,
   IpcChannel.MediaConfirmResolvedEvent,
-  IpcChannel.McpStatusEvent,
   IpcChannel.AssetChanged,
   IpcChannel.WindowStateChanged,
   IpcChannel.ProjectChanged,

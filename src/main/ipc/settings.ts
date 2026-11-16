@@ -8,8 +8,7 @@
  *   settings:custom-remove-provider / settings:custom-add-model
  * - 模型管理（内置+自定义）：settings:models-list / settings:model-edit /
  *   settings:model-remove / settings:model-restore
- * - MCP / Skills（真实接入）：settings:mcp-status / settings:mcp-set /
- *   settings:skills-list / settings:skills-set-disabled
+ * - Skills：settings:skills-list / settings:skills-set-disabled
  *
  * 域内局部（不进 IpcContext）：afterChatConfigChange（覆盖层写完后的统一收尾）。
  */
@@ -20,7 +19,6 @@ import {
   type CustomModelInput,
   type CustomProviderInput,
   type ManagedModelInfo,
-  type McpServerConfig,
   type ModelEditInput,
   type SettingsSetApiKeyRequest,
   type SettingsSkillsListResult
@@ -33,7 +31,6 @@ import {
   removeCustomProvider,
   restoreBuiltinModel
 } from '../models/overlay'
-import { normalizeServerConfig, writeMcpServers } from '../mcp/store'
 import { scanSkills } from '../agent/skills'
 import { resolveBuiltinSkillsRoots } from '../agent/blockoutTools'
 import type { IpcContext } from './shared'
@@ -41,7 +38,6 @@ import { describe, invalidPayload, isNonEmptyString, ok } from './shared'
 
 export function registerSettingsIpc(ctx: IpcContext): void {
   const store = ctx.store
-  const mcpManager = ctx.mcpManager
   const currentDir = ctx.currentDir
   // 模型目录/凭据走 WorkspaceModels（与 pi 解耦）：Key 录入、供应商清单、模型管理
   // 不再要求 pi 加载成功。testProvider 仍留在 host（要做真实请求 + 读 pi 的认证快照）。
@@ -223,31 +219,7 @@ export function registerSettingsIpc(ctx: IpcContext): void {
     }
   })
 
-  // ------------------------------------------------- settings 域（MCP / Skills）
-
-  /** MCP 配置是全局的（跨工作区），不要求打开工作区 */
-  ipcMain.handle(IpcChannel.SettingsMcpStatus, () => {
-    mcpManager.sync()
-    return { ok: true, value: { servers: mcpManager.runtimeInfo() } }
-  })
-
-  ipcMain.handle(IpcChannel.SettingsMcpSet, (_event, payload: unknown) => {
-    const request = payload as { servers?: unknown } | null
-    if (!Array.isArray(request?.servers)) return invalidPayload('settings:mcp-set 需要 servers 数组')
-    const cleaned: McpServerConfig[] = []
-    for (const entry of request.servers) {
-      const normalized = normalizeServerConfig(entry)
-      if (typeof normalized === 'string') return invalidPayload(normalized)
-      cleaned.push(normalized)
-    }
-    try {
-      writeMcpServers(cleaned)
-    } catch (error) {
-      return { ok: false, code: 'unknown' as const, error: describe(error) }
-    }
-    mcpManager.sync()
-    return { ok: true, value: { servers: mcpManager.runtimeInfo() } }
-  })
+  // ------------------------------------------------------- settings 域（Skills）
 
   ipcMain.handle(IpcChannel.SettingsSkillsList, (): ChatResult<SettingsSkillsListResult> => {
     const dir = currentDir()

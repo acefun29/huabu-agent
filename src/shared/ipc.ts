@@ -201,19 +201,13 @@ export const IpcChannel = {
   SettingsMediaRemoveKey: 'settings:media-remove-key',
 
   /* ------------------------------------------------------------------ */
-  /* settings 域（Skills / MCP：真实接入）                                  */
+  /* settings 域（Skills：真实接入）                                        */
   /* ------------------------------------------------------------------ */
 
-  /** MCP 服务器清单 + 运行态（全局配置 userData/huabu-state/mcp.json；不依赖工作区） */
-  SettingsMcpStatus: 'settings:mcp-status',
-  /** 整表替换 MCP 服务器配置，落盘并同步连接池，返回最新运行态 */
-  SettingsMcpSet: 'settings:mcp-set',
   /** 工作区技能清单（扫描 .huabu/skills/ 的 SKILL.md；需要当前工作区） */
   SettingsSkillsList: 'settings:skills-list',
   /** 设置被禁用技能名单（写 workspace.json skills.disabled；影响之后新建的会话） */
   SettingsSkillsSetDisabled: 'settings:skills-set-disabled',
-  /** 事件类：MCP 服务器连接状态变化（设置页徽章实时更新） */
-  McpStatusEvent: 'mcp:status',
 
   /* ------------------------------------------------------------------ */
   /* media 域（M11：媒体生成任务编排 / M12：导入）                          */
@@ -1318,39 +1312,8 @@ export interface MediaSettingsStatus {
 }
 
 /* -------------------------------------------------------------------------- */
-/* settings 域：MCP / Skills（真实接入）                                        */
+/* settings 域：Skills                                                          */
 /* -------------------------------------------------------------------------- */
-
-/** 全局 MCP 服务器配置条目（userData/huabu-state/mcp.json；格式对齐 Claude Desktop 的事实标准） */
-export interface McpServerConfig {
-  id: string
-  name: string
-  command: string
-  args: string[]
-  /** 附加环境变量（与 SDK 安全白名单合并，同名覆盖） */
-  env?: Record<string, string>
-  enabled: boolean
-}
-
-export type McpServerStatus = 'starting' | 'connected' | 'error' | 'disabled'
-
-/** 配置 + 运行态的合并视图（设置页徽章数据源） */
-export interface McpServerRuntimeInfo extends McpServerConfig {
-  status: McpServerStatus
-  /** connected 时已发现的工具数 */
-  toolCount?: number
-  /** 非 connected 状态下的最近错误摘要（含 server stderr 尾部） */
-  error?: string
-}
-
-export interface SettingsMcpStatusResult {
-  servers: McpServerRuntimeInfo[]
-}
-
-export interface SettingsMcpSetRequest {
-  /** 整表替换：渲染端先在现有清单上增删改，再整体提交 */
-  servers: McpServerConfig[]
-}
 
 /** 技能（SKILL.md，agentskills.io 规范）：用户级（~/.agents/skills 等）或工作区级（.huabu/skills/） */
 export interface SkillInfo {

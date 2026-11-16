@@ -179,15 +179,9 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
       modelRestore: (providerId, modelId) =>
         invoke(IpcChannel.SettingsModelRestore, { providerId, modelId }),
 
-      mcpStatus: () => invoke(IpcChannel.SettingsMcpStatus),
-
-      mcpSet: (request) => invoke(IpcChannel.SettingsMcpSet, request),
-
       skillsList: () => invoke(IpcChannel.SettingsSkillsList),
 
-      skillsSetDisabled: (request) => invoke(IpcChannel.SettingsSkillsSetDisabled, request),
-
-      onMcpStatus: (listener) => subscribe(IpcChannel.McpStatusEvent, () => listener())
+      skillsSetDisabled: (request) => invoke(IpcChannel.SettingsSkillsSetDisabled, request)
     },
 
     media: {

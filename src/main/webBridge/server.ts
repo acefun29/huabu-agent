@@ -6,7 +6,7 @@
  *   channel → handler 表（见 ipcRegistry），HTTP 请求按 channel 直接派发，
  *   与 Electron 内 ipcRenderer.invoke 走同一条代码路径、同一份状态。
  * - **事件走 WS**：主进程已有 broadcastXxx 系列广播函数（chat:event /
- *   media:job / asset:changed / task:event / project:changed / mcp:status）。
+ *   media:job / asset:changed / task:event / project:changed）。
  *   桥把它们统一转发到 WS，浏览器按 channel 订阅——与 preload 的 onEvent 语义一致。
  * - **默认关闭**：只有显式 `HUABU_WEB_BRIDGE=1` / `HUABU_HEADLESS=1`（`pnpm web`，
  *   主进程不建窗口）才监听，不改变 Electron 默认行为、不额外开端口。

@@ -46,8 +46,8 @@ Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、�
   （带时间戳低清关键帧）、`read_video_frames` 定点精读，素材引用契约闭环——拖入即参考。
 - **聊天模型目录**：内置 Anthropic / DeepSeek / GLM / Kimi / OpenAI / Qwen / Token Plan 目录，
   支持隐藏 / 恢复 / 编辑内置模型，支持按协议（OpenAI / Anthropic / Gemini）自建供应商。
-- **MCP 与技能**：可接入 MCP 服务器（工具以 `mcp_<server>_<tool>` 注入）；工作区技能按
-  agentskills.io 规范放在 `.huabu/skills/<name>/SKILL.md`，可按需启用/禁用。
+- **技能**：工作区技能按 agentskills.io 规范放在 `.huabu/skills/<name>/SKILL.md`，
+  可按需启用/禁用；启用后随新会话注入系统提示。
 - **Agent 运行时**：Mastra（LibSQL 记忆）。会话、fork、compact、steer 均已可用。
   运行时、模型目录、凭据与工具装配都不依赖外部 Agent SDK。
   **旧版 JSONL 会话历史不再恢复**（会话本身可继续用，会以新线程开始）。
@@ -192,7 +192,6 @@ huabu/
 │   │   ├── superagent/        # SuperAgent 领域引擎：journal 事实源 / 任务板投影 / 版本槽 / 专家池 / 编排
 │   │   ├── media/             # 媒体生成：供应商适配器、模型目录、缩略图、确认闸门
 │   │   ├── models/            # 聊天模型目录、覆盖层、一次性迁移
-│   │   ├── mcp/               # MCP 服务器管理与工具注入
 │   │   ├── project/           # 项目结构模型（层级看板）
 │   │   └── workspace/         # 工作区存储（一个工作区 = 一张画布 + 一个磁盘目录）
 │   ├── preload/               # contextBridge 暴露 window.huabu（事件白名单）
@@ -213,8 +212,7 @@ huabu/
 - `contextIsolation: true`、`nodeIntegration: false`，渲染进程只能通过 `window.huabu` 访问原生能力；
   事件类 IPC 通道需在 preload 白名单登记后才可订阅。
 - **文件工具边界**：内置 `ls`、`read`、`write` 和 `patch` 使用工作区相对路径；
-  `write` 可覆盖已有文本，`patch` 可精确修改已有文本。启用的 MCP 服务器还可提供额外工具，
-  应仅接入信任的服务器。
+  `write` 可覆盖已有文本，`patch` 可精确修改已有文本。
 - **`cwd` 越界一律拒绝**（错误码 `cwd_rejected`），不做「悄悄纠正到默认目录」。
 - **凭据保护**：保存时通过 IPC 将用户输入的 Key 交给主进程加密；查询配置状态时只返回
   `{ configured, source, label }` 等元数据，不返回已保存的 Key。

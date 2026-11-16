@@ -1,7 +1,8 @@
 import { app, BrowserWindow, dialog, Menu, shell } from 'electron'
 import { join } from 'path'
-import { disposeChatSessions, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
+import { disposeChatSessions, getWorkspaceStore, registerIpcHandlers } from './ipc'
 import { startWebBridge, setActiveBridge } from './webBridge/server'
+import { removeLegacyMcpConfig } from './workspace/stateDir'
 import { IpcChannel } from '../shared/ipc'
 import { initMediaProtocol, registerMediaSchemePrivileged } from './media/protocol'
 import { inboxRoot } from './assets/manager'
@@ -180,6 +181,8 @@ registerMediaSchemePrivileged()
 void app.whenReady().then(() => {
   // 自绘标题栏替代原生菜单栏（File/Edit/View/Window 是 Electron 默认菜单）
   Menu.setApplicationMenu(null)
+  // MCP 已移除：清理旧版全局配置，避免残留文件被误认为仍受支持。
+  removeLegacyMcpConfig()
   registerIpcHandlers()
   // Web 后端桥（默认关闭）：HUABU_WEB_BRIDGE=1 / --headless 时监听 127.0.0.1，供浏览器里的
   // renderer 调同一批 IPC handler（复用业务逻辑，不重写）。仅本地开发用途，生产不启用。
@@ -227,8 +230,8 @@ app.on('window-all-closed', () => {
   }
 })
 
-// 退出前释放会话：Mastra 的两张表（sessions + OM bindings）。will-quit 里无法阻塞
-// 等待，所以这里只做同步收口 + 触发异步关停（Pi 侧已随运行时移除）。
+// 退出前释放会话：Mastra 的两张表（sessions + OM bindings）。will-quit 里无法阻塞等待，
+// 所以这里只做同步收口 + 触发异步关停。
 app.on('will-quit', () => {
   // 画布快照最后一道冲刷：窗口 close 流程之外的退出路径（系统关机、Cmd+Q）也覆盖
   try {
@@ -237,6 +240,4 @@ app.on('will-quit', () => {
     console.error('[main] 退出前保存画布失败：', error)
   }
   disposeChatSessions()
-  // MCP 子进程关停（关 stdin → 等 SDK 兜底 kill）；close 异步但触发即算完成职责
-  getMcpManager()?.disposeAll()
 })

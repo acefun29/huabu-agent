@@ -1,16 +1,16 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import type { McpServerConfig, McpServerRuntimeInfo, SkillInfo } from '@shared/ipc'
+import type { SkillInfo } from '@shared/ipc'
 import { useMediaSettingsState, type MediaSettingsState } from './settings/media'
 import { useChatSettingsState, type ChatSettingsState } from './settings/chat'
-import { useExtensionsSettingsState, type ExtensionsSettingsState } from './settings/extensions'
+import { useSkillsSettingsState, type SkillsSettingsState } from './settings/skills'
 export { hasBridge } from './settings/bridge'
 
 /** 组合聊天、媒体、扩展和外观设置，同时提供各域独立订阅。 */
 
-export type { SkillInfo, McpServerConfig, McpServerRuntimeInfo }
+export type { SkillInfo }
 
 /** 设置面板的 tab 键（SettingsPanel 的导航分派；openSettings(tab) 直达用） */
-export type SettingsTabKey = 'providers' | 'media' | 'skills' | 'mcp' | 'appearance'
+export type SettingsTabKey = 'providers' | 'media' | 'skills' | 'appearance'
 
 export interface AppearanceSettings {
   theme: 'light' | 'dark'
@@ -39,7 +39,7 @@ type AppearanceState = {
   setAppearance: (patch: Partial<AppearanceSettings>) => void
 }
 
-type SettingsState = ChatSettingsState & MediaSettingsState & ExtensionsSettingsState & AppearanceState & {
+type SettingsState = ChatSettingsState & MediaSettingsState & SkillsSettingsState & AppearanceState & {
   refreshAll: (workspacePath?: string) => Promise<void>
 }
 
@@ -76,14 +76,14 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
 
   const chat = useChatSettingsState()
   const media = useMediaSettingsState()
-  const extensions = useExtensionsSettingsState()
+  const skillsState = useSkillsSettingsState()
   const { refreshChat, resetChatWorkspace } = chat
   const { refreshMedia, resetMediaWorkspace } = media
-  const { refreshExtensions, resetExtensions } = extensions
+  const { refreshSkills, resetSkills } = skillsState
 
   const [appearance, setAppearanceState] = useState(initial.appearance)
 
-  // 外观是纯 UI 偏好，留在 localStorage（Skills/MCP 已改走真实 IPC 持久化）
+  // 外观是纯 UI 偏好，留在 localStorage（Skills 已改走真实 IPC 持久化）
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ appearance }))
@@ -102,10 +102,10 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (workspacePath) {
       resetChatWorkspace()
       resetMediaWorkspace()
-      resetExtensions()
+      resetSkills()
     }
-    await Promise.all([refreshChat(workspacePath), refreshMedia(workspacePath), refreshExtensions()])
-  }, [refreshChat, refreshMedia, refreshExtensions, resetChatWorkspace, resetMediaWorkspace, resetExtensions])
+    await Promise.all([refreshChat(workspacePath), refreshMedia(workspacePath), refreshSkills()])
+  }, [refreshChat, refreshMedia, refreshSkills, resetChatWorkspace, resetMediaWorkspace, resetSkills])
 
   const setAppearance = useCallback((patch: Partial<AppearanceSettings>) => {
     setAppearanceState((prev) => ({ ...prev, ...patch }))
@@ -125,8 +125,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [appearance, setAppearance]
   )
   const value = useMemo<SettingsState>(
-    () => ({ ...chat, ...media, ...extensions, ...appearanceValue, refreshAll }),
-    [chat, media, extensions, appearanceValue, refreshAll]
+    () => ({ ...chat, ...media, ...skillsState, ...appearanceValue, refreshAll }),
+    [chat, media, skillsState, appearanceValue, refreshAll]
   )
 
   // UI 层只依赖 isOpen/requestedTab（openSettings/closeSettings 恒定），面板开合不再重建数据域 value

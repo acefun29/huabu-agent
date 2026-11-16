@@ -21,7 +21,7 @@ export const MEDIA_SRC_MARKER = '[huabu:media-src '
 /** 锚点开头：幂等判断依据（已淘汰的块以它开头，重跑直接跳过） */
 const ANCHOR_HEAD = '[图片已从上下文移除'
 
-/** 标记行缺失时的占位路径（旧历史、未带标记的工具/MCP 结果） */
+/** 标记行缺失时的占位路径（旧历史、未带标记的工具结果） */
 const UNKNOWN_PATH = '路径未记录'
 
 /**
