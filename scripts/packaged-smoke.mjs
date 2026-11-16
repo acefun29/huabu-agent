@@ -75,9 +75,33 @@ record(
 const mediaProviders = await evalp('window.huabu.media.providers()')
 record('打包态 media:providers', mediaProviders.ok === true && mediaProviders.value.length >= 1, `count=${mediaProviders.value?.length}`)
 
-// 媒体协议：在打包态页面里注入 <img> 加载一个已知产物
-const mediaDir = path.join(PROJECT_ROOT, '.workspaces', 'full-scenario', '.huabu', 'media')
-const sample = fs.existsSync(mediaDir) ? fs.readdirSync(mediaDir).find((f) => f.endsWith('.png')) : null
+/*
+ * 媒体协议：在打包态页面里注入 <img> 加载当前工作区的一张图。
+ *
+ * 样本必须落在**当前打开的工作区**的产物目录里——`huabu-media://media/...` 只服务
+ * 当前工作区的 media 根，拿别的工作区的文件名去加载必然 404（此前写死了 full-scenario，
+ * 换工作区后这条就一直假失败）。当前工作区没有样本时临时生成一张，测完删掉。
+ */
+const activeWorkspace = wsState.workspace?.path ?? null
+const mediaDir = activeWorkspace ? path.join(activeWorkspace, '.huabu', 'media') : null
+let tempSample = null
+if (mediaDir) {
+  fs.mkdirSync(mediaDir, { recursive: true })
+  const existing = fs.readdirSync(mediaDir).find((f) => f.endsWith('.png'))
+  if (existing) {
+    tempSample = null
+  } else {
+    // 1x1 透明 PNG
+    fs.writeFileSync(
+      path.join(mediaDir, 'smoke-sample.png'),
+      Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64')
+    )
+    tempSample = path.join(mediaDir, 'smoke-sample.png')
+  }
+}
+const sample = mediaDir
+  ? (fs.existsSync(mediaDir) ? fs.readdirSync(mediaDir).find((f) => f.endsWith('.png')) : null)
+  : null
 if (sample) {
   // 工作区未恢复时先手动打开（生产构建无 __huabuStores 钩子，只能依赖自动恢复）
   if (!wsState.workspace) {
@@ -93,11 +117,20 @@ if (sample) {
     record('huabu-media:// 打包态可加载', String(load).startsWith('loaded'), String(load))
   }
 } else {
-  record('huabu-media:// 打包态可加载', false, '没有样例图片（先跑 full-scenario）')
+  record('huabu-media:// 打包态可加载', false, '当前工作区没有可用样例图')
 }
 
 const pong = await evalp('window.huabu.ping()')
 record('app:ping', pong === 'pong', String(pong))
+
+// 临时样本用完即删，不在用户工作区里留垃圾
+if (tempSample) {
+  try {
+    fs.rmSync(tempSample, { force: true })
+  } catch {
+    /* 尽力清理 */
+  }
+}
 
 session.close()
 // 关闭打包实例
