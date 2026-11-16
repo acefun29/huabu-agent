@@ -1,5 +1,5 @@
 import { Type } from 'typebox'
-import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
+import type { ToolDefinition } from './contracts'
 import {
   DEFAULT_MEDIA_DURATION_S,
   DEFAULT_MEDIA_RATIO,
@@ -20,6 +20,7 @@ import {
   type ModelCapabilities
 } from '../../shared/media'
 import { MEDIA_SRC_MARKER } from './contextEviction'
+import { artifactPathOf } from '../tools/produce'
 
 /** 宿主持有的工具定义（pi 的 ToolDefinition，类型擦除后无运行时依赖） */
 export type ToolDefinitionLike = ToolDefinition
@@ -559,6 +560,12 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
       // 图片产物与视频首帧同源（都是 final.artifact），一条标记即可覆盖整组图块
       if (images.length > 0) text += `\n${MEDIA_SRC_MARKER}${final.artifact.relPath}]`
       text += '请基于以上真实结果回答用户。'
+      /*
+       * 产物路径的**结构化回执**（A02）：`artifact.relPath` 是相对落盘目录的名字，
+       * 编排层要的是工作区相对路径。换算收口在 `tools/produce.ts`——那里同时做
+       * 越界归一与非法路径拒绝，这里不再另拼一份（两处各拼一次必然漂移）。
+       */
+      const artifactPath = artifactPathOf({ artifact: final.artifact, ...(final.outputDir ? { outputDir: final.outputDir } : {}), ...(final.artifactDirRel ? { artifactDirRel: final.artifactDirRel } : {}) })
       return {
         content: [{ type: 'text', text }, ...images],
         details: {
@@ -566,6 +573,9 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
           jobId: final.jobId,
           state: final.state,
           artifact: final.artifact,
+          artifactPath,
+          ...(final.outputDir ? { outputDir: final.outputDir } : {}),
+          ...(final.artifactDirRel ? { artifactDirRel: final.artifactDirRel } : {}),
           ...(final.params ? { params: final.params } : {})
         }
       }

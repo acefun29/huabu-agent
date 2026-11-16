@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai'
+import { InMemoryCredentialStore } from '../../contracts'
 import { Agent } from '@mastra/core/agent'
 import { InMemoryStore } from '@mastra/core/storage'
 import { MockMemory } from '@mastra/core/memory'

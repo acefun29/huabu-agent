@@ -56,11 +56,39 @@ interface JobRecord {
   cancelRequested?: boolean
   /** 本任务的落库目录（绝对路径；缺省 = 媒体产物目录），submit 时校验过越界 */
   outputDirAbs?: string
+  /**
+   * 任务所属工作区与它的媒体目录（R04：提交时钉住，之后不再随"当前工作区"漂移）。
+   *
+   * 共享的 manager 一直在用 `this.context()`——切到工作区 B 之后，A 的**在途任务**
+   * 会用 B 的媒体目录算产物路径、把账本写进 B 的 jobs.json。工作区归属必须跟着任务走。
+   */
+  workspaceDir?: string
+  mediaDirAbs?: string
   /** 净化后的产物文件主名（不含扩展名）；缺省 = jobId（随机 id 命名） */
   artifactName?: string
 }
 
 type WritableJobState = MediaJobStatus['state']
+/** 媒体任务运行所需的工作区上下文（宿主注入；R04 的任务归属以此为准） */
+export interface MediaJobContext {
+  /** 当前工作区媒体目录（绝对路径），未打开工作区时为 null */
+  mediaDir: string | null
+  /** 当前工作区根（绝对路径），落库目录越界校验用 */
+  workspaceDir: string | null
+  config: WorkspaceMediaConfig
+  /** 合并清单（内置目录 + 用户覆盖层），清单展示与提交校验的事实来源 */
+  providers: AdapterProviderConfig[]
+  /** 已实例化的适配器（按合并清单顺序） */
+  adapters: MediaProviderAdapter[]
+  /** 提交前校验：工作区是否可用 */
+  ready: boolean
+  /** 凭据来源探测（media:providers 的真实 authHint 用）；宿主未提供时回落适配器静态值 */
+  keySourceOf?: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
+  /** 读某供应商凭据明文（上传通道换临时引用用；适配器另有同一依赖） */
+  resolveKey?: (auth: { authKey?: string; authEnv?: string }) => Promise<string | undefined>
+  /** 素材库内容有变化的广播（产物落进库目录后调用，渲染端据此刷新素材库面板） */
+  notifyAssetsChanged: () => void
+}
 
 export class MediaJobManager {
   private readonly jobs = new Map<string, JobRecord>()
@@ -71,25 +99,7 @@ export class MediaJobManager {
 
   constructor(
     private readonly emit: (job: MediaJobStatus) => void,
-    private readonly context: () => {
-      /** 当前工作区媒体目录（绝对路径），未打开工作区时为 null */
-      mediaDir: string | null
-      /** 当前工作区根（绝对路径），落库目录越界校验用 */
-      workspaceDir: string | null
-      config: WorkspaceMediaConfig
-      /** 合并清单（内置目录 + 用户覆盖层），清单展示与提交校验的事实来源 */
-      providers: AdapterProviderConfig[]
-      /** 已实例化的适配器（按合并清单顺序） */
-      adapters: MediaProviderAdapter[]
-      /** 提交前校验：工作区是否可用 */
-      ready: boolean
-      /** 凭据来源探测（media:providers 的真实 authHint 用）；宿主未提供时回落适配器静态值 */
-      keySourceOf?: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
-      /** 读某供应商凭据明文（上传通道换临时引用用；适配器另有同一依赖） */
-      resolveKey?: (auth: { authKey?: string; authEnv?: string }) => Promise<string | undefined>
-      /** 素材库内容有变化的广播（产物落进库目录后调用，渲染端据此刷新素材库面板） */
-      notifyAssetsChanged: () => void
-    }
+    private readonly context: () => MediaJobContext
   ) {}
 
   /* ------------------------------------------------------------------ */
@@ -274,6 +284,9 @@ export class MediaJobManager {
       },
       adapter,
       input,
+      // 工作区归属随任务走（R04）：切工作区后不改变本任务的目录与账本
+      ...(ctx.workspaceDir ? { workspaceDir: ctx.workspaceDir } : {}),
+      mediaDirAbs: mediaDir,
       ...(outputDirAbs ? { outputDirAbs } : {}),
       ...(artifactName ? { artifactName } : {})
     }
@@ -321,7 +334,8 @@ export class MediaJobManager {
   /** 单个任务的生命周期：提交 → 轮询（退避+超时） → 下载落盘 → 事件 */
   private async runJob(record: JobRecord): Promise<void> {
     const { status, adapter } = record
-    const { mediaDir } = this.context()
+    // 任务的媒体目录在提交时钉住（R04）：切工作区后 A 的在途任务仍落在 A 的目录
+    const mediaDir = record.mediaDirAbs ?? this.context().mediaDir
     if (!mediaDir) return this.finish(record, 'failed', undefined, '工作区已关闭，任务中止')
     // 落库目录优先于默认产物目录（jobs.json 索引仍放默认目录，只有产物文件换位）
     const artifactDir = record.outputDirAbs ?? mediaDir
@@ -557,13 +571,20 @@ export class MediaJobManager {
     try {
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as { jobs?: MediaJobStatus[] }
       const jobs = Array.isArray(parsed.jobs) ? parsed.jobs : []
+      const ownerDir = this.context().workspaceDir ?? undefined
       // 历史记录只需要一个占位 adapter（永不再次提交），不依赖清单顺序之外的任何类型
       const placeholderAdapter = this.adapters()[0]
       let dirty = 0
       for (const old of jobs) {
         if (old.state === 'succeeded' || old.state === 'failed' || old.state === 'cancelled') {
           if (!this.jobs.has(old.jobId)) {
-            this.jobs.set(old.jobId, { status: old, adapter: placeholderAdapter, input: { prompt: old.prompt } })
+            this.jobs.set(old.jobId, {
+              status: old,
+              adapter: placeholderAdapter,
+              input: { prompt: old.prompt },
+              mediaDirAbs: mediaDir,
+              ...(ownerDir ? { workspaceDir: ownerDir } : {})
+            })
           }
           continue
         }
@@ -576,7 +597,13 @@ export class MediaJobManager {
         // 保留更新时间最大的那条（避免同 jobId 被旧账本覆盖本次会话的状态）
         const existing = this.jobs.get(old.jobId)
         if (!existing) {
-          this.jobs.set(old.jobId, { status: revived, adapter: placeholderAdapter, input: { prompt: old.prompt } })
+          this.jobs.set(old.jobId, {
+            status: revived,
+            adapter: placeholderAdapter,
+            input: { prompt: old.prompt },
+            mediaDirAbs: mediaDir,
+            ...(ownerDir ? { workspaceDir: ownerDir } : {})
+          })
         }
         dirty += 1
       }
@@ -632,19 +659,29 @@ export class MediaJobManager {
       this.persistTimer = null
     }
     this.persistDirty = false
-    const { mediaDir } = this.context()
-    if (!mediaDir) return
-    try {
-      mkdirSync(mediaDir, { recursive: true })
-      const file = resolve(mediaDir, 'jobs.json')
-      const payload = JSON.stringify({
-        version: 1,
-        savedAt: new Date().toISOString(),
-        jobs: [...this.jobs.values()].map((job) => job.status)
-      })
-      atomicWriteSync(file, payload)
-    } catch (error) {
-      console.warn(`[media-jobs] 任务账本写入失败：${String(error)}`)
+    /*
+     * 账本按**任务所属工作区**分文件（R04）：共享 manager 里的任务可能来自不同工作区，
+     * 一律写到"当前"媒体目录会把 A 的任务记进 B 的 jobs.json。按 mediaDirAbs 分组，
+     * 每组写到自己的目录；没有归属信息的（历史/占位记录）落当前目录。
+     */
+    const currentMediaDir = this.context().mediaDir
+    const groups = new Map<string, MediaJobStatus[]>()
+    for (const job of this.jobs.values()) {
+      const dir = job.mediaDirAbs ?? currentMediaDir
+      if (!dir) continue
+      const bucket = groups.get(dir)
+      if (bucket) bucket.push(job.status)
+      else groups.set(dir, [job.status])
+    }
+    for (const [mediaDir, jobs] of groups) {
+      try {
+        mkdirSync(mediaDir, { recursive: true })
+        const file = resolve(mediaDir, 'jobs.json')
+        const payload = JSON.stringify({ version: 1, savedAt: new Date().toISOString(), jobs })
+        atomicWriteSync(file, payload)
+      } catch (error) {
+        console.warn(`[media-jobs] 任务账本写入失败：${String(error)}`)
+      }
     }
   }
 }

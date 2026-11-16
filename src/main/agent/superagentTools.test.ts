@@ -25,6 +25,7 @@ function fakeRunner(options?: { failStart?: boolean; finishStatus?: BoardTask['s
       scope: '第02集/第2场',
       expert: 'expert-visual',
       attempts: 0,
+      requirementRevision: 1,
       updatedAt: '2026-03-01T00:00:00Z'
     },
     {
@@ -34,6 +35,7 @@ function fakeRunner(options?: { failStart?: boolean; finishStatus?: BoardTask['s
       scope: '第02集/第3场',
       expert: 'expert-visual',
       attempts: 2,
+      requirementRevision: 1,
       lastReason: '比例不符 16:9',
       updatedAt: '2026-03-01T00:01:00Z'
     }
@@ -50,7 +52,10 @@ function fakeRunner(options?: { failStart?: boolean; finishStatus?: BoardTask['s
     cancel: (dir: string, taskId: string) => {
       void dir
       cancelled.push(taskId)
-      return taskId === 'task-live' || taskId.startsWith('task-new-')
+      // 取消结果三态（A08）：stopped / stopping / not-running
+      if (taskId === 'task-stopping') return 'stopping'
+      if (taskId === 'task-live' || taskId.startsWith('task-new-')) return 'stopped'
+      return 'not-running'
     },
     appendUserChange: async () => {
       throw new Error('本测试不覆盖 user.changed')
@@ -70,6 +75,7 @@ function fakeRunner(options?: { failStart?: boolean; finishStatus?: BoardTask['s
         scope: String(request.scope ?? ''),
         expert: String(request.expert ?? 'expert-visual'),
         attempts: 0,
+        requirementRevision: 1,
         ...(status === 'attention' || status === 'blocked' ? { lastReason: '验收未通过' } : { lastArtifactId: 'art-new' }),
         updatedAt: '2026-03-01T00:02:00Z'
       })
@@ -126,6 +132,25 @@ describe('list_tasks', () => {
     expect(text).toContain('比例不符 16:9')
     expect(text).toContain('已试 2 次')
     expect(result.details.ok).toBe(true)
+  })
+
+  it('需求变更后，最新 prompt/accept 出现在模型可见文本里（A05）', async () => {
+    const { runner } = fakeRunner()
+    const tools = assembleSuperAgentTools({ currentDir: () => 'E:/ws', runner })
+    // 模拟用户在专家对话里改需求：投影上 prompt/accept 已更新、requirementChangedAt 有值
+    const board = await runner.board('E:/ws')
+    const target = board.tasks.find((task) => task.taskId === 'task-attention')
+    Object.assign(target!, {
+      prompt: '按 4:3 重新出一版，保留原构图',
+      accept: ['4:3', '角色与参考一致'],
+      requirementChangedAt: '2026-03-01T10:00:00Z',
+      requirementRevision: 2
+    })
+    const text = textOf(await runTool(tools, 'list_tasks', { status: 'attention' }))
+    // 关键：这些内容此前只在 details 里，模型的 toModelOutput 只拿 text → 看不到
+    expect(text).toContain('第 2 版')
+    expect(text).toContain('4:3')
+    expect(text).toContain('最新需求：按 4:3 重新出一版')
   })
 
   it('status 过滤：只看 attention', async () => {
@@ -279,6 +304,15 @@ describe('cancel_task', () => {
     const result = await runTool(tools, 'cancel_task', { taskId: 'task-old-done' })
     expect(textOf(result)).toContain('不在运行中')
     expect(result.details.cancelled).toBe(false)
+  })
+
+  it('超时未收口 → 不谎称已停止（A08）', async () => {
+    const result = await runTool(tools, 'cancel_task', { taskId: 'task-stopping' })
+    const text = textOf(result)
+    expect(text).toContain('发出取消请求')
+    expect(text).toContain('还没有收口')
+    expect(text).not.toContain('已取消任务')
+    expect(result.details.state).toBe('stopping')
   })
 
   it('缺 taskId → 指引从 list_tasks 取', async () => {

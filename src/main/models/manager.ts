@@ -1,4 +1,4 @@
-import type { CredentialStore } from '@earendil-works/pi-ai'
+import type { CredentialStore } from '../agent/contracts'
 import type {
   ChatModelApi,
   ChatProviderDef,

@@ -1,6 +1,14 @@
 /**
  * 派单工具（`list_tasks` / `delegate_tasks` / `cancel_task`）——主 Agent 指挥专家团的入口。
  *
+ * ⚠️ **已停用（施工计划 v4 第 6 步）**：`assembleSuperAgentTools` 不再被 `ipc/chat.ts` 装配，
+ * 模型拿不到这三个工具。任务模型改为 `tools/taskTools.ts` 的
+ * `create_task` / `finish_task` / `drop_task` / `list_tasks`（写 `work.*` 事件）。
+ *
+ * 为什么保留文件而不是删掉：专家编排（`superagent/orchestrator.ts`）与旧任务板仍在为
+ * **历史任务**提供只读展示与取消，删这一层会牵动 runner / IPC / 渲染端三处，属于纯收益为零的
+ * 大范围改动。要删就整条链路一起删，别只删这个文件。
+ *
  * 背景：专家池、任务板、journal 都已在主进程落地，但主 Agent 之前完全不知道它们存在。
  * 这三个工具把「看板 / 派单 / 取消」暴露给模型，且与 IPC 的 superagent 域共用同一条
  * 编排链（`SuperAgentRunner`）——不存在「Agent 走一套、UI 走另一套」的分叉。
@@ -40,7 +48,11 @@ const STATUS_LABEL: Record<string, string> = {
   attention: '待重派'
 }
 
-/** 工具参数里的引用（与 IPC 载荷同形，字段可省略处都是可选的） */
+/** 模型可见文本的截断：需求原文可能很长，进工具文本要收敛 */
+function truncateText(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
 function toIntentRefs(raw: unknown): SuperAgentAssetRef[] {
   if (!Array.isArray(raw)) return []
   const refs: SuperAgentAssetRef[] = []
@@ -111,6 +123,18 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
             task.attempts > 0 ? `已试 ${task.attempts} 次` : '',
             task.lastReason ? `原因：${task.lastReason}` : ''
           ].filter(Boolean)
+          /*
+           * 需求变化必须出现在**模型可见文本**里（A05）。此前新版 prompt/accept 只放在
+           * 工具结果的 details 里，而 mastra/tools.toModelOutput() 只把 text/images 交给
+           * 模型——主 Agent 因此看不到用户改过的需求，会按旧需求重派。
+           */
+          const changed = Boolean(task.requirementChangedAt)
+          if (changed && task.accept?.length) {
+            parts.push(`需求已更新至第 ${task.requirementRevision} 版：验收 ${task.accept.join('、')}`)
+          }
+          if (changed && task.prompt) {
+            parts.push(`最新需求：${truncateText(task.prompt, 200)}`)
+          }
           return parts.join(' · ')
         }),
         ...(filtered.length > rows.length ? [`-（另有 ${filtered.length - rows.length} 个未列出，可加 status/limit 缩小）`] : []),
@@ -118,7 +142,8 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
           ? wantedStatus
             ? `没有状态为「${STATUS_LABEL[wantedStatus] ?? wantedStatus}」的任务。`
             : '任务板是空的：还没有派过单。'
-          : '需要重派 attention 任务时，用相同 scope/prompt 再调 delegate_tasks（会生成新 taskId）。'
+          : '需要重派 attention 任务时，用相同 scope/prompt 再调 delegate_tasks 并填 supersedes=<旧 taskId>：' +
+            '旧任务会被标为已顶替，看板不会同时挂两条互不相关的行。'
       ]
       return {
         content: [{ type: 'text' as const, text: lines.join('\n') }],
@@ -163,7 +188,12 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
           ),
           adjacent: Type.Optional(Type.Array(Type.Object({}, { additionalProperties: true }))),
           negative: Type.Optional(Type.Array(Type.String())),
-          expert: Type.Optional(Type.String({ description: 'expert-visual（默认）/ expert-exec' }))
+          expert: Type.Optional(Type.String({ description: 'expert-visual（默认）/ expert-exec' })),
+          supersedes: Type.Optional(
+            Type.String({
+              description: '重派时填旧任务的 taskId（从 list_tasks 取）：旧任务会被标为已顶替，看板不再挂两条孤立行'
+            })
+          )
         }),
         { description: `要派的任务列表，一次最多 ${MAX_DELEGATE} 个` }
       ),
@@ -194,6 +224,7 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
           adjacent?: unknown
           negative?: unknown
           expert?: unknown
+          supersedes?: unknown
         } | null
         const scope = typeof task?.scope === 'string' ? task.scope.trim() : ''
         const prompt = typeof task?.prompt === 'string' ? task.prompt.trim() : ''
@@ -225,6 +256,10 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
           ...(negative.length ? { negative } : {}),
           ...(lane.length ? { lane } : {}),
           ...(typeof task?.expert === 'string' && task.expert.trim() ? { expert: task.expert.trim() } : {}),
+          // 重派关联（C14）：主 Agent 从 list_tasks 拿到旧 taskId 后回填
+          ...(typeof task?.supersedes === 'string' && task.supersedes.trim()
+            ? { supersedes: task.supersedes.trim() }
+            : {}),
           shadow
         })
         if (!started.ok) {
@@ -319,17 +354,18 @@ export function assembleSuperAgentTools(deps: SuperAgentToolDeps): ToolDefinitio
           details: { ok: false }
         }
       }
-      const cancelled = deps.runner.cancel(dir, taskId)
+      // 等终态落盘再回报（C16 / A08）：stopping = 取消请求已发但超时没等到收口，
+      // 不能对模型宣称「已经停止」
+      const outcome = await deps.runner.cancel(dir, taskId)
+      const text =
+        outcome === 'stopped'
+          ? `已取消任务 ${taskId}。正在进行的生成已被中断，任务状态为受阻（blocked），可在 list_tasks 里确认。`
+          : outcome === 'stopping'
+            ? `已向任务 ${taskId} 发出取消请求，但它还没有收口（模型或工具卡在不可中断的等待里）。稍后用 list_tasks 确认最终状态，不要重复取消。`
+            : `任务 ${taskId} 不在运行中（可能已完成、已取消或不存在）。可用 list_tasks 确认当前状态。`
       return {
-        content: [
-          {
-            type: 'text' as const,
-            text: cancelled
-              ? `已取消任务 ${taskId}。正在进行的生成会被中断，任务状态转为受阻（blocked）。`
-              : `任务 ${taskId} 不在运行中（可能已完成、已取消或不存在）。可用 list_tasks 确认当前状态。`
-          }
-        ],
-        details: { ok: true, cancelled, taskId }
+        content: [{ type: 'text' as const, text }],
+        details: { ok: true, cancelled: outcome !== 'not-running', state: outcome, taskId }
       }
     }
   }

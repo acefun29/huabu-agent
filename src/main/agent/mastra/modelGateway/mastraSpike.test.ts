@@ -10,7 +10,7 @@
  */
 
 import { afterAll, describe, expect, it } from 'vitest'
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai'
+import { InMemoryCredentialStore } from '../../contracts'
 import { Agent } from '@mastra/core/agent'
 import { createTool } from '@mastra/core/tools'
 import { ChatModelManager } from '../../../models/manager'

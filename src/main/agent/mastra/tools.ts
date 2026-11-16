@@ -108,6 +108,7 @@ function toMastraTool(tool: ToolDefinitionLike, ctx: ToolBridgeContext) {
         )) as {
           content?: Array<{ type: string; text?: string; data?: string; mimeType?: string }>
           details?: unknown
+          isError?: boolean
         } | undefined
         const texts: string[] = []
         const images: Array<{ mimeType: string; bytes: number; data?: string }> = []
@@ -123,6 +124,10 @@ function toMastraTool(tool: ToolDefinitionLike, ctx: ToolBridgeContext) {
         }
         const output: AdaptedToolOutput = {
           text: texts.join('\n') || '(无文本输出)',
+          // 工具自己判定的失败要带出去：toModelOutput 只有看到 isError 才会输出
+          // error-text。此前这里没传，导致「工具返回失败」在模型侧表现为正常结果
+          // （工具卡也显示成功），只有真的抛异常才走 catch 那支。
+          ...(result?.isError === true ? { isError: true } : {}),
           ...(images.length ? { images } : {}),
           ...(result?.details !== undefined ? { details: result.details } : {}),
         }

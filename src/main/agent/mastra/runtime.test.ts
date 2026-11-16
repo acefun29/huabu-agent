@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai'
+import { InMemoryCredentialStore } from '../contracts'
 import { ChatModelManager } from '../../models/manager'
 import type { ChatEvent, ChatRuntimeInfo } from '../../../shared/ipc'
 import { MastraAgentRuntime, type MastraRuntimeDeps } from './runtime'
@@ -65,6 +65,8 @@ function stubDeps(overrides: Partial<MastraRuntimeDeps> = {}): MastraRuntimeDeps
       value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo,
     }),
     assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
     ...overrides,
   }
 }
@@ -104,22 +106,85 @@ describe('MastraAgentRuntime 契约（无网络）', () => {
     expect(dup).toMatchObject({ ok: false, code: 'session_exists' })
   })
 
-  it('旧 JSONL sessionFile / history 被前缀闸门挡下（Phase 5 迁移前不误读）', async () => {
+  it('旧 JSONL sessionFile 不再硬失败：按新线程开，历史回放给空（批次 3 的前置）', async () => {
     const rt = new MastraAgentRuntime(stubDeps())
-    const created = await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1', sessionFile: 'W:\\fake-ws\\.huabu\\sessions\\x.jsonl' })
-    expect(created).toMatchObject({ ok: false, code: 'unknown' })
+    const created = await rt.create({
+      nodeId: 'n1',
+      modelId: 'stub-a/a1',
+      sessionFile: 'W:\\fake-ws\\.huabu\\sessions\\x.jsonl'
+    })
+    // 关键：不再 fail。翻默认运行时之后，老会话必须还能发出去（否则整个会话不可用）
+    expect(created.ok).toBe(true)
+    // 返回的句柄是新的 mastra: 线程 → 渲染端 meta 会被 onBound 覆盖，自愈
+    expect(created.ok && created.value.sessionFile?.startsWith('mastra:')).toBe(true)
+
     const history = await rt.history({ nodeId: 'n2', sessionFile: 'W:\\x.jsonl' })
-    expect(history).toMatchObject({ ok: false, code: 'unknown' })
+    // 旧 JSONL 没有可回放的历史：空表而不是错误（错误会让渲染端每次切回都重试并刷 warn）
+    expect(history).toMatchObject({ ok: true, value: { messages: [] } })
   })
 
-  it('未创建会话的显式失败：steer / compact / fork；prompt → session_missing', async () => {
+  it('cwd 守卫（A10）：越界与工作区内子目录都明确拒绝，不再静默落到工作区根', async () => {
+    const ws = mkdtempSync(join(tmpdir(), 'huabu-mastra-cwd-'))
+    const rt = new MastraAgentRuntime(stubDeps({ currentDir: () => ws }))
+    // 越界：README 承诺的「cwd 越出工作区一律拒绝」此前在 Mastra 路径上并不成立
+    const outside = await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1', cwd: join(ws, '..', 'elsewhere') })
+    expect(outside).toMatchObject({ ok: false, code: 'cwd_rejected' })
+    // 工作区内子目录：记忆库按工作区建，用子目录会另开一个 mastra.db → 同样拒绝
+    const sub = await rt.create({ nodeId: 'n2', modelId: 'stub-a/a1', cwd: join(ws, 'scenes') })
+    expect(sub).toMatchObject({ ok: false, code: 'cwd_rejected' })
+    // 等于工作区根：放行（渲染端会带这个值）
+    const same = await rt.create({ nodeId: 'n3', modelId: 'stub-a/a1', cwd: ws })
+    expect(same.ok).toBe(true)
+  })
+
+  it('界面历史读全量，不受模型 lastMessages 限制（A11）', async () => {
+    const ws = mkdtempSync(join(tmpdir(), 'mastra-hist-'))
+    stubWsDirs.push(ws)
+    const memory = await mastraMemoryFor(ws)
+    const threadId = 'node-hist-cap'
+    const now = new Date('2026-01-01T00:00:00Z')
+    await memory.saveThread({
+      thread: { id: threadId, resourceId: MEMORY_RESOURCE, title: 'hist', createdAt: now, updatedAt: now }
+    })
+    // 60 条 > Memory 的 lastMessages: 50
+    await memory.saveMessages({
+      messages: Array.from({ length: 60 }, (_, i) => ({
+        id: `msg-${i}`,
+        threadId,
+        resourceId: MEMORY_RESOURCE,
+        role: (i % 2 === 0 ? 'user' : 'assistant') as 'user' | 'assistant',
+        content: { format: 2, parts: [{ type: 'text' as const, text: `M${i}` }] },
+        createdAt: new Date(now.getTime() + i * 1000)
+      }))
+    })
+
+    const rt = new MastraAgentRuntime(stubDeps({ currentDir: () => ws }))
+    const result = await rt.history({ nodeId: 'n1', sessionFile: `mastra:${threadId}` })
+    expect(result.ok).toBe(true)
+    const messages = result.ok ? result.value.messages : []
+    // 修复前 recall 默认分页 → 只有 50 条（早期消息还在库里，属于回放截断）
+    expect(messages.length).toBe(60)
+    expect(messages[0]?.text).toBe('M0')
+    await rt.disposeAll()
+  })
+
+  it('未创建会话的显式失败：steer / compact；prompt → session_missing', async () => {
     const rt = new MastraAgentRuntime(stubDeps())
     // steer 已实装（Mastra signals）：未创建会话才是 session_missing
     expect(await rt.steer({ nodeId: 'n1', text: 'x' })).toMatchObject({ ok: false, code: 'session_missing' })
     // compact 已实装（Phase 2 收尾）：未创建会话才是 session_missing
     expect(await rt.compact({ nodeId: 'n1' })).toMatchObject({ ok: false, code: 'session_missing' })
-    expect(await rt.fork({ nodeId: 'n1', sessionFile: 'mastra:t' })).toMatchObject({ ok: false, code: 'unknown' })
     expect(await rt.prompt({ nodeId: 'ghost', text: 'hi' })).toMatchObject({ ok: false, code: 'session_missing' })
+  })
+
+  it('fork：旧 JSONL 句柄明确拒绝（不造空线程冒充成功）；mastra 句柄走复制', async () => {
+    const rt = new MastraAgentRuntime(stubDeps())
+    const legacy = await rt.fork({ nodeId: 'n1', sessionFile: 'W:\\ws\\.huabu\\sessions\\x.jsonl' })
+    expect(legacy).toMatchObject({ ok: false, code: 'unknown' })
+    expect(legacy.ok === false && legacy.error).toContain('旧 JSONL')
+    // 不存在源线程时复制会失败，但绝不能返回一个假的成功句柄
+    const ghost = await rt.fork({ nodeId: 'n1', sessionFile: 'mastra:no-such-thread' })
+    expect(ghost.ok).toBe(false)
   })
 
   it('setModel / setThinking：非法值拒绝，合法值更新会话', async () => {
@@ -142,6 +207,23 @@ describe('MastraAgentRuntime 契约（无网络）', () => {
     await rt.create({ nodeId: 'n1', modelId: 'stub-a/a1' })
     expect(await rt.abort({ nodeId: 'n1' })).toMatchObject({ ok: true })
     expect(await rt.abort({ nodeId: 'ghost' })).toMatchObject({ ok: false, code: 'session_missing' })
+  })
+
+  it('disposeAll：按工作区过滤释放，收口后节点回到未创建（A3）', async () => {
+    // currentDir 固定成一个目录，两次 create 才是同一个工作区的两个会话
+    const fixed = mkdtempSync(join(tmpdir(), 'mastra-rt-stub-'))
+    stubWsDirs.push(fixed)
+    const rt = new MastraAgentRuntime(stubDeps({ currentDir: () => fixed }))
+    expect((await rt.create({ nodeId: 'd1', modelId: 'stub-a/a1' })).ok).toBe(true)
+    expect((await rt.create({ nodeId: 'd2', modelId: 'stub-a/a1' })).ok).toBe(true)
+
+    // 别的工作区不受影响：只释放匹配的那个目录
+    expect(rt.disposeAll(join(fixed, 'other'))).toBe(0)
+    expect(await rt.abort({ nodeId: 'd1' })).toMatchObject({ ok: true })
+
+    expect(rt.disposeAll(fixed)).toBe(2)
+    expect(await rt.abort({ nodeId: 'd1' })).toMatchObject({ ok: false, code: 'session_missing' })
+    expect(rt.disposeAll()).toBe(0)
   })
 })
 
@@ -186,6 +268,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
           value: { ready: true, models: [], configuredProviders: ['deepseek'] } satisfies ChatRuntimeInfo,
         }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
 
       const created = await rt.create({ nodeId: 'e2e-1' })
@@ -250,6 +334,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       // 上一用例的 thread（node-e2e-1）落在同一个工作区库里
       const created = await rt2.create({ nodeId: 'e2e-2', sessionFile: 'mastra:node-e2e-1' })
@@ -262,6 +348,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       // 用 e2e-2（绑定同 thread）继续问，历史应可见
       await rt3.create({ nodeId: 'e2e-2', sessionFile: 'mastra:node-e2e-1' })
@@ -289,6 +377,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       await rtTh.create({ nodeId: 'e2e-thinking' })
       expect(await rtTh.setThinking({ nodeId: 'e2e-thinking', thinkingLevel: 'high' })).toMatchObject({ ok: true })
@@ -340,6 +430,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [visionTool as never],
+        disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       // 临时工作区跨测试运行复用，threadId 又是确定性的——脏历史会污染 vision 判定，
       // 每次运行用唯一 nodeId 开新 thread
@@ -389,6 +481,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       await rtSt.create({ nodeId: 'e2e-steer' })
       // 启动一个较长的生成，等出现首个 delta 后插话
@@ -435,6 +529,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       await rtOm.create({ nodeId: 'e2e-om' })
       // 两轮真实对话（制造可观察历史）
@@ -483,6 +579,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       await rtWm.create({ nodeId: 'e2e-wm' })
       const p = await rtWm.prompt({
@@ -529,6 +627,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [fakeTool as never],
+        disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       const created = await rtTools.create({ nodeId: 'e2e-tools' })
       expect(created.ok && created.value.activeTools).toEqual(['echo_card'])
@@ -576,6 +676,8 @@ describe.skipIf(!DEEPSEEK_KEY)('MastraAgentRuntime E2E（DeepSeek 真模型）',
         managerForWorkspace: async () => manager,
         runtimeInfo: async () => ({ ok: true as const, value: { ready: true, models: [], configuredProviders: [] } satisfies ChatRuntimeInfo }),
         assembleTools: async () => [],
+    disabledSkills: () => [],
+    builtinSkillRoots: () => [],
       })
       await rt4.create({ nodeId: 'e2e-rollback' })
       const p = await rt4.prompt({ nodeId: 'e2e-rollback', text: '只回复：好' })

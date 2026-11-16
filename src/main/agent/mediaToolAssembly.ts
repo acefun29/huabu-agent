@@ -84,6 +84,35 @@ export interface MediaAssemblyDeps {
     nodeId: string,
     signal: AbortSignal | undefined
   ) => Promise<boolean>
+  /**
+   * 产物落盘目录覆盖（**专家 = 任务 lane**，A02）。返回 undefined = 走默认落库链。
+   *
+   * 缺了它会发生什么：专家按默认库把图写到 `assets/images`，而任务 lane 是
+   * `scenes/s3/`，编排器随后用 `isPathAllowed()` 判越界——钱已经花了，产物却
+   * 过不了验收。所有有写入副作用的工具都必须遵守同一任务写区。
+   */
+  outputDirFor?: (kind: 'image' | 'video' | 'audio') => string | undefined
+}
+
+/**
+ * 任务 lane → 媒体落盘目录（工作区相对路径）。
+ *
+ * lane 是写区前缀（如 `scenes/s3/`），产物必须落在其中，所以取第一条可用前缀并
+ * 去掉首尾斜杠。绝对路径、盘符、`..` 穿越一律跳过；全部不可用返回 undefined，
+ * 由调用方回退默认落库链（mediaManager 侧还会再校验一次目录必须在工作区内）。
+ */
+export function laneOutputDir(lane: readonly string[]): string | undefined {
+  for (const raw of lane) {
+    const trimmed = raw.trim()
+    if (!trimmed) continue
+    const normalized = trimmed.replace(/\\/g, '/').replace(/^\.\//, '')
+    // 绝对路径 / 盘符 / 穿越都不可用：宁可回退默认链，也不把「写区」解释成别处
+    if (normalized.startsWith('/') || normalized.startsWith('..') || /^[a-zA-Z]:/.test(normalized)) continue
+    const cleaned = normalized.replace(/\/+$/, '')
+    if (!cleaned) continue
+    return cleaned
+  }
+  return undefined
 }
 
 /**
@@ -142,8 +171,11 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
       const { providers: effective, config } = mediaContext()
       const resolution = resolveAgentMedia(effective, config, input.kind)
       // Agent 生成同样走落库链（类型默认 > 全局默认 > 公共库 > 画布素材分类），
-      // 与画布卡片/设置页同一套语义——否则 Agent 生成的产物永远留在隐藏产物目录
-      const outputLibrary = resolveOutputLibrary(store, config, input.kind)
+      // 与画布卡片/设置页同一套语义——否则 Agent 生成的产物永远留在隐藏产物目录。
+      // 专家有任务写区时以 lane 为准（A02）：生成必须落在自己的 lane 内，否则会被
+      // 编排器判越界——钱花了、产物却过不了验收。
+      const outputLibrary =
+        deps.outputDirFor?.(input.kind) ?? resolveOutputLibrary(store, config, input.kind)
       const { jobId } = await mediaManager.submit({
         kind: input.kind,
         provider: resolution.provider,

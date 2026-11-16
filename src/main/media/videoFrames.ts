@@ -224,6 +224,38 @@ async function probeDurationSec(ffmpegPath: string, absPath: string): Promise<nu
   return Number.isFinite(sec) && sec > 0 ? sec : null
 }
 
+/**
+ * 探测音视频的**真实**尺寸与时长（验收器用，A04）。
+ *
+ * 只读 `ffmpeg -i` 的 stderr，不引 ffprobe：视频流那一行形如
+ * `Stream #0:0: Video: h264 ..., 1920x1080, ...`，时长在 `Duration: 00:00:05.10`。
+ *
+ * 为什么验收需要它：此前视频的宽高与时长全部取自**模型回执**，等于让被验的一方
+ * 自己出证据——写一个字符串存成 `.mp4`、回执里填 `width:1920,durationS:5`，
+ * 所有任务标准都会「通过」。拿不到真实值时返回 null，由验收器记为证据缺口，
+ * 而不是把自报值当测量值。
+ */
+export async function probeMediaMetadata(
+  absPath: string
+): Promise<{ width?: number; height?: number; durationS?: number } | null> {
+  const ffmpegPath = resolveFfmpegBinary()
+  if (!ffmpegPath) return null
+  const run = await runFfmpeg(ffmpegPath, ['-hide_banner', '-i', absPath], FRAME_SPAWN_TIMEOUT_MS)
+  const text = run.stderr
+  const out: { width?: number; height?: number; durationS?: number } = {}
+  const dims = /Video:.*?(\d{2,5})x(\d{2,5})/.exec(text)
+  if (dims) {
+    out.width = Number(dims[1])
+    out.height = Number(dims[2])
+  }
+  const duration = /Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)/.exec(text)
+  if (duration) {
+    const sec = Number(duration[1]) * 3600 + Number(duration[2]) * 60 + Number(duration[3])
+    if (Number.isFinite(sec) && sec > 0) out.durationS = sec
+  }
+  return out.width || out.height || out.durationS ? out : null
+}
+
 /** 均匀采样取"区间中点"而不是端点：t=0 常是黑场，t=duration 会 seek 到文件尾 */
 function uniformMidpoints(startSec: number, endSec: number, count: number): number[] {
   const span = endSec - startSec

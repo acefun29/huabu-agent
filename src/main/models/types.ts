@@ -3,9 +3,8 @@ import type {
   OpenAICompletionsCompat,
   OpenAIResponsesCompat,
   ModelCost,
-  ThinkingLevel,
-  ThinkingTokenBudgetField
-} from '@earendil-works/pi-ai'
+  ThinkingLevel
+} from '../agent/contracts'
 
 /**
  * 聊天模型目录的类型（架构计划 §3）。
@@ -32,9 +31,10 @@ import type { ChatModelApi } from '../../shared/chatApi'
 /**
  * api → compat 类型映射。
  *
- * 直接复用 pi-ai 的 compat 接口，而不是自己抄一遍字段名：pi 的 `Model.compat` 本身就是
- * 按 api 条件取的（types.d.ts:736），抄一份必然漂移。复用带来的**类型级保证**正是我们需要的——
+ * 直接复用**本地** contracts 的 compat 接口，而不是自己抄一遍字段名：`Model.compat` 本身
+ * 就是按 api 条件取的，抄一份必然漂移。枚举带来的**类型级保证**正是我们需要的——
  * 写错 compat 键名（`thinkingFormats`）会被 tsc 拒绝，而运行时它是静默失效的。
+ * （键集合来自目录实际读写的真实键，见 contracts.ts 文件头。）
  */
 export type ChatCompatFor<A extends ChatModelApi> = A extends 'openai-completions'
   ? OpenAICompletionsCompat
@@ -213,4 +213,4 @@ export interface EffectiveChatProvider {
   models: EffectiveChatModel[]
 }
 
-export type { ThinkingTokenBudgetField }
+export type { ThinkingTokenBudgetField } from '../agent/contracts'

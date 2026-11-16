@@ -51,12 +51,25 @@ export interface AdapterProviderConfig {
   models: AdapterModelConfig[]
 }
 
-/** 适配器运行所需的环境依赖（宿主注入，适配器不自取） */
+/** 适配器运行所需的环境依赖（宿主注入，适配器不自取）。已绑定工作区，适配器不感知"当前工作区" */
 export interface AdapterDeps {
-  /** 当前工作区媒体目录绝对路径；未打开工作区时为 null */
+  /** 所属工作区的媒体目录绝对路径（创建时钉住）；未打开工作区时为 null */
   mediaDir: () => string | null
   /** 读某供应商凭据明文（加密存储优先，回退 authEnv 声明的环境变量）。绝不进日志 */
   resolveKey: (auth: { authKey?: string; authEnv?: string }) => Promise<string | undefined>
+}
+
+/**
+ * 宿主提供给 `createAdapters` 的依赖（R04）：凭据解析**显式带工作区**。
+ *
+ * 此前这条闭包内部读全局 currentDir——切到工作区 B 之后，A 的在途任务会拿 B 的 Key
+ * 去请求供应商。现在工作区是参数，`createAdapters` 负责把它绑进每个适配器。
+ */
+export interface AdapterHostDeps extends Omit<AdapterDeps, 'resolveKey'> {
+  resolveKey: (
+    auth: { authKey?: string; authEnv?: string },
+    workspace: string | null
+  ) => Promise<string | undefined>
 }
 
 export type AdapterFactory = (deps: AdapterDeps, config: AdapterProviderConfig) => MediaProviderAdapter
@@ -163,13 +176,29 @@ export function isRegisteredAdapterType(type: string): type is MediaProviderType
   return registry.has(type as MediaProviderType)
 }
 
-/** 按合并清单实例化适配器；未注册的类型在这里显式报错，绝不静默忽略 */
-export function createAdapters(providers: readonly AdapterProviderConfig[], deps: AdapterDeps): MediaProviderAdapter[] {
+/**
+ * 按合并清单实例化适配器；未注册的类型在这里显式报错，绝不静默忽略。
+ *
+ * `workspace` = 这批适配器所属工作区（R04）。创建时把两件事钉死：
+ * - 媒体目录取**创建时**的值（适配器不会跟着当前工作区漂移）；
+ * - 凭据解析带上这个工作区（不再由闭包内部读 currentDir）。
+ * 适配器自身的调用签名不变，拿到的是已绑定工作区的 deps。
+ */
+export function createAdapters(
+  providers: readonly AdapterProviderConfig[],
+  deps: AdapterHostDeps,
+  workspace: string | null
+): MediaProviderAdapter[] {
+  const mediaDir = deps.mediaDir()
+  const bound: AdapterDeps = {
+    mediaDir: () => mediaDir,
+    resolveKey: (auth) => deps.resolveKey(auth, workspace)
+  }
   return providers.map((config) => {
     const factory = registry.get(config.type)
     if (!factory) {
       throw new Error(`适配器类型未注册：${config.type}（provider ${config.id}）`)
     }
-    return factory(deps, config)
+    return factory(bound, config)
   })
 }

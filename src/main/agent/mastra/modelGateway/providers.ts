@@ -149,6 +149,109 @@ function toReasoningEffort(level: string | undefined): string | undefined {
   return level
 }
 
+/** 目录 compat 的窄视图（只取网关真的会消费的键，A06） */
+interface CompletionsCompatView {
+  supportsReasoningEffort?: boolean
+  thinkingFormat?: string
+  requiresReasoningContentOnAssistantMessages?: boolean
+  /** 思考预算走哪个顶层字段（千问：thinking_budget） */
+  thinkingTokenBudgetField?: string
+  /** max tokens 的字段名（缺省 max_tokens） */
+  maxTokensField?: string
+}
+
+interface AnthropicCompatView {
+  forceAdaptiveThinking?: boolean
+}
+
+function completionsCompatOf(target: ProviderTarget): CompletionsCompatView {
+  return (target.compat ?? {}) as CompletionsCompatView
+}
+
+/**
+ * 按目录声明的 `thinkingFormat` 写思考参数（A06）。
+ *
+ * 此前网关只 `body.reasoning_effort = effort`：`supportsReasoningEffort=false` 的供应商
+ * 照样收到该字段，`thinkingFormat=qwen/zai/...` 的形态字段（`enable_thinking` /
+ * `thinking` / `chat_template_kwargs`）一个都不发——目录里写的兼容配置等于没生效。
+ * 形态表对齐 pi 的参考实现（pi-ai/openai-completions），只实现目录实际会用到的几种；
+ * 未列出的 format 只发 reasoning_effort，未知值不会崩。
+ */
+function applyCompletionsThinking(
+  body: Record<string, unknown>,
+  compat: CompletionsCompatView,
+  effort: string | undefined
+): void {
+  const format = compat.thinkingFormat
+  const supportsEffort = compat.supportsReasoningEffort !== false
+  if (effort) {
+    switch (format) {
+      case 'zai':
+        body.thinking = { type: 'enabled', clear_thinking: false }
+        break
+      case 'qwen':
+        body.enable_thinking = true
+        break
+      case 'qwen-chat-template':
+        body.chat_template_kwargs = { enable_thinking: true, preserve_thinking: true }
+        break
+      case 'deepseek':
+        body.thinking = { type: 'enabled' }
+        break
+      case 'openrouter':
+        body.reasoning = { effort }
+        return
+      case 'together':
+        body.reasoning = { enabled: true }
+        break
+      case 'string-thinking':
+        body.thinking = effort
+        return
+      case 'ant-ling':
+        body.reasoning = { effort }
+        return
+      case 'chat-template':
+      case 'baseten':
+        // chat-template 的参数需要模型级的 template kwargs，目录未提供时不发（不是漏发：没有值可发）
+        break
+      default:
+        break
+    }
+  } else if (format === 'qwen') {
+    // 显式关闭：qwen 用布尔开关而不是省略字段
+    body.enable_thinking = false
+    return
+  } else if (format === 'zai' || format === 'deepseek') {
+    body.thinking = { type: 'disabled' }
+    return
+  }
+  if (effort && supportsEffort && format !== 'qwen-chat-template') {
+    body.reasoning_effort = effort
+  }
+}
+
+/**
+ * 思考预算走顶层字段（`thinkingTokenBudgetField`，如千问的 `thinking_budget`）。
+ *
+ * 目录里 qwen 的两个条目声明了这个键，但网关从没发过——"目录声明了"不等于"发送层实现了"。
+ * 取值对齐 pi 的默认档位表；共享 max_tokens 的协议要留出回答空间（至少 1024），
+ * 否则思考会把整个响应预算吃光、连工具调用都放不下。
+ */
+const THINKING_BUDGETS: Record<string, number> = { minimal: 1024, low: 2048, medium: 8192, high: 16384 }
+const MIN_ANSWER_TOKENS = 1024
+
+function applyThinkingBudget(
+  body: Record<string, unknown>,
+  field: string | undefined,
+  effort: string | undefined,
+  maxTokensCeiling: number
+): void {
+  if (!field || !effort) return
+  const budget = THINKING_BUDGETS[effort] ?? THINKING_BUDGETS.medium!
+  const capped = Math.min(budget, Math.max(0, maxTokensCeiling - MIN_ANSWER_TOKENS))
+  if (capped > 0) body[field] = capped
+}
+
 /* ------------------------------------------------ OpenAI Chat Completions */
 
 interface OAToolCallAcc {
@@ -166,10 +269,16 @@ async function* callOpenAICompletions(req: ProviderCallRequest): AsyncIterable<P
     stream: true,
     stream_options: { include_usage: true },
   }
-  if (req.maxOutputTokens) body.max_tokens = Math.min(req.maxOutputTokens, target.maxTokens)
+  // max tokens 字段名由目录 compat 决定（`maxTokensField`）；缺省 max_tokens
+  const maxTokensCeiling = req.maxOutputTokens ? Math.min(req.maxOutputTokens, target.maxTokens) : target.maxTokens
+  const maxTokensField =
+    completionsCompatOf(target).maxTokensField === 'max_completion_tokens' ? 'max_completion_tokens' : 'max_tokens'
+  if (req.maxOutputTokens) body[maxTokensField] = maxTokensCeiling
   if (req.temperature != null) body.temperature = req.temperature
+  const completionsCompat = completionsCompatOf(target)
   const effort = toReasoningEffort(req.reasoning)
-  if (effort) body.reasoning_effort = effort
+  applyCompletionsThinking(body, completionsCompat, effort)
+  applyThinkingBudget(body, completionsCompat.thinkingTokenBudgetField, effort, maxTokensCeiling)
   if (req.tools?.length) {
     body.tools = req.tools.map((tool) => ({
       type: 'function',
@@ -247,6 +356,8 @@ async function* callOpenAICompletions(req: ProviderCallRequest): AsyncIterable<P
 
 /** 网关消息 → OpenAI chat 消息（assistant toolCall 走 tool_calls；tool 走 role=tool） */
 function toOpenAIMessages(req: ProviderCallRequest): unknown[] {
+  // 回放历史 assistant 时要按目录 compat 决定是否补 reasoning_content（A06）
+  const completionsCompat = completionsCompatOf(req.target)
   const out: unknown[] = []
   if (req.system) out.push({ role: 'system', content: req.system })
   for (const msg of req.messages) {
@@ -260,8 +371,23 @@ function toOpenAIMessages(req: ProviderCallRequest): unknown[] {
     }
     if (msg.role === 'assistant') {
       const texts = msg.content.filter((p) => p.type === 'text').map((p) => (p as { text: string }).text)
+      const thinking = msg.content
+        .filter((p) => p.type === 'thinking')
+        .map((p) => (p as { text: string }).text)
+        .join('')
       const calls = msg.content.filter((p) => p.type === 'tool-call')
       const entry: Record<string, unknown> = { role: 'assistant', content: texts.join('') || null }
+      /*
+       * 历史 assistant 的思考内容不能直接丢（A06）：DeepSeek 这类供应商要求带
+       * `reasoning_content` 字段（pi 的 compat 键 requiresReasoningContentOnAssistantMessages）。
+       * 缺字段会被判成非法请求，而此前的转换只看 text/tool-call。
+       * 有真实思考文本就回传；没有则按参考实现补空串（字段存在即可）。
+       */
+      if (completionsCompat.requiresReasoningContentOnAssistantMessages) {
+        entry.reasoning_content = thinking || ''
+      } else if (thinking) {
+        entry.reasoning_content = thinking
+      }
       if (calls.length) {
         entry.tool_calls = calls.map((p) => {
           const c = p as { toolCallId: string; toolName: string; args: Record<string, unknown> }
@@ -371,6 +497,8 @@ async function* callOpenAIResponses(req: ProviderCallRequest): AsyncIterable<Pro
 
   let finishReason = 'stop'
   const toolAcc = new Map<string, { name: string; argsText: string }>()
+  /** item_id → call_id 别名（Responses 的参数分片可能只带前者，A06） */
+  const itemToCall = new Map<string, string>()
   for await (const data of readSse(response)) {
     if (data === '[DONE]') break
     let event: { type?: string; [key: string]: unknown }
@@ -388,16 +516,30 @@ async function* callOpenAIResponses(req: ProviderCallRequest): AsyncIterable<Pro
         if (typeof event.delta === 'string') yield { type: 'thinking', text: event.delta }
         break
       case 'response.output_item.added': {
-        const item = event.item as { type?: string; call_id?: string; name?: string } | undefined
+        const item = event.item as { type?: string; id?: string; call_id?: string; name?: string } | undefined
         if (item?.type === 'function_call' && item.call_id) {
           toolAcc.set(item.call_id, { name: item.name ?? '', argsText: '' })
+          // 参数分片可能只带 item_id（与 call_id 不同）：建一份别名，否则增量全丢（A06）
+          if (item.id) itemToCall.set(item.id, item.call_id)
         }
         break
       }
       case 'response.function_call_arguments.delta': {
-        const callId = typeof event.call_id === 'string' ? event.call_id : typeof event.item_id === 'string' ? event.item_id : ''
+        const raw =
+          typeof event.call_id === 'string' ? event.call_id : typeof event.item_id === 'string' ? event.item_id : ''
+        // 先用 item_id → call_id 的别名映射，再回退到原始 id
+        const callId = itemToCall.get(raw) ?? raw
         const acc = toolAcc.get(callId)
         if (acc && typeof event.delta === 'string') acc.argsText += event.delta
+        break
+      }
+      case 'response.function_call_arguments.done': {
+        // 有些供应商只在 done 里给完整 arguments：delta 全丢时用它兜底
+        const raw =
+          typeof event.call_id === 'string' ? event.call_id : typeof event.item_id === 'string' ? event.item_id : ''
+        const callId = itemToCall.get(raw) ?? raw
+        const acc = toolAcc.get(callId)
+        if (acc && !acc.argsText && typeof event.arguments === 'string') acc.argsText = event.arguments
         break
       }
       case 'response.completed': {
@@ -439,10 +581,21 @@ async function* callAnthropicMessages(req: ProviderCallRequest): AsyncIterable<P
   if (req.system || system) body.system = [req.system, system].filter(Boolean).join('\n\n')
   if (req.temperature != null) body.temperature = req.temperature
   const effort = toReasoningEffort(req.reasoning)
-  // Anthropic 用 thinking.budget_tokens；档位 → 预算（比例取自模型 maxTokens）
+  /*
+   * Anthropic 的思考形态由目录 compat 决定（A06）：`forceAdaptiveThinking` 的模型
+   * 要发 `{ type: 'adaptive' }` + `output_config.effort`；老模型走 budget_tokens。
+   * 此前一律发 budget 形态，自适应思考的模型（Claude 新系）会拒收。
+   */
+  const anthropicCompat = (target.compat ?? {}) as AnthropicCompatView
   if (effort) {
-    const ratio = effort === 'minimal' ? 0.05 : effort === 'low' ? 0.1 : effort === 'medium' ? 0.2 : 0.4
-    body.thinking = { type: 'enabled', budget_tokens: Math.max(1024, Math.floor(target.maxTokens * ratio)) }
+    if (anthropicCompat.forceAdaptiveThinking === true) {
+      body.thinking = { type: 'adaptive' }
+      body.output_config = { effort }
+    } else {
+      // 档位 → 预算（比例取自模型 maxTokens）
+      const ratio = effort === 'minimal' ? 0.05 : effort === 'low' ? 0.1 : effort === 'medium' ? 0.2 : 0.4
+      body.thinking = { type: 'enabled', budget_tokens: Math.max(1024, Math.floor(target.maxTokens * ratio)) }
+    }
   }
   if (req.tools?.length) {
     body.tools = req.tools.map((tool) => ({

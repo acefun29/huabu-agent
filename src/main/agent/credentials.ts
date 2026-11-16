@@ -1,13 +1,14 @@
 import { safeStorage } from 'electron'
 import { existsSync, readFileSync } from 'fs'
-import type { Credential, CredentialInfo, CredentialStore } from '@earendil-works/pi-ai'
+import type { Credential, CredentialInfo, CredentialStore } from './contracts'
 import { atomicWriteSync } from '../fsutil/atomic'
 
 /**
  * 工作区级加密凭据存储（M9 扩展）。
  *
- * 实现 pi-ai 的 CredentialStore 接口，直接喂给 `ModelRuntime.create({ credentials })`，
- * 因此 pi 的认证解析、getProviderAuthStatus、getAuth 全部走这一份存储，无需环境变量。
+ * 凭据存储（`CredentialStore` 的自有实现，见 agent/contracts.ts）。
+ * 直接喂给 `ModelRuntime.create({ credentials })`，因此 pi 的认证解析、
+ * getProviderAuthStatus、getAuth 全部走这一份存储，无需环境变量。
  *
  * 安全设计（开发计划 M9 审查要点：任何日志/IPC/canvas.json 不出现明文 Key）：
  * - 明文 Key 只在主进程内存中出现，经 Electron safeStorage 加密（Windows DPAPI）后落盘；

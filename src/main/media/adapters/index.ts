@@ -21,4 +21,11 @@ export {
   getAdapterTypes,
   isRegisteredAdapterType
 } from './registry'
-export type { AdapterDeps, AdapterProviderConfig, AdapterRefCaps, MediaKindDelivery, MediaRefDelivery } from './registry'
+export type {
+  AdapterDeps,
+  AdapterHostDeps,
+  AdapterProviderConfig,
+  AdapterRefCaps,
+  MediaKindDelivery,
+  MediaRefDelivery
+} from './registry'

@@ -3,6 +3,7 @@ import type { IpcRendererEvent } from 'electron'
 import { createHuabuApi } from '../shared/apiFactory'
 import type { ChatEvent } from '../shared/ipc'
 import { IpcChannel } from '../shared/ipc'
+import { EVENT_CHANNEL_ALLOWLIST } from '../shared/eventChannels'
 
 /**
  * 渲染进程唯一的原生能力入口。
@@ -12,23 +13,10 @@ import { IpcChannel } from '../shared/ipc'
  */
 
 /**
- * 允许渲染进程订阅的事件通道白名单。
- * 新增事件通道时必须在此登记，否则订阅直接抛错（docs/ipc-contract.md 硬性约束 2）。
+ * 允许渲染进程订阅的事件通道：来自 `@shared/eventChannels` 的唯一清单
+ * （与 Web WS 桥共用，见那里的说明）。新增通道必须在那里登记，
+ * 否则订阅直接抛错（docs/ipc-contract.md 硬性约束 2）。
  */
-const EVENT_CHANNEL_ALLOWLIST: readonly string[] = [
-  IpcChannel.ChatEvent,
-  IpcChannel.MediaJobEvent,
-  IpcChannel.MediaConfirmRequest,
-  IpcChannel.MediaConfirmResolvedEvent,
-  IpcChannel.McpStatusEvent,
-  IpcChannel.AssetChanged,
-  IpcChannel.WindowStateChanged,
-  // 项目结构变更（层级/节点增删改）：此前漏登记，Electron 里 project.onChanged 订阅会直接抛错
-  IpcChannel.ProjectChanged,
-  // SuperAgent 任务/验收进度（计划 §9.7 新增事件）
-  IpcChannel.TaskEvent
-]
-
 function assertChannelAllowed(channel: string): void {
   if (!EVENT_CHANNEL_ALLOWLIST.includes(channel)) {
     throw new Error(`[huabu] 未登记的事件通道，禁止订阅: ${channel}`)

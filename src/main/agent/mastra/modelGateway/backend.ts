@@ -93,6 +93,12 @@ export class ModelGatewayImpl {
     this.aborts.set(req.runId, () => controller.abort())
     const forward = () => controller.abort()
     signal.addEventListener('abort', forward)
+    /*
+     * 同步检查已取消的 signal（A08）：`addEventListener` 只覆盖「之后才取消」，
+     * 传入时就已经 abort 的 signal 永远等不到事件——下游 fetch 会照常发出请求，
+     * 于是「已取消的任务」还是会花钱、还是会回写结果。
+     */
+    if (signal.aborted) controller.abort()
 
     try {
       const system = [req.system, ...systemMessagesOf(req)].filter(Boolean).join(String.fromCharCode(10, 10))

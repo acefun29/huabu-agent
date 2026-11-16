@@ -263,7 +263,7 @@ function isNonEmptyString(value: unknown): value is string {
 /* 状态目录/凭据路径已拆到 stateDir.ts（轻量模块，避免无关闭包）；此处 re-export 保住既有引用 */
 export { getCredentialsFile } from './stateDir'
 import { getAppStateDir, getCredentialsFile } from './stateDir'
-import { normalizeAgentRuntime, type AgentRuntimeKind } from '../agent/runtime'
+import type { AgentRuntimeKind } from '../agent/runtime'
 
 export class WorkspaceStore {
   private current: WorkspaceInfo | null = null
@@ -347,7 +347,9 @@ export class WorkspaceStore {
     if (dir === dirname(dir)) {
       throw new Error(`不能把盘符根用作工作区：${dir}`)
     }
-    mkdirSync(join(dir, '.huabu', 'sessions'), { recursive: true })
+    // 只需要 .huabu 本体：会话历史已改用 LibSQL（.huabu/mastra.db），不再预建
+    // sessions/ 目录（那是 Pi 的 JSONL 落点，运行时已移除）。
+    mkdirSync(join(dir, '.huabu'), { recursive: true })
 
     // workspace.json 的首次读取点：先把崩溃可能遗留的 .bak 还原回来。原子写在
     // 「旧文件已挪成 .bak、新文件未落位」之间被强杀的话，不还原直接读会把旧工作区
@@ -519,12 +521,6 @@ export class WorkspaceStore {
     return cleaned
   }
 
-  /** 当前工作区的 Agent 运行时 flag（未打开工作区 / 非法值 = pi，回滚友好） */
-  agentRuntime(): AgentRuntimeKind {
-    const dir = this.current?.path
-    return dir ? normalizeAgentRuntime(this.readMeta(dir).agent?.runtime) : 'pi'
-  }
-
   /**
    * 当前工作区定义的全部分级结构（未打开工作区 = 空数组）。
    * 结构是工作区数据，不是内置模板：空数组 = 这个项目还没定义过分级维度。
@@ -594,15 +590,6 @@ export class WorkspaceStore {
     }
     this.writeMeta(dir, meta)
     return true
-  }
-
-  /** 设置运行时 flag（工作区级；只影响之后新建的会话，已绑定会话保持原运行时） */
-  setAgentRuntime(runtime: AgentRuntimeKind): void {
-    if (!this.current) throw new Error('尚未打开工作区')
-    const dir = this.current.path
-    const meta = this.readMeta(dir)
-    meta.agent = { ...meta.agent, runtime }
-    this.writeMeta(dir, meta)
   }
 
   /**

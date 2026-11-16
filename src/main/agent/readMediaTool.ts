@@ -1,5 +1,5 @@
 import { Type } from 'typebox'
-import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
+import type { ToolDefinition } from './contracts'
 import type { MediaRoots } from '../../shared/assets'
 import {
   SWITCH_VISION_MODEL_HINT,

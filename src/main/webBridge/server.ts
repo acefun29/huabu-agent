@@ -22,6 +22,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { randomUUID } from 'node:crypto'
 import type { WebSocket } from 'ws'
 import { handleMediaRequest } from '../media/protocol'
+import { EVENT_CHANNEL_ALLOWLIST } from '../../shared/eventChannels'
+import { ReplayBuffer, isHighVolumeEvent } from './replayBuffer'
 
 /** channel → handler（由 IPC 注册层登记） */
 export type ChannelHandler = (payload: unknown) => unknown
@@ -53,18 +55,13 @@ export interface WebBridgeHandle {
   broadcast(channel: string, payload: unknown): void
 }
 
-/** 事件通道白名单：与 preload EVENT_CHANNEL_ALLOWLIST 保持一致（只转发这些） */
-const EVENT_CHANNELS = new Set([
-  'chat:event',
-  'media:job',
-  'media:confirm-request',
-  'media:confirm-resolved',
-  'asset:changed',
-  'workspace:state-changed',
-  'task:event',
-  'project:changed',
-  'mcp:status',
-])
+/**
+ * 事件通道白名单：与 preload 共用 `@shared/eventChannels` 的唯一清单。
+ *
+ * 此前这里是手抄的第二份，并且把 `window:state-changed` 抄成了
+ * `workspace:state-changed`——死字符串，转发永不出错也永远不生效（A18）。
+ */
+const EVENT_CHANNELS = new Set(EVENT_CHANNEL_ALLOWLIST)
 
 /**
  * 启动桥服务。
@@ -74,6 +71,8 @@ export async function startWebBridge(options: WebBridgeOptions = {}): Promise<We
   const port = options.port ?? 4788
   const token = options.token ?? randomUUID()
   const clients = new Set<WebSocket>()
+  /** 没有在线客户端期间攒下的终态帧（D6）：只留生命周期事件，见 replayBuffer.ts */
+  const replay = new ReplayBuffer()
 
   const server: Server = createServer(async (req, res) => {
     // CORS：本地 dev server（5174/5173）跨端口调用需要
@@ -186,6 +185,10 @@ export async function startWebBridge(options: WebBridgeOptions = {}): Promise<We
       ws.on('close', () => clients.delete(ws))
       ws.on('error', () => clients.delete(ws))
       ws.send(JSON.stringify({ channel: '__ready', payload: { channels: registeredChannels() } }))
+      // 补发断线期间的终态事件（D6）：先 __ready 再重放，客户端此刻订阅者已就位
+      for (const frame of replay.drain()) {
+        if (ws.readyState === ws.OPEN) ws.send(frame)
+      }
     })
   })
 
@@ -202,11 +205,19 @@ export async function startWebBridge(options: WebBridgeOptions = {}): Promise<We
     broadcast(channel: string, payload: unknown): void {
       if (!EVENT_CHANNELS.has(channel)) return
       const frame = JSON.stringify({ channel, payload })
+      let delivered = 0
       for (const ws of clients) {
-        if (ws.readyState === ws.OPEN) ws.send(frame)
+        if (ws.readyState === ws.OPEN) {
+          ws.send(frame)
+          delivered += 1
+        }
       }
+      // 没有任何在线客户端：这一帧会永久丢失（客户端不做状态重取）。
+      // 只留生命周期帧，重放时把界面拉回正确终态；逐字增量不留（见 replayBuffer.ts）。
+      if (delivered === 0 && !isHighVolumeEvent(payload)) replay.push(frame)
     },
     async close(): Promise<void> {
+      replay.clear()
       for (const ws of clients) ws.terminate()
       clients.clear()
       wss.close()
@@ -222,9 +233,22 @@ export function setActiveBridge(bridge: WebBridgeHandle | null): void {
   activeBridge = bridge
 }
 
-/** 转发事件到浏览器（未启用桥时直接返回） */
+/**
+ * 转发事件到浏览器（未启用桥时直接返回）。
+ *
+ * 必须自己吞异常（A15）：调用方是六条 `broadcastXxx`，其中 `broadcastChatEvent`
+ * 同时是 AgentHost 的 emitter 与 Mastra 的 `deps.broadcast`。这里一旦抛出
+ * （WS 正在关闭、payload 有环引用、JSON.stringify 失败），异常会顺着 broadcast
+ * 打断整条事件链；Mastra 侧更严重——收尾广播抛错会让 `session.run` 永远停着，
+ * 该会话之后每次 prompt 都回 busy（见 A2）。
+ */
 export function forwardEvent(channel: string, payload: unknown): void {
-  activeBridge?.broadcast(channel, payload)
+  if (!activeBridge) return
+  try {
+    activeBridge.broadcast(channel, payload)
+  } catch (error) {
+    console.error(`[web-bridge] 事件转发失败（${channel}）：`, error)
+  }
 }
 
 /* ---------------------------------------------------------------- 小工具 */

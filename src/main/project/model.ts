@@ -104,9 +104,26 @@ export function childrenOf(project: Project, parentId: string | null): ProjectNo
     .sort((a, b) => a.order - b.order)
 }
 
-/** 从根到该节点的路径（含自身）；原型 pathOf */
-export function pathOf(project: Project, nodeId: string): ProjectNode[] {
+/**
+ * 全树节点（深度优先，按层级 + order 展开）。
+ *
+ * 常驻段的「实体索引」要的是**跨 scope 稳定**的项目全貌，而不是当前这一层的子节点
+ * —— 用当前 scope 的子节点会让下钻一次就把常驻段整段换掉，逐轮去重的命中率归零（B10）。
+ */
+export function flattenProject(project: Project): ProjectNode[] {
   const out: ProjectNode[] = []
+  const walk = (parentId: string | null): void => {
+    for (const node of childrenOf(project, parentId)) {
+      out.push(node)
+      walk(node.id)
+    }
+  }
+  walk(null)
+  return out
+}
+
+/** 从根到该节点的路径（含自身）；原型 pathOf */
+export function pathOf(project: Project, nodeId: string): ProjectNode[] {  const out: ProjectNode[] = []
   let node = findNode(project, nodeId)
   while (node) {
     out.unshift(node)
