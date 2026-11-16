@@ -21,7 +21,7 @@ import { randomUUID } from 'crypto'
 import { mkdirSync, statSync } from 'fs'
 import { writeFile } from 'fs/promises'
 import { basename, extname, join, resolve, sep } from 'path'
-import type { AgentHost } from '../agent/host'
+import type { WorkspaceModels } from '../agent/workspaceModels'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
 import { MediaJobManager } from '../media/manager'
 import type { MediaProviderAdapter } from '../media/provider'
@@ -30,7 +30,7 @@ import {
   createAdapters,
   getAdapterKindMatrix,
   isRegisteredAdapterType,
-  type AdapterDeps,
+  type AdapterHostDeps,
   type AdapterProviderConfig
 } from '../media/adapters'
 import {
@@ -73,6 +73,7 @@ import { resolveMediaTarget } from '../../shared/mediaResolve'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString, ok } from './shared'
 import { consumeSourcePath } from './workspace'
+import { forwardEvent } from '../webBridge/server'
 
 // ---------------------------------------------------------------- media 域：Agent 变更前确认（accessMode=confirm）
 
@@ -103,28 +104,34 @@ export const requestMediaApproval = (
           /* 窗口可能正在销毁 */
         }
       }
+      // Web 模式同样要撤卡（D5）
+      forwardEvent(IpcChannel.MediaConfirmResolvedEvent, { requestId })
     }
     pendingApprovals.set(requestId, { nodeId, resolve: settle })
     // 10 分钟兜底超时：回执与 signal 中止都不来的话（渲染端假死、事件丢失），
     // Promise 永久悬挂会把 agent 工具的 execute 一起挂死；超时按拒绝处理并撤卡
     const timeout = setTimeout(() => settle(false), 10 * 60 * 1000)
+    const confirmPayload = {
+      requestId,
+      nodeId,
+      kind,
+      prompt: info.prompt,
+      ...(info.provider ? { provider: info.provider } : {}),
+      ...(info.model ? { model: info.model } : {}),
+      ...(info.ratio ? { ratio: info.ratio } : {}),
+      ...(info.durationSeconds ? { durationSeconds: info.durationSeconds } : {}),
+      refSummary: info.refSummary
+    } satisfies MediaConfirmPayload
     for (const window of BrowserWindow.getAllWindows()) {
       try {
-        window.webContents.send(IpcChannel.MediaConfirmRequest, {
-          requestId,
-          nodeId,
-          kind,
-          prompt: info.prompt,
-          ...(info.provider ? { provider: info.provider } : {}),
-          ...(info.model ? { model: info.model } : {}),
-          ...(info.ratio ? { ratio: info.ratio } : {}),
-          ...(info.durationSeconds ? { durationSeconds: info.durationSeconds } : {}),
-          refSummary: info.refSummary
-        } satisfies MediaConfirmPayload)
+        window.webContents.send(IpcChannel.MediaConfirmRequest, confirmPayload)
       } catch {
         /* 窗口可能正在销毁 */
       }
     }
+    // Web 模式（headless 不建窗口）：确认卡只经 webContents.send 是发不出去的，
+    // 浏览器端永远看不到卡，审批会挂满 10 分钟按拒绝返回（D5）
+    forwardEvent(IpcChannel.MediaConfirmRequest, confirmPayload)
     if (signal) {
       if (signal.aborted) settle(false)
       else signal.addEventListener('abort', () => settle(false), { once: true })
@@ -162,7 +169,8 @@ export type MediaContextReturnType = {
 /** createMediaRuntime 的依赖：由编排器（src/main/ipc.ts）在注册各域 handler 前提供 */
 export interface MediaRuntimeDeps {
   store: WorkspaceStore
-  host: AgentHost
+  /** 媒体凭据走 WorkspaceModels（与 pi 解耦）：方法名与原先 host 上的同名转出一致 */
+  models: WorkspaceModels
   currentDir: () => string | null
   broadcastAssetChanged: () => void
   broadcastMediaJob: (job: MediaJobStatus) => void
@@ -176,24 +184,30 @@ export interface MediaRuntimeDeps {
 export function createMediaRuntime(
   deps: MediaRuntimeDeps
 ): { mediaManager: MediaJobManager; mediaContext: () => MediaContextReturnType } {
-  const { store, host, currentDir, broadcastAssetChanged, broadcastMediaJob } = deps
+  const { store, models, currentDir, broadcastAssetChanged, broadcastMediaJob } = deps
 
   /**
    * 媒体凭据读取：加密存储优先，退回供应商声明的环境变量（合并层已按
    * 目录 auth.env / 适配器默认值缺省化，这里不再写死任何厂商约定）。
+   *
+   * `workspace` = **适配器所属**工作区（R04）。此前这个闭包内部读全局 `currentDir()`，
+   * 切到工作区 B 之后，A 的在途任务会拿 B 的 Key 去请求供应商——快照只固定了配置对象，
+   * 没有固定闭包内部的依赖。
    */
-  const resolveMediaKey =
-    async (auth: { authKey?: string; authEnv?: string }): Promise<string | undefined> => {
-      const dir = currentDir()
-      if (!dir) return undefined
-      if (auth.authKey) {
-        const stored = await host.getMediaKey(dir, auth.authKey)
-        if (stored) return stored
-      }
-      return auth.authEnv ? process.env[auth.authEnv] : undefined
+  const resolveMediaKey = async (
+    auth: { authKey?: string; authEnv?: string },
+    workspace: string | null
+  ): Promise<string | undefined> => {
+    const dir = workspace ?? currentDir()
+    if (!dir) return undefined
+    if (auth.authKey) {
+      const stored = await models.getMediaKey(dir, auth.authKey)
+      if (stored) return stored
     }
+    return auth.authEnv ? process.env[auth.authEnv] : undefined
+  }
 
-  const adapterDeps: AdapterDeps = {
+  const adapterDeps: AdapterHostDeps = {
     mediaDir: () => store.mediaDir(),
     resolveKey: resolveMediaKey
   }
@@ -215,7 +229,7 @@ export function createMediaRuntime(
       adapterCache = {
         workspace,
         fingerprint,
-        adapters: createAdapters(providers, adapterDeps)
+        adapters: createAdapters(providers, adapterDeps, workspace)
       }
     }
     return {
@@ -225,11 +239,11 @@ export function createMediaRuntime(
       providers,
       adapters: adapterCache.adapters,
       ready: Boolean(workspace),
-      // 上传通道换临时引用时要读凭据明文（与适配器共用同一个解析闭包）
-      resolveKey: resolveMediaKey,
+      // 上传通道换临时引用时要读凭据明文（与适配器共用同一个解析闭包，绑定本工作区 —— R04）
+      resolveKey: (auth) => resolveMediaKey(auth, workspace),
       keySourceOf: async (auth) => {
         if (!workspace) return 'none'
-        if (auth.authKey && (await host.hasMediaKey(workspace, auth.authKey))) return 'workspace-store'
+        if (auth.authKey && (await models.hasMediaKey(workspace, auth.authKey))) return 'workspace-store'
         return auth.authEnv && process.env[auth.authEnv] ? 'environment' : 'none'
       },
       // 产物落进素材库目录后由 MediaJobManager 调用，面板才会即时出现新文件（否则要重开工作区）
@@ -245,7 +259,7 @@ export function createMediaRuntime(
 
 export function registerMediaIpc(ctx: IpcContext): void {
   const store = ctx.store
-  const host = ctx.host
+  const models = ctx.models
   const currentDir = ctx.currentDir
   const mediaManager = ctx.mediaManager
 
@@ -257,7 +271,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
       const effective = mergeCatalog(BUILTIN_PROVIDERS, config)
       const providers: MediaProviderStatus[] = []
       for (const entry of effective) {
-        const hasStored = await host.hasMediaKey(dir, entry.authKey)
+        const hasStored = await models.hasMediaKey(dir, entry.authKey)
         const keySource: MediaProviderStatus['keySource'] = hasStored
           ? 'workspace-store'
           : entry.authEnv && process.env[entry.authEnv]
@@ -632,7 +646,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
     try {
-      await host.setMediaKey(dir, authKeyOf(request.providerId), request.apiKey)
+      await models.setMediaKey(dir, authKeyOf(request.providerId), request.apiKey)
       return ok()
     } catch (error) {
       return { ok: false, code: 'unknown', error: describe(error) }
@@ -645,7 +659,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
     try {
-      await host.removeMediaKey(dir, authKeyOf(providerId))
+      await models.removeMediaKey(dir, authKeyOf(providerId))
       return ok()
     } catch (error) {
       return { ok: false, code: 'unknown' as const, error: describe(error) }

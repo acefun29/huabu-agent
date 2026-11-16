@@ -96,10 +96,11 @@ export function envelopeToInstructions(envelope: Envelope): string {
     '',
     '## 回执（必须遵守的格式）',
     '产物落到 lane 内之后，最后单独输出一行回执 JSON，字段名不可更改：',
-    '{"artifactId":"<唯一 id>","assetId":"<资产 id，同一镜头复用>","version":"<版本标记，如 v2>",' +
+    '{"artifactId":"<唯一 id>","assetId":"<可选：同一资产的后续版本填上一版的 id，首次交付可留空>","version":"<版本标记，如 v2>",' +
       '"kind":"image|video|audio|text","path":"<相对工作区的产物路径>","format":"<小写扩展名>",' +
       '"bytes":<字节数>,"width":<图片/视频宽>,"height":<高>,"durationS":<视频秒数>}',
-    '只有 path 落在 lane 内、且字段齐全的回执才能通过结构验收；不要省略 JSON 行，也不要用代码块包裹。'
+    'artifactId、version、kind 必填；assetId 留空时系统按 artifactId 生成（不要为了填它去编造资产）。',
+    '只有 path 落在 lane 内、且必填字段齐全的回执才能通过结构验收；不要省略 JSON 行，也不要用代码块包裹。'
   )
   return lines.join(String.fromCharCode(10))
 }
@@ -130,7 +131,93 @@ export function isPathAllowed(envelope: Envelope, relativePath: string): boolean
   const normalized = segments.join('/')
   return envelope.lane.some((prefix) => {
     const clean = prefix.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')
-    if (!clean) return false
+    if (!isWellFormedLanePrefix(clean)) return false
     return normalized === clean || normalized.startsWith(`${clean}/`)
   })
+}
+
+/**
+ * lane 前缀自身的合法性（C6）。此前只归一化「被比较的路径」，前缀写什么都不校验：
+ * `../etc/` 或 `C:/tmp` 这类前缀归一化后永远匹配不上，结果是**整体拒绝**（fail-closed），
+ * 不会真的逃逸；但错误配置变成「永远不越界」的假象，排查时只看到任务莫名失败。
+ * 显式拒绝能让派单阶段的配置错误直接暴露。
+ */
+function isWellFormedLanePrefix(clean: string): boolean {
+  if (!clean || clean === '.') return false
+  if (clean.startsWith('/') || /^[a-zA-Z]:/.test(clean)) return false
+  return !clean.split('/').some((segment) => segment === '..')
+}
+
+/**
+ * 从 journal 重建派单输入（A10）：重派不能只拿 scope/prompt/accept。
+ *
+ * `task.created` 里除了展示字段，还落了 `spec`（参考资产 / 邻接镜 / 负面约束 /
+ * 分层提示 / 自定义 lane）。回放它就能得到与原始派单等价的输入；旧任务没有 spec
+ * 时退化成「只有 scope/prompt/accept」——那是当时确实记下来的全部。
+ *
+ * 返回不含 taskId：重派要开新任务，新 id 由调用方生成。
+ */
+export function taskInputFromJournal(
+  events: readonly { type: string; taskId: string; payload: Record<string, unknown> }[],
+  taskId: string
+): Omit<TaskIntent, 'taskId'> | null {
+  const created = [...events].reverse().find((event) => event.taskId === taskId && event.type === 'task.created')
+  if (!created) return null
+  const payload = created.payload
+  const scope = typeof payload.scope === 'string' ? payload.scope : ''
+  const prompt = typeof payload.prompt === 'string' ? payload.prompt : ''
+  if (!scope || !prompt) return null
+  const accept = Array.isArray(payload.accept) ? payload.accept.map(String) : []
+  const expert = typeof payload.expert === 'string' ? payload.expert : undefined
+  const spec = (payload.spec ?? {}) as Record<string, unknown>
+  /**
+   * 需求变更（R05）：重派必须用**最新**需求，而不是创建时那份。
+   *
+   * `user.changed` 是用户直连专家改需求的唯一事实；投影（看板）已经按它更新了
+   * prompt/accept，但这里此前只读 `task.created`，于是「用户改完需求再点重派」
+   * 会按旧需求重做一遍。
+   */
+  let effectivePrompt = prompt
+  let effectiveAccept = accept
+  for (const event of events) {
+    if (event.taskId !== taskId || event.type !== 'user.changed') continue
+    const changed = event.payload
+    if (typeof changed.prompt === 'string' && changed.prompt.trim()) effectivePrompt = changed.prompt
+    if (Array.isArray(changed.accept)) effectiveAccept = changed.accept.map(String)
+  }
+  const strings = (value: unknown): string[] | undefined => {
+    if (!Array.isArray(value)) return undefined
+    const cleaned = value.map(String).filter((item) => item.trim())
+    return cleaned.length > 0 ? cleaned : undefined
+  }
+  const layers = Array.isArray(spec.promptLayers)
+    ? spec.promptLayers
+        .filter((layer): layer is { level?: unknown; prompt?: unknown } => Boolean(layer) && typeof layer === 'object')
+        .map((layer) => ({ level: String(layer.level ?? 'layer'), prompt: String(layer.prompt ?? '') }))
+        .filter((layer) => layer.prompt.trim())
+    : []
+  const refs = (value: unknown): EnvelopeAssetRef[] | undefined => {
+    if (!Array.isArray(value)) return undefined
+    const cleaned = value.filter(
+      (item): item is EnvelopeAssetRef =>
+        Boolean(item) && typeof item === 'object' && typeof (item as { assetId?: unknown }).assetId === 'string'
+    )
+    return cleaned.length > 0 ? cleaned : undefined
+  }
+  const lanes = strings(spec.lane)
+  const negative = strings(spec.negative)
+  const entities = refs(spec.entities)
+  const adjacent = refs(spec.adjacent)
+  return {
+    scope,
+    // 重派用的是「最新需求」（R05）：prompt/accept 取 user.changed 之后的值
+    prompt: effectivePrompt,
+    accept: effectiveAccept,
+    ...(layers.length > 0 ? { promptLayers: layers } : {}),
+    ...(entities ? { entities } : {}),
+    ...(adjacent ? { adjacent } : {}),
+    ...(negative ? { negative } : {}),
+    ...(lanes ? { lane: lanes } : {}),
+    ...(expert ? { expert } : {})
+  }
 }

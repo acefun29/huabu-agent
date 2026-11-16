@@ -74,8 +74,21 @@ export const IpcChannel = {
   SuperAgentRunTask: 'superagent:run-task',
   /** 取消运行中的任务 */
   SuperAgentCancelTask: 'superagent:cancel-task',
+  /** 重派：主进程从 journal 重建完整输入后开新任务（A10） */
+  SuperAgentRedispatch: 'superagent:redispatch',
   /** 读原始事实日志（审计 / 回放） */
   SuperAgentJournal: 'superagent:journal',
+  /**
+   * 新任务模型的读路径（施工计划 v4）：`work.*` 事件的投影。
+   *
+   * 与 `SuperAgentBoard` 并存而不是取代它：旧板投影 `task.*`，新投影 `work.*`，
+   * 过渡期两边都能读。删旧路径（计划第 6 步）之后只剩这一个。
+   */
+  SuperAgentWorkState: 'superagent:work-state',
+  /** 放弃一个任务（新模型）：终态，可回退的是新建任务而不是复活 */
+  SuperAgentDropTask: 'superagent:drop-task',
+  /** 任务事实变化（work.* / artifact.recorded）→ 渲染端重拉 work-state */
+  WorkChanged: 'work:changed',
   /** 用户直连专家改需求：追加 user.changed 事实（不改任务状态） */
   SuperAgentAppendUserChange: 'superagent:append-user-change',
   /** 专家池清单（id / 名称 / 角色 / 是否常驻） */
@@ -481,6 +494,11 @@ export type TaskEvent =
       assetId: string
       version: string
       artifactId: string
+      /**
+       * 被激活产物的工作区相对路径（R01）：画布据此只激活**这一份**产物。
+       * 任务级事件不能解释为「激活该任务的全部候选」——失败尝试的产物必须留在候选。
+       */
+      path?: string
     }
   /**
    * 专家流式输出（任务板详情实时显示；Mastra memory 按轮落库，不能等落库后才可见）。
@@ -549,6 +567,8 @@ export interface SuperAgentTaskView {
   attempts: number
   lastArtifactId?: string
   lastReason?: string
+  /** 用户直连专家改需求的时刻（user.changed）；有值说明 prompt/accept 已是新版 */
+  requirementChangedAt?: string
   updatedAt: string
 }
 
@@ -593,6 +613,14 @@ export interface SuperAgentRunTaskRequest {
   expert?: string
   /** shadow：只写 staging + journal，不切 active */
   shadow?: boolean
+  /**
+   * 重派：被本任务顶替的旧 taskId（C14）。
+   *
+   * 重派一直只是「用新 taskId 再派一次」——旧任务永久停在 attention/blocked 且与
+   * 新任务毫无关联，看板上就是两条同 scope 的孤立行。带上这个字段后，主进程会先
+   * 中止仍在跑的旧任务、再追加一条 `task.superseded` 事实把两者连起来。
+   */
+  supersedes?: string
 }
 
 /** 派单载荷里的资产引用（= EnvelopeAssetRef 的可传输形态） */
@@ -617,6 +645,15 @@ export interface SuperAgentRunTaskAccepted {
   /** 预检阶段就被拒时的原因（此时不会真正执行） */
   rejected?: string[]
   dropped?: string[]
+}
+
+/**
+ * 取消结果（A08）：区分「已停下」「还在停」「没在跑」。
+ * 此前用布尔返回，超时后也报成功——界面对用户宣称已停止，任务其实还在跑。
+ */
+export interface SuperAgentCancelResult {
+  /** stopped = 终态已落盘；stopping = 已发取消请求但超时未收口 */
+  state: 'stopped' | 'stopping'
 }
 
 /** 专家池里的一个专家 */
@@ -679,6 +716,39 @@ export interface SuperAgentJournalEntry {
   payload: Record<string, unknown>
 }
 
+/** 新任务模型：一个任务（`work.*` 投影；施工计划 v4 §3） */
+export interface WorkTaskView {
+  id: string
+  title: string
+  brief: string
+  lane: string
+  kind: 'image' | 'video' | 'text'
+  status: 'todo' | 'doing' | 'done' | 'dropped'
+  /** 依次产出的产物 id，最后一个是当前版 */
+  artifacts: string[]
+  createdAt: string
+  updatedAt: string
+}
+
+/** 新任务模型：一个产物（`artifact.recorded` 投影；不可变，同一路径多版并存） */
+export interface WorkArtifactView {
+  id: string
+  path: string
+  kind: 'image' | 'video' | 'audio' | 'text'
+  mime: string
+  bytes: number
+  taskId?: string
+  createdAt: string
+}
+
+/** `superagent:work-state` 的返回：任务 + 产物 + 回放时无法应用的事件 */
+export interface SuperAgentWorkStateView {
+  tasks: WorkTaskView[]
+  artifacts: WorkArtifactView[]
+  /** 历史里有但应用不了的事件（终态不可重开之类）。不隐藏——让人能看见 */
+  ignored: Array<{ eventId: string; type: string; reason: string }>
+}
+
 /* ---------------------------- 项目结构（原型 index-projects.html） ---------------------------- */
 
 /** 单个节点在快照里的形态（含派生状态与继承后的提示词） */
@@ -697,6 +767,17 @@ export interface ProjectNodeView {
   cover?: string
   /** 自己这层的 prompt（可空 = 靠继承） */
   prompt?: string
+  /** 容器专用：子树叶子进度 */
+  stats?: { total: number; done: number; pct: number }
+}
+
+/** 全树轻量索引的一行（常驻段实体索引用；刻意不含 prompt/cover 等重字段） */
+export interface ProjectIndexNodeView {
+  id: string
+  title: string
+  level: number
+  parentId: string | null
+  status: 'todo' | 'generating' | 'done' | 'attention'
   /** 容器专用：子树叶子进度 */
   stats?: { total: number; done: number; pct: number }
 }
@@ -728,6 +809,15 @@ export interface ProjectSnapshot {
   } | null
   /** 当前 scope 下的子节点（scopeId 为空 = 根看板） */
   nodes: ProjectNodeView[]
+  /**
+   * 全树轻量索引（跨 scope 不变；常驻段的实体索引来源）。
+   *
+   * 与 `nodes` 分开是必须的（B10）：两者共用同一份「当前 scope 子节点」时，下钻一次
+   * 就会让「变化极少」的常驻段整段变化，逐轮去重的命中率归零，而常驻段的全部价值
+   * 就在于它不怎么变。只带 id/title/level/parentId/status/stats——常驻段本来也不用
+   * 提示词、封面这些重字段，避免每轮快照把整棵树带过 IPC。
+   */
+  indexNodes: ProjectIndexNodeView[]
   /** 面包屑（根 → 当前 scope） */
   breadcrumb: { id: string | null; title: string }[]
   /** 当前 scope 节点的提示词继承层（详情用；根为项目级） */
@@ -1258,8 +1348,8 @@ export interface SkillInfo {
   description: string
   /** 技能根目录（用户级为 ~ 缩写的绝对路径；工作区级为相对路径） */
   dir: string
-  /** 来源目录：user = 用户级（跨工作区共享）；workspace = 当前工作区独有 */
-  source: 'user' | 'workspace'
+  /** 来源目录：user = 用户级（跨工作区共享）；workspace = 当前工作区独有；builtin = 随应用分发（resources/skills） */
+  source: 'user' | 'workspace' | 'builtin'
   /** false = 在 workspace.json skills.disabled 名单里（不进新会话系统提示） */
   enabled: boolean
   /** 校验失败原因（frontmatter 缺字段 / name 与目录不一致等；带值的条目不会注入会话） */

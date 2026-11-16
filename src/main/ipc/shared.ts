@@ -3,7 +3,7 @@
  *
  * 自 src/main/ipc.ts 拆出（实现原样搬移）：
  * - 校验/包装助手：isNonEmptyString / asNodeRequest / invalidPayload / ok / describe / guardSync / guardAsync
- * - 广播：chat:event（AgentHost 的 onUpdate 回调）、asset:changed、media:job
+ * - 广播：chat:event（运行时 onUpdate 回调）、asset:changed、media:job
  * - IpcContext：编排器（src/main/ipc.ts）组装后注入各域注册函数的依赖上下文
  *
  * 安全约定：渲染进程发来的载荷一律按「不可信输入」处理，先做形状校验再交给服务层。
@@ -11,7 +11,7 @@
  */
 import { BrowserWindow } from 'electron'
 import { forwardEvent } from '../webBridge/server'
-import type { AgentHost } from '../agent/host'
+import type { WorkspaceModels } from '../agent/workspaceModels'
 import type { WorkspaceStore } from '../workspace/store'
 import type { MediaJobManager } from '../media/manager'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
@@ -70,7 +70,7 @@ async function guardAsync<T>(fn: () => Promise<T>): Promise<ChatResult<T>> {
   }
 }
 
-/** chat:event 广播：作为 AgentHost 的 onUpdate 回调传入（见 src/main/ipc.ts 编排器） */
+/** chat:event 广播：作为运行时与 webBridge 的事件出口（见 src/main/ipc.ts 编排器） */
 export function broadcastChatEvent(event: ChatEvent): void {
   // Web 桥：同一事件转给浏览器（未启用时零开销）
   forwardEvent(IpcChannel.ChatEvent, event)
@@ -128,6 +128,25 @@ export function broadcastAssetChanged(): void {
   }
 }
 
+/**
+ * work:changed 广播：任务事实（work.* / artifact.recorded）追加后通知渲染端重拉投影。
+ *
+ * 只送一个"变了"的信号，不送内容——投影由 `superagent:work-state` 统一算，
+ * 避免事件里再维护一份形状（那样迟早和投影漂开）。
+ */
+export function broadcastWorkChanged(): void {
+  forwardEvent(IpcChannel.WorkChanged, { at: Date.now() })
+  for (const window of BrowserWindow.getAllWindows()) {
+    const contents = window.webContents
+    if (contents.isDestroyed()) continue
+    try {
+      contents.send(IpcChannel.WorkChanged, { at: new Date().toISOString() })
+    } catch (error) {
+      console.error(`[ipc] work:changed 广播失败：${String(error)}`)
+    }
+  }
+}
+
 export function broadcastMediaJob(job: MediaJobStatus): void {
   // Web 桥：同一事件转给浏览器（未启用时零开销）
   forwardEvent(IpcChannel.MediaJobEvent, job)
@@ -162,7 +181,12 @@ export function broadcastMcpStatus(): void {
  */
 export interface IpcContext {
   store: WorkspaceStore
-  host: AgentHost
+  /**
+   * 工作区模型目录/凭据服务（**不依赖 pi**）。
+   * Mastra 运行时的模型清单与凭据走这里，而不是 host——host 那条路径要先成功加载 pi，
+   * 一旦 pi 出问题，模型下拉与 Key 录入会跟着一起失效。
+   */
+  models: WorkspaceModels
   currentDir: () => string | null
   broadcastAssetChanged: () => void
   /** 项目结构变更广播（project:changed）：渲染端刷新层级视图 */

@@ -15,6 +15,7 @@ import { ipcMain } from './ipcMainBridge'
 import {
   IpcChannel,
   type ChatResult,
+  type ProjectIndexNodeView,
   type ProjectNodeView,
   type ProjectSnapshot,
   type ProjectSnapshotRequest
@@ -26,6 +27,7 @@ import {
   deriveStatus,
   effectivePrompt,
   findNode,
+  flattenProject,
   leafStats,
   pathOf,
   projectDepth,
@@ -98,6 +100,7 @@ function buildSnapshot(file: ProjectFile, scopeId: string | null, request: Proje
       activeProjectId: file.activeProjectId,
       project: null,
       nodes: [],
+      indexNodes: [],
       breadcrumb: [],
       promptLayers: [],
     }
@@ -110,6 +113,20 @@ function buildSnapshot(file: ProjectFile, scopeId: string | null, request: Proje
   const nodes = childrenOf(project, scope?.id ?? null).map((node) =>
     toNodeView(project, node, request.runtime)
   )
+  /*
+   * 全树轻量索引（B10）：常驻段「实体索引」要的是**跨 scope 稳定**的项目全貌，
+   * 而不是当前这一层的子节点。此前两段共用 `nodes`，下钻一次常驻段就整段变化，
+   * 逐轮去重永远命中不了——而常驻段的全部价值就是「变化极少，折叠后每轮只花一行」。
+   * 只取 id/title/level/parentId/status/stats：常驻段不读提示词/封面，别把整棵树的重字段带过去。
+   */
+  const indexNodes: ProjectIndexNodeView[] = flattenProject(project).map((node) => ({
+    id: node.id,
+    title: node.title,
+    level: node.level,
+    parentId: node.parentId,
+    status: deriveStatus(project, node, request.runtime),
+    ...(node.level < depth ? { stats: leafStats(project, node.id) } : {}),
+  }))
   const chain = scope ? pathOf(project, scope.id) : []
   const layers = scope
     ? effectivePrompt(project, scope.id).layers
@@ -136,6 +153,7 @@ function buildSnapshot(file: ProjectFile, scopeId: string | null, request: Proje
       levels: project.levels,
     },
     nodes,
+    indexNodes,
     breadcrumb: [
       { id: null, title: project.rootLabel },
       ...chain.map((node) => ({ id: node.id, title: node.title })),

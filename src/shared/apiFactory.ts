@@ -278,9 +278,16 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
     superagent: {
       board: () => invoke(IpcChannel.SuperAgentBoard),
 
+      workState: () => invoke(IpcChannel.SuperAgentWorkState),
+
+      dropTask: (taskId) => invoke(IpcChannel.SuperAgentDropTask, { taskId }),
+
       runTask: (request) => invoke(IpcChannel.SuperAgentRunTask, request),
 
       cancelTask: (taskId) => invoke(IpcChannel.SuperAgentCancelTask, { taskId }),
+
+      // 重派（A10）：输入由主进程从 journal 重建，渲染端只给旧 taskId
+      redispatchTask: (taskId) => invoke(IpcChannel.SuperAgentRedispatch, { taskId }),
 
       journal: () => invoke(IpcChannel.SuperAgentJournal),
 
@@ -291,7 +298,9 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
       conversation: (taskId) => invoke(IpcChannel.SuperAgentConversation, { taskId }),
 
       onTaskEvent: (listener) =>
-        subscribe(IpcChannel.TaskEvent, (payload) => listener(payload as TaskEvent))
+        subscribe(IpcChannel.TaskEvent, (payload) => listener(payload as TaskEvent)),
+
+      onWorkChanged: (listener) => subscribe(IpcChannel.WorkChanged, () => listener())
     }
   }
 

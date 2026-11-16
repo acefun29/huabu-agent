@@ -12,9 +12,9 @@ describe('专家注册表', () => {
   it('内置两个薄核心：视觉（挂媒体工具）与执行（纯文本）', () => {
     const experts = listExperts()
     expect(experts.map((expert) => expert.id)).toEqual(['expert-visual', 'expert-exec'])
-    expect(findExpert('expert-visual')?.tools).toBe('media')
+    expect(findExpert('expert-visual')?.tools).toEqual(['media'])
     expect(findExpert('expert-visual')?.favors).toContain('image')
-    expect(findExpert('expert-exec')?.tools).toBe('none')
+    expect(findExpert('expert-exec')?.tools).toEqual(['files'])
     expect(findExpert('expert-exec')?.favors).toEqual(['text'])
   })
 

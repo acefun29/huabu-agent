@@ -34,14 +34,18 @@ import {
   restoreBuiltinModel
 } from '../models/overlay'
 import { normalizeServerConfig, writeMcpServers } from '../mcp/store'
+import { scanSkills } from '../agent/skills'
+import { resolveBuiltinSkillsRoots } from '../agent/blockoutTools'
 import type { IpcContext } from './shared'
 import { describe, invalidPayload, isNonEmptyString, ok } from './shared'
 
 export function registerSettingsIpc(ctx: IpcContext): void {
-  const host = ctx.host
   const store = ctx.store
   const mcpManager = ctx.mcpManager
   const currentDir = ctx.currentDir
+  // 模型目录/凭据走 WorkspaceModels（与 pi 解耦）：Key 录入、供应商清单、模型管理
+  // 不再要求 pi 加载成功。testProvider 仍留在 host（要做真实请求 + 读 pi 的认证快照）。
+  const models = ctx.models
 
   // ---------------------------------------------------------------- settings 域（M9）
 
@@ -53,7 +57,7 @@ export function registerSettingsIpc(ctx: IpcContext): void {
         value: { providers: [], credentialsHint: '' }
       } satisfies ChatResult<unknown>
     }
-    return host.chatProviders(dir)
+    return models.providersInfo(dir)
   })
 
   ipcMain.handle(IpcChannel.SettingsSetApiKey, (_event, payload: unknown) => {
@@ -62,7 +66,7 @@ export function registerSettingsIpc(ctx: IpcContext): void {
     if (!isNonEmptyString(request.apiKey)) return invalidPayload('settings:set-api-key 需要 apiKey')
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
-    return host.setApiKey(dir, request.providerId, request.apiKey)
+    return models.setApiKey(dir, request.providerId, request.apiKey)
   })
 
   ipcMain.handle(IpcChannel.SettingsRemoveApiKey, (_event, payload: unknown) => {
@@ -70,7 +74,7 @@ export function registerSettingsIpc(ctx: IpcContext): void {
     if (!isNonEmptyString(providerId)) return invalidPayload('settings:remove-api-key 需要 providerId')
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
-    return host.removeApiKey(dir, providerId)
+    return models.removeApiKey(dir, providerId)
   })
 
   ipcMain.handle(IpcChannel.SettingsTestProvider, (_event, payload: unknown) => {
@@ -78,18 +82,20 @@ export function registerSettingsIpc(ctx: IpcContext): void {
     if (!isNonEmptyString(providerId)) return invalidPayload('settings:test-provider 需要 providerId')
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
-    return host.testProvider(dir, providerId)
+    return models.testProvider(dir, providerId)
   })
 
   // ------------------------------------------------ settings 域：自定义模型/供应商（T5 起写 chat 段）
 
   /**
-   * 覆盖层写完后的统一收尾：重注册 + 归一错误。
-   * 忘记调用就等于"设置改了但不生效"，所以收成一个函数而不是各处手抄。
+   * 覆盖层写完后的统一收尾（归一错误）。
+   *
+   * 此前这里要调 `host.refreshModels()` 把清单重新注进 pi 的 ModelRuntime——pi 的清单
+   * 在运行时里有一份副本，不重注就不生效。pi 移除后这一步不再需要：管理器每次现算
+   * （目录唯一来源），改写即刻生效。保留这个函数是为了统一错误出口。
    */
-  async function afterChatConfigChange(dir: string): Promise<ChatResult<undefined>> {
-    const refreshed = await host.refreshModels(dir)
-    return refreshed.ok ? ok() : refreshed
+  async function afterChatConfigChange(_dir: string): Promise<ChatResult<undefined>> {
+    return ok()
   }
 
   ipcMain.handle(IpcChannel.SettingsCustomAddProvider, async (_event, payload: unknown) => {
@@ -158,7 +164,7 @@ export function registerSettingsIpc(ctx: IpcContext): void {
       if (!isNonEmptyString(providerId)) return invalidPayload('settings:models-list 需要 providerId')
       const dir = currentDir()
       if (!dir) return invalidPayload('尚未打开工作区')
-      return host.managedModels(dir, providerId)
+      return models.managedModels(dir, providerId)
     }
   )
 
@@ -247,10 +253,22 @@ export function registerSettingsIpc(ctx: IpcContext): void {
     const dir = currentDir()
     if (!dir) return invalidPayload('尚未打开工作区')
     const disabled = new Set(store.skillsDisabled())
-    const { skills } = host.listSkills(dir)
+    // 自建扫描（agent/skills.ts）：原先走 host.listSkills → pi 的 loadSkillsFromDir，
+    // 设置页因此在 pi 未就绪时永远是「暂无技能」。现在与会话注入同源，且内置技能
+    // （resources/skills，如 blockout-shot）也如实列出，用户可停用。
+    const { skills } = scanSkills({ workspaceDir: dir, builtinRoots: resolveBuiltinSkillsRoots() })
     return {
       ok: true,
-      value: { skills: skills.map((skill) => ({ ...skill, enabled: !disabled.has(skill.name) })) }
+      value: {
+        skills: skills.map((skill) => ({
+          name: skill.name,
+          description: skill.description,
+          dir: skill.dir,
+          source: skill.source,
+          enabled: !disabled.has(skill.name),
+          ...(skill.invalid ? { invalid: skill.invalid } : {})
+        }))
+      }
     }
   })
 

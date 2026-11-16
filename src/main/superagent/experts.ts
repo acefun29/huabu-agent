@@ -1,6 +1,10 @@
 /**
  * 专家池（架构图 to-be ② 的「专家」列）。
  *
+ * ⚠️ **已停用（施工计划 v4）**：单一 Agent 模型下不再有「派给哪个专家」这回事，
+ * 角色只作为数据保留（4 个能力档 image / video / text / qa）。模型侧的工具已换成
+ * `tools/taskTools.ts`；本文件仍被 `orchestrator.ts` 用来跑**历史任务**，但新任务不走它。
+ *
  * 一个专家 = 一份指令追加 + 一个工具面 + 一个（可选的）常驻线程。
  * 专家本身不带任何业务状态：任务状态在 journal，产物在版本槽，专家只是「谁来干」。
  *
@@ -11,6 +15,9 @@
  * 未知 expert id 一律回落到默认专家，并把回落事实写进返回值——
  * 派单失败不该是「静默换人」，但也不该因为拼错一个 id 就把任务废掉。
  */
+
+/** 工具能力集（白名单）；装配方按集合取工具，未知能力忽略 */
+export type ExpertToolset = 'media' | 'files'
 
 export interface ExpertDefinition {
   id: string
@@ -23,10 +30,15 @@ export interface ExpertDefinition {
   /** 追加到信封指令末尾的专家专属规则（可空） */
   instructions: string
   /**
-   * 工具面：'media' = 挂媒体生成 + 读媒体工具；'none' = 只有文本回执能力。
-   * 后续接入其它工具集时在此扩展（白名单式，不做「全部工具」）。
+   * 工具面（白名单式，不做「全部工具」）：
+   * - `media` = 媒体生成 + 读媒体 + 视频理解；
+   * - `files` = ls / read / write（**write 限定任务 lane**）。
+   *
+   * 文本专家必须带 `files`：验收要求回执里的 path 对应真实文件（A03）。
+   * 此前它是 `'none'`，于是「指令说没写文件工具 → 验收要求文件存在」这条链
+   * 永远走不通，重试也补不出来。
    */
-  tools: 'media' | 'none'
+  tools: ExpertToolset[]
   /** 优先承担的产物类型（派单未显式给 expert 时按任务内容猜） */
   favors: Array<'image' | 'video' | 'audio' | 'text'>
 }
@@ -38,7 +50,7 @@ const VISUAL: ExpertDefinition = {
   label: '视觉专家',
   role: '按信封生成图片/视频产物，负责画面一致性',
   resident: false,
-  tools: 'media',
+  tools: ['media'],
   favors: ['image', 'video'],
   instructions: [
     '你是视觉专家：用 generate_image / generate_video 真正产出画面，不靠文字描述代替生成。',
@@ -51,15 +63,15 @@ const VISUAL: ExpertDefinition = {
 const EXEC: ExpertDefinition = {
   id: 'expert-exec',
   label: '执行专家',
-  role: '产出文本类结果（分镜表、提示词、脚本段落）',
+  role: '产出文本类结果（分镜表、提示词、脚本段落），并把成品落成文件',
   resident: false,
-  tools: 'none',
+  tools: ['files'],
   favors: ['text'],
   instructions: [
-    '你是执行专家：产出的是文本制品（分镜表、提示词、脚本段落），不生成画面，也没有文件写入工具。',
-    '把文本产物直接写在回答正文里；最后的回执 JSON 仍必须给出 path（lane 内的建议落盘路径）与 format=md，',
-    '由主 Agent 决定是否落盘。kind 填 text。',
-    '不要声称已经写了文件——你只产出文本与回执。'
+    '你是执行专家：产出文本制品（分镜表、提示词、脚本段落），不生成画面。',
+    '你有 ls / read / write 三个文件工具，且**写入限定在本任务的 lane 内**。',
+    '工作方式：先把成品真正 write 到 lane 内的路径（父目录会自动创建），再用回执 JSON 声明**你实际写入的那个** path、format=md、kind=text。',
+    '不要只在正文里写出内容就声明路径——验收会按磁盘检查文件是否存在；也不要声明你没写过的文件。'
   ].join('\n')
 }
 

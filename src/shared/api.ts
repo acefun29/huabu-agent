@@ -58,6 +58,8 @@ import type {
   SuperAgentBoardSnapshot,
   SuperAgentExpertInfo,
   SuperAgentJournalEntry,
+  SuperAgentWorkStateView,
+  SuperAgentCancelResult,
   SuperAgentRunTaskAccepted,
   SuperAgentRunTaskRequest,
   SuperAgentTaskConversation,
@@ -480,11 +482,26 @@ export interface SuperAgentApi {
    */
   runTask(request: SuperAgentRunTaskRequest): Promise<ChatResult<SuperAgentRunTaskAccepted>>
 
-  /** 取消运行中的任务（未在跑的任务返回明确失败） */
-  cancelTask(taskId: string): Promise<ChatResult>
+  /** 取消运行中的任务（未在跑的任务返回明确失败；stopping = 已请求取消但超时未收口） */
+  cancelTask(taskId: string): Promise<ChatResult<SuperAgentCancelResult>>
+
+  /** 重派：主进程按 journal 重建完整输入（参考资产/负面约束/分层提示/lane 都不丢） */
+  redispatchTask(taskId: string): Promise<ChatResult<SuperAgentRunTaskAccepted>>
 
   /** 读原始事实日志（审计 / 回放，按顺序返回全部事件） */
   journal(): Promise<ChatResult<SuperAgentJournalEntry[]>>
+
+  /**
+   * 新任务模型的读路径（施工计划 v4）：work.* 事件的投影。
+   * 与 oard() 并存：过渡期旧板读 	ask.*，新面板读这个。
+   */
+  workState(): Promise<ChatResult<SuperAgentWorkStateView>>
+
+  /** 放弃一个任务（终态；已完成的任务不能放弃） */
+  dropTask(taskId: string): Promise<ChatResult<{ taskId: string; status: 'dropped' }>>
+
+  /** 任务事实变化（work.* / artifact.recorded）→ 重拉 workState */
+  onWorkChanged(listener: () => void): () => void
 
   /** 用户直连专家改需求：追加 user.changed 事实（不改任务状态） */
   appendUserChange(request: {

@@ -39,8 +39,18 @@ export function projectVersions(events: readonly JournalEvent[]): VersionSlots {
   const slots: VersionSlots = {}
   const assetOf = (assetId: string): AssetVersions => (slots[assetId] ??= { staging: [], active: [] })
 
-  /** taskId+artifactId → 已 accept 的证据（激活时反查） */
-  const accepted = new Map<string, { taskId: string; accept: NonNullable<VersionRecord['accept']> }>()
+  /**
+   * taskId+artifactId → 已 accept 的证据（激活时反查）。
+   * 除证据本身，还记下这次 accept 针对的 assetId/version 与是否 shadow（C4/C19）：
+   * 此前只按 taskId+artifactId 反查，激活时可以填任意 assetId/version——于是
+   * 「A 资产的验收结论」能激活 B 资产的版本；shadow 任务也能被事后补一条激活。
+   */
+  const accepted = new Map<
+    string,
+    { taskId: string; assetId?: string; version?: string; shadow: boolean; accept: NonNullable<VersionRecord['accept']> }
+  >()
+  /** 已激活过的 assetId:version（C20：同一版本不得重复激活，active 只应单调追加） */
+  const activated = new Set<string>()
 
   for (const event of events) {
     const payload = event.payload as Record<string, unknown>
@@ -58,6 +68,9 @@ export function projectVersions(events: readonly JournalEvent[]): VersionSlots {
         if (!artifactId) break
         accepted.set(`${event.taskId}:${artifactId}`, {
           taskId: event.taskId,
+          ...(str(payload.assetId) ? { assetId: str(payload.assetId) } : {}),
+          ...(str(payload.version) ? { version: str(payload.version) } : {}),
+          shadow: payload.shadow === true,
           accept: {
             acceptCriteria: (payload.acceptCriteria as string[]) ?? [],
             diff: payload.diff,
@@ -74,6 +87,17 @@ export function projectVersions(events: readonly JournalEvent[]): VersionSlots {
         // 防御：没有 accept 证据的激活不生效（不变量由投影保证）
         const accept = accepted.get(`${event.taskId}:${artifactId}`)
         if (!accept) break
+        // shadow 任务的验收结论不构成激活资格（C19）：shadow 的唯一区别就是「不切 active」，
+        // 若事后补一条 version.activated 就能激活，那条约束只活在 orchestrator 的 if 里
+        if (accept.shadow) break
+        // 激活必须针对被验收的那一份产物（C4）：accept 记了 assetId/version 就必须一致，
+        // 否则「A 的验收」可以给 B 上版本
+        if (accept.assetId && accept.assetId !== assetId) break
+        if (accept.version && accept.version !== version) break
+        // 同一版本重复激活不产生第二条 active（C20）
+        const slotKey = `${assetId}:${version}`
+        if (activated.has(slotKey)) break
+        activated.add(slotKey)
         assetOf(assetId).active.push({
           artifactId,
           version,

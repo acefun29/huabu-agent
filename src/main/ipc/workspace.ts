@@ -28,6 +28,7 @@ import { atomicWriteSync } from '../fsutil/atomic'
 import { isInboxPath } from '../assets/manager'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString } from './shared'
+import { disposeChatSessions } from './chat'
 
 // ---------------------------------------------------------------- 拖拽源路径登记（防伪造导入）
 
@@ -69,7 +70,6 @@ export function consumeSourcePath(path: string): boolean {
 
 export function registerWorkspaceIpc(ctx: IpcContext): void {
   const store = ctx.store
-  const host = ctx.host
   const currentDir = ctx.currentDir
 
   // 拖拽源路径登记（fire-and-forget send）：只登记非空字符串，超上限先清过期再落表
@@ -110,12 +110,21 @@ export function registerWorkspaceIpc(ctx: IpcContext): void {
     }
   })
 
-  /** 释放切换前工作区的会话；返回释放数（dispose 的可观察证据） */
+  /** 释放切换前工作区的会话与专家任务；返回释放数（dispose 的可观察证据） */
   async function disposePreviousWorkspace(previous: string | null): Promise<number> {
     if (!previous) return 0
-    const count = await host.disposeWorkspace(previous)
+    // 单一运行时后只剩一条链：Mastra 的 sessions 与 OM bindings（Pi 侧已移除）。
+    // 漏掉它们，旧会话在切走后仍会按旧 nodeId 广播。
+    const count = disposeChatSessions(previous)
+    /*
+     * 专家任务也必须收口（A07）：专家工具只有 currentDir 绑定在启动时的目录上，
+     * 媒体配置/凭据/任务管理器仍按"当前工作区"现读——A 的任务在切到 B 之后继续跑，
+     * 就会用 B 的凭据与配置写入 A 的 journal。取消后由编排器落 task.cancelled 终态。
+     */
+    const cancelledTasks = await ctx.superAgent.cancelWorkspace(previous)
     if (count > 0) console.log(`[ipc] 工作区切换：已释放旧工作区 ${previous} 的 ${count} 个会话`)
-    return count
+    if (cancelledTasks > 0) console.log(`[ipc] 工作区切换：已取消旧工作区 ${previous} 的 ${cancelledTasks} 个专家任务`)
+    return count + cancelledTasks
   }
 
   ipcMain.handle(IpcChannel.WorkspaceCanvasSave, (_event, payload: unknown) => {

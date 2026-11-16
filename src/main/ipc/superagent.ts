@@ -18,13 +18,15 @@ import {
   type SuperAgentBoardSnapshot,
   type SuperAgentExpertInfo,
   type SuperAgentJournalEntry,
+  type SuperAgentWorkStateView,
   type SuperAgentRunTaskAccepted,
   type SuperAgentRunTaskRequest,
   type SuperAgentTaskView,
   type SuperAgentVersionView
 } from '../../shared/ipc'
 import type { IpcContext } from './shared'
-import { invalidPayload, isNonEmptyString } from './shared'
+import { broadcastWorkChanged, invalidPayload, isNonEmptyString } from './shared'
+import { projectWork } from '../store/tasks'
 
 /** 验收标准条数上限（过长会让信封提示词失衡） */
 const MAX_ACCEPT_ITEMS = 12
@@ -125,6 +127,8 @@ export function registerSuperAgentIpc(ctx: IpcContext): void {
         ...(negative.length > 0 ? { negative } : {}),
         ...(lane.length > 0 ? { lane } : {}),
         ...(isNonEmptyString(request.expert) ? { expert: request.expert } : {}),
+        // 重派关联（C14）：旧 taskId 由渲染端从看板带上，主进程据此落一条 superseded 事实
+        ...(isNonEmptyString(request.supersedes) ? { supersedes: request.supersedes } : {}),
         shadow: request.shadow === true
       })
       if (!started.ok) {
@@ -144,10 +148,33 @@ export function registerSuperAgentIpc(ctx: IpcContext): void {
     withDir(async (dir) => {
       const taskId = (payload as { taskId?: unknown } | null)?.taskId
       if (!isNonEmptyString(taskId)) return invalidPayload('superagent:cancel-task 需要 taskId')
-      const cancelled = runner.cancel(dir, String(taskId))
-      return cancelled
-        ? { ok: true, value: undefined }
-        : { ok: false, code: 'unknown', error: '该任务不在运行中（可能已完成或已取消）' }
+      // 等终态事实落盘再回报（C16 / A08）：区分「已停下」与「还在停」，
+      // 不再用布尔把超时和真停止混为一谈
+      const outcome = await runner.cancel(dir, String(taskId))
+      if (outcome === 'not-running') {
+        return { ok: false, code: 'unknown', error: '该任务不在运行中（可能已完成或已取消）' }
+      }
+      return { ok: true, value: { state: outcome } }
+    })
+  )
+
+  ipcMain.handle(IpcChannel.SuperAgentRedispatch, (_event, payload: unknown) =>
+    withDir(async (dir) => {
+      const taskId = (payload as { taskId?: unknown } | null)?.taskId
+      if (!isNonEmptyString(taskId)) return invalidPayload('superagent:redispatch 需要 taskId')
+      // 输入从 journal 重建（A10）：渲染端只给旧 taskId，不再自己拼一份丢字段的载荷
+      const started = await runner.redispatch(dir, String(taskId))
+      if (!started.ok) {
+        return {
+          ok: false as const,
+          code: started.error.code === 'task_missing' ? ('unknown' as const) : ('model_unavailable' as const),
+          error: started.error.message
+        }
+      }
+      return {
+        ok: true as const,
+        value: { taskId: started.value.taskId, expert: started.value.expert }
+      }
     })
   )
 
@@ -165,6 +192,7 @@ export function registerSuperAgentIpc(ctx: IpcContext): void {
         attempts: task.attempts,
         ...(task.lastArtifactId ? { lastArtifactId: task.lastArtifactId } : {}),
         ...(task.lastReason ? { lastReason: task.lastReason } : {}),
+        ...(task.requirementChangedAt ? { requirementChangedAt: task.requirementChangedAt } : {}),
         updatedAt: task.updatedAt
       }))
       const versionViews: SuperAgentBoardSnapshot['versions'] = {}
@@ -194,6 +222,47 @@ export function registerSuperAgentIpc(ctx: IpcContext): void {
       const events = await runner.journal(dir)
       // journal 事件是可序列化结构；v/id/at 原样保留（审计与回放都靠它们）
       return { ok: true, value: events as unknown as SuperAgentJournalEntry[] }
+    })
+  )
+
+  /*
+   * 新任务模型的读路径（施工计划 v4）：`work.*` 事件的投影。
+   * 与 `superagent:board` 并存——旧板读 `task.*`，新面板读这个。
+   */
+  ipcMain.handle(IpcChannel.SuperAgentWorkState, () =>
+    withDir(async (dir) => {
+      const state = projectWork(await runner.journal(dir))
+      return {
+        ok: true as const,
+        value: {
+          tasks: state.tasks as unknown as SuperAgentWorkStateView['tasks'],
+          artifacts: state.artifacts as unknown as SuperAgentWorkStateView['artifacts'],
+          ignored: state.ignored
+        }
+      }
+    })
+  )
+
+  ipcMain.handle(IpcChannel.SuperAgentDropTask, (_event, payload: unknown) =>
+    withDir(async (dir) => {
+      const taskId = (payload as { taskId?: unknown } | null)?.taskId
+      if (!isNonEmptyString(taskId)) return invalidPayload('superagent:drop-task 需要 taskId')
+      const state = projectWork(await runner.journal(dir))
+      const task = state.tasks.find((entry) => entry.id === String(taskId))
+      if (!task) return { ok: false as const, code: 'unknown' as const, error: `没有任务 ${String(taskId)}` }
+      if (task.status === 'dropped') {
+        return { ok: true as const, value: { taskId: task.id, status: 'dropped' as const } }
+      }
+      if (task.status === 'done') {
+        return {
+          ok: false as const,
+          code: 'unknown' as const,
+          error: `任务 ${task.id} 已完成，不能放弃。要改方向请开一个新任务。`
+        }
+      }
+      await runner.journalHandle(dir).append('work.dropped', task.id, 'user', {})
+      broadcastWorkChanged()
+      return { ok: true as const, value: { taskId: task.id, status: 'dropped' as const } }
     })
   )
 

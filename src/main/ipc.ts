@@ -1,9 +1,10 @@
-import { AgentHost } from './agent/host'
+import { WorkspaceModels } from './agent/workspaceModels'
+import { SafeStorageCredentialStore } from './agent/credentials'
+import { getCredentialsFile } from './workspace/stateDir'
 import { WorkspaceStore } from './workspace/store'
 import { McpManager } from './mcp/manager'
 import {
   broadcastAssetChanged,
-  broadcastChatEvent,
   broadcastProjectChangedEvent,
   broadcastMediaJob,
   broadcastMcpStatus,
@@ -14,7 +15,7 @@ import { registerWindowAppIpc } from './ipc/windowApp'
 import { registerWorkspaceIpc } from './ipc/workspace'
 import { registerAssetIpc } from './ipc/asset'
 import { registerMediaIpc, createMediaRuntime, requestMediaApproval } from './ipc/media'
-import { registerChatIpc } from './ipc/chat'
+import { registerChatIpc, disposeChatSessions } from './ipc/chat'
 import { registerProjectIpc } from './ipc/project'
 import { registerSuperAgentIpc } from './ipc/superagent'
 import { registerSettingsIpc } from './ipc/settings'
@@ -31,14 +32,8 @@ import { inboxRoot } from './assets/manager'
  * 事件广播前检查 webContents 是否已销毁，否则关窗瞬间会抛错。
  */
 
-let agentHost: AgentHost | null = null
 let workspaceStore: WorkspaceStore | null = null
 let mcpManagerSingleton: McpManager | null = null
-
-/** 供主进程其它模块（如退出流程、媒体协议）访问；未注册时为 null */
-export function getAgentHost(): AgentHost | null {
-  return agentHost
-}
 
 export function getWorkspaceStore(): WorkspaceStore | null {
   return workspaceStore
@@ -49,6 +44,13 @@ export function getMcpManager(): McpManager | null {
   return mcpManagerSingleton
 }
 
+/**
+ * 退出流程用：收口全部会话运行时（A3）。
+ * Pi 侧由 `AgentHost.disposeAllSync` 处理，Mastra 侧的两张表由这里处理，
+ * 两者都要调——只调前者会漏掉 `MastraAgentRuntime.sessions` 与 OM bindings。
+ */
+export { disposeChatSessions }
+
 export function registerIpcHandlers(): void {
   const store = new WorkspaceStore()
   workspaceStore = store
@@ -57,12 +59,12 @@ export function registerIpcHandlers(): void {
     console.log(`[workspace] 冷启动已恢复上次工作区：${store.currentDir}`)
   }
 
-  const host = new AgentHost(broadcastChatEvent)
-  agentHost = host
+  // 工作区模型目录/凭据服务：与 pi 解耦（设置页的模型清单、Key 录入不再依赖 pi 加载成功）。
+  // 凭据工厂在这里注入——safeStorage 属 electron，不能让服务模块自己 import。
+  const models = new WorkspaceModels({
+    createCredentials: async (dir) => SafeStorageCredentialStore.forWorkspace(getCredentialsFile(dir))
+  })
 
-  // 预热：pi 是动态导入，放到窗口创建前 await 会拖慢启动。
-  // chat:runtime / chat:create 内部各自 await init()，天然幂等。
-  void host.init()
 
   /** 当前工作区目录（可能为 null：选择页状态下不该有会话） */
   const currentDir = (): string | null => store.currentDir
@@ -72,7 +74,7 @@ export function registerIpcHandlers(): void {
   // 仍在 registerIpcHandlers 同步段内完成（首个 invoke 到来之前必然就绪）。
   const { mediaManager, mediaContext } = createMediaRuntime({
     store,
-    host,
+    models,
     currentDir,
     broadcastAssetChanged,
     broadcastMediaJob
@@ -87,14 +89,15 @@ export function registerIpcHandlers(): void {
   const superAgent = new SuperAgentRunner({
     currentDir,
     defaultModelId: () => store.currentWorkspace?.defaultModel,
-    modelManagerFor: (dir) => host.chatManagerFor(dir),
+    // SuperAgent 的专家模型解析走 WorkspaceModels（与 pi 解耦）
+    modelManagerFor: (dir) => models.managerFor(dir),
     media: { store, mediaManager, mediaContext, requestApproval: requestMediaApproval, inboxRoot },
     broadcastTaskEvent
   })
 
   const ctx: IpcContext = {
     store,
-    host,
+    models,
     currentDir,
     broadcastAssetChanged,
     broadcastProjectChanged: broadcastProjectChangedEvent,
