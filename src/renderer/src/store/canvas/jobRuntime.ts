@@ -16,7 +16,6 @@ import type {
 import type { CanvasState } from '../canvasStore'
 import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, MEDIA_LABEL, jobCardIndex, newNodeId, settingsBridgeRef, spawnOffset, zCounter } from './shared'
 import type { StoreSet } from './chatRuntime'
-import { expertTaskIdOf } from './activationPolicy'
 
 /**
  * 生成任务域：生成是卡片的一种瞬时状态，产物即普通媒体卡 —— 任务事件驱动
@@ -334,22 +333,12 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
           produced = version
           runtimeRef.current = { id: node.id, state: null }
           /*
-           * 专家产物先记候选（A01）：生成成功只登记产物与文件事实，
-           * **不**写 activeVersionId。正式激活由主进程的 `task.activated`
-           * （验收通过 + 版本投影）驱动，画布不再自己下结论。
+           * 生成成功即当前版本。
+           *
+           * 旧模型里专家产物要先进「候选」、等主进程验收通过再激活；v4 取消了验收，
+           * 产物不可变、最新一版就是当前版，所以这里不再有候选态与激活等待。
            */
-          const expertTaskId = expertTaskIdOf(job.sourceChatId)
-          const nextVersions = expertTaskId
-            ? [{ ...version, taskId: expertTaskId, candidate: true }, ...versions]
-            : [version, ...versions]
-          // 待激活的身份是「任务 + 产物路径」（R01），不是任务级
-          const activationKey = expertTaskId ? `${expertTaskId}\u0000${version.path}` : ''
-          const activateNow = expertTaskId === null || pendingActivations.has(activationKey)
-          const activated = activateNow ? nextVersions[0]! : null
-          if (expertTaskId && activateNow) {
-            pendingActivations.delete(activationKey)
-            nextVersions[0] = { ...nextVersions[0]!, candidate: false }
-          }
+          const nextVersions = [version, ...versions]
           return {
             ...node,
             data: {
@@ -366,8 +355,7 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
               ...(job.outputDir && inputs?.params.libraryId ? { libraryId: inputs.params.libraryId } : {}),
               pendingJob: undefined,
               versions: nextVersions,
-              // 候选不夺权：卡片保留原有 activeVersionId，等权威激活结论
-              ...(activated ? { activeVersionId: activated.id } : {})
+              activeVersionId: nextVersions[0]!.id
             }
           }
         }
