@@ -57,6 +57,8 @@ export interface RoundContextInput extends MessageContextInput {
   previousDigests?: { library?: string; canvas?: string; project?: string; scope?: string; queue?: string }
   /** 上轮已携带的 genSummary 签名表（卡片 id → 签名；缺省 = 首轮，全部携带） */
   genSummarySeen?: Record<string, string>
+  /** 本轮注入文本的字符预算（缺省 CONTEXT_CHAR_BUDGET_DEFAULT；调用方按会话 contextWindow 派生） */
+  charBudget?: number
 }
 
 /** 队列段输入（只取渲染端需要的字段，避免把 IPC 类型灌进纯函数） */
@@ -69,6 +71,8 @@ export interface ContextTaskBoard {
     expert?: string
     attempts: number
     lastReason?: string
+    /** 用户直连专家改过需求的时刻（有值 = 投影里的 prompt/accept 已是新版） */
+    requirementChangedAt?: string
   }>
   runningTaskIds: string[]
 }
@@ -87,13 +91,19 @@ export interface ContextSegments {
 export interface CollectedRoundContext {
   /** 随消息载荷发送的附件（仅路径；顺序 = 工作区素材在前、临时上传在后） */
   attachments: MessageAttachment[]
+  /** 因单轮附件上限被丢弃的引用数（>0 时载荷里会带一行说明） */
+  attachmentOverflow: number
   /** 四段装配后的上下文文本（常驻 → 轮换 → 队列 → 注入），拼进消息尾部。
    * 与上轮全文一致的段折叠为「头 + DIGEST_UNCHANGED_NOTE」单行占位（token 经济） */
   contextText: string
   /** 分段结果（调试/自检用；注入了占位行之后的最终形态） */
   segments: ContextSegments
-  /** 本轮各段的**完整全文**（供调用方存为下轮的 previousDigests；存全量而非占位） */
-  digests: { library: string; canvas: string; project: string; scope: string; queue: string }
+  /**
+   * 本轮各段**真正发出去**的完整全文（供调用方存为下轮的 previousDigests）。
+   * 因预算整段省略的段**不写入**——没送达就不能记成「已发」，否则下一轮会把它
+   * 折叠成「与上轮一致」的占位行，模型永远拿不到全文（与 B4 同一条纪律）。
+   */
+  digests: { library?: string; canvas?: string; project?: string; scope?: string; queue?: string }
   /** 本轮已携带的 genSummary 签名表（卡片 id → 签名；只含当前仍在附件集合里的卡片，
    * 调用方整表存回，离场的卡片自然出局） */
   genSummarySeen: Record<string, string>
@@ -108,6 +118,58 @@ export const LIBRARY_DIGEST_MAX_LIBS = 12
 /** 画布态势最多列出的卡片数，超出折叠 */
 export const CANVAS_DIGEST_MAX_CARDS = 30
 
+/**
+ * 单轮注入文本的字符预算（B2）。
+ *
+ * 为什么需要除了条数上限之外的总量上限：条数上限只管「每类最多几条」，
+ * 而单条内容没有上界（长路径、长标题、长 genSummary），且四段是叠加的——
+ * 极端情况下注入文本会吃掉大半个窗口。真到了那一步，`TokenLimiterProcessor`
+ * 会对整个 prompt 做 best-fit 裁剪，单条超预算直接 TripWire，请求直接失败。
+ * 按 chars/2.5 的保守比例估算 token：20000 字 ≈ 8000 tokens。
+ */
+export const CONTEXT_CHAR_BUDGET_DEFAULT = 20_000
+/** 单轮附件上限：`injectedAssetIds` 会跨轮累积（取消选中后 chip 仍保留），必须封顶 */
+export const MAX_ROUND_ATTACHMENTS = 40
+
+/** 各段的落盘头（省略占位行必须以本段头开头，否则主进程回放拆分认不出来） */
+const SEGMENT_HEADER: Record<keyof ContextSegments, string> = {
+  resident: PROJECT_DIGEST_HEADER,
+  rotating: SCOPE_DIGEST_HEADER,
+  queue: QUEUE_DIGEST_HEADER,
+  injected: LIBRARY_DIGEST_HEADER
+}
+
+/**
+ * 总量预算裁剪：按「注入 → 常驻 → 轮换」的顺序整段省略，队列段永不舍弃
+ * （那是等主 Agent 决策的 attention/blocked，丢掉就等于让它继续瞎猜）。
+ * 省略后换成同样以段头开头的单行说明，回放拆分与「未变化」折叠都无需感知。
+ */
+function applyCharBudget(
+  segments: ContextSegments,
+  budget: number
+): { segments: ContextSegments; omitted: Array<keyof ContextSegments> } {
+  const order: Array<keyof ContextSegments> = ['injected', 'resident', 'rotating']
+  let next = { ...segments }
+  const omitted: Array<keyof ContextSegments> = []
+  const total = () => next.resident.length + next.rotating.length + next.queue.length + next.injected.length
+  for (const key of order) {
+    if (total() <= budget) break
+    const text = next[key]
+    if (!text) continue
+    omitted.push(key)
+    next = {
+      ...next,
+      [key]: `${SEGMENT_HEADER[key]}（本轮因上下文预算省略 ${text.length} 字；需要时请聚焦到更小的范围再问）`
+    }
+  }
+  // 兜底：三段都省掉还超（只会发生在队列段本身异常膨胀时），硬截断
+  const joined = [next.resident, next.rotating, next.queue, next.injected].filter(Boolean).join('\n\n')
+  if (joined.length > budget) {
+    next.queue = `${next.queue.slice(0, Math.max(0, budget))}\n（上下文超预算，已截断）`
+  }
+  return { segments: next, omitted }
+}
+
 export function collectRoundContext(input: RoundContextInput): CollectedRoundContext {
   const assetNodes = Array.from(new Set([...input.selectedAssetIds, ...input.injectedAssetIds]))
     .map((id) => input.nodes.find((n) => n.id === id))
@@ -116,9 +178,8 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
   // 签名表输出整表交由调用方存回，只含本轮仍在附件集合里的卡片（离场即出局）
   const seenGenSigs = input.genSummarySeen ?? {}
   const carriedGenSigs: Record<string, string> = {}
-  const attachments: MessageAttachment[] = [
-    ...assetNodes
-      .map((n) => ({ nodeId: n.id, data: n.data }))
+  const allAttachments: MessageAttachment[] = [
+    ...assetNodes      .map((n) => ({ nodeId: n.id, data: n.data }))
       .filter(({ data }) => Boolean(data.path) && Boolean(data.storage))
       .flatMap(({ nodeId, data }) => {
         // 解析口径唯一：media 形态的 path 相对产物目录（见 AssetData.pathRoot），
@@ -146,6 +207,10 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
       }),
     ...input.tempAttachments
   ]
+  // 单轮附件封顶（B2）：`injectedAssetIds` 跨轮累积（取消选中后 chip 仍保留），
+  // 不封顶的话引用载荷会随会话时长单调膨胀，最终把窗口吃掉
+  const attachments = allAttachments.slice(0, MAX_ROUND_ATTACHMENTS)
+  const attachmentOverflow = allAttachments.length - attachments.length
   const libraryDigest = buildLibraryDigest(input.libraries, input.workspaceDir)
   const canvasDigest = buildCanvasDigest(input.nodes, input.selectedAssetIds, input.injectedAssetIds, input.jobStates)
   // 四段装配（架构图 to-be ①）：常驻 / 轮换 / 队列 / 注入。
@@ -171,20 +236,36 @@ export function collectRoundContext(input: RoundContextInput): CollectedRoundCon
       .filter(Boolean)
       .join('\n\n')
   }
-  const contextText = [segments.resident, segments.rotating, segments.queue, segments.injected]
+  // 总量预算（B2）：四段叠加后的字符上限，超出按「注入 → 常驻 → 轮换」整段省略
+  const { segments: finalSegments, omitted } = applyCharBudget(
+    segments,
+    input.charBudget ?? CONTEXT_CHAR_BUDGET_DEFAULT
+  )
+  const contextText = [
+    finalSegments.resident,
+    finalSegments.rotating,
+    finalSegments.queue,
+    finalSegments.injected
+  ]
     .filter(Boolean)
     .join('\n\n')
+  // 只有真正发出去的段才记 digest：被预算省略的段若记成「已发」，下一轮会折叠成
+  // 「与上轮一致」的占位行，而模型从未见过全文（与 B4「失败不回滚去重状态」同一条纪律）
+  const delivered = (key: keyof ContextSegments): boolean => !omitted.includes(key)
+  const digests: CollectedRoundContext['digests'] = {}
+  if (delivered('resident')) digests.project = projectDigest
+  if (delivered('rotating')) digests.scope = scopeDigest
+  if (delivered('queue')) digests.queue = queueDigest
+  if (delivered('injected')) {
+    digests.library = libraryDigest
+    digests.canvas = canvasDigest
+  }
   return {
     attachments,
+    attachmentOverflow,
     contextText,
-    segments,
-    digests: {
-      library: libraryDigest,
-      canvas: canvasDigest,
-      project: projectDigest,
-      scope: scopeDigest,
-      queue: queueDigest
-    },
+    segments: finalSegments,
+    digests,
     genSummarySeen: carriedGenSigs
   }
 }
@@ -198,6 +279,10 @@ export const PROJECT_DIGEST_MAX_ENTITIES = 40
  * 常驻段（架构图 to-be ①「常驻」）：项目是什么、层级怎么分、有哪些实体。
  * 这部分变化极少，逐轮去重命中率最高——折叠后每轮只花一行 token。
  *
+ * 数据源是 `snapshot.indexNodes`（**全树**轻量索引），不是 `snapshot.nodes`
+ * （当前 scope 的子节点）。此前两段共用 `nodes`，下钻一次实体索引就整段变，
+ * 「变化极少」的前提直接不成立，逐轮去重永远命中不了（B10）。
+ *
  * 刻意不含节点正文与提示词：那些属于轮换段（当前 scope）与注入段（被引用的卡片），
  * 常驻段膨胀会让每一轮都为「不在这轮工作集里」的内容付费。
  */
@@ -208,10 +293,12 @@ export function buildProjectDigest(snapshot: ProjectSnapshot | null): string {
     `${PROJECT_DIGEST_HEADER}（项目「${project.name}」${project.kind ? ` · ${project.kind}` : ''}${project.tagline ? `：${project.tagline}` : ''}）`,
     `- 层级：${project.levels.map((level, index) => `${index + 1}.${level.label}（${level.plural}）`).join(' → ')}`
   ]
-  const containers = snapshot.nodes.filter((node) => node.level < project.levels.length)
+  // 全树索引：跨 scope 稳定，下钻不会让常驻段变脸
+  const index = snapshot.indexNodes ?? []
+  const containers = index.filter((node) => node.level < project.levels.length)
   const total = snapshot.projects.length
   lines.push(
-    `- 项目共 ${total} 个（当前生效「${project.name}」）；当前范围下 ${snapshot.nodes.length} 个节点` +
+    `- 项目共 ${total} 个（当前生效「${project.name}」）；本项目全树 ${index.length} 个节点` +
       `${containers.length > 0 ? `（其中 ${containers.length} 个可下钻容器）` : ''}`
   )
   // 其它项目的名字给出来：Agent 才知道「用户说的另一个项目」是否存在
@@ -220,7 +307,7 @@ export function buildProjectDigest(snapshot: ProjectSnapshot | null): string {
     lines.push(`- 其它项目：${others.map((entry) => `${entry.name}${entry.summary ? `（${entry.summary}）` : ''}`).join('、')}`)
   }
   // 实体索引：title + id，供「把第3场那几个镜头…」这类指代落到具体节点
-  const entities = snapshot.nodes.slice(0, PROJECT_DIGEST_MAX_ENTITIES)
+  const entities = index.slice(0, PROJECT_DIGEST_MAX_ENTITIES)
   if (entities.length > 0) {
     lines.push('- 节点索引（id → 标题 → 状态）：')
     for (const node of entities) {
@@ -228,7 +315,7 @@ export function buildProjectDigest(snapshot: ProjectSnapshot | null): string {
       const stats = node.stats ? `，完成 ${node.stats.done}/${node.stats.total}` : ''
       lines.push(`  · ${node.id} → ${node.title}（${levelLabel}，${node.status}${stats}）`)
     }
-    const rest = snapshot.nodes.length - entities.length
+    const rest = index.length - entities.length
     if (rest > 0) lines.push(`  ·（另有 ${rest} 个节点未列出）`)
   }
   if (snapshot.promptLayers.length > 0) {
@@ -322,6 +409,16 @@ export function buildQueueDigest(board: ContextTaskBoard | null): string {
       .map((task) => task.scope || task.title || task.taskId)
       .join('、')
     lines.push(`- 执行中 ${active.length} 个：${names}${active.length > 5 ? ' …' : ''}（完成后自动验收并激活版本）`)
+  }
+  // 用户直连专家改过需求的任务（C13）：重派前必须知道需求已变更，
+  // 否则会拿投影里的旧 prompt 重做一遍。这里给出名单，细节让 Agent 调 list_tasks 取。
+  const changed = board.tasks.filter((task) => task.requirementChangedAt)
+  if (changed.length > 0) {
+    const names = changed
+      .slice(-5)
+      .map((task) => `${task.taskId}${task.scope ? `·${task.scope}` : ''}`)
+      .join('、')
+    lines.push(`- 用户已直连改需求 ${changed.length} 个：${names}（重派前用 list_tasks 取最新 prompt/accept）`)
   }
   if (done.length > 0) {
     const recent = done.slice(-3).map((task) => task.scope || task.title || task.taskId)

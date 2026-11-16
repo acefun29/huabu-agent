@@ -1,8 +1,8 @@
 import type { MediaJobStatus } from '@shared/ipc'
 import { normalizeMediaCaps } from '@shared/media'
 import type { MediaKind, MediaRefInput, MediaRatio, ResolvedRefCaps } from '@shared/media'
-import { MEDIA_ROOT_REL } from '@shared/assets'
 import { shortModelLabel } from '@shared/mediaResolve'
+import { nodeRelPath } from '../../lib/workspacePath'
 import { normalizePath } from '../../harness/assetCategories'
 import { activeVersionOf, assignRefRoles, validateRefSet } from '../../lib/mediaReferenceGraph'
 import type {
@@ -16,6 +16,7 @@ import type {
 import type { CanvasState } from '../canvasStore'
 import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, MEDIA_LABEL, jobCardIndex, newNodeId, settingsBridgeRef, spawnOffset, zCounter } from './shared'
 import type { StoreSet } from './chatRuntime'
+import { expertTaskIdOf } from './activationPolicy'
 
 /**
  * 生成任务域：生成是卡片的一种瞬时状态，产物即普通媒体卡 —— 任务事件驱动
@@ -35,6 +36,9 @@ import type { StoreSet } from './chatRuntime'
  *   严格校验（错误不发起 IPC），冻结 GenerateInputSnapshot；快速成功事件早于 IPC
  *   返回时先按 jobId 缓冲、绑定后 replay。
  */
+
+/** 已收到权威激活结论、但产物尚未落卡的专家任务：落卡时立刻激活（事件跨通道先后不确定） */
+const pendingActivations = new Set<string>()
 
 export interface JobRuntimeDeps {
   set: StoreSet
@@ -89,12 +93,6 @@ const PENDING_EVENT_MAX_AGE_MS = 60_000
 
 const isTerminalState = (state: MediaJobStatus['state']): boolean =>
   state === 'succeeded' || state === 'failed' || state === 'cancelled'
-
-/** 卡片（或其历史版本）的工作区相对路径：media 形态 = pathRoot/path，ws 形态 = path */
-const nodeRelPath = (ref: { storage?: string; path?: string; pathRoot?: string }): string | null => {
-  if (!ref.path) return null
-  return ref.storage === 'media' ? `${(ref.pathRoot ?? MEDIA_ROOT_REL).replace(/\/+$/, '')}/${ref.path}` : ref.path
-}
 
 /** path 反查索引：工作区相对路径 + 绝对路径（双键，各自带小写兜底） */
 interface NodePathIndex {
@@ -335,6 +333,23 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
           }
           produced = version
           runtimeRef.current = { id: node.id, state: null }
+          /*
+           * 专家产物先记候选（A01）：生成成功只登记产物与文件事实，
+           * **不**写 activeVersionId。正式激活由主进程的 `task.activated`
+           * （验收通过 + 版本投影）驱动，画布不再自己下结论。
+           */
+          const expertTaskId = expertTaskIdOf(job.sourceChatId)
+          const nextVersions = expertTaskId
+            ? [{ ...version, taskId: expertTaskId, candidate: true }, ...versions]
+            : [version, ...versions]
+          // 待激活的身份是「任务 + 产物路径」（R01），不是任务级
+          const activationKey = expertTaskId ? `${expertTaskId}\u0000${version.path}` : ''
+          const activateNow = expertTaskId === null || pendingActivations.has(activationKey)
+          const activated = activateNow ? nextVersions[0]! : null
+          if (expertTaskId && activateNow) {
+            pendingActivations.delete(activationKey)
+            nextVersions[0] = { ...nextVersions[0]!, candidate: false }
+          }
           return {
             ...node,
             data: {
@@ -350,8 +365,9 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
               // 产物落库后卡片归入对应素材库（提交时记下的落库目标）
               ...(job.outputDir && inputs?.params.libraryId ? { libraryId: inputs.params.libraryId } : {}),
               pendingJob: undefined,
-              versions: [version, ...versions],
-              activeVersionId: version.id
+              versions: nextVersions,
+              // 候选不夺权：卡片保留原有 activeVersionId，等权威激活结论
+              ...(activated ? { activeVersionId: activated.id } : {})
             }
           }
         }
@@ -773,6 +789,50 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
     })
   }
 
+  /**
+   * 把**某一份**候选产物提升为正式版本（A01 的唯一权威激活入口）。
+   *
+   * 由 `task.activated`（主进程在验收通过并写 `version.activated` 之后发出）驱动。
+   * 身份用「任务 id + 产物路径」（R01）：同一任务可能有多次尝试的候选（先失败 A、
+   * 重试通过 B，分属不同卡片），按 taskId 批量激活会把未通过验收的 A 也升为正式版本。
+   * 幂等：重复事件不会重复入版；事件早于产物登记时先记 pending，落卡那一刻再激活。
+   *
+   * `artifactPath` 为空 = 事件没带产物身份，此时**不激活任何东西**——宁可等，
+   * 也不能退化成"激活该任务全部候选"。
+   */
+  const activateCandidateForTask = (taskId: string, artifactPath: string): void => {
+    if (!artifactPath) return
+    const key = `${taskId}\u0000${artifactPath}`
+    let hit = false
+    applyNodes((prev) =>
+      prev.map((node) => {
+        const versions = node.data.versions ?? []
+        const index = versions.findIndex(
+          (version) => version.taskId === taskId && version.candidate && version.path === artifactPath
+        )
+        if (index < 0) return node
+        hit = true
+        const target = versions[index]!
+        const nextVersions = versions.map((version, i) => (i === index ? { ...version, candidate: false } : version))
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            name: target.name,
+            storage: target.storage,
+            path: target.path,
+            ...(target.pathRoot ? { pathRoot: target.pathRoot } : { pathRoot: undefined }),
+            mime: target.mime,
+            bytes: target.bytes,
+            versions: nextVersions,
+            activeVersionId: target.id
+          }
+        }
+      })
+    )
+    if (!hit) pendingActivations.add(key)
+  }
+
   return {
     handleJobEvent,
     reconcileJobs,
@@ -780,6 +840,7 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
     retryGeneration,
     mediaCapsFor,
     clearGenerateVersions,
-    requestClearGenerateVersions
+    requestClearGenerateVersions,
+    activateCandidateForTask
   }
 }

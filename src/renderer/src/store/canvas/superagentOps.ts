@@ -4,8 +4,10 @@ import type {
   SuperAgentExpertInfo,
   SuperAgentTaskConversation,
   SuperAgentTaskView,
+  SuperAgentWorkStateView,
   TaskEvent
 } from '@shared/ipc'
+import { buildOwnership, type ArtifactOwner } from '../../lib/artifactOwnership'
 import type { CanvasState } from '../canvasStore'
 import type { StoreSet } from './chatRuntime'
 import { BRIDGE_AVAILABLE } from './shared'
@@ -53,6 +55,36 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
     applySnapshot(result.value)
   }
 
+  /**
+   * 新任务模型的投影（施工计划 v4）。与旧板并存：旧板读 task.*，这里读 work.*。
+   *
+   * 一次拉取同时更新三样东西：原始投影、面板分组、产物归属表。
+   * 归属表在这里算好，画布卡片按路径查，避免每张卡各算一遍。
+   */
+  const refreshWorkItems = async (): Promise<void> => {
+    if (!BRIDGE_AVAILABLE || !get().workspace) return
+    const result = await window.huabu.superagent.workState()
+    if (!result.ok) return
+    const state = result.value
+    set({
+      workState: state,
+      workItems: state.tasks ?? [],
+      artifactOwners: buildOwnership(state.tasks ?? [], state.artifacts ?? [])
+    })
+  }
+
+  /** 放弃一个任务（用户的显式操作；已完成的任务主进程会拒绝） */
+  const dropWorkItem = async (taskId: string): Promise<void> => {
+    if (!BRIDGE_AVAILABLE) return
+    const result = await window.huabu.superagent.dropTask(taskId)
+    if (!result.ok) {
+      showToast(`放弃失败：${result.error}`)
+      return
+    }
+    showToast(`已放弃 ${taskId}`)
+    await refreshWorkItems()
+  }
+
   /** 专家池清单（注册表是静态的，工作区切换后拉一次即可） */
   const refreshSuperAgentExperts = async (): Promise<void> => {
     if (!BRIDGE_AVAILABLE || !get().workspace) return
@@ -69,7 +101,12 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
       showToast(result.error)
       return
     }
-    showToast('已请求取消，任务会转为止步（blocked）')
+    // 超时未收口 ≠ 已停止（A08）：不能对用户宣称已经停了
+    showToast(
+      result.value?.state === 'stopping'
+        ? '已发出取消请求，但任务还没收口（模型或工具仍在等待）；稍后确认看板状态'
+        : '已取消，任务转为受阻（blocked）'
+    )
     await refreshSuperAgent()
   }
 
@@ -92,6 +129,15 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
   const handleTaskEvent = (event: TaskEvent): void => {
     // 专家流式片段只供详情页实时渲染，不触发 board 全量重拉
     if (event.type.startsWith('task.expert_')) return
+    /*
+     * 唯一权威激活入口（A01）：主进程在验收通过并写 `version.activated` 之后发这个事件。
+     * 画布收到媒体任务成功时只记候选，等这里才把候选提升为正式版本——否则「未验收 /
+     * 已取消 / shadow」的产物会被当成当前版本供下游引用。
+     */
+    if (event.type === 'task.activated') {
+      // 用事件自带的产物路径定位（R01）：任务级激活会连带激活失败尝试的候选
+      get().activateCandidateForTask(event.taskId, event.path ?? '')
+    }
     void refreshSuperAgent()
   }
 
@@ -121,22 +167,15 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
   }
 
   /**
-   * 重派 attention/blocked 任务：用原 scope/prompt/accept 再派一次（新 taskId）。
-   * 原任务的失败原因仍留在 journal，重派是追加事实而不是覆盖——可回放性不受影响。
+   * 重派 attention/blocked 任务。
+   *
+   * 输入由主进程按 journal 的 `task.created.spec` 重建（A10）——渲染端只给旧 taskId，
+   * 不再自己拼载荷。此前只传 scope/prompt/accept/expert，参考资产、邻接镜、负面约束、
+   * 分层提示与自定义 lane 全丢，「重派」等于换了个任务重做。
    */
   const redispatchSuperAgentTask = async (task: SuperAgentTaskView): Promise<void> => {
     if (!BRIDGE_AVAILABLE) return
-    const prompt = task.prompt ?? task.title ?? ''
-    if (!task.scope || !prompt) {
-      showToast('这条任务缺少原始描述，无法自动重派；请在对话里重新说明需求')
-      return
-    }
-    const result = await window.huabu.superagent.runTask({
-      scope: task.scope,
-      prompt,
-      accept: task.accept ?? [],
-      ...(task.expert ? { expert: task.expert } : {})
-    })
+    const result = await window.huabu.superagent.redispatchTask(task.taskId)
     if (!result.ok) {
       showToast(`重派失败：${result.error}`)
       return
@@ -149,15 +188,21 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
     superAgentTasks: [] as Array<{ task: SuperAgentTaskView; running: boolean }>,
     superAgentExperts: [] as SuperAgentExpertInfo[],
     superAgentRunning: [] as string[],
+    workItems: [] as SuperAgentWorkStateView['tasks'],
+    workState: null as SuperAgentWorkStateView | null,
+    artifactOwners: new Map<string, ArtifactOwner>(),
     refreshSuperAgent,
     refreshSuperAgentExperts,
+    refreshWorkItems,
+    dropWorkItem,
     cancelSuperAgentTask,
     redispatchSuperAgentTask,
     appendSuperAgentUserChange,
     loadSuperAgentConversation,
     handleTaskEvent,
     /** @internal 供工作区切换清理用 */
-    resetSuperAgent: (): void => set({ superAgentTasks: [], superAgentRunning: [] })
+    resetSuperAgent: (): void =>
+      set({ superAgentTasks: [], superAgentRunning: [], workItems: [], workState: null, artifactOwners: new Map() })
   }
 }
 

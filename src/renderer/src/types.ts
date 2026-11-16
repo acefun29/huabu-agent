@@ -240,6 +240,13 @@ export interface GenerateVersion {
   model?: string
   /** 产出该版本的真实任务 id（media job；运行时按它去重/回溯） */
   jobId?: string
+  /**
+   * 产出该版本的专家任务 id（A01）。专家派单的产物先记为候选，
+   * 等主进程 `task.activated`（唯一权威激活结论）到达才成为正式版本。
+   */
+  taskId?: string
+  /** true = 候选版本：生成成功但业务验收未通过，不能作为可引用的正式版本 */
+  candidate?: boolean
   /** 提交时的输入定格（参考快照/参数/模型，见 GenerateInputSnapshot）。老版本无此字段 = 无从比对，引用新鲜度读作 unknown */
   inputs?: GenerateInputSnapshot
   createdAt: string

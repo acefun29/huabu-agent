@@ -24,8 +24,8 @@ import { compactTokens } from '../lib/format'
 import { ChatMessageBlocks } from './chat/ChatMessageBlocks'
 import { ExpertAvatar } from './chat/ExpertAvatar'
 import { ExpertConversationView } from './chat/ExpertConversationView'
-import { ExpertStrip } from './chat/ExpertStrip'
-import { TeamPopover } from './chat/TeamPopover'
+import { WorkStrip } from './chat/WorkStrip'
+import { WorkPanel } from './chat/WorkPanel'
 import { TASK_STATUS_META, relativeTime } from './chat/taskBoardMeta'
 import { Composer } from './Composer'
 import { SessionsPanel } from './sidebar/SessionsPanel'
@@ -208,8 +208,8 @@ export function ChatDock() {
   const { createSession, requestRemoveSession, requestRemoveSessions, switchSession } = useCanvasStore.getState()
   /** 会话切换菜单（原型 .session-menu）：点了标题才展开，选完即收 */
   const [menuOpen, setMenuOpen] = useState(false)
-  /** 专家团任务板浮层：从底部状态条向上展开 */
-  const [teamOpen, setTeamOpen] = useState(false)
+  /** 工作项面板：从底部状态条向上展开 */
+  const [workOpen, setWorkOpen] = useState(false)
   /**
    * 当前对话坞展示的是哪条专家对话（null = 主对话）。
    * 进入后整块对话坞变成专家的只读历史，头部面包屑负责切回主对话或换一个专家。
@@ -250,7 +250,7 @@ export function ChatDock() {
   // 工作区切换后任务板会被清空：旧专家视图必须一起退出，不能把上一个工作区的线程留在画面上
   useEffect(() => {
     setExpertTaskId(null)
-    setTeamOpen(false)
+    setWorkOpen(false)
   }, [workspace?.path])
 
   // 任务从 board 投影里消失（理论上只在切换工作区/清理时发生）：退回主对话
@@ -641,21 +641,12 @@ export function ChatDock() {
         </div>
       </div>
 
-      {/* 底部输入区（原型 .chat-footer）：专家团状态条 + 一条分隔线 + Composer。
-          任务板浮层从状态条向上展开（absolute bottom-full），不挤压消息流。 */}
+      {/* 底部输入区（原型 .chat-footer）：工作项状态条 + 一条分隔线 + Composer。
+          面板从状态条向上展开（absolute bottom-full），不挤压消息流。 */}
       <div className="relative shrink-0 border-t border-(--outline-soft) px-3 pb-3 pt-2.5">
         <div className="relative">
-          {teamOpen && (
-            <TeamPopover
-              onClose={() => setTeamOpen(false)}
-              onOpenConversation={(taskId) => {
-                setExpertTaskId(taskId)
-                setTeamOpen(false)
-                setMenuOpen(false)
-              }}
-            />
-          )}
-          <ExpertStrip expanded={teamOpen} onToggle={() => setTeamOpen((v) => !v)} />
+          {workOpen && <WorkPanel onClose={() => setWorkOpen(false)} />}
+          <WorkStrip expanded={workOpen} onToggle={() => setWorkOpen((v) => !v)} />
         </div>
         <Composer />
       </div>

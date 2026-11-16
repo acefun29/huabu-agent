@@ -96,7 +96,21 @@ function CanvasFilterBar({
   const active = hasActiveFilter(filter)
   const set = (patch: Partial<CanvasFilter>): void => onChange({ ...filter, ...patch })
 
+  /**
+   * 每个维度都只有「有可选项」时才渲染：只有一种类型 / 没有标签 / 没有素材库 / 没配分级时，
+   * 对应那组按钮本来就不出。
+   */
+  const showKinds = kinds.length > 1
+  const showFacets = facetLevels.length > 0
+  const showTags = tags.length > 0
+  const showLibs = libs.length > 1
+
   if (nodes.length === 0) return null
+  /**
+   * 一个可点项都没有、筛选也没生效 = 条内没有任何作用，只剩一圈 padding：
+   * 不渲染这个空壳（否则画布右上角会留下一枚没有作用的白色胶囊）。
+   */
+  if (!showKinds && !showFacets && !showTags && !showLibs && !active) return null
 
   return (
     <div
@@ -107,7 +121,7 @@ function CanvasFilterBar({
       className="absolute top-3 z-20 flex max-w-[calc(100%-88px)] flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl bg-(--chrome-bg) px-2.5 py-1.5 shadow-(--chrome-shadow) ring-1 ring-(--outline-soft)"
     >
       {/* 类型 */}
-      {kinds.length > 1 ? (
+      {showKinds ? (
         <div className="flex items-center gap-1">
           <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">类型</span>
           {kinds.map((k) => (
@@ -161,7 +175,7 @@ function CanvasFilterBar({
       ))}
 
       {/* 标签 */}
-      {tags.length > 0 ? (
+      {showTags ? (
         <div className="flex items-center gap-1">
           <TagIcon size={10} className="shrink-0 text-(--on-surface-muted)" />
           {tags.map((t) => (
@@ -181,7 +195,7 @@ function CanvasFilterBar({
       ) : null}
 
       {/* 素材库 */}
-      {libs.length > 1 ? (
+      {showLibs ? (
         <div className="flex items-center gap-1">
           <span className="text-[9.5px] font-semibold uppercase tracking-wider text-(--on-surface-muted)">库</span>
           {libs.map((l) => (

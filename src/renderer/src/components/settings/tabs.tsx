@@ -62,7 +62,9 @@ export function SkillsTab() {
                         : 'bg-(--success-bg) text-(--success-text)'
                     }`}
                   >
-                    {s.source === 'user' ? '用户级' : '工作区'}
+                    {/* 内置技能（resources/skills，如 blockout-shot）此前不进清单，用户没法停用；
+                        现在如实列出来，来源分三档 */}
+                    {s.source === 'user' ? '用户级' : s.source === 'builtin' ? '内置' : '工作区'}
                   </span>
                   {s.invalid && (
                     <span className="rounded-full bg-(--danger-bg, rgba(0,0,0,0.06)) px-2 py-0.5 text-[10px] font-medium text-(--danger)">

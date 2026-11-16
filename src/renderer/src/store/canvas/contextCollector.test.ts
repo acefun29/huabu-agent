@@ -9,6 +9,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ProjectSnapshot } from '@shared/ipc'
 import {
+  MAX_ROUND_ATTACHMENTS,
   PROJECT_DIGEST_MAX_ENTITIES,
   QUEUE_DIGEST_MAX_TASKS,
   SCOPE_DIGEST_MAX_NODES,
@@ -23,7 +24,7 @@ const WS = 'E:/ws'
 
 /** 最小可用快照：两级（集 → 镜），根下 3 个集 */
 function snapshot(overrides: Partial<ProjectSnapshot> = {}): ProjectSnapshot {
-  return {
+  const merged = {
     projects: [
       { id: 'p1', name: '夜行列车', kind: '短剧', summary: '3 集 · 9 镜' },
       { id: 'p2', name: '套图企划', kind: '漫画', summary: '2 话' }
@@ -93,6 +94,21 @@ function snapshot(overrides: Partial<ProjectSnapshot> = {}): ProjectSnapshot {
     breadcrumb: [{ id: null, title: '剧集' }],
     promptLayers: [{ level: 'project', label: '夜行列车', prompt: '冷调写实' }],
     ...overrides
+  } as ProjectSnapshot
+  // 全树索引（B10）：默认按本快照的 nodes 派生；要验证「下钻不给常驻段换脸」
+  // 时单独传 indexNodes（模拟真实快照里 indexNodes 跨 scope 不变）
+  return {
+    ...merged,
+    indexNodes:
+      overrides.indexNodes ??
+      merged.nodes.map((node) => ({
+        id: node.id,
+        title: node.title,
+        level: node.level,
+        parentId: node.parentId,
+        status: node.status,
+        ...(node.stats ? { stats: node.stats } : {})
+      }))
   }
 }
 
@@ -146,6 +162,34 @@ describe('常驻段（项目索引）', () => {
     })
     const text = buildProjectDigest(withPrompt)
     expect(text).not.toContain('这是一大段不该出现在常驻段里的镜头描述')
+  })
+
+  it('下钻不给常驻段换脸：indexNodes 跨 scope 不变 ⇒ 常驻段全文不变（B10）', () => {
+    const root = snapshot()
+    // 下钻到 ep2：nodes 换成该 scope 的子节点，indexNodes 仍是全树（真实快照就是这样）
+    const drilled = snapshot({
+      nodes: [
+        {
+          id: 'sh1',
+          level: 2,
+          parentId: 'ep2',
+          title: '第1镜',
+          order: 1,
+          fields: { shotNo: '1' },
+          status: 'done'
+        }
+      ],
+      indexNodes: root.indexNodes,
+      breadcrumb: [
+        { id: null, title: '剧集' },
+        { id: 'ep2', title: '第02集' }
+      ]
+    })
+    // 常驻段必须逐字节一致，否则下钻一次就让「变化极少」的前提失效，去重永远命中不了
+    expect(buildProjectDigest(drilled)).toBe(buildProjectDigest(root))
+    // 而轮换段本来就该变——它是当前工作集
+    expect(buildScopeDigest(drilled)).not.toBe(buildScopeDigest(root))
+    expect(buildScopeDigest(drilled)).toContain('sh1｜第1镜')
   })
 })
 
@@ -328,5 +372,62 @@ describe('四段装配：顺序 / 零注入 / 逐段折叠', () => {
     expect(second.contextText).toContain('sh1｜第1镜')
     // 常驻段：节点索引变了（ep1/ep2/ep3 → sh1），所以它是全文而不是占位
     expect(second.contextText).not.toContain(`${PROJECT_DIGEST_HEADER}${DIGEST_UNCHANGED_NOTE}`)
+  })
+
+  /* ---------------- 总量预算与单轮附件上限（B2） ---------------- */
+
+  const queueInput = {
+    tasks: [{ taskId: 't1', status: 'attention' as const, scope: 's', attempts: 1, lastReason: 'x' }],
+    runningTaskIds: [] as string[]
+  }
+
+  it('超预算：按「注入 → 常驻 → 轮换」整段省略，队列段永不舍弃', () => {
+    const out = collectRoundContext({ ...base, project: snapshot(), taskBoard: queueInput, charBudget: 200 })
+    // 省略行仍以段头开头——主进程回放拆分按前缀认注入行，改头就静默失效
+    expect(out.segments.resident.startsWith(PROJECT_DIGEST_HEADER)).toBe(true)
+    expect(out.segments.resident).toContain('预算省略')
+    expect(out.segments.rotating).toContain('预算省略')
+    // 队列段是等主 Agent 决策的内容，哪怕超预算也要完整留着
+    expect(out.segments.queue).toContain('t1')
+    expect(out.segments.queue).not.toContain('预算省略')
+    // 四段拼接仍与 segments 一致
+    expect(out.contextText).toBe(
+      [out.segments.resident, out.segments.rotating, out.segments.queue, out.segments.injected]
+        .filter(Boolean)
+        .join('\n\n')
+    )
+  })
+
+  it('被省略的段不记 digest ⇒ 下一轮重发全文，不会折叠成「与上轮一致」', () => {
+    const first = collectRoundContext({ ...base, project: snapshot(), charBudget: 200 })
+    // 常驻段这一轮被预算省略，因此不能记为「已发」
+    expect(first.digests.project).toBeUndefined()
+    expect(first.segments.resident).toContain('预算省略')
+    // 下一轮预算充足、但上轮没送达：必须重发全文，而不是占位行
+    const second = collectRoundContext({ ...base, project: snapshot(), previousDigests: first.digests })
+    expect(second.digests.project).toContain('夜行列车')
+    expect(second.contextText).toContain('夜行列车')
+    expect(second.contextText).not.toContain(`${PROJECT_DIGEST_HEADER}${DIGEST_UNCHANGED_NOTE}`)
+  })
+
+  it('单轮附件上限：超出截断并回报 overflow（injectedAssetIds 会跨轮累积）', () => {
+    const nodes = Array.from({ length: MAX_ROUND_ATTACHMENTS + 5 }, (_, i) => ({
+      id: `n${i}`,
+      type: 'asset' as const,
+      x: 0,
+      y: 0,
+      width: 10,
+      height: 10,
+      zIndex: 1,
+      data: {
+        name: `a${i}.png`,
+        kind: 'image' as const,
+        storage: 'ws' as const,
+        path: `assets/images/a${i}.png`
+      }
+    }))
+    const out = collectRoundContext({ ...base, nodes, selectedAssetIds: nodes.map((n) => n.id) })
+    expect(out.attachments).toHaveLength(MAX_ROUND_ATTACHMENTS)
+    expect(out.attachmentOverflow).toBe(5)
   })
 })

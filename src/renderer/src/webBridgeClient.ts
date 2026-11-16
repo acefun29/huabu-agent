@@ -158,15 +158,27 @@ export function createWebBridgeApi(config: WebBridgeConfig): HuabuApi {
   }
 
   const invoke = async <T = unknown>(channel: string, payload?: unknown): Promise<T> => {
-    const post = (authToken: string): Promise<Response> =>
-      fetch(`${base}/invoke`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify({ channel, payload }),
-      })
+    const post = async (authToken: string): Promise<Response> => {
+      try {
+        return await fetch(`${base}/invoke`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${authToken}`,
+          },
+          body: JSON.stringify({ channel, payload }),
+        })
+      } catch (error) {
+        /*
+         * fetch 只在**网络层**失败时抛原生 `TypeError: Failed to fetch`——桥进程被关、
+         * 端口被占、dev server 死了都长这样。这个字符串一路冒到界面上就是
+         * 「创建会话时发生异常：TypeError: Failed to fetch」，用户完全无从下手。
+         * 这里换成能指路的说法：Web 端最常见的故障就是 `pnpm web` 已经不在了。
+         */
+        const detail = error instanceof Error ? error.message : String(error)
+        throw new Error(`本地桥连不上（${base}）：请确认 \`pnpm web\` 仍在运行（${detail}）`)
+      }
+    }
     let res = await post(token)
     if (res.status === 401 && refreshToken()) {
       res = await post(token)

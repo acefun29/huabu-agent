@@ -1,12 +1,12 @@
 import { ChatBridge } from '../../lib/agent'
-import { ChatErrorCode, type ChatEvent, type ChatHistoryMessage } from '@shared/ipc'
+import { ChatErrorCode, THINKING_LEVELS, type ChatEvent, type ChatHistoryMessage } from '@shared/ipc'
 import { compactGate, createStreamState, draftToMessage, mergeStreamHistory, reduceChatEvent, type ChatDraft, type ChatStreamState } from '../../lib/chatStream'
 import { isCommandInput, parseChatCommand } from '../../lib/chatCommands'
 import { guessKind } from '../../lib/media'
 import { buildReferencePayload } from '../../harness/prompt'
 import type { AssetData, AssetKind, CanvasNode, ChatData, ChatMessage, SessionMeta } from '../../types'
 import type { CanvasState } from '../canvasStore'
-import { collectRoundContext } from './contextCollector'
+import { collectRoundContext, CONTEXT_CHAR_BUDGET_DEFAULT } from './contextCollector'
 import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, newNodeId, settingsBridgeRef, spawnOffset, toolArgString, zCounter } from './shared'
 
 /**
@@ -44,6 +44,15 @@ const lastRoundDigests = new Map<
 /** 逐轮注入去重的 genSummary 签名表（key = sessionId，卡片 id → 签名）：
  * 签名与上轮一致的生成卡片不再重复携带 genSummary 括注 */
 const genSummarySeen = new Map<string, Record<string, string>>()
+/** 发送中的会话（同步哨兵）。chat.running 要等 create/prompt 的 IPC 返回才置位，
+ * 只靠它挡不住「await 期间第二次发送」的重入：两次都推进 → 两条用户气泡配一份回复，
+ * 且后失败的一方会删掉先成功那一方的流状态（D1）。 */
+const sendingSessions = new Set<string>()
+/** 已停止的会话：abort 之后残留的 delta / tool_update 不得继续 fold 进草稿（D4）。
+ * 下一轮真正开始时（agent_start）解除。 */
+const stoppedSessions = new Set<string>()
+/** 历史回放中的会话（与 historyLoaded 分开：只有成功才写后者） */
+const historyLoading = new Set<string>()
 
 /** 默认占位标题：命中即视为「还没按实际对话起过名」，首发消息/历史回放时自动命名 */
 const DEFAULT_SESSION_TITLES = new Set(['新会话', '新对话'])
@@ -77,8 +86,16 @@ const IMMEDIATE_CHAT_EVENTS = new Set([
 const pendingChatEvents = new Map<string, ChatEvent[]>()
 let chatFlushTimer: ReturnType<typeof setTimeout> | null = null
 
-/** draft → ChatMessage 的转换缓存（按 draft 对象身份）：settled 消息引用稳定，流式刷新只重渲染尾部 */
-const draftMessageCache = new Map<string, Map<ChatDraft, ChatMessage>>()
+/**
+ * draft → ChatMessage 的转换缓存（按 draft 对象身份）：settled 消息引用稳定，流式刷新
+ * 只重渲染尾部。
+ *
+ * 内层用 WeakMap 而不是 Map（D9）：流式期间每次 flush 都会给正在生成的那条 draft 造
+ * 新对象，强引用 Map 会把每个历史版本连同它的全文一起留到下一轮 agent_start 才回收，
+ * 单轮内总量随输出长度近似平方增长。WeakMap 让被替换下来的 draft 随流状态一起被回收，
+ * 语义不变（还在用的 draft 天然被 stream 状态引用着）。
+ */
+const draftMessageCache = new Map<string, WeakMap<ChatDraft, ChatMessage>>()
 
 /** zustand store 的 setState 窄化签名（域模块只用这两种形态） */
 export type StoreSet = (partial: Partial<CanvasState> | ((state: CanvasState) => Partial<CanvasState>)) => void
@@ -109,7 +126,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     const baseLen = baseLens.get(sessionId) ?? 0
     let cache = draftMessageCache.get(sessionId)
     if (!cache) {
-      cache = new Map()
+      cache = new WeakMap()
       draftMessageCache.set(sessionId, cache)
     }
     const draftMessages: ChatMessage[] = (stream?.drafts ?? []).map((draft) => {
@@ -270,6 +287,19 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
             if (entry.sessionId === sessionId) writeToolPaths.delete(callId)
           }
         }
+        // 压缩成功（手动 /compact 与自动 threshold 两条路径都经这里）：历史已被换成
+        // 摘要，上轮注入的四段全文不再在模型上下文里。去重状态必须整体作废——否则
+        // 下一轮仍判定「与上轮一致」只发一行占位，模型却从未见过全文，素材库清单 /
+        // 画布态势 / 项目索引 / 任务队列就此挂空（B1）。
+        //
+        // 判成功不能靠 `summary !== undefined`：只有 Pi 侧会把摘要透传成 summary，
+        // Mastra 的 OM 钩子（mastra/memory.ts:106,128）只发 estimatedTokensAfter，
+        // 这样写会让 Mastra 的自动压缩永远清不掉状态。可用的一致信号只有
+        // 「未被中止且没有错误」——误判成功最多多花一次全文 token，绝不会丢信息。
+        if (event.type === 'compaction_end' && !event.aborted && !event.errorMessage) {
+          lastRoundDigests.delete(sessionId)
+          genSummarySeen.delete(sessionId)
+        }
       }
       if (sawAgentStart) {
         // 新一轮：旧的 draft→message 缓存整体作废（drafts 已重置）
@@ -281,6 +311,12 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
   }
 
   const handleChatEvent = (sessionId: string, event: ChatEvent) => {
+    // 停止后仍在传输途中的流式片段：直接丢弃，不进缓冲（flush 会把它 fold 进草稿，
+    // 用户按下停止之后还会继续长出文本）。agent_start 表示新一轮真的开始了，解除抑制。
+    if (stoppedSessions.has(sessionId)) {
+      if (event.type === 'agent_start') stoppedSessions.delete(sessionId)
+      else if (event.type === 'delta' || event.type === 'tool_update') return
+    }
     const buffer = pendingChatEvents.get(sessionId) ?? []
     buffer.push(event)
     pendingChatEvents.set(sessionId, buffer)
@@ -335,13 +371,25 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
    * + 注入段拆分。幂等，每会话只回放一次。
    */
   const replayChatHistory = async (sessionId: string, sessionFile: string) => {
-    if (!BRIDGE_AVAILABLE || historyLoaded.has(sessionId)) return
-    historyLoaded.add(sessionId)
-    const result = await window.huabu.chat.history({ nodeId: sessionId, sessionFile })
+    if (!BRIDGE_AVAILABLE || historyLoaded.has(sessionId) || historyLoading.has(sessionId)) return
+    // 「已加载」必须等 IPC 真的成功之后才记：此前先 add 再请求，一次失败（会话尚未
+    // 建立、主进程忙、旧 JSONL 读不出）就把该会话永久标成已加载，之后再也回放不了，
+    // 切回来永远是空白历史（D3）。并发保护交给独立的 historyLoading。
+    historyLoading.add(sessionId)
+    let result: Awaited<ReturnType<typeof window.huabu.chat.history>>
+    try {
+      result = await window.huabu.chat.history({ nodeId: sessionId, sessionFile })
+    } catch (error) {
+      console.warn('[canvas] 回放会话历史异常：', error)
+      return
+    } finally {
+      historyLoading.delete(sessionId)
+    }
     if (!result.ok) {
       console.warn('[canvas] 回放会话历史失败：', result.error)
       return
     }
+    historyLoaded.add(sessionId)
     const messages: ChatMessage[] = result.value.messages.map((m: ChatHistoryMessage, index) => ({
       id: `${sessionId}-replay-${index}`,
       role: m.role,
@@ -384,6 +432,10 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     genSummarySeen.clear()
     // 切工作区：所有会话一并清空，write 路径条目（含旧 sessionId）没有留存价值
     writeToolPaths.clear()
+    // 这三张表都按 sessionId 键持有瞬时态：旧工作区的会话 id 不会再出现，一并清掉
+    sendingSessions.clear()
+    stoppedSessions.clear()
+    historyLoading.clear()
   }
 
   const setActiveSessionId = (id: string | null) => {
@@ -486,6 +538,8 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     draftMessageCache.delete(id)
     lastRoundDigests.delete(id)
     genSummarySeen.delete(id)
+    stoppedSessions.delete(id)
+    historyLoading.delete(id)
     for (const [callId, entry] of writeToolPaths) {
       if (entry.sessionId === id) writeToolPaths.delete(callId)
     }
@@ -586,17 +640,44 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       }
     }
     const chat = get().chatsMap[sid]
-    if (chat?.running) return
+    // 同步哨兵必须先于下面每一个 await 落下：chat.running 要等 create/prompt 的 IPC
+    // 返回才置位，只靠它挡重入，await 窗口里的第二次发送会同时推进——两条用户气泡
+    // 配一份回复，且 send 被拒的一方会删掉对方刚建好的流状态与 running（D1）。
+    if (chat?.running || sendingSessions.has(sid)) return
+    sendingSessions.add(sid)
+    try {
+      await sendRound(sid, trimmed, ws.path)
+    } finally {
+      sendingSessions.delete(sid)
+    }
+  }
+
+  /**
+   * 一轮发送的实际流程（上下文采集 → 建会话 → 拼 outbound → 落用户气泡 → 发问）。
+   * 从 sendMessage 抽出，只为让同步哨兵能用 try/finally 收口；入参均由 sendMessage 定好。
+   */
+  const sendRound = async (sid: string, trimmed: string, workspaceDir: string) => {
+    // 新一轮真的开始了：解除上一次 abort 留下的流式抑制（D4）
+    stoppedSessions.delete(sid)
     const meta = get().sessions.find((s) => s.id === sid)
 
     // 本轮上下文 = 采集器唯一组装口：引用载荷（含 T11 生成卡回喂摘要）+ T9 素材库摘要
     // + T10 画布态势。全部逐轮动态注入（拼进消息文本），不进静态系统提示词；
     // @backend(payload)：只把路径与清单文本拼在消息后发给模型，文件内容不进上下文。
     const s = get()
+    // 注入文本的字符预算（B2）：取会话已知 contextWindow 的一小部分（≈10% token，
+    // 按 chars/2.5 折算），并夹在 [2000, CONTEXT_CHAR_BUDGET_DEFAULT] 之间。
+    // 窗口未知时用默认值——注入文本自己克制，才不会把 TokenLimiterProcessor 逼到
+    // best-fit 甚至 TripWire（单条超预算时整轮请求会直接失败）。
+    const knownWindow = get().chatsMap[sid]?.contextUsage?.contextWindow
+    const charBudget = knownWindow
+      ? Math.max(2_000, Math.min(CONTEXT_CHAR_BUDGET_DEFAULT, Math.floor(knownWindow * 0.25)))
+      : CONTEXT_CHAR_BUDGET_DEFAULT
     // 逐轮去重（token 经济）：传入上轮摘要全文与 genSummary 签名表，返回的新状态整表
-    // 存回（digests 是全量全文、签名表只含本轮仍在附件集合里的卡片），供下一轮比较
+    // 存回（digests 是本轮真正发出去的全文、签名表只含本轮仍在附件集合里的卡片）
     const {
       attachments,
+      attachmentOverflow,
       contextText,
       digests,
       genSummarySeen: carriedGenSigs
@@ -605,7 +686,8 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       injectedAssetIds: s.injectedAssetIds,
       nodes: s.nodes,
       tempAttachments: s.tempAttachments,
-      workspaceDir: ws.path,
+      workspaceDir,
+      charBudget,
       jobStates: s.jobStates,
       libraries: s.libraries,
       // 四段装配的数据来源：常驻/轮换段来自项目快照，队列段来自任务板投影
@@ -619,13 +701,6 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       previousDigests: lastRoundDigests.get(sid),
       genSummarySeen: genSummarySeen.get(sid)
     })
-    lastRoundDigests.set(sid, digests)
-    genSummarySeen.set(sid, carriedGenSigs)
-    // 发送时把当前选中的资产固化为「已注入」，之后即使取消选中，chip 仍保留
-    set((prev) => ({
-      injectedAssetIds: Array.from(new Set([...prev.injectedAssetIds, ...prev.selectedAssetIds])),
-      tempAttachments: []
-    }))
 
     const bridge = ensureBridge(sid)
     const ready = await bridge.ensureCreated(
@@ -633,8 +708,13 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       //（pi 对显式传入的 model 优先）；首次创建再兜底工作区默认模型，重绑无记录则不传（用会话内模型）
       meta?.modelId ?? (meta?.sessionFile ? undefined : settingsBridgeRef.current?.defaultModel ?? undefined),
       meta?.sessionFile,
-      // 未建会话时暂存的档位随 create 生效（重绑旧会话也传，pi 会按模型 clamp）
-      meta?.thinkingLevel
+      // 未建会话时暂存的档位随 create 生效（重绑旧会话也传，运行时按模型能力 clamp）。
+      // 必须先过 THINKING_LEVELS 白名单：A1 修好之后主进程会真的校验这个字段，
+      // 旧快照或手改 canvas.json 留下的非法值会让 create 直接 fail、整个会话发不出去；
+      // 非法即不传，退回到运行时的默认档位。
+      meta?.thinkingLevel && (THINKING_LEVELS as readonly string[]).includes(meta.thinkingLevel)
+        ? meta.thinkingLevel
+        : undefined
     )
     if (!ready) return
 
@@ -642,7 +722,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     // 不再把母会话文本摘要拼进首条消息——那条 20 条 transcript 注入路径已删除
     // （旧版 fork 会话没有 sessionFile 的兜底注入也一并废弃：旧产物不救，用户裁决）。
     let outbound = trimmed
-    const payload = buildReferencePayload(attachments)
+    const payload = buildReferencePayload(attachments, attachmentOverflow)
     if (payload) outbound = `${outbound}\n\n${payload}`
     // T9/T10：素材库清单与画布态势逐轮注入（引用清单之后；两者皆空时不加任何文本）
     if (contextText) outbound = `${outbound}\n\n${contextText}`
@@ -662,12 +742,28 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     patchChat(sid, (c) => ({ ...c, history: [...c.history, userMsg], running: true }))
     const accepted = await bridge.send(outbound)
     if (!accepted) {
+      // 发送被拒：模型没收到这一轮全文，去重状态就不能记为「已发」——否则下一轮
+      // 与这里的 digests 比对一致，只发一行「与上轮一致」占位，模型永远拿不到全文（B4）。
+      // 未写入即保持上一轮的值，下一轮会照常重发全文。
       streams.delete(sid)
       patchChat(sid, (c) => ({ ...c, running: false }))
+      return
     }
+    // 只在真的受理之后才固化去重状态与「已注入」集合：发送失败要能用同一份上下文重试
+    lastRoundDigests.set(sid, digests)
+    genSummarySeen.set(sid, carriedGenSigs)
+    // 发送成功才把当前选中的资产固化为「已注入」，之后即使取消选中 chip 仍保留
+    set((prev) => ({
+      injectedAssetIds: Array.from(new Set([...prev.injectedAssetIds, ...prev.selectedAssetIds])),
+      tempAttachments: []
+    }))
   }
 
   const stopChat = async (sessionId: string) => {
+    // 先丢缓冲再发 abort：abort 之后仍在途的片段由 stoppedSessions 抑制（D4）。
+    // 只调 bridge.stop() 的话，缓冲里那一批 delta 会在下次 flush 时照旧 fold 进草稿。
+    pendingChatEvents.delete(sessionId)
+    stoppedSessions.add(sessionId)
     const bridge = bridges.get(sessionId)
     if (bridge) await bridge.stop()
   }
@@ -686,7 +782,14 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       showToast('会话尚未开始对话，无需压缩')
       return
     }
-    await bridge.compact()
+    const ok = await bridge.compact()
+    // 压缩把历史换成摘要 → 上轮注入的四段全文已不在上下文里，去重状态整体作废，
+    // 下一轮重发全文（B1）。成功路径另有 compaction_end 事件兜住自动压缩；
+    // 这里同时处理，避免事件晚于用户下一次发送的窗口。
+    if (ok) {
+      lastRoundDigests.delete(sessionId)
+      genSummarySeen.delete(sessionId)
+    }
   }
 
   /**

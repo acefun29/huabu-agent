@@ -26,6 +26,8 @@ import { useCanvasStore } from '../store/canvasStore'
 import { ASSET_IDS_MIME } from '../store/canvasStore'
 import { bumpRender } from '../lib/perfProbe'
 import { CARD_THUMB_SIZE, assetSrc, formatBytes } from '../lib/media'
+import { nodeRelPath } from '../lib/workspacePath'
+import { TaskPill } from './chat/TaskPill'
 import { KIND_LABEL, type AssetData, type AssetKind, type CanvasNode } from '../types'
 import { Collapse } from './Collapse'
 
@@ -433,6 +435,11 @@ const UnifiedAssetCard = memo(function UnifiedAssetCard({ node, data }: { node: 
   // 生成运行态（内存）：进度/失败条；引用不存在时不订阅触发重渲染
   const runtime = useCanvasStore((s) => s.jobStates[node.id])
   const src = assetSrc(data, CARD_THUMB_SIZE)
+  // 产物归属：这张卡是哪次交付产出的、第几版；用户自己拖进来的素材没有归属，也就不显示
+  const owner = useCanvasStore((s) => {
+    const rel = nodeRelPath(data)
+    return rel ? s.artifactOwners.get(rel) : undefined
+  })
   const [previewBroken, setPreviewBroken] = useState(false)
   const viewable = data.kind === 'image' || data.kind === 'video' || data.kind === 'audio'
   /** 保存成功后 +1：驱动 useDocText 重读文件，卡片展示立即反映新内容 */
@@ -495,6 +502,7 @@ const UnifiedAssetCard = memo(function UnifiedAssetCard({ node, data }: { node: 
           </div>
         </>
       )}
+      {owner && <TaskPill owner={owner} shifted={selected} />}
       {/* 悬浮操作：沉浸式隐藏——悬停或选中才浮现；隐藏时连点穿（pointer-events-none），
           不可见按钮截胡点击会出现「点了没反应」的错觉 */}
       <div

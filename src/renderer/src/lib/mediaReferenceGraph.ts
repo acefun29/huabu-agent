@@ -46,11 +46,19 @@ export function isReferenceSourceProduced(source: CanvasNode): boolean {
   return (data.storage === 'media' || data.storage === 'ws') && Boolean(data.path)
 }
 
-/** 卡片的激活版本（activeVersionId 缺失/失效时回退最新版本）；无版本 = undefined */
+/**
+ * 卡片的激活版本（activeVersionId 缺失/失效时回退最新**正式**版本）；无 = undefined。
+ *
+ * 候选版本（`candidate: true`）永远不参与解析（A01）：专家产物在验收通过前只是候选，
+ * 若这里回退到 `versions[0]`，队首的候选就会绕过激活门成为「当前版本」，
+ * 下游引用照样拿到未经业务验收的结果。
+ */
 export function activeVersionOf(node: CanvasNode): GenerateVersion | undefined {
   const versions = node.data.versions
   if (!versions || versions.length === 0) return undefined
-  return versions.find((v) => v.id === node.data.activeVersionId) ?? versions[0]
+  const formal = versions.filter((version) => !version.candidate)
+  if (formal.length === 0) return undefined
+  return formal.find((v) => v.id === node.data.activeVersionId) ?? formal[0]
 }
 
 /**

@@ -10,10 +10,12 @@ import type {
   SuperAgentExpertInfo,
   SuperAgentTaskConversation,
   SuperAgentTaskView,
+  SuperAgentWorkStateView,
   TaskEvent,
   WorkspaceDeleteResult,
   WorkspaceInfo
 } from '@shared/ipc'
+import type { ArtifactOwner } from '../lib/artifactOwnership'
 import type { MediaKind, ResolvedRefCaps } from '@shared/media'
 import type { Facet, FacetSchema } from '@shared/facets'
 import { useSettings, useSettingsUi } from './settingsStore'
@@ -166,6 +168,8 @@ export interface CanvasState {
   mediaCapsFor: (kind: GenerationRequest['kind'], modelId?: string) => ResolvedRefCaps
   clearGenerateVersions: (nodeId: string) => void
   requestClearGenerateVersions: (nodeId: string) => void
+  /** 专家任务的候选产物提升为正式版本（A01）：由 task.activated 驱动，画布不自行激活 */
+  activateCandidateForTask: (taskId: string, artifactPath: string) => void
 
   /* 生成 Popover（直接生成入口，锚定卡片/划选/画布光标；生命周期短，不持久化） */
   genComposer: GenComposerTarget | null
@@ -280,6 +284,16 @@ export interface CanvasState {
   /* SuperAgent 协作（任务板 / 专家池 / 用户直连改需求；事实源在主进程 journal） */
   /** 任务板最近投影（新的在前；running 以主进程运行态为准） */
   superAgentTasks: Array<{ task: SuperAgentTaskView; running: boolean }>
+
+  /** 新任务模型的投影（施工计划 v4）：面板用分组，画布用归属表 */
+  workState: SuperAgentWorkStateView | null
+  workItems: SuperAgentWorkStateView['tasks']
+  artifactOwners: Map<string, ArtifactOwner>
+
+  refreshWorkItems: () => Promise<void>
+
+  /** 放弃一个任务（用户显式操作；已完成的任务主进程会拒绝） */
+  dropWorkItem: (taskId: string) => Promise<void>
   /** 专家池（静态注册表，工作区切换后拉一次） */
   superAgentExperts: SuperAgentExpertInfo[]
   /** 主进程里正在执行的 taskId */
@@ -938,6 +952,10 @@ function useCanvasBootstrap() {
     const unsubAsset = window.huabu.asset.onChanged(() => {
       void useCanvasStore.getState().refreshLibraries()
     })
+    // 任务事实变化（work.* / artifact.recorded）：重拉投影，面板与画布角标一起更新
+    const unsubWork = window.huabu.superagent.onWorkChanged(() => {
+      void useCanvasStore.getState().refreshWorkItems()
+    })
     const unsubConfirm = window.huabu.media.onConfirmRequest((payload) =>
       useCanvasStore.setState((s) =>
         s.pendingApprovals.some((p) => p.requestId === payload.requestId)
@@ -955,6 +973,7 @@ function useCanvasBootstrap() {
     return () => {
       unsubJob()
       unsubAsset()
+      unsubWork()
       unsubConfirm()
       unsubConfirmResolved()
       unsubTask()

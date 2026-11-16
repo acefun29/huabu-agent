@@ -22,10 +22,18 @@ export function TeamPopover({
   onOpenConversation: (taskId: string) => void
 }) {
   const tasks = useCanvasStore((s) => s.superAgentTasks)
+  const workItems = useCanvasStore((s) => s.workItems)
+  const refreshWorkItems = useCanvasStore((s) => s.refreshWorkItems)
+  const dropWorkItem = useCanvasStore((s) => s.dropWorkItem)
   const experts = useCanvasStore((s) => s.superAgentExperts)
   const refresh = useCanvasStore((s) => s.refreshSuperAgent)
   const cancelTask = useCanvasStore((s) => s.cancelSuperAgentTask)
   const panelRef = useRef<HTMLDivElement>(null)
+
+  // 新任务模型的事件不推送，打开面板时拉一次就够（投影很便宜）
+  useEffect(() => {
+    void refreshWorkItems()
+  }, [refreshWorkItems])
 
   const expertLabel = useMemo(() => {
     const map = new Map(experts.map((expert) => [expert.id, expert.label]))
@@ -65,6 +73,66 @@ export function TeamPopover({
       <div className="px-2 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-(--on-surface-muted)">
         任务板 · {tasks.length}
       </div>
+
+      {/*
+       * 新任务模型（施工计划 v4）：`work.*` 投影。与下面的旧板并存——
+       * 过渡期两套都在，删旧路径之后这一段就是唯一的任务列表。
+       * 没有"通过/驳回"：判定是动作（不满意就再做一版），这里只显示进度。
+       */}
+      {workItems.length > 0 && (
+        <div className="mb-1 rounded-xl bg-(--surface-chip)/50 px-1.5 py-1">
+          <div className="px-1 pb-1 pt-0.5 text-[10px] font-semibold uppercase tracking-wide text-(--on-surface-muted)">
+            工作项 · {workItems.filter((item) => item.status !== 'done' && item.status !== 'dropped').length} 个未完成
+          </div>
+          <ul className="flex flex-col gap-0.5">
+            {workItems
+              .slice()
+              .reverse()
+              .slice(0, 8)
+              .map((item) => {
+                const tone =
+                  item.status === 'done'
+                    ? 'text-(--on-surface-muted)'
+                    : item.status === 'doing'
+                      ? 'text-(--accent)'
+                      : item.status === 'dropped'
+                        ? 'text-(--on-surface-muted) line-through'
+                        : 'text-(--on-surface)'
+                const label =
+                  item.status === 'done'
+                    ? '已完成'
+                    : item.status === 'doing'
+                      ? '进行中'
+                      : item.status === 'dropped'
+                        ? '已放弃'
+                        : '待办'
+                return (
+                  <li key={item.id} className="flex items-center gap-2 rounded-lg px-1 py-1">
+                    <span className={`min-w-0 flex-1 truncate text-[12px] font-medium ${tone}`}>
+                      {item.title || item.id}
+                      {item.artifacts.length > 0 ? (
+                        <span className="ml-1 text-[10px] font-normal text-(--on-surface-muted)">
+                          {item.artifacts.length} 版
+                        </span>
+                      ) : null}
+                    </span>
+                    <span className="shrink-0 text-[10px] text-(--on-surface-muted)">{label}</span>
+                    {item.status === 'todo' || item.status === 'doing' ? (
+                      <button
+                        type="button"
+                        onClick={() => void dropWorkItem(item.id)}
+                        title="放弃这个任务（终态，不会删除已有产物）"
+                        className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] text-(--on-surface-muted) transition-colors hover:bg-(--surface-card) hover:text-(--on-surface)"
+                      >
+                        放弃
+                      </button>
+                    ) : null}
+                  </li>
+                )
+              })}
+          </ul>
+        </div>
+      )}
 
       {tasks.length === 0 ? (
         <div className="px-3 py-6 text-center text-[12px] leading-relaxed text-(--on-surface-muted)">

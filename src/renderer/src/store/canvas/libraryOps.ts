@@ -1,6 +1,7 @@
 import type { AssetLibraryFile } from '@shared/ipc'
 import type { Facet, FacetSchema } from '@shared/facets'
-import { assetDirForKind, MEDIA_ROOT_REL } from '@shared/assets'
+import { assetDirForKind } from '@shared/assets'
+import { nodeRelPath } from '../../lib/workspacePath'
 import { KIND_LABEL, type AssetData, type CanvasNode, type DirEntry, type MaterialLibrary, type MediaKind, type MessageAttachment } from '../../types'
 import type { CanvasState } from '../canvasStore'
 import type { StoreSet } from './chatRuntime'
@@ -326,12 +327,6 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   /* ---------------- 拖拽归档（asset:transfer）：画布卡/库条目移动，OS 文件复制 ---------------- */
-
-  /** 卡片（或其历史版本）的工作区相对路径：media 形态 = pathRoot/path，ws 形态 = path */
-  const nodeRelPath = (ref: { storage?: 'media' | 'ws'; path?: string; pathRoot?: string }): string | null => {
-    if (!ref.path) return null
-    return ref.storage === 'media' ? `${(ref.pathRoot ?? MEDIA_ROOT_REL).replace(/\/+$/, '')}/${ref.path}` : ref.path
-  }
 
   const libraryName = (id: string): string =>
     get().libraries.find((l) => l.id === id)?.name ?? (id === BUILTIN_LIBRARY ? '画布素材' : id)
