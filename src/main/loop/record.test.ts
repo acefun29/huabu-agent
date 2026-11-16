@@ -5,7 +5,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { WorkspaceJournal } from '../superagent/journal'
 import { projectWork } from '../store/tasks'
 import { finishTask } from '../core/task'
-import { bindSessionTask, resetSessionTasks } from './sessionTask'
+import { bindSessionTask, resetSessionTasks, sessionTaskId, unbindSessionTask } from './sessionTask'
 import {
   artifactFromToolResult,
   recordToolArtifact,
@@ -103,7 +103,7 @@ describe('recordToolArtifact', () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { lane: 'assets/visual' })
 
-    const outcome = await recordToolArtifact(deps, mediaDetails('assets/visual/a.png'))
+    const outcome = await recordToolArtifact(deps, mediaDetails('assets/visual/a.png'), 'V-02')
     expect(outcome).toMatchObject({ recorded: true, taskId: 'V-02', path: 'assets/visual/a.png' })
 
     const state = projectWork(await journal.read())
@@ -121,7 +121,7 @@ describe('recordToolArtifact', () => {
   it('路径越出写区 → 不记', async () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { lane: 'assets/visual' })
-    const outcome = await recordToolArtifact(deps, mediaDetails('story/a.png'))
+    const outcome = await recordToolArtifact(deps, mediaDetails('story/a.png'), 'V-02')
     expect(outcome).toMatchObject({ recorded: false })
     expect((await journal.read())).toHaveLength(2) // 只有 created + started
   })
@@ -129,22 +129,22 @@ describe('recordToolArtifact', () => {
   it('文本写入记到文本任务上', async () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { lane: 'story', kind: 'text' })
-    const outcome = await recordToolArtifact(deps, { artifact: { path: 'story/ep01.md', bytes: 120 } })
+    const outcome = await recordToolArtifact(deps, { artifact: { path: 'story/ep01.md', bytes: 120 } }, 'V-02')
     expect(outcome).toMatchObject({ recorded: true })
   })
 
   it('文本写入不记到图片任务上（中间文件不是交付物）', async () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { lane: 'assets/visual', kind: 'image' })
-    const outcome = await recordToolArtifact(deps, { artifact: { path: 'assets/visual/prompt.txt', bytes: 20 } })
+    const outcome = await recordToolArtifact(deps, { artifact: { path: 'assets/visual/prompt.txt', bytes: 20 } }, 'V-02')
     expect(outcome).toMatchObject({ recorded: false })
   })
 
   it('同任务多次产出 → 累积成多个版本', async () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { lane: 'assets/visual' })
-    await recordToolArtifact(deps, mediaDetails('assets/visual/v1.png'))
-    await recordToolArtifact(deps, mediaDetails('assets/visual/v2.png'))
+    await recordToolArtifact(deps, mediaDetails('assets/visual/v1.png'), 'V-02')
+    await recordToolArtifact(deps, mediaDetails('assets/visual/v2.png'), 'V-02')
 
     const state = projectWork(await journal.read())
     expect(state.tasks[0]!.artifacts).toHaveLength(2)
@@ -174,7 +174,10 @@ describe('withArtifactRecording', () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { lane: 'assets/visual' })
 
-    const [wrapped] = withArtifactRecording([fakeTool(mediaDetails('assets/visual/a.png'))], deps)
+    const [wrapped] = withArtifactRecording([fakeTool(mediaDetails('assets/visual/a.png'))], {
+      ...deps,
+      taskId: () => 'V-02'
+    })
     const result = await wrapped!.execute('c1', {}, undefined, undefined, {})
     expect(result).toMatchObject({ details: { artifactPath: 'assets/visual/a.png' } })
 
@@ -192,13 +195,34 @@ describe('withArtifactRecording', () => {
     expect(state.tasks[0]!.artifacts).toHaveLength(0)
   })
 
+  it('归属在调用开始时定格：工具执行期间任务收工，产物不再补记', async () => {
+    const { journal, deps } = await workspace()
+    await startTask(journal, { lane: 'assets/visual' })
+    const inner = fakeTool(mediaDetails('assets/visual/a.png'))
+    const closing = {
+      ...inner,
+      // 长工具跑到一半，任务被收工（模型/用户随时可能这么做）
+      execute: async (...args: never[]) => {
+        await journal.append('work.finished', 'V-02', 'main')
+        return (inner.execute as (...a: never[]) => unknown)(...args)
+      }
+    } as never
+    const [wrapped] = withArtifactRecording([closing], { ...deps, taskId: () => 'V-02' })
+    await wrapped!.execute('c1', {}, undefined, undefined, {})
+    const state = projectWork(await journal.read())
+    expect(state.tasks[0]!.artifacts).toHaveLength(0)
+  })
+
   it('记账抛错不影响工具结果（文件已经落盘，不能让模型以为生成失败）', async () => {
     const deps: RecordArtifactDeps = {
       journal: () => {
         throw new Error('journal 打不开')
       }
     }
-    const [wrapped] = withArtifactRecording([fakeTool(mediaDetails('assets/visual/a.png'))], deps)
+    const [wrapped] = withArtifactRecording([fakeTool(mediaDetails('assets/visual/a.png'))], {
+      ...deps,
+      taskId: () => 'V-02'
+    })
     const result = await wrapped!.execute('c1', {}, undefined, undefined, {})
     expect(result.isError).toBeUndefined()
     expect(result.details).toMatchObject({ artifactPath: 'assets/visual/a.png' })
@@ -238,7 +262,7 @@ describe('产出契约回归：只读不算产出，create_note 算', () => {  c
     const { journal, deps } = await workspace()
     await startTask(journal, { id: 'T-02', lane: 'assets/documents', kind: 'text' })
 
-    const outcome = await recordToolArtifact(deps, noteDetails('assets/documents/方案-1010.md'))
+    const outcome = await recordToolArtifact(deps, noteDetails('assets/documents/方案-1010.md'), 'T-02')
     expect(outcome).toMatchObject({
       recorded: true,
       taskId: 'T-02',
@@ -258,7 +282,7 @@ describe('产出契约回归：只读不算产出，create_note 算', () => {  c
   it('create_note 落在写区外 → 不记（写区仍是交付边界）', async () => {
     const { journal, deps } = await workspace()
     await startTask(journal, { id: 'T-03', lane: 'story', kind: 'text' })
-    const outcome = await recordToolArtifact(deps, noteDetails('assets/documents/方案-1010.md'))
+    const outcome = await recordToolArtifact(deps, noteDetails('assets/documents/方案-1010.md'), 'T-03')
     expect(outcome).toMatchObject({ recorded: false })
     expect((await journal.read())).toHaveLength(2) // 只有 created + started
   })
@@ -279,7 +303,7 @@ describe('会话级归属：多会话不串记账', () => {
     await startTask(journal, { id: 'T-B', lane: 'assets/documents', kind: 'text' })
 
     const outcome = await recordToolArtifact(
-      { ...deps, nodeId: () => 'node-a' },
+      { ...deps, taskId: () => sessionTaskId('node-a') },
       { artifact: { path: 'assets/documents/a.md', bytes: 12 } }
     )
     expect(outcome).toMatchObject({ recorded: true, taskId: 'T-A' })
@@ -294,15 +318,38 @@ describe('会话级归属：多会话不串记账', () => {
     resetSessionTasks()
   })
 
-  it('未绑定会话回退全局最近开工（旧行为保留）', async () => {
+  it('未绑定会话不记账：不回退全局（否则会记给另一个会话的 B）', async () => {
     resetSessionTasks()
     const { journal, deps } = await workspace()
     await startTask(journal, { id: 'T-A', lane: 'assets/documents', kind: 'text' })
     await startTask(journal, { id: 'T-B', lane: 'assets/documents', kind: 'text' })
 
-    const outcome = await recordToolArtifact(deps, {
-      artifact: { path: 'assets/documents/x.md', bytes: 8 }
-    })
-    expect(outcome).toMatchObject({ recorded: true, taskId: 'T-B' })
+    const outcome = await recordToolArtifact(
+      { ...deps, taskId: () => sessionTaskId('node-unbound') },
+      { artifact: { path: 'assets/documents/x.md', bytes: 8 } }
+    )
+    expect(outcome).toMatchObject({ recorded: false })
+    const state = projectWork(await journal.read())
+    expect(state.tasks.every((task) => task.artifacts.length === 0)).toBe(true)
+  })
+
+  it('A 收工后继续写文件：不记给仍在做的 B', async () => {
+    resetSessionTasks()
+    const { journal, deps } = await workspace()
+    await startTask(journal, { id: 'T-A', lane: 'assets/documents', kind: 'text' })
+    bindSessionTask('node-a', 'T-A')
+    await startTask(journal, { id: 'T-B', lane: 'assets/documents', kind: 'text' })
+    // A 收工：解绑（与 taskTools 的 onTaskClosed 同语义）
+    await journal.append('work.finished', 'T-A', 'main')
+    unbindSessionTask('node-a', 'T-A')
+
+    const outcome = await recordToolArtifact(
+      { ...deps, taskId: () => sessionTaskId('node-a') },
+      { artifact: { path: 'assets/documents/unowned.md', bytes: 9 } }
+    )
+    expect(outcome).toMatchObject({ recorded: false })
+    const state = projectWork(await journal.read())
+    expect(state.tasks.find((task) => task.id === 'T-B')!.artifacts).toHaveLength(0)
+    resetSessionTasks()
   })
 })

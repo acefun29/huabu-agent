@@ -74,6 +74,7 @@ vi.mock('../agent/fileTools', () => ({ createFileTools: () => [] }))
 vi.mock('../assets/manager', () => ({ inboxRoot: () => process.env.TEMP ?? '.' }))
 
 import { WorkspaceJournal } from '../superagent/journal'
+import { bindSessionTask, resetSessionTasks } from '../loop/sessionTask'
 import { registerChatIpc } from './chat'
 
 const dirs: string[] = []
@@ -131,6 +132,9 @@ describe('chat 工具装配', () => {
       kind: 'image'
     })
     await journal.append('work.started', 'V-02', 'main')
+    // 归属是会话级的：任务必须绑定到这个会话才会被认作「本会话正在做」
+    resetSessionTasks()
+    bindSessionTask('node-2', 'V-02')
 
     registerChatIpc({
       ...(baseCtx([]) as Record<string, unknown>),

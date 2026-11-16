@@ -11,7 +11,7 @@
  * - 未绑定/绑定已失效（任务收工、被别处放弃）时回退全局最近开工，保留旧行为；
  * - 继续旧任务由 `start_task` 显式按 id 绑定，不按创建顺序猜。
  */
-import { activeTask, type WorkState } from '../store/tasks'
+import type { WorkState } from '../store/tasks'
 import type { Task } from '../core/task'
 
 const bindings = new Map<string, string>()
@@ -37,16 +37,18 @@ export function sessionTaskId(nodeId: string | undefined): string | undefined {
 }
 
 /**
- * 这个会话当前在执行的任务：优先会话绑定；绑定项不再是 doing（已收工/放弃）
- * 或根本没绑过，回退全局最近开工。
+ * 这个会话当前在执行的任务：只看会话绑定，**不回退全局**。
+ *
+ * 为什么坚决不回退：未绑定的会话（刚恢复、或刚收工）继续写文件时，
+ * 全局「最近开工」可能是**另一个会话**的任务——产物会被记错人、那个任务被
+ * 伪造成「有产出」。没有绑定就没有归属，产物只落盘不记账；要继续旧任务，
+ * 用 start_task 按 id 显式接续（journal 照常可读）。
  */
 export function taskForSession(state: WorkState, nodeId: string | undefined): Task | undefined {
   const boundId = sessionTaskId(nodeId)
-  if (boundId) {
-    const bound = state.tasks.find((task) => task.id === boundId)
-    if (bound?.status === 'doing') return bound
-  }
-  return activeTask(state)
+  if (!boundId) return undefined
+  const bound = state.tasks.find((task) => task.id === boundId)
+  return bound?.status === 'doing' ? bound : undefined
 }
 
 /** 仅测试用：清空绑定表（模块级状态不能在用例之间串） */

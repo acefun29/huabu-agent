@@ -24,18 +24,16 @@
 import type { ToolDefinition } from '../agent/contracts'
 import type { WorkspaceJournal } from '../superagent/journal'
 import { loadWorkState } from './run'
-import { taskForSession } from './sessionTask'
 import { isWithinLane } from '../core/task'
 import { normalizeArtifactPath } from '../core/artifact'
 
 export interface RecordArtifactDeps {
   journal: () => WorkspaceJournal
   /**
-   * 这次工具调用属于哪个会话。产物记到**该会话正在做的任务**上：
-   * 同一工作区多会话并行时，全局「最近开工」会把 A 的产物记给 B。
-   * 缺省（没有会话上下文，如单测）按全局最近开工。
+   * 这次工具调用属于哪个会话的任务号（调用开始时取一次并定格）。
+   * 缺省表示没有会话归属——不回退全局「最近开工」，那是别的会话的任务。
    */
-  nodeId?: () => string | undefined
+  taskId?: () => string | undefined
   /** 观测到候选产物时的旁路通知（测试与调试用；生产用它广播刷新） */
   onRecorded?: (info: { taskId: string; path: string }) => void
 }
@@ -107,25 +105,31 @@ export type RecordOutcome =
   | { recorded: false; reason: string }
 
 /**
- * 把一次工具回执记到活跃任务上。
+ * 把一次工具回执记到**这次调用开始时**属于该会话的任务上。
  *
  * 跳过规则（都是「不该记」而不是「记了但不算」）：
  * - 回执里没有产物路径
- * - 当前没有正在做的任务
+ * - 该会话没有正在做的任务（不回退全局：那是别的会话的任务）
+ * - 任务在调用期间已收工/被放弃
  * - 路径不在任务写区内
  * - 是文本产出但任务本身不是文本任务（避免把中间文件当交付物）
  */
 export async function recordToolArtifact(
   deps: RecordArtifactDeps,
-  details: unknown
+  details: unknown,
+  /** 归属在调用开始时定格；缺省时才现取（测试与直接调用方） */
+  taskId?: string
 ): Promise<RecordOutcome> {
   const candidate = artifactFromToolResult(details)
   if (!candidate) return { recorded: false, reason: '回执里没有产物' }
 
+  const wantedId = taskId ?? deps.taskId?.()
+  if (!wantedId) return { recorded: false, reason: '当前会话没有在做的任务' }
+
   const journal = deps.journal()
   const state = await loadWorkState(journal)
-  const task = taskForSession(state, deps.nodeId?.())
-  if (!task) return { recorded: false, reason: '当前没有正在做的任务' }
+  const task = state.tasks.find((entry) => entry.id === wantedId && entry.status === 'doing')
+  if (!task) return { recorded: false, reason: `任务 ${wantedId} 已不在执行中` }
   if (!isWithinLane(task.lane, candidate.path)) {
     return { recorded: false, reason: `产物不在任务写区 ${task.lane}/ 内` }
   }
@@ -158,11 +162,16 @@ export function withArtifactRecording(
   return tools.map((tool) => ({
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+      /*
+       * 归属在**调用开始时**定格：生成类工具可能跑几十秒，期间模型/用户完全
+       * 可能收工或切换任务——回执必须记给「发起这次产出的那个任务」。
+       */
+      const taskIdAtCallStart = deps.taskId?.()
       const result = await tool.execute(toolCallId, params, signal, onUpdate, ctx)
       // 工具失败时不记账：没有产物可言（失败必须让产物不存在，§12 推论 3）
       if (!result.isError) {
         try {
-          await recordToolArtifact(deps, result.details)
+          await recordToolArtifact(deps, result.details, taskIdAtCallStart)
         } catch (error) {
           // 记账失败不能让工具调用看起来失败：文件已经落盘了，让模型重试生成只会浪费钱。
           // 记一条 warn，产物仍然可以被用户在磁盘上看到。

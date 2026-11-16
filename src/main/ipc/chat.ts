@@ -20,6 +20,7 @@ import { buildWorkspaceContext, loadWorkState, taskToolDeps } from '../loop/run'
 import { withArtifactRecording } from '../loop/record'
 import {
   bindSessionTask,
+  sessionTaskId,
   taskForSession,
   unbindSessionTask
 } from '../loop/sessionTask'
@@ -98,12 +99,25 @@ export function registerChatIpc(ctx: IpcContext): void {
     // vision 已通（toModelOutput content/media）：按会话模型目录 input 声明判定
     // （与 Pi 侧同一份数据），模型不支持时工具内自动降级元数据
     assembleTools: async (nodeId) => {
+      /*
+       * 工作区在**会话装配时定格**。
+       *
+       * 工具与记账都按这个目录解析路径、读 journal：切工作区后旧会话的在途
+       * 回执只能写回自己的事实源，不能顺着可变的 currentDir 落进新工作区
+       * （那是别人的 journal，会把 A 的产物记成新工作区某任务的东西）。
+       */
+      const sessionDir = currentDir()
+      const sessionCurrentDir = () => sessionDir
+      const sessionJournal = () => {
+        if (!sessionDir) throw new Error('尚未打开工作区')
+        return ctx.superAgent.journalHandle(sessionDir)
+      }
       const { mediaTools, readMediaTool, videoTools } = assembleMediaTools(nodeId, {
         store,
         mediaManager,
         requestApproval: requestMediaApproval,
         sessionModelSupportsImages: (nid) => mastraRuntime.sessionSupportsImages(nid),
-        currentDir,
+        currentDir: sessionCurrentDir,
         mediaContext,
         inboxRoot,
         /*
@@ -112,19 +126,15 @@ export function registerChatIpc(ctx: IpcContext): void {
          * 生成成功也不会成为任务产物。没有任务（手动/闲聊生成）沿用默认落库链。
          */
         outputDirFor: async (kind) => {
-          const dir = currentDir()
-          if (!dir) return undefined
-          const task = taskForSession(
-            await loadWorkState(ctx.superAgent.journalHandle(dir)),
-            nodeId
-          )
+          if (!sessionDir) return undefined
+          const task = taskForSession(await loadWorkState(sessionJournal()), nodeId)
           // 只认同类任务：文本任务里顺手生成的参考图仍走默认库，不该记成文本任务的版本
           return task && task.kind === kind ? laneOutputDir([task.lane]) : undefined
         }
       })
-      const noteTool = assembleNoteTool({ currentDir })
+      const noteTool = assembleNoteTool({ currentDir: sessionCurrentDir })
       const facetTools = assembleFacetTools({
-        currentDir,
+        currentDir: sessionCurrentDir,
         schemas: () => store.facetSchemas(),
         activeSchemaId: () => store.facetSchemaId(),
         saveSchema: (schema, activate) => store.saveFacetSchema(schema, activate),
@@ -146,12 +156,8 @@ export function registerChatIpc(ctx: IpcContext): void {
        */
       const taskTools = assembleTaskTools(
         taskToolDeps({
-          currentDir,
-          journal: () => {
-            const dir = currentDir()
-            if (!dir) throw new Error('尚未打开工作区')
-            return ctx.superAgent.journalHandle(dir)
-          },
+          currentDir: sessionCurrentDir,
+          journal: sessionJournal,
           newTaskId: () => `task-${randomUUID().slice(0, 8)}`,
           onAppend: broadcastWorkChanged,
           // 任务归属是会话级的：开工/继续把任务绑到本会话，收工/放弃解绑
@@ -164,12 +170,12 @@ export function registerChatIpc(ctx: IpcContext): void {
       // 重建），因此这里**常驻**。取舍：常驻只多占工具列表一行的 token，而 blockout
       // 的入口本来就要先读 blockout-shot 技能正文才会被正确调用；惰性机制省下的那点
       // 收益不值得在 Mastra 侧再造一套工具热改。
-      const blockoutTool = assembleBlockoutTool({ currentDir })
+      const blockoutTool = assembleBlockoutTool({ currentDir: sessionCurrentDir })
       // 文件三件套（全量去 pi 的前提）：Pi 侧由 pi 的内置 ls/read/write 提供，Mastra 侧
       // 原本**完全没有**——而 shared/prompt.ts 一直在教模型「文本用 read」「中间文件用
       // write」，渲染端的「写的媒体文件自动上画布」也挂在 write 的工具事件上。
       // 守卫在 fileTools.ts 里（工作区相对路径 + realpath 防符号链接逃逸 + 读写上限）。
-      const fileTools = createFileTools({ currentDir })
+      const fileTools = createFileTools({ currentDir: sessionCurrentDir })
       /*
        * MCP 工具：设置页接进来的服务器必须真的能进模型手里，否则「已连接」只是个徽章。
        * 连接状态与启用开关由 manager 自己判定（未连接/未启用/已 disposed → 空数组），
@@ -193,13 +199,9 @@ export function registerChatIpc(ctx: IpcContext): void {
        * 只包 execute，工具对模型的行为完全不变。
        */
       return withArtifactRecording(tools, {
-        journal: () => {
-          const dir = currentDir()
-          if (!dir) throw new Error('尚未打开工作区')
-          return ctx.superAgent.journalHandle(dir)
-        },
-        // 产物归属跟着会话走：多会话并行时不能记到「全局最近开工」的那个任务上
-        nodeId: () => nodeId,
+        journal: sessionJournal,
+        // 归属跟着会话走：调用开始时取本会话的绑定任务，不回退全局「最近开工」
+        taskId: () => sessionTaskId(nodeId),
         // 记账成功即广播：长轮次里产物一落盘，工作项与角标就该刷新，
         // 不能等 finish_task 才有动静（那时可能已经过去几十秒）。
         onRecorded: () => broadcastWorkChanged()

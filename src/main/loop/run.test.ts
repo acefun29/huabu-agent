@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { WorkspaceJournal } from '../superagent/journal'
 import { buildWorkspaceContext, readStudioContent, taskToolDeps } from './run'
+import { bindSessionTask, resetSessionTasks } from './sessionTask'
 
 /**
  * Loop 的读写边界：真实读 `studio.md`、真实写 journal、真实投影。
@@ -65,8 +66,11 @@ describe('buildWorkspaceContext', () => {
       kind: 'image'
     })
     await journal.append('work.started', 'V-02', 'main')
+    // 上下文里的任务跟着会话走：必须显式绑定，不会借用全局「最近开工」
+    resetSessionTasks()
+    bindSessionTask('node-1', 'V-02')
 
-    const context = await buildWorkspaceContext({ dir, journal: () => journal })
+    const context = await buildWorkspaceContext({ dir, journal: () => journal, nodeId: 'node-1' })
     expect(context.indexOf('项目记忆')).toBeLessThan(context.indexOf('当前任务'))
     expect(context).toContain('暖色')
     expect(context).toContain('V-02')
@@ -88,10 +92,27 @@ describe('buildWorkspaceContext', () => {
       mime: 'image/png',
       bytes: 2048
     })
+    resetSessionTasks()
+    bindSessionTask('node-1', 'V-02')
 
-    const context = await buildWorkspaceContext({ dir, journal: () => journal })
+    const context = await buildWorkspaceContext({ dir, journal: () => journal, nodeId: 'node-1' })
     expect(context).toContain('已产出：1 个版本')
     expect(context).toContain('assets/visual/s03.png')
+  })
+
+  it('未绑定会话不显示别人的任务（归属是会话级的）', async () => {
+    const { dir, journal } = workspace()
+    await journal.append('work.created', 'V-02', 'main', {
+      title: 't',
+      brief: 'b',
+      lane: 'assets/visual',
+      kind: 'image'
+    })
+    await journal.append('work.started', 'V-02', 'main')
+    resetSessionTasks()
+
+    const context = await buildWorkspaceContext({ dir, journal: () => journal, nodeId: 'node-other' })
+    expect(context).not.toContain('当前任务')
   })
 
   it('已完成的任务不再算「当前任务」', async () => {

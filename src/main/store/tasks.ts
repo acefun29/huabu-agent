@@ -165,11 +165,11 @@ export function projectWork(events: readonly JournalEvent[]): WorkState {
 }
 
 /**
- * 当前正在做的任务：**最近开工**的那个 doing。
+ * 投影里「最近开工」的那个 doing。
  *
- * 为什么不是「第一个 doing」：历史里可能留着几个 doing（任务开了但没做完、进程崩过、
- * 用户换了方向）。取第一个会让新一轮的产物被记到几天前的旧任务上——产物归属错了，
- * 任务永远完成不了，而且错得很难发现。取最近开工的才符合「我现在在做这件事」。
+ * **不要用它决定产物归属**：一个工作区可以同时有多个会话在跑，任务归属是会话级的
+ * （见 loop/sessionTask.ts）。用它当「当前任务」会把 A 的产物记给 B 刚开的任务。
+ * 保留它只作为投影层的通用查询（列表、调试、测试）。
  */
 export function activeTask(state: WorkState): Task | undefined {
   for (let index = state.tasks.length - 1; index >= 0; index -= 1) {

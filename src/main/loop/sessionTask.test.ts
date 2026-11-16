@@ -40,14 +40,14 @@ describe('taskForSession', () => {
     bindSessionTask('node-a', 'T-A')
     const both = state(task('T-A', 'doing'), task('T-B', 'doing'))
     expect(taskForSession(both, 'node-a')?.id).toBe('T-A')
-    // 未绑定的会话沿用旧行为：全局最近开工
-    expect(taskForSession(both, 'node-b')?.id).toBe('T-B')
+    // 未绑定的会话没有归属：不能借用别人的 doing（否则产物会记错人）
+    expect(taskForSession(both, 'node-b')).toBeUndefined()
   })
 
-  it('绑定已失效（任务收工）→ 回退全局最近开工', () => {
+  it('绑定已失效（任务收工）→ 不借用其他 doing，未归属', () => {
     bindSessionTask('node-a', 'T-A')
     const mixed = state(task('T-A', 'done'), task('T-B', 'doing'))
-    expect(taskForSession(mixed, 'node-a')?.id).toBe('T-B')
+    expect(taskForSession(mixed, 'node-a')).toBeUndefined()
   })
 
   it('没有任何 doing → undefined，不乱选', () => {
