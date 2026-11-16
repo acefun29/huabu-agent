@@ -119,6 +119,7 @@ export interface ChatRuntimeDeps {
 }
 
 export function createChatRuntime(deps: ChatRuntimeDeps) {
+  let workspaceGeneration = 0
   const { set, get, showToast, applyNodes, applySessions, patchChat, recomputeChatDerived, clearTransient } = deps
 
   const syncChatHistory = (sessionId: string) => {
@@ -372,6 +373,9 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
    */
   const replayChatHistory = async (sessionId: string, sessionFile: string) => {
     if (!BRIDGE_AVAILABLE || historyLoaded.has(sessionId) || historyLoading.has(sessionId)) return
+    const workspacePath = get().workspace?.path
+    if (!workspacePath) return
+    const generation = workspaceGeneration
     // 「已加载」必须等 IPC 真的成功之后才记：此前先 add 再请求，一次失败（会话尚未
     // 建立、主进程忙、旧 JSONL 读不出）就把该会话永久标成已加载，之后再也回放不了，
     // 切回来永远是空白历史（D3）。并发保护交给独立的 historyLoading。
@@ -383,8 +387,10 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
       console.warn('[canvas] 回放会话历史异常：', error)
       return
     } finally {
-      historyLoading.delete(sessionId)
+      if (generation === workspaceGeneration) historyLoading.delete(sessionId)
     }
+    if (generation !== workspaceGeneration || get().workspace?.path !== workspacePath) return
+    if (!get().sessions.some((session) => session.id === sessionId && session.sessionFile === sessionFile)) return
     if (!result.ok) {
       console.warn('[canvas] 回放会话历史失败：', result.error)
       return
@@ -420,6 +426,7 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
   }
 
   const disposeAllBridges = () => {
+    workspaceGeneration += 1
     for (const bridge of bridges.values()) bridge.dispose()
     bridges.clear()
     streams.clear()
@@ -706,7 +713,9 @@ export function createChatRuntime(deps: ChatRuntimeDeps) {
     const ready = await bridge.ensureCreated(
       // 重绑（有 sessionFile）也传 meta.modelId：恢复后用户切换过模型的话要在重绑时生效
       //（pi 对显式传入的 model 优先）；首次创建再兜底工作区默认模型，重绑无记录则不传（用会话内模型）
-      meta?.modelId ?? (meta?.sessionFile ? undefined : settingsBridgeRef.current?.defaultModel ?? undefined),
+      meta?.modelId ?? (meta?.sessionFile || settingsBridgeRef.current?.chatWorkspacePath !== workspaceDir
+        ? undefined
+        : settingsBridgeRef.current.defaultModel ?? undefined),
       meta?.sessionFile,
       // 未建会话时暂存的档位随 create 生效（重绑旧会话也传，运行时按模型能力 clamp）。
       // 必须先过 THINKING_LEVELS 白名单：A1 修好之后主进程会真的校验这个字段，

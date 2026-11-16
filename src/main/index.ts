@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, shell } from 'electron'
+import { app, BrowserWindow, dialog, Menu, shell } from 'electron'
 import { join } from 'path'
 import { disposeChatSessions, getMcpManager, getWorkspaceStore, registerIpcHandlers } from './ipc'
 import { startWebBridge, setActiveBridge } from './webBridge/server'
@@ -73,7 +73,7 @@ function createMainWindow(): BrowserWindow {
    *
    * 渲染端画布自动保存有 800ms 防抖、主进程写盘还有 200ms 合并窗口，直接 close
    * 会把「刚新建的会话 / 刚改的卡片」丢在内存里（实测窗口内关闭只留下上一版）。
-   * 这里拦一次 close：请渲染端立刻冲刷，等快照真正落盘（或超时兜底）后亲手 destroy。
+   * 这里拦一次 close：请渲染端立刻冲刷，确认落盘后再关闭；失败时提示用户。
    */
   let closing = false
   mainWindow.on('close', (event) => {
@@ -82,7 +82,27 @@ function createMainWindow(): BrowserWindow {
     event.preventDefault()
     if (closing) return
     closing = true
-    void finishWindowClose(mainWindow)
+    void finishWindowClose(mainWindow).catch(async (error) => {
+      console.error('[main] 关闭前保存画布失败：', error)
+      if (mainWindow.isDestroyed()) return
+      try {
+        const result = await dialog.showMessageBox(mainWindow, {
+          type: 'error',
+          title: '画布未保存',
+          message: '无法确认画布已保存。',
+          detail: '返回应用后可检查存储空间或权限并重试；仍然关闭可能丢失未保存的更改。',
+          buttons: ['返回应用', '仍然关闭'],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true
+        })
+        if (result.response === 1 && !mainWindow.isDestroyed()) mainWindow.destroy()
+      } catch (dialogError) {
+        console.error('[main] 无法显示保存失败提示：', dialogError)
+      } finally {
+        closing = false
+      }
+    })
   })
 
   mainWindow.on('ready-to-show', () => {
@@ -147,7 +167,7 @@ async function finishWindowClose(window: BrowserWindow): Promise<void> {
     // 先挂等待者再发事件：渲染端的回执可能比等待者就位更早到
     const confirmed = requestCloseFlushConfirmation(CLOSE_FLUSH_TIMEOUT_MS)
     window.webContents.send(IpcChannel.AppFlushBeforeClose)
-    await confirmed
+    if (!(await confirmed)) throw new Error('渲染端未确认画布保存成功')
   }
   // 主进程侧最后一道：把渲染端刚交上来（或更早）的最后一版快照写盘
   store?.flushPendingWrites()
@@ -211,7 +231,11 @@ app.on('window-all-closed', () => {
 // 等待，所以这里只做同步收口 + 触发异步关停（Pi 侧已随运行时移除）。
 app.on('will-quit', () => {
   // 画布快照最后一道冲刷：窗口 close 流程之外的退出路径（系统关机、Cmd+Q）也覆盖
-  getWorkspaceStore()?.flushPendingWrites()
+  try {
+    getWorkspaceStore()?.flushPendingWrites()
+  } catch (error) {
+    console.error('[main] 退出前保存画布失败：', error)
+  }
   disposeChatSessions()
   // MCP 子进程关停（关 stdin → 等 SDK 兜底 kill）；close 异步但触发即算完成职责
   getMcpManager()?.disposeAll()

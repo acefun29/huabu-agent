@@ -25,7 +25,7 @@ vi.mock('./shared', () => ({
   asNodeRequest: () => null,
   isNonEmptyString: () => false
 }))
-vi.mock('./media', () => ({ settleApprovalsForNode: () => {} }))
+vi.mock('./mediaApproval', () => ({ settleApprovalsForNode: () => {} }))
 vi.mock('../agent/mastra/runtime', () => ({
   MastraAgentRuntime: class {
     constructor(deps: unknown) {

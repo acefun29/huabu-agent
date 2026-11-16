@@ -46,6 +46,7 @@ function collectSources() {
   // 协议白名单挪到了 shared（渲染端要枚举它做下拉），main/models/types.ts 对它做的是
   // **值**再导出，运行时真要 require —— 不加进来转译就会在模块解析上炸
   files.push(path.join(PROJECT_ROOT, 'src', 'shared', 'chatApi.ts'))
+  files.push(path.join(PROJECT_ROOT, 'src', 'shared', 'ipc.ts'))
   return files
 }
 

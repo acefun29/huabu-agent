@@ -655,6 +655,8 @@ export interface MediaArtifact {
 /** 一条媒体任务的完整状态（media:job 事件与 media:jobs 查询共用） */
 export interface MediaJobStatus {
   jobId: string
+  /** 任务所属工作区；旧任务数据可能没有该字段。 */
+  workspacePath?: string
   provider: string
   model: string
   kind: MediaKind
@@ -667,6 +669,10 @@ export interface MediaJobStatus {
   artifact?: MediaArtifact
   /** 失败原因（可操作，不含密钥） */
   error?: string
+  /** 任务账本暂未写入时的提示；这是运行时状态，不写入任务账本。 */
+  persistenceWarning?: string
+  /** 工作区内的账本目录，用于区分保存状态；仅在运行时传输。 */
+  persistenceScope?: string
   createdAt: string
   updatedAt: string
   nodeId?: string

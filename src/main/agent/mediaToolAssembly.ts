@@ -1,4 +1,4 @@
-import { join } from 'path'
+import { join, resolve, sep } from 'path'
 import type { MediaJobStatus } from '@shared/ipc'
 import { MediaFailureError, type MediaRefInput } from '../../shared/media'
 import type { AdapterProviderConfig } from '../media/adapters'
@@ -56,7 +56,7 @@ export interface MediaAssemblyDeps {
       refs?: MediaRefInput[]
       outputDir?: string
       sourceChatId?: string
-    }): Promise<{ jobId: string }>
+    }, expectedWorkspace?: string, signal?: AbortSignal): Promise<{ jobId: string }>
     waitForCompletion(
       jobId: string,
       opts?: {
@@ -68,10 +68,13 @@ export interface MediaAssemblyDeps {
   /** 当前会话的对话模型是否声明图片输入（host.sessionModelSupportsImages） */
   sessionModelSupportsImages: (nodeId: string) => boolean | undefined
   currentDir: () => string | null
+  /** 宿主可拒绝已不再活跃的工作区。 */
+  isWorkspaceActive?: (workspaceDir: string) => boolean
   mediaContext: () => {
     providers: readonly AdapterProviderConfig[]
     config: ReturnType<MediaAssemblyStore['mediaConfig']>
     mediaDir: string | null
+    workspaceDir?: string | null
   }
   inboxRoot: () => string
   /**
@@ -170,16 +173,37 @@ export function resolveAgentMedia(
 /** 组装会话的媒体工具面：3 个生成工具 + read_media（顺序即 chat:create 的 customTools） */
 export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
   const { store, mediaManager, mediaContext } = deps
+  const boundContext = () => {
+    const workspace = deps.currentDir()
+    if (!workspace || (deps.isWorkspaceActive && !deps.isWorkspaceActive(workspace))) return null
+    const context = mediaContext()
+    if (context.workspaceDir !== undefined && context.workspaceDir !== workspace) return null
+    return context
+  }
+  const artifactDirectory = (workspace: string, relativeDir?: string): string | undefined => {
+    const root = resolve(workspace)
+    const dir = resolve(root, relativeDir ?? MEDIA_ROOT_REL)
+    return dir !== root && dir.startsWith(root + sep) ? dir : undefined
+  }
 
   const mediaTools = createMediaTools({
+    workspaceAvailable: () => boundContext() !== null,
     submit: async (input, signal, onProgress) => {
-      const { providers: effective, config } = mediaContext()
+      const workspacePath = deps.currentDir()
+      const current = boundContext()
+      if (!workspacePath || !current) {
+        throw new Error('工作区已切换，媒体任务未提交')
+      }
+      const { providers: effective, config } = current
       const resolution = resolveAgentMedia(effective, config, input.kind)
       // Agent 生成同样走落库链（类型默认 > 全局默认 > 公共库 > 画布素材分类），
       // 与画布卡片/设置页同一套语义——否则 Agent 生成的产物永远留在隐藏产物目录。
       // 有正在做的同类任务时以 lane 为准（提交边界现取）：产物必须落在任务写区内，
       // 否则记账会跳过——钱花了、产物却不属于任何任务。
       const override = deps.outputDirFor ? await deps.outputDirFor(input.kind) : undefined
+      if (signal?.aborted || deps.currentDir() !== workspacePath || !boundContext()) {
+        throw new Error('工作区已切换或任务已取消，媒体任务未提交')
+      }
       const outputLibrary = override ?? resolveOutputLibrary(store, config, input.kind)
       const { jobId } = await mediaManager.submit({
         kind: input.kind,
@@ -193,7 +217,7 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
         ...(input.refs && input.refs.length > 0 ? { refs: input.refs } : {}),
         ...(outputLibrary ? { outputDir: outputLibrary } : {}),
         sourceChatId: nodeId
-      })
+      }, workspacePath, signal)
       return mediaManager.waitForCompletion(jobId, {
         ...(signal ? { signal } : {}),
         ...(onProgress
@@ -208,15 +232,17 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
           : {})
       })
     },
-    confirmVideo: () => store.mediaConfig().confirmVideo ?? true,
+    confirmVideo: () => boundContext()?.config.confirmVideo ?? true,
     // 访问模式现读（改 workspace.json 即时生效）；'confirm' 时 execute 先走 requestApproval
-    accessMode: () => store.mediaConfig().accessMode ?? 'full',
+    accessMode: () => boundContext()?.config.accessMode ?? 'full',
     // 变更前确认：装配层先解析 provider/model 填进确认卡（解析失败照样弹卡，只是不带模型名），
     // 事件发射与回执等待在 ipc 注入的实现里
     ...(deps.requestApproval
       ? {
           requestApproval: (kind: 'image' | 'video' | 'audio', info: MediaApprovalInfo, signal: AbortSignal | undefined) => {
-            const { providers: effective, config } = mediaContext()
+            const current = boundContext()
+            if (!current) return Promise.resolve(false)
+            const { providers: effective, config } = current
             let provider: string | undefined
             let model: string | undefined
             try {
@@ -232,7 +258,9 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
       : {}),
     // 当前解析到的模型能力：工具 execute 内每次现读，做比例/时长的合法性校验
     capabilities: (kind) => {
-      const { providers: effective, config } = mediaContext()
+      const current = boundContext()
+      if (!current) return undefined
+      const { providers: effective, config } = current
       const resolved = resolveMediaTarget(effective, {
         kind,
         agentProvider: config.agentProvider,
@@ -243,8 +271,12 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
     // 多模态回传开关：当前会话的对话模型支持图片输入才回传产物图
     supportsImageInput: () => deps.sessionModelSupportsImages(nodeId) ?? false,
     // 产物读图在主进程完成（解码/缩放/JPEG），base64 不落渲染进程；IO 异步
-    readArtifactAsBase64: async (relPath, maxEdge) => {
-      const dir = mediaContext().mediaDir
+    readArtifactAsBase64: async (relPath, maxEdge, artifactDirRel) => {
+      const workspace = deps.currentDir()
+      if (!workspace) return undefined
+      const dir = artifactDirRel
+        ? artifactDirectory(workspace, artifactDirRel)
+        : boundContext()?.mediaDir ?? artifactDirectory(workspace)
       return dir ? readArtifactAsBase64(relPath, dir, maxEdge) : undefined
     },
     // 视频成功结果回传首帧关键帧（P2 多模态自检）：与 read_media/videoTools 同一套抽帧管线
@@ -257,7 +289,10 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
         // 目录用任务状态里记录的 artifactDirRel（提交时的实际落盘目录，相对工作区根）——
         // media.outputDir 是随时可改的设置，按"当前配置"拼历史产物必错（见 MediaJobStatus.artifactDirRel）；
         // 缺省回退媒体产物目录根 MEDIA_ROOT_REL
-        const absPath = join(workspaceDir, artifact.artifactDirRel ?? MEDIA_ROOT_REL, artifact.relPath)
+        const artifactDir = artifactDirectory(workspaceDir, artifact.artifactDirRel)
+        if (!artifactDir) return undefined
+        const absPath = resolve(artifactDir, artifact.relPath)
+        if (!absPath.startsWith(artifactDir + sep)) return undefined
         // maxFrames=2 是抽帧管线的下限：videoFrames.ts 抽帧后有 extracted.length < 2 判失败的守卫，
         // 传 1 必 ok:false（首帧永远回不来）；故传 2 取第 1 帧 —— "只回 1 帧"的意图不变，
         // 多抽的那帧只进磁盘缓存，不进模型上下文
@@ -281,7 +316,9 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
   const mediaRoots = () => {
     const dir = deps.currentDir()
     if (!dir) return null
-    const mediaDir = mediaContext().mediaDir ?? undefined
+    const current = boundContext()
+    if (!current) return null
+    const mediaDir = current.mediaDir ?? undefined
     return { workspaceDir: dir, ...(mediaDir ? { mediaDir } : {}), inboxDir: deps.inboxRoot() }
   }
   const readMediaTool = createReadMediaTool({

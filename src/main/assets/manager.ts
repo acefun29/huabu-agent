@@ -26,7 +26,8 @@ import type {
   AssetTransferResult,
   ImportedAsset
 } from '../../shared/ipc'
-import { copyIntoDir, WorkspaceStore } from '../workspace/store'
+import { copyIntoDir } from '../fsutil/copy'
+import type { WorkspaceStore } from '../workspace/store'
 import { loadTagsIndex, setFileTags } from './tagsIndex'
 import { loadFacetsIndex, migrateFacetKey, removeFacetKey } from './facetsIndex'
 import { activeFacetSchema, type Facet } from '../../shared/facets'

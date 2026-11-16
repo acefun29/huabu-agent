@@ -32,6 +32,9 @@ const MAX_TASK_ROWS = 60
 
 export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
   const { set, get, showToast } = deps
+  let boardSequence = 0
+  let workSequence = 0
+  let expertsSequence = 0
 
   const applySnapshot = (snapshot: SuperAgentBoardSnapshot | undefined | null): void => {
     // 浏览器预览等环境下 IPC 可能返回空值：按「没有任务」处理，不让面板崩掉
@@ -48,13 +51,14 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
   const refreshSuperAgent = async (): Promise<void> => {
     const dir = get().workspace?.path
     if (!BRIDGE_AVAILABLE || !dir) return
+    const requestId = ++boardSequence
     const result = await window.huabu.superagent.board()
     if (!result.ok) {
       // 未打开工作区是常态（选择页），不当错误提示
       return
     }
     // 工作区已切换：旧请求的回包按「不属于当前画布」丢弃，不能把旧板刷回来
-    if (get().workspace?.path !== dir) return
+    if (requestId !== boardSequence || get().workspace?.path !== dir) return
     applySnapshot(result.value)
   }
 
@@ -67,10 +71,11 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
   const refreshWorkItems = async (): Promise<void> => {
     const dir = get().workspace?.path
     if (!BRIDGE_AVAILABLE || !dir) return
+    const requestId = ++workSequence
     const result = await window.huabu.superagent.workState()
     if (!result.ok) return
     // 同上：切换工作区后到达的旧投影直接丢，否则新画布会短暂显示别的工作区的任务
-    if (get().workspace?.path !== dir) return
+    if (requestId !== workSequence || get().workspace?.path !== dir) return
     const state = result.value
     set({
       workState: state,
@@ -93,9 +98,11 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
 
   /** 专家池清单（注册表是静态的，工作区切换后拉一次即可） */
   const refreshSuperAgentExperts = async (): Promise<void> => {
-    if (!BRIDGE_AVAILABLE || !get().workspace) return
+    const dir = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !dir) return
+    const requestId = ++expertsSequence
     const result = await window.huabu.superagent.experts()
-    if (!result.ok) return
+    if (!result.ok || requestId !== expertsSequence || get().workspace?.path !== dir) return
     set({ superAgentExperts: Array.isArray(result.value) ? result.value : [] })
   }
 
@@ -207,8 +214,12 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
     loadSuperAgentConversation,
     handleTaskEvent,
     /** @internal 供工作区切换清理用 */
-    resetSuperAgent: (): void =>
+    resetSuperAgent: (): void => {
+      boardSequence += 1
+      workSequence += 1
+      expertsSequence += 1
       set({ superAgentTasks: [], superAgentRunning: [], workItems: [], workState: null, artifactOwners: new Map() })
+    }
   }
 }
 

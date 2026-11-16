@@ -12,7 +12,7 @@ import {
 } from 'lucide-react'
 import { LIBRARY_ASSET_MIME, useCanvasStore } from '../store/canvasStore'
 import { collectFacetValues, facetMatchesPrefix, type FacetLevel } from '@shared/facets'
-import { useSettings } from '../store/settingsStore'
+import { useAppearanceSettings } from '../store/settingsStore'
 import { bumpRender } from '../lib/perfProbe'
 import { parseLibraryEntryPayload } from '../lib/dragPayload'
 import { type CanvasNode, type MediaKind, type ViewState } from '../types'
@@ -293,7 +293,7 @@ export function CanvasWorkspace() {
   // 默认进入项目结构（原型主界面）；自由画布作为可切换的次要视图
   const view = useCanvasStore((s) => s.view)
   const selectedAssetIds = useCanvasStore((s) => s.selectedAssetIds)
-  const { appearance, setAppearance } = useSettings()
+  const { appearance, setAppearance } = useAppearanceSettings()
   const [menu, setMenu] = useState<MenuState | null>(null)
   /** 标签筛选：非 null 时只亮带该标签的卡片（其余降透明度） */
   /** 画布属性筛选（类型/状态/标签/素材库，AND 叠加；不匹配卡片降透明） */

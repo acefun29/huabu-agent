@@ -7,10 +7,10 @@ import { WorkspaceModels, authSourceOf, deriveThinkingLevels } from './workspace
 import { startStubProvider } from './mastra/stubProvider'
 
 /**
- * 工作区模型目录/凭据服务（**不依赖 pi**）。
+ * 工作区模型目录/凭据服务。
  *
- * 这是「把 pi 从 package.json 摘掉」的前置：此前这些能力全挂在 `AgentHost.runtimeFor()`
- * 上，而那条路径要先 `await import(pi)` 成功——pi 坏了，设置页连 API Key 都录不进去。
+ * 这些能力不挂在会话运行时上：设置页录入 Key、拉模型清单时只依赖本服务，
+ * 不需要先创建 Agent 会话。
  *
  * 凭据工厂是注入的，所以这里用 `InMemoryCredentialStore` 就能完整覆盖目录逻辑，
  * 不需要 electron 的 safeStorage。

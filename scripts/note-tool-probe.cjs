@@ -11,15 +11,12 @@
  * - 标题净化：路径非法字符归一为 -；纯符号标题落兜底名；
  * - 同分钟同名冲突 ⇒ 自动加序号，两个文件并存；
  * - 空内容 ⇒ 拒绝且不落盘；
- * - 成功后 broadcastAssetChanged 恰好一次（stub 计数）。
- *
- * ipc/shared 重定向到 stub（真实现链拖进 electron 全家，本探针只验工具语义）。
+ * - 成功后素材变更通知恰好一次。
  */
 const { app } = require('electron')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
-const Module = require('node:module')
 const ts = require('typescript')
 
 const PROJECT_ROOT = path.resolve(__dirname, '..')
@@ -67,46 +64,23 @@ function transpileToTmp(relSources) {
   }
 }
 
-/** stub 状态经 globalThis 回记（stub 模块与探针不共享模块闭包） */
+/** 记录注入的素材变更通知。 */
 globalThis.__noteProbe = { broadcastCount: 0 }
-
-function writeStubs() {
-  const stubDir = path.join(TMP, 'stubs')
-  fs.mkdirSync(stubDir, { recursive: true })
-  fs.writeFileSync(
-    path.join(stubDir, 'ipcShared.js'),
-    [
-      'function broadcastAssetChanged() {',
-      '  globalThis.__noteProbe.broadcastCount += 1',
-      '}',
-      'module.exports = { broadcastAssetChanged }'
-    ].join('\n')
-  )
-  return stubDir
-}
-
-// 转译产物里的 ../ipc/shared 重定向到 stub；typebox 走工程 node_modules 正常解析
-let stubDir
-const origResolve = Module._resolveFilename
-Module._resolveFilename = function (request, parent, ...rest) {
-  if (parent && String(parent.filename).includes('note-tool-probe-tmp')) {
-    if (request === '../ipc/shared') return path.join(stubDir, 'ipcShared.js')
-  }
-  return origResolve.call(this, request, parent, ...rest)
-}
 
 const startedAt = new Date().toISOString()
 
 async function main() {
   transpileToTmp(['src/main/agent/noteTool.ts'])
-  stubDir = writeStubs()
   const { assembleNoteTool } = require(path.join(TMP, 'src', 'main', 'agent', 'noteTool.js'))
 
   const parent = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'huabu-note-'))
   const wsRoot = path.join(parent, 'ws')
   fs.mkdirSync(wsRoot, { recursive: true })
   let currentDir = wsRoot
-  const tool = assembleNoteTool({ currentDir: () => currentDir })
+  const tool = assembleNoteTool({
+    currentDir: () => currentDir,
+    notifyAssetsChanged: () => { globalThis.__noteProbe.broadcastCount += 1 }
+  })
   const textOf = (r) => (r?.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n')
 
   await check('工具契约：name / parameters / 画布拦截契约描述', async () => {

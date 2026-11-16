@@ -11,12 +11,12 @@ import type {
  *
  * 与 media/catalog 同构：`catalog/providers/*.ts` 是随应用发布的**代码数据**，
  * 模型清单的单一事实来源；workspace.json 只存覆盖层，运行时由 merge.ts 合成生效清单，
- * 最终由 manager 产出注册载荷喂给 pi（接缝只有 registerProvider 一处）。
+ * 最终由 manager 产出注册载荷交给模型网关（接缝只有 registerProvider 一处）。
  *
  * 两条铁律：
  * 1. 模型 `id` 合入后不得改名（用户配置与 Agent 默认都引用它）；厂商升级时老模型标
  *    `status:'deprecated'` 保留，新模型加新条目。
- * 2. compat 必须**显式写**，不依赖 pi 的域名自动探测。`detectCompat` 会把
+ * 2. compat 必须**显式写**，不依赖网关的域名自动探测。`detectCompat` 会把
  *    moonshot/zai 域名的 `supportsReasoningEffort` 探测为 false，于是 thinkingFormat
  *    分支里的 effort 字段被**静默跳过**（不报错、只少发字段）。见实施计划 §2.5。
  */

@@ -1,7 +1,7 @@
 import { memo, useEffect, useRef, useState, type ReactNode } from 'react'
 import { ArrowUp, Brain, ChevronDown, FolderOpen, Plus, ShieldAlert, ShieldCheck, SlashSquare, Square, X } from 'lucide-react'
 import { useCanvasStore } from '../store/canvasStore'
-import { hasBridge, useSettings } from '../store/settingsStore'
+import { hasBridge, useChatSettings } from '../store/settingsStore'
 import { useDismiss } from '../lib/hooks'
 import { parseAssetIdsPayload, parseLegacyAssetPayload } from '../lib/dragPayload'
 import { THINKING_LEVEL_LABEL, type MediaAccessMode, type ThinkingLevelName } from '@shared/ipc'
@@ -91,7 +91,7 @@ export const Composer = memo(function Composer() {
     setSessionThinking,
     stopChat
   } = useCanvasStore.getState()
-  const { defaultModel, chatModels } = useSettings()
+  const { defaultModel, chatModels } = useChatSettings()
   const [text, setText] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [attachOpen, setAttachOpen] = useState(false)

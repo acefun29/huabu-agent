@@ -74,6 +74,8 @@ async function main() {
     'src/main/mcp/store.ts',
     'src/main/workspace/stateDir.ts',
     'src/main/workspace/store.ts',
+    'src/main/workspace/canvasPersistence.ts',
+    'src/main/workspace/metadata.ts',
     'src/main/models/migrate.ts',
     'src/main/models/types.ts',
     'src/main/models/catalog/index.ts',
@@ -85,6 +87,7 @@ async function main() {
     'src/main/models/catalog/providers/qwen.ts',
     'src/main/models/catalog/providers/anthropic.ts',
     'src/main/models/catalog/providers/openai.ts',
+    'src/main/models/catalog/providers/tokenPlan.ts',
     'src/main/media/catalog/merge.ts',
     'src/main/media/catalog/types.ts',
     'src/main/media/adapters/registry.ts',
@@ -92,7 +95,8 @@ async function main() {
     'src/shared/ipc.ts',
     'src/shared/media.ts',
     'src/shared/chatApi.ts',
-    'src/shared/assets.ts'
+    'src/shared/assets.ts',
+    'src/shared/facets.ts'
   ])
   const { McpManager } = require(path.join(TMP, 'src/main/mcp/manager.js'))
   const { normalizeServerConfig, writeMcpServers, getMcpConfigFile } = require(path.join(TMP, 'src/main/mcp/store.js'))

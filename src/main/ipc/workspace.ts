@@ -128,15 +128,34 @@ export function registerWorkspaceIpc(ctx: IpcContext): void {
   }
 
   ipcMain.handle(IpcChannel.WorkspaceCanvasSave, (_event, payload: unknown) => {
-    // 快照外壳形状由 WorkspaceStore 校验；这里只挡掉明显的非对象载荷
     if (!payload || typeof payload !== 'object') return invalidPayload('workspace:canvas-save 需要快照对象')
+    const wrapped = 'snapshot' in payload
+    const request = payload as { snapshot?: unknown; workspacePath?: unknown; flush?: unknown }
+    if (wrapped && request.workspacePath !== undefined &&
+        (!isNonEmptyString(request.workspacePath) || request.workspacePath !== currentDir())) {
+      return invalidPayload('工作区已切换，画布未保存')
+    }
+    if (wrapped && request.flush !== undefined && typeof request.flush !== 'boolean') {
+      return invalidPayload('workspace:canvas-save 的 flush 必须为布尔值')
+    }
+    const snapshot = wrapped ? request.snapshot : payload
+    if (!snapshot || typeof snapshot !== 'object') return invalidPayload('workspace:canvas-save 需要快照对象')
     return guardSync(() => {
-      store.saveCanvas(payload as CanvasSnapshot)
+      store.saveCanvas(snapshot as CanvasSnapshot)
+      if (wrapped && request.flush === true) store.flushPendingWrites()
       return undefined
     })
   })
 
-  ipcMain.handle(IpcChannel.WorkspaceCanvasLoad, () => guardSync(() => store.loadCanvas()))
+  ipcMain.handle(IpcChannel.WorkspaceCanvasLoad, (_event, payload: unknown) => {
+    if (payload !== undefined) {
+      const workspacePath = (payload as { workspacePath?: unknown } | null)?.workspacePath
+      if (!isNonEmptyString(workspacePath) || workspacePath !== currentDir()) {
+        return invalidPayload('工作区已切换，画布未载入')
+      }
+    }
+    return guardSync(() => store.loadCanvas())
+  })
 
   ipcMain.handle(IpcChannel.WorkspaceSetDefaultModel, (_event, payload: unknown) => {
     const modelId = (payload as { modelId?: unknown } | null)?.modelId

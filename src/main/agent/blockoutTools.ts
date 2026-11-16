@@ -5,7 +5,6 @@ import { basename, isAbsolute, join, relative, resolve as resolvePath } from 'pa
 import { app } from 'electron'
 import { Type } from 'typebox'
 import { importToWorkspace } from '../assets/manager'
-import { broadcastAssetChanged } from '../ipc/shared'
 import { resolveFfmpegBinary } from '../media/videoFrames'
 import type { ToolDefinitionLike } from './mediaTools'
 
@@ -62,6 +61,8 @@ interface BlockoutToolParams {
 export interface BlockoutToolDeps {
   /** 当前工作区根目录（无工作区时工具返回指引文本而不是抛错） */
   currentDir: () => string | null
+  /** 成片发布后通知素材库刷新。 */
+  notifyAssetsChanged: () => void
 }
 
 /**
@@ -376,7 +377,7 @@ export function assembleBlockoutTool(deps: BlockoutToolDeps): ToolDefinitionLike
           ])
           const hit = imported[0]
           if (hit) {
-            broadcastAssetChanged()
+            deps.notifyAssetsChanged()
             const relPath = hit.relPath ?? relative(workspaceDir, hit.absPath).replace(/\\/g, '/')
             published = { relPath, name: hit.name, kind: hit.kind, ...(hit.bytes ? { bytes: hit.bytes } : {}) }
             content[0] = {

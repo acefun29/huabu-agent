@@ -7,7 +7,7 @@
  * 流式增量经 shared.ts 的 broadcastChatEvent（AgentHost onUpdate）以 chat:event 推送。
  * 运行时选择：workspace.json agent.runtime（pi | mastra）；会话在 create 时绑定运行时，
  * 中途改 flag 只影响新建会话（与 defaultModel 同款语义），dispose 解绑。
- * chat:dispose 成功后经 media.ts 的 settleApprovalsForNode 把该节点的挂起确认按拒绝 settle。
+ * chat:dispose 成功后经 mediaApproval 的 settleApprovalsForNode 把该节点的挂起确认按拒绝 settle。
  */
 import { randomUUID } from 'node:crypto'
 import { ipcMain } from './ipcMainBridge'
@@ -38,7 +38,7 @@ import {
 } from '../../shared/ipc'
 import type { IpcContext } from './shared'
 import { asNodeRequest, invalidPayload, isNonEmptyString } from './shared'
-import { settleApprovalsForNode } from './media'
+import { settleApprovalsForNode } from './mediaApproval'
 
 /**
  * 全量释放本进程持有的会话运行时（切工作区 / 退出时调用），返回释放数量。
@@ -63,14 +63,14 @@ export function registerChatIpc(ctx: IpcContext): void {
   const mediaContext = ctx.mediaContext
   const requestMediaApproval = ctx.requestMediaApproval
 
-  // 唯一运行时（Pi 已移除）：会话/记忆走 LibSQL（.huabu/mastra.db），模型只经自有网关。
+  // 唯一运行时：会话/记忆走 LibSQL（.huabu/mastra.db），模型只经自有网关。
   // 会话、fork、compact、steer 全部已实装。
   const mastraRuntime = new MastraAgentRuntime({
     broadcast: broadcastChatEvent,
     currentDir,
     defaultModel: () => store.currentWorkspace?.defaultModel,
-    // 模型清单与凭据走 WorkspaceModels（**不依赖 pi**）：host 那条路径要先成功加载 pi，
-    // 一旦 pi 出问题，Mastra 侧的模型下拉与 Key 录入会跟着一起失效。
+    // 模型清单与凭据统一从 WorkspaceModels 取：运行时只消费模型服务，
+    // 不经过会话装配，避免运行器故障时模型下拉与 Key 录入一起失效。
     managerForWorkspace: (dir) => ctx.models.managerFor(dir),
     runtimeInfo: (dir) => ctx.models.runtimeInfo(dir),
     // 技能注入的禁用名单（Mastra 侧此前完全不注入技能，见 agent/skills.ts 的文件头）
@@ -114,6 +114,7 @@ export function registerChatIpc(ctx: IpcContext): void {
         requestApproval: requestMediaApproval,
         sessionModelSupportsImages: (nid) => mastraRuntime.sessionSupportsImages(nid),
         currentDir: sessionCurrentDir,
+        isWorkspaceActive: (dir) => ctx.currentDir() === dir,
         mediaContext,
         inboxRoot,
         /*
@@ -127,7 +128,7 @@ export function registerChatIpc(ctx: IpcContext): void {
           return task && task.kind === kind ? laneOutputDir([task.lane]) : undefined
         }
       })
-      const noteTool = assembleNoteTool({ currentDir: sessionCurrentDir })
+      const noteTool = assembleNoteTool({ currentDir: sessionCurrentDir, notifyAssetsChanged: broadcastAssetChanged })
       const facetTools = assembleFacetTools({
         currentDir: sessionCurrentDir,
         schemas: () => store.facetSchemas(),
@@ -165,7 +166,7 @@ export function registerChatIpc(ctx: IpcContext): void {
       // 重建），因此这里**常驻**。取舍：常驻只多占工具列表一行的 token，而 blockout
       // 的入口本来就要先读 blockout-shot 技能正文才会被正确调用；惰性机制省下的那点
       // 收益不值得在 Mastra 侧再造一套工具热改。
-      const blockoutTool = assembleBlockoutTool({ currentDir: sessionCurrentDir })
+      const blockoutTool = assembleBlockoutTool({ currentDir: sessionCurrentDir, notifyAssetsChanged: broadcastAssetChanged })
       // 文件三件套（全量去 pi 的前提）：Pi 侧由 pi 的内置 ls/read/write 提供，Mastra 侧
       // 原本**完全没有**——而 shared/prompt.ts 一直在教模型「文本用 read」「中间文件用
       // write」，渲染端的「写的媒体文件自动上画布」也挂在 write 的工具事件上。

@@ -5,7 +5,7 @@ import { nodeRelPath } from '../../lib/workspacePath'
 import { KIND_LABEL, type AssetData, type CanvasNode, type DirEntry, type MaterialLibrary, type MediaKind, type MessageAttachment } from '../../types'
 import type { CanvasState } from '../canvasStore'
 import type { StoreSet } from './chatRuntime'
-import { BUILTIN_LIBRARY, BRIDGE_AVAILABLE, newNodeId, settingsBridgeRef, spawnOffset, zCounter } from './shared'
+import { BUILTIN_LIBRARY, BRIDGE_AVAILABLE, mediaSettingsFor, newNodeId, spawnOffset, zCounter } from './shared'
 
 /**
  * 素材库域（T8 拆分）：工作区级共享，清单由主进程现算（asset:libraries），
@@ -29,11 +29,15 @@ export interface LibraryOpsDeps {
 
 export function createLibraryOps(deps: LibraryOpsDeps) {
   const { set, get, showToast, applyNodes } = deps
+  let librariesSequence = 0
+  let filesSequence = 0
 
   const refreshLibraries = async () => {
-    if (!BRIDGE_AVAILABLE || !get().workspace) return
+    const workspacePath = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !workspacePath) return
+    const requestId = ++librariesSequence
     const result = await window.huabu.asset.libraries()
-    if (!result.ok) return
+    if (!result.ok || requestId !== librariesSequence || get().workspace?.path !== workspacePath) return
     set({
       libraries: result.value.libraries,
       inboxDir: result.value.inboxDir,
@@ -96,9 +100,11 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   const refreshDirFiles = async () => {
-    if (!BRIDGE_AVAILABLE || !get().workspace) return
+    const workspacePath = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !workspacePath) return
+    const requestId = ++filesSequence
     const result = await window.huabu.workspace.files()
-    if (!result.ok) return
+    if (!result.ok || requestId !== filesSequence || get().workspace?.path !== workspacePath) return
     set({
       dirFiles: result.value.map((f) => ({ name: f.name, kind: f.kind, path: f.relPath, bytes: f.bytes }))
     })
@@ -307,7 +313,7 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
    */
   const resolveOutputLibrary = (kind: MediaKind, overrideId?: string): MaterialLibrary | undefined => {
     const libraries = get().libraries
-    const media = settingsBridgeRef.current?.mediaStatus
+    const media = mediaSettingsFor(get().workspace?.path)?.mediaStatus
     const byId = (id?: string): MaterialLibrary | undefined => {
       if (!id) return undefined
       if (id === BUILTIN_LIBRARY) {
@@ -718,6 +724,7 @@ export function createLibraryOps(deps: LibraryOpsDeps) {
   }
 
   return {
+    invalidateLibraryRequests: () => { librariesSequence += 1; filesSequence += 1 },
     refreshLibraries,
     refreshDirFiles,
     createLibrary,

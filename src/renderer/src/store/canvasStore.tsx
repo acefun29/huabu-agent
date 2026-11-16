@@ -47,7 +47,8 @@ import {
   buildJobCardIndex,
   jobCardIndex,
   settingsBridgeRef,
-  zCounter
+  zCounter,
+  type SettingsApi
 } from './canvas/shared'
 
 /* 对外契约（T8 拆分前就有的导出符号，消费者按此引用；实现已移入 store/canvas/*） */
@@ -327,11 +328,12 @@ export interface CanvasState {
   /* @internal：Provider 引导 / 自动保存 / 探针用，业务组件不要订阅 */
   refreshWorkspaceState: () => Promise<void>
   handleJobEvent: (job: MediaJobStatus) => void
-  saveCanvasNow: () => Promise<void>
+  saveCanvasNow: () => Promise<boolean>
 }
 
 /** 画布载入期间不触发自动保存（避免把「恢复中」的中间态写回去） */
 let hydrated = false
+let canvasRevision = 0
 let saveTimer: ReturnType<typeof setTimeout> | null = null
 let toastTimer: number | null = null
 /** 性能基准（pnpm bench）用的流式模拟定时器 */
@@ -413,10 +415,41 @@ export const useCanvasStore = create<CanvasState>()(
       }
     }
 
-    const saveCanvasNow = async () => {
-      if (!get().workspace || !BRIDGE_AVAILABLE) return
-      const result = await window.huabu.workspace.saveCanvas(toSnapshot())
-      if (!result.ok) console.warn('[canvas] 保存画布失败：', result.error)
+    let saveInFlight: Promise<boolean> | null = null
+    const persistCanvas = async (): Promise<boolean> => {
+      const workspace = get().workspace
+      if (!workspace || !BRIDGE_AVAILABLE) return true
+      if (!hydrated) {
+        showToast('画布尚未成功载入，无法保存；请检查工作区文件')
+        return false
+      }
+      try {
+        // 写盘期间可能继续编辑；只有已写入的快照仍是最新版时才报告成功。
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (saveTimer) clearTimeout(saveTimer)
+          saveTimer = null
+          const revision = canvasRevision
+          const result = await window.huabu.workspace.saveCanvas(toSnapshot(), workspace.path, true)
+          if (!result.ok) {
+            console.warn('[canvas] 保存画布失败：', result.error)
+            break
+          }
+          if (get().workspace?.path !== workspace.path) break
+          if (revision === canvasRevision) return true
+        }
+      } catch (error) {
+        console.warn('[canvas] 保存画布失败：', error)
+      }
+      showToast('保存画布失败，请重试后再切换工作区')
+      return false
+    }
+    const saveCanvasNow = (): Promise<boolean> => {
+      if (saveInFlight) return saveInFlight.then((saved) => saved ? saveCanvasNow() : false)
+      const task = persistCanvas().finally(() => {
+        if (saveInFlight === task) saveInFlight = null
+      })
+      saveInFlight = task
+      return task
     }
 
     /* ---------------- 四域装配（显式 deps 注入，无循环 import） ---------------- */
@@ -444,9 +477,22 @@ export const useCanvasStore = create<CanvasState>()(
 
     /* ---------------- 工作区：打开 / 切换 / 载入画布 ---------------- */
 
-    const loadWorkspaceCanvas = async () => {
+    const loadWorkspaceCanvas = async (workspacePath: string): Promise<boolean> => {
       hydrated = false
-      const result = await window.huabu.workspace.loadCanvas()
+      let result: Awaited<ReturnType<typeof window.huabu.workspace.loadCanvas>>
+      try {
+        result = await window.huabu.workspace.loadCanvas(workspacePath)
+      } catch (error) {
+        console.error('[canvas] 载入画布失败：', error)
+        showToast('载入画布失败，已暂停自动保存')
+        return false
+      }
+      if (get().workspace?.path !== workspacePath) return false
+      if (!result.ok) {
+        console.warn('[canvas] 载入画布失败：', result.error)
+        showToast('载入画布失败，已暂停自动保存')
+        return false
+      }
       const restored: CanvasNode[] = []
       let restoredSessions: SessionMeta[] = []
       let metaActiveSession: string | null = null
@@ -500,8 +546,6 @@ export const useCanvasStore = create<CanvasState>()(
         } else {
           metaActiveSession = snapshot.meta?.activeChatId ?? null
         }
-      } else if (!result.ok) {
-        console.warn('[canvas] 载入画布失败：', result.error)
       }
       // 旧结构迁移（AssetData.gen → versions/pendingJob/references 平铺）：版本与引用链
       // 无损搬运，空壳生成卡（无版本无文件无在途任务）剔除。legacy refs/refRoles 刻意
@@ -541,22 +585,43 @@ export const useCanvasStore = create<CanvasState>()(
         if (s.sessionFile) void chat.replayChatHistory(s.id, s.sessionFile)
       }
       await job.reconcileJobs()
+      return get().workspace?.path === workspacePath
     }
 
-    const switchToWorkspace = async (info: WorkspaceInfo) => {
+    const switchToWorkspace = async (info: WorkspaceInfo): Promise<boolean> => {
       // 注意：此刻主进程的当前工作区已经切换（openDialog/openPath/create 都在 IPC 里先切换
       // 再返回），所以「切走前落盘」必须发生在发起这些 IPC 之前 —— 由各调用方负责。
+      const current = await window.huabu.workspace.state()
+      if (current.workspace?.path !== info.path) {
+        showToast('工作区已发生变化，请重新打开')
+        return false
+      }
+      hydrated = false
+      if (saveTimer) {
+        clearTimeout(saveTimer)
+        saveTimer = null
+      }
       chat.disposeAllBridges()
+      library.invalidateLibraryRequests()
+      project.invalidateProjectRequests()
+      job.invalidateJobReconciliation()
       const next: Workspace = { path: info.path, name: info.name }
       set((s) => ({
         workspace: next,
-        recents: [{ path: info.path, name: info.name }, ...s.recents.filter((r) => r.path !== info.path)]
+        recents: [{ path: info.path, name: info.name }, ...s.recents.filter((r) => r.path !== info.path)],
+        nodes: [], nodesById: buildNodeIndex([]), view: { x: 0, y: 0, scale: 1 },
+        sessions: [], chatsMap: {}, activeSessionId: null, activeChat: null, isChatRunning: false,
+        selectedAssetIds: [], injectedAssetIds: [], tempAttachments: [], jobStates: {},
+        libraries: [], inboxDir: null, facetSchema: null, facetSchemas: [], dirFiles: [],
+        genComposer: null, cardInspector: null, viewer: null, undoEntry: null, canUndo: false,
+        projectSnapshot: null, projectScopeId: null
       }))
-      await loadWorkspaceCanvas()
-      settingsBridgeRef.current?.refreshAll()
+      superagent.resetSuperAgent()
+      // 尽早刷新设置，避免旧工作区的在途请求在画布加载期间覆盖新状态。
+      void settingsBridgeRef.current?.refreshAll(info.path)
+      if (!(await loadWorkspaceCanvas(info.path))) return false
       void library.refreshLibraries()
       // SuperAgent 任务板与专家池跟着工作区走（journal 是工作区文件）
-      superagent.resetSuperAgent()
       void superagent.refreshSuperAgentExperts()
       void superagent.refreshSuperAgent()
       // 新任务模型的投影也要立刻拉一次：否则要等第一个 work:changed 才有工作项，
@@ -564,6 +629,24 @@ export const useCanvasStore = create<CanvasState>()(
       void superagent.refreshWorkItems()
       // 项目快照同样按工作区重建（常驻段/轮换段的数据来源）
       void project.refreshProject(null)
+      return true
+    }
+
+    let workspaceTransitionInProgress = false
+    const withWorkspaceTransition = async (action: () => Promise<void>): Promise<void> => {
+      if (workspaceTransitionInProgress) {
+        showToast('工作区正在切换，请稍候')
+        return
+      }
+      workspaceTransitionInProgress = true
+      try {
+        await action()
+      } catch (error) {
+        console.error('[workspace] 切换工作区失败：', error)
+        showToast('切换工作区失败，请检查工作区后重试')
+      } finally {
+        workspaceTransitionInProgress = false
+      }
     }
 
     const refreshWorkspaceState = async () => {
@@ -571,12 +654,13 @@ export const useCanvasStore = create<CanvasState>()(
         set({ booted: true })
         return
       }
+      if (workspaceTransitionInProgress) return
       try {
-        const state = await window.huabu.workspace.state()
-        set({ recents: (state.recents ?? []).map((r) => ({ path: r.path, name: r.name })) })
-        if (state.workspace) {
-          await switchToWorkspace(state.workspace)
-        }
+        await withWorkspaceTransition(async () => {
+          const state = await window.huabu.workspace.state()
+          set({ recents: (state.recents ?? []).map((r) => ({ path: r.path, name: r.name })) })
+          if (state.workspace) await switchToWorkspace(state.workspace)
+        })
       } catch (error) {
         // 启动期任何一步失败都不该让应用停在「正在恢复」——记录并继续（画布/面板各自降级）
         console.error('[canvas] 恢复工作区失败：', error)
@@ -594,39 +678,40 @@ export const useCanvasStore = create<CanvasState>()(
       })
     }
 
-    const openDirDialog = async () => {
+    const openDirDialog = async () => withWorkspaceTransition(async () => {
       if (!BRIDGE_AVAILABLE) return
       // 打开系统对话框前先落盘：对话框/切换 IPC 都会改变主进程的当前工作区
-      await saveCanvasNow()
+      if (!(await saveCanvasNow())) return
       const result = await window.huabu.workspace.openDialog()
       if (result.cancelled || !result.workspace) return
       await switchToWorkspace(result.workspace)
-    }
+    })
 
-    const openWorkspace = async (path: string) => {
+    const openWorkspace = async (path: string) => withWorkspaceTransition(async () => {
       if (!BRIDGE_AVAILABLE) return
       // 切换 IPC 会先改主进程当前目录再返回，旧画布必须先落盘
-      await saveCanvasNow()
+      if (!(await saveCanvasNow())) return
       const result = await window.huabu.workspace.openPath(path)
       if (!result.ok) {
         showToast(`打开工作区失败：${result.error}`)
         return
       }
       await switchToWorkspace(result.value.workspace)
-    }
+    })
 
-    const createWorkspace = async (name: string) => {
+    const createWorkspace = async (name: string) => withWorkspaceTransition(async () => {
       if (!BRIDGE_AVAILABLE) return
       // 新建即切换：切换 IPC 会改主进程当前目录，旧画布必须先落盘
-      await saveCanvasNow()
+      if (!(await saveCanvasNow())) return
       const result = await window.huabu.workspace.create(name)
       if (!result.ok) {
         showToast(`新建工作区失败：${result.error}`)
         return
       }
-      await switchToWorkspace(result.value.workspace)
-      showToast(`已创建工作区 ${result.value.workspace.name}`)
-    }
+      if (await switchToWorkspace(result.value.workspace)) {
+        showToast(`已创建工作区 ${result.value.workspace.name}`)
+      }
+    })
 
     const deleteWorkspaces = async (paths: string[]): Promise<WorkspaceDeleteResult | null> => {
       if (!BRIDGE_AVAILABLE || paths.length === 0) return null
@@ -724,6 +809,7 @@ useCanvasStore.subscribe(
   (s) => [s.nodes, s.view, s.sessions, s.activeSessionId, s.workspace] as const,
   () => {
     if (!useCanvasStore.getState().workspace || !hydrated) return
+    canvasRevision += 1
     if (saveTimer) clearTimeout(saveTimer)
     saveTimer = setTimeout(() => {
       void useCanvasStore.getState().saveCanvasNow()
@@ -967,10 +1053,11 @@ function useCanvasBootstrap() {
      */
     const unsubFlushBeforeClose = window.huabu.onEvent(IpcChannel.AppFlushBeforeClose, () => {
       void (async () => {
+        let saved = false
         try {
-          await useCanvasStore.getState().saveCanvasNow()
+          saved = await useCanvasStore.getState().saveCanvasNow()
         } finally {
-          await window.huabu.window.confirmCloseFlush()
+          await window.huabu.window.confirmCloseFlush(saved)
         }
       })()
     })
@@ -1003,16 +1090,29 @@ function useCanvasBootstrap() {
 }
 
 export function CanvasProvider({ children }: { children: ReactNode }) {
-  // settings 仍是 Context：把最新实例交给 store action 跨域调用（resolveMediaModel / refreshAll 等）
+  // 将画布需要的设置能力注入 store action。
   const settings = useSettings()
-  // UI 域的 openSettings 并入 bridge：生成被拦的 toast「去设置」需要从 store 域直达设置页
   const { openSettings } = useSettingsUi()
-  // 渲染体里直接写 ref 是渲染期副作用（StrictMode 双渲染会双写），移到提交后同步；
-  // 不写依赖数组 = 每次渲染后都刷新为最新实例。卸载时刻意不清空：bridge 语义是
-  // 「最近一次挂载的实例」，清空反而让卸载瞬间在途的跨域调用读不到 settings。
   useEffect(() => {
-    settingsBridgeRef.current = { ...settings, openSettings }
-  })
+    const bridge: SettingsApi = {
+      defaultModel: settings.defaultModel,
+      chatWorkspacePath: settings.chatWorkspacePath,
+      mediaWorkspacePath: settings.mediaWorkspacePath,
+      mediaProviders: settings.mediaProviders,
+      mediaStatus: settings.mediaStatus,
+      resolveMediaModel: settings.resolveMediaModel,
+      refreshAll: settings.refreshAll,
+      openSettings
+    }
+    settingsBridgeRef.current = bridge
+    return () => {
+      if (settingsBridgeRef.current === bridge) settingsBridgeRef.current = null
+    }
+  }, [
+    settings.defaultModel, settings.chatWorkspacePath, settings.mediaWorkspacePath,
+    settings.mediaProviders, settings.mediaStatus, settings.resolveMediaModel,
+    settings.refreshAll, openSettings
+  ])
   useCanvasBootstrap()
   return <>{children}</>
 }

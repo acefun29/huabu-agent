@@ -8,9 +8,7 @@ import type { useSettings, SettingsUiState } from '../settingsStore'
 /**
  * 画布四域（会话/节点/生成任务/素材库）之间的共享常量、纯函数与模块级可变状态。
  *
- * 拆分约定（T8）：域实现放同目录的 chatRuntime / jobRuntime / nodeOps / libraryOps，
- * 各域经显式 deps 注入拿 store 的 set/get 与内部工具；**只有这里允许放跨域可变量**
- —— 之前散在 store 顶层的 ref 群（旧 Provider 时代）集中收拢，谁在用一目了然。
+ * 域实现通过显式依赖获取 store 的 set/get；跨域状态集中在本模块。
  */
 
 /** 内置「画布素材」合成库的固定 id（主进程 listLibraries 用同名值；落库链做 kind 映射） */
@@ -31,12 +29,21 @@ export const BRIDGE_UNAVAILABLE = 'IPC 未联通：请在 Electron 窗口内使�
 export const BRIDGE_AVAILABLE = isAgentAvailable()
 
 /**
- * settings 仍是 Context：由 CanvasProvider 每次渲染把最新实例写进来，供 store action 跨域调用。
- * openSettings 来自 UI 域（面板开合），由 CanvasProvider 一并并入 bridge——生成被拦的
- * toast「去设置」跳转经它直达设置页，不必把 UI 域灌进数据域 value。
+ * CanvasProvider 将画布实际需要的设置放入桥接对象，供 store action 调用。
+ * 快照包含所属工作区，调用方可以拒绝使用过期数据。
  */
-export type SettingsApi = ReturnType<typeof useSettings> & Pick<SettingsUiState, 'openSettings'>
+export type SettingsApi = Pick<
+  ReturnType<typeof useSettings>,
+  'defaultModel' | 'chatWorkspacePath' | 'mediaWorkspacePath' | 'mediaProviders' |
+  'mediaStatus' | 'resolveMediaModel' | 'refreshAll'
+> & Pick<SettingsUiState, 'openSettings'>
 export const settingsBridgeRef: { current: SettingsApi | null } = { current: null }
+
+/** 仅返回属于指定工作区的媒体设置快照。 */
+export function mediaSettingsFor(workspacePath: string | undefined): SettingsApi | null {
+  const settings = settingsBridgeRef.current
+  return workspacePath !== undefined && settings?.mediaWorkspacePath === workspacePath ? settings : null
+}
 
 /** 画布空白处的默认落点（新节点按画布节点数错开） */
 export function spawnOffset(nodes: CanvasNode[]): number {

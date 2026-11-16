@@ -1,26 +1,6 @@
 /**
- * 工作区模型目录与凭据服务——**不依赖 pi**。
- *
- * ## 为什么从 AgentHost 里剥出来
- *
- * `AgentHost` 的所有模型/凭据方法都先走 `runtimeFor()`，而那条路径要先
- * `await import(pi)` 成功。后果是：pi 一旦加载失败（没装包、包损坏、ESM 解析异常），
- * **设置页的模型清单、Key 录入、媒体 Key 全部一起失效**，尽管这些能力一点都不需要 pi。
- *
- * 默认运行时刻已经是 Mastra，这个耦合就成了真正的单点：它让「把 pi 从 package.json
- * 摘掉」在物理上做不到。本文件把它拆开——凭据存储 + 模型目录 + 一次性迁移，
- * 三个都只需要 fs 与 safeStorage。
- *
- * ## 刻意不做的事
- *
- * 不碰会话、不碰 pi 的 `ModelRuntime`、不做 provider 连通性自检（`testProvider` 要发真
- * 请求给供应商，依赖 pi 的 auth 快照，留在 host 里，随 pi 一起删）。
- *
- * ## 为什么凭据工厂由外部注入
- *
- * `SafeStorageCredentialStore` 走 electron 的 `safeStorage`，一旦本模块静态 import 它，
- * 这个文件就再也不能在 node 单测里加载（同一个坑在 `mastra/runtime.ts` 踩过一次）。
- * 工厂从主进程传入，测试里换成 `InMemoryCredentialStore` 即可完整覆盖目录逻辑。
+ * 工作区模型目录、凭据和供应商连通性服务。
+ * 凭据存储由调用方注入，使模型管理与 Electron 的具体加密实现解耦。
  */
 
 import type { CredentialStore } from './contracts'
@@ -36,7 +16,7 @@ import type {
 import { THINKING_LEVELS } from '../../shared/ipc'
 import { ChatModelManager } from '../models/manager'
 import { applyCredentialMoves } from '../models/migrate'
-import { readChatConfig, readChatMigrationPlan, writeChatSegment } from '../workspace/store'
+import { readChatConfig, readChatMigrationPlan, writeChatSegment } from '../workspace/metadata'
 import { createModelGateway } from './mastra/modelGateway'
 
 /**
@@ -333,7 +313,7 @@ export class WorkspaceModels {
 
   /**
    * 供应商认证状态清单（设置页的凭据面板）。与 `runtimeInfo` 同一数据源，
-   * 同样**不需要 pi**——原先这条路径要先成功加载 pi，否则设置页会显示空清单。
+   * 直接读取工作区模型服务，不依赖会话运行时是否已就绪。
    */
   async providersInfo(workspaceDir: string): Promise<ChatResult<SettingsProvidersInfo>> {
     try {

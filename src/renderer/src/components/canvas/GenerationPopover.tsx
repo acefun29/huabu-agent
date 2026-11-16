@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react'
 import { useCanvasStore } from '../../store/canvasStore'
-import { useSettings } from '../../store/settingsStore'
+import { useMediaSettings } from '../../store/settingsStore'
 import { useEsc } from '../../lib/hooks'
 import { assetSrc } from '../../lib/media'
 import { KIND_LABEL, type AssetData, type CanvasNode, type GenerateParams, type MediaKind } from '../../types'
@@ -76,7 +76,7 @@ export function GenerationPopover() {
     const st = s.jobStates[t]
     return st?.status === 'queued' || st?.status === 'running'
   })
-  const { mediaProviders, resolveMediaModel, mediaStatus } = useSettings()
+  const { mediaProviders, resolveMediaModel, mediaStatus } = useMediaSettings()
 
   // 再次生成的目标卡（可能被删除 → 关面板）
   const targetNode = useMemo(

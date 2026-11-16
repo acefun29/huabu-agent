@@ -16,7 +16,7 @@ import { IpcChannel } from './ipc'
  * 注意：**在这里登记 ≠ 一定会被转发**。主进程发事件有两条路径——
  * `forwardEvent`（走桥）与 `webContents.send`（只到窗口）。只走后者的事件
  * （曾经包括 media:confirm-*）即便登记了，Web 模式也收不到；新增事件时必须
- * 两边都发（见 `ipc/media.ts` 的 requestMediaApproval）。
+ * 两边都发（见 `ipc/mediaApproval.ts` 的 requestMediaApproval）。
  */
 export const EVENT_CHANNEL_ALLOWLIST: readonly string[] = [
   IpcChannel.ChatEvent,

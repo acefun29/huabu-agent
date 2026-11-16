@@ -2,7 +2,6 @@ import { existsSync } from 'fs'
 import { mkdir, rename, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { Type } from 'typebox'
-import { broadcastAssetChanged } from '../ipc/shared'
 import type { ToolDefinitionLike } from './mediaTools'
 
 /**
@@ -24,6 +23,8 @@ import type { ToolDefinitionLike } from './mediaTools'
 export interface NoteToolDeps {
   /** 当前工作区根目录（无工作区时工具返回指引文本而不是抛错） */
   currentDir: () => string | null
+  /** 文本产物落盘后通知素材库刷新。 */
+  notifyAssetsChanged: () => void
 }
 
 /** 标题净化后仍可能整串变空（纯符号标题），保底一个名字 */
@@ -75,7 +76,7 @@ export function assembleNoteTool(deps: NoteToolDeps): ToolDefinitionLike {
       const tempPath = `${absPath}.part`
       await writeFile(tempPath, content, 'utf8')
       await rename(tempPath, absPath)
-      broadcastAssetChanged()
+      deps.notifyAssetsChanged()
 
       const relPath = `assets/documents/${name}`
       return {

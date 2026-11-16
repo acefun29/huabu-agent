@@ -143,7 +143,7 @@ export interface WindowApi {
    * 再调用它。主进程只认这个确认（或超时）才继续关闭——不能用「任意一次落盘」
    * 当证据，否则合并窗口里的旧快照提前放行就会丢掉最新编辑。
    */
-  confirmCloseFlush(): Promise<void>
+  confirmCloseFlush(saved?: boolean): Promise<void>
 }
 
 /**
@@ -236,11 +236,11 @@ export interface WorkspaceApi {
   /** 在系统文件管理器中显示工作区内的文件 */
   reveal(relPath: string): Promise<ChatResult>
 
-  /** 画布快照落盘（原子写） */
-  saveCanvas(snapshot: CanvasSnapshot): Promise<ChatResult>
+  /** 保存画布；指定工作区时校验归属，flush 为 true 时等待写入完成。 */
+  saveCanvas(snapshot: CanvasSnapshot, workspacePath?: string, flush?: boolean): Promise<ChatResult>
 
   /** 读取画布快照；从未保存过时返回 null */
-  loadCanvas(): Promise<ChatResult<CanvasSnapshot | null>>
+  loadCanvas(workspacePath?: string): Promise<ChatResult<CanvasSnapshot | null>>
 
   /** 修改工作区默认聊天模型（只影响新建会话） */
   setDefaultModel(modelId: string | null): Promise<ChatResult<WorkspaceInfo>>
@@ -312,10 +312,10 @@ export interface MediaApi {
   providers(): Promise<ChatResult<MediaProviderInfo[]>>
 
   /** 提交生成任务；进度经 media:job 事件推送 */
-  generate(request: MediaGenerateRequest): Promise<ChatResult<{ jobId: string }>>
+  generate(request: MediaGenerateRequest, workspacePath?: string): Promise<ChatResult<{ jobId: string }>>
 
   /** 取消任务 */
-  cancel(jobId: string): Promise<ChatResult>
+  cancel(jobId: string, workspacePath?: string): Promise<ChatResult>
 
   /** 近期任务清单（画布恢复对账用） */
   jobs(): Promise<ChatResult<MediaJobStatus[]>>

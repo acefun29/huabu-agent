@@ -22,10 +22,13 @@ export interface ProjectOpsDeps {
 
 export function createProjectOps(deps: ProjectOpsDeps) {
   const { set, get } = deps
+  let requestSequence = 0
 
   /** 拉取当前 scope 的快照（scopeId 缺省 = 根看板） */
   const refreshProject = async (scopeId?: string | null): Promise<void> => {
-    if (!BRIDGE_AVAILABLE || !get().workspace) {
+    const requestId = ++requestSequence
+    const workspacePath = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !workspacePath) {
       set({ projectSnapshot: null })
       return
     }
@@ -34,6 +37,7 @@ export function createProjectOps(deps: ProjectOpsDeps) {
       const result = await window.huabu.project.snapshot(
         wanted ? { scopeId: wanted } : {}
       )
+      if (requestId !== requestSequence || get().workspace?.path !== workspacePath) return
       if (!result.ok) {
         set({ projectSnapshot: null })
         return
@@ -45,7 +49,7 @@ export function createProjectOps(deps: ProjectOpsDeps) {
         projectScopeId: lastCrumb?.id ?? null
       })
     } catch {
-      set({ projectSnapshot: null })
+      if (requestId === requestSequence && get().workspace?.path === workspacePath) set({ projectSnapshot: null })
     }
   }
 
@@ -60,6 +64,7 @@ export function createProjectOps(deps: ProjectOpsDeps) {
     projectSnapshot: null as ProjectSnapshot | null,
     /** 当前浏览的容器节点 id（null = 根） */
     projectScopeId: null as string | null,
+    invalidateProjectRequests: () => { requestSequence += 1 },
     refreshProject,
     setProjectScope
   }

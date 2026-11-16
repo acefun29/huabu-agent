@@ -57,7 +57,8 @@ export function registerWindowAppIpc(_ctx: IpcContext): void {
   })
 
   // 关窗冲刷回执：渲染端把最新快照交给主进程后调用，主进程据此放行关闭
-  ipcMain.handle(IpcChannel.AppFlushDone, () => {
-    confirmCloseFlush()
+  ipcMain.handle(IpcChannel.AppFlushDone, (_event, payload: unknown) => {
+    const saved = (payload as { saved?: unknown } | null)?.saved
+    confirmCloseFlush(saved !== false)
   })
 }

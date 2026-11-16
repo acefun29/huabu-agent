@@ -14,7 +14,7 @@ import type {
   GenerateVersion
 } from '../../types'
 import type { CanvasState } from '../canvasStore'
-import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, MEDIA_LABEL, jobCardIndex, newNodeId, settingsBridgeRef, spawnOffset, zCounter } from './shared'
+import { BRIDGE_AVAILABLE, BRIDGE_UNAVAILABLE, MEDIA_LABEL, jobCardIndex, mediaSettingsFor, newNodeId, settingsBridgeRef, spawnOffset, zCounter } from './shared'
 import type { StoreSet } from './chatRuntime'
 
 /**
@@ -102,7 +102,20 @@ interface NodePathIndex {
 }
 
 export function createJobRuntime(deps: JobRuntimeDeps) {
+  let reconcileSequence = 0
   const { set, get, showToast, applyNodes, mutateNodeData } = deps
+  const warnedPersistenceScopes = new Set<string>()
+
+  const warnPersistence = (job: MediaJobStatus): void => {
+    const scope = job.persistenceScope ?? job.jobId
+    if (!job.persistenceWarning) {
+      if (warnedPersistenceScopes.delete(scope)) showToast('媒体任务状态已恢复保存')
+      return
+    }
+    if (warnedPersistenceScopes.has(scope)) return
+    warnedPersistenceScopes.add(scope)
+    showToast(job.persistenceWarning)
+  }
 
   /* ------------- 运行态（内存）：jobStates[nodeId] ------------- */
 
@@ -149,6 +162,7 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
 
   /** 无人认领的事件回归默认分发：Agent 来源建卡承接，画布来源静默丢弃（可被对账找回终态） */
   const dispatchUnhandledJob = (job: MediaJobStatus) => {
+    if (job.workspacePath && job.workspacePath !== get().workspace?.path) return
     if (job.sourceChatId && (job.state === 'queued' || job.state === 'running')) spawnCardForJob(job)
   }
 
@@ -444,13 +458,17 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
   }
 
   const handleJobEvent = (job: MediaJobStatus) => {
+    if (job.workspacePath && job.workspacePath !== get().workspace?.path) return
+    warnPersistence(job)
     const indexed = jobCardIndex.has(job.jobId)
     // 终态即解绑：索引收尾（卡上的 pendingJob 由 patchJobTerminal 处理）
     if (isTerminalState(job.state)) jobCardIndex.delete(job.jobId)
     const { handled } = patchJobTerminal(job)
     if (handled) {
-      if (job.state === 'succeeded') showToast('生成完成，产物已写入工作目录')
-      if (job.state === 'failed') showToast(`生成失败：${job.error ?? '未知原因'}`)
+      if (job.state === 'succeeded') {
+        showToast(job.persistenceWarning ? `生成完成。${job.persistenceWarning}` : '生成完成，产物已写入工作目录')
+      }
+      if (job.state === 'failed') showToast(`生成失败：${job.error ?? '未知原因'}${job.persistenceWarning ? `；${job.persistenceWarning}` : ''}`)
       return
     }
     // patch 没命中但索引命中（Agent 建卡与绑定之间的瞬时差）：已有卡片承接，不缓冲不建卡
@@ -465,7 +483,9 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
 
   /** 单任务对账：jobs() 里已终态但事件未到/丢失 → 就地收尾（去重保证不重复入库） */
   const probeJobOnce = async (jobId: string) => {
-    if (!BRIDGE_AVAILABLE) return
+    const workspacePath = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !workspacePath) return
+    const sequence = reconcileSequence
     let result: Awaited<ReturnType<typeof window.huabu.media.jobs>>
     try {
       result = await window.huabu.media.jobs()
@@ -473,9 +493,10 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
       console.warn('[jobRuntime] 单任务对账异常：', error)
       return
     }
-    if (!result.ok) return
+    if (!result.ok || sequence !== reconcileSequence || get().workspace?.path !== workspacePath) return
     const job = result.value.find((j) => j.jobId === jobId)
     if (job && isTerminalState(job.state)) {
+      warnPersistence(job)
       jobCardIndex.delete(jobId)
       patchJobTerminal(job)
     }
@@ -483,7 +504,9 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
 
   /** 画布（重）载入后对账：pendingJob 引用的任务已终态/失效则收尾，在途则恢复运行态 */
   const reconcileJobs = async () => {
-    if (!BRIDGE_AVAILABLE) return
+    const workspacePath = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !workspacePath) return
+    const requestId = ++reconcileSequence
     let result: Awaited<ReturnType<typeof window.huabu.media.jobs>>
     try {
       result = await window.huabu.media.jobs()
@@ -491,7 +514,13 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
       console.warn('[jobRuntime] 任务对账异常：', error)
       return
     }
-    if (!result.ok) return
+    if (requestId !== reconcileSequence || get().workspace?.path !== workspacePath) return
+    if (!result.ok) {
+      showToast(`读取媒体任务失败：${result.error}`)
+      return
+    }
+    // 已完成的卡片不再携带 pendingJob，也要恢复它们所属账本的保存提示。
+    for (const job of result.value) warnPersistence(job)
     const byId = new Map(result.value.map((job) => [job.jobId, job]))
     for (const node of get().nodes) {
       const jobId = node.data.pendingJob?.jobId
@@ -517,9 +546,10 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
    * 从同一份能力声明派生），渲染端只做即时反馈，权威判定在提交时。
    */
   const mediaCapsFor = (kind: MediaKind, modelId?: string): ResolvedRefCaps => {
-    const resolved = settingsBridgeRef.current?.resolveMediaModel(kind, modelId)
+    const settings = mediaSettingsFor(get().workspace?.path)
+    const resolved = settings?.resolveMediaModel(kind, modelId)
     const caps = resolved
-      ? settingsBridgeRef.current?.mediaProviders
+      ? settings?.mediaProviders
           ?.find((p) => p.id === resolved.provider)
           ?.models.find((m) => m.id === resolved.model)?.capabilities
       : undefined
@@ -570,7 +600,13 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
       return { ok: false, error: '提示词为空' }
     }
     const kind = request.kind
-    const resolved = settingsBridgeRef.current?.resolveMediaModel(kind, request.params.model)
+    const settings = mediaSettingsFor(get().workspace?.path)
+    if (!settings) {
+      const error = '当前工作区的媒体配置尚未就绪，请在媒体设置中检查或重试'
+      showToast(error, { label: '去设置', onAction: () => settingsBridgeRef.current?.openSettings('media') })
+      return { ok: false, error }
+    }
+    const resolved = settings.resolveMediaModel(kind, request.params.model)
     if (!resolved) {
       // 媒体配置强制化：默认模型未显式选择/已失效 ⇒ 拦截并给「去设置」直达（openSettings 经 bridge 注入）
       const error = request.params.model
@@ -684,13 +720,15 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
           nodeId,
           ...(plan.outputDir ? { outputDir: plan.outputDir } : {}),
           ...(plan.refs.length > 0 ? { refs: plan.refs } : {})
-        })
+        }, workspacePath)
       } catch (error) {
         result = { ok: false, code: 'unknown', error: `提交生成异常：${error instanceof Error ? error.message : String(error)}` }
       }
       if (!result.ok) {
-        mutateNodeData(nodeId, (d) => ({ ...d, pendingJob: undefined }))
-        setJobState(nodeId, { status: 'failed', progress: 0, error: result.error })
+        if ((get().workspace?.path ?? '') === workspacePath) {
+          mutateNodeData(nodeId, (d) => ({ ...d, pendingJob: undefined }))
+          setJobState(nodeId, { status: 'failed', progress: 0, error: result.error })
+        }
         return { ok: false, error: result.error }
       }
       const jobId = result.value.jobId
@@ -698,7 +736,8 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
       if (!get().nodesById.get(nodeId) || (get().workspace?.path ?? '') !== workspacePath) {
         flushPendingJob(jobId)
         try {
-          await window.huabu.media.cancel(jobId)
+          const cancelled = await window.huabu.media.cancel(jobId, workspacePath)
+          if (!cancelled.ok) console.warn('[jobRuntime] 取消孤儿任务失败：', cancelled.error)
         } catch (error) {
           console.warn('[jobRuntime] 取消孤儿任务失败：', error)
         }
@@ -822,6 +861,7 @@ export function createJobRuntime(deps: JobRuntimeDeps) {
   }
 
   return {
+    invalidateJobReconciliation: () => { reconcileSequence += 1; warnedPersistenceScopes.clear() },
     handleJobEvent,
     reconcileJobs,
     submitGeneration,

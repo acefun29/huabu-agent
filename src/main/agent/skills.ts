@@ -1,13 +1,11 @@
 /**
- * 工作区技能发现与注入（agentskills.io 规范）——**不依赖 pi 的自有实现**。
+ * 工作区技能发现与注入（agentskills.io 规范）的自有实现。
  *
  * ## 为什么要有这个文件
  *
- * 技能此前整条链路都长在 Pi 上：`host.ts` 用 pi 的 `DefaultResourceLoader` +
- * `additionalSkillPaths` 把 `<available_skills>` 注入系统提示词，`listSkills` 用 pi 的
- * `loadSkillsFromDir` 扫目录。Mastra 运行时**完全不注入技能**——`buildAgentSystemPrompt`
- * 只吃 workspaceDir 一个参数，没有技能的位置。全量去 pi 之后「技能」会整体失效，
- * 而施工单只把这件事当成设置页的展示问题（`listSkills` 改名），漏了注入本身。
+ * 运行时不会自动读取工作区技能：`buildAgentSystemPrompt` 只接收 workspaceDir，
+ * 没有技能槽位。技能清单与禁用名单由这里扫描，再由提示词装配显式注入；
+ * 否则「技能」只剩设置页展示，对话里完全不生效。
  *
  * ## 扫描与优先级
  *

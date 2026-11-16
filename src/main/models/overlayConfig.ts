@@ -4,9 +4,7 @@ import type {
   ModelEditInput,
   ThinkingLevelName
 } from '../../shared/ipc'
-// 刻意值导入不用 shared/ipc（那边连着 electron）：本文件必须保持纯 Node 可加载
-// （chat-catalog:check 直接跑它）。与 shared/ipc 的 THINKING_LEVELS 同源同序，改一处必改两处
-const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+import { THINKING_LEVELS } from '../../shared/ipc'
 import type { ChatUserModelConfig, ChatUserProviderConfig, WorkspaceChatConfig } from './types'
 import {
   BUILTIN_CHAT_PROVIDERS,
@@ -20,9 +18,7 @@ import {
 /**
  * `chat` 覆盖层的**纯**改写规则（架构计划 §3：workspace.json 的 chat 段是唯一可写面）。
  *
- * 与 overlay.ts 分家的唯一理由是"能不能被机器验"：这一份不碰磁盘也不碰 electron，
- * 因此 `pnpm chat-catalog:check` 能直接跑它（overlay.ts 经由 workspace/store 依赖 electron，
- * 纯 Node 加载不了）。写入面是最不该"只在真机上点一次"的代码——改坏了是用户配置没了。
+ * 本模块只修改传入的配置，不负责磁盘读写；overlay.ts 负责保存结果。
  *
  * 三条规则：
  * 1. **只接受合法形状**：id 走目录同款正则、协议走白名单、baseUrl 必须 http(s)，

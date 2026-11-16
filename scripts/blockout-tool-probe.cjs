@@ -4,7 +4,7 @@
  * 运行：pnpm probe:blockout-tool
  *
  * 在 electron 主进程语境里真调 assembleBlockoutTool（依赖注入 mock：currentDir 指向
- * 临时工作区；assets/manager 与 ipc/shared 用 stub 换掉，经 globalThis 回记调用），
+ * 临时工作区；assets/manager 使用 stub，素材通知通过注入回调记录），
  * 断言的是工具语义本身，引擎子进程是真跑的：
  *
  *   工具面：name/label/description/schema（action 七枚举、无 promptSnippet）
@@ -90,26 +90,15 @@ function writeStubs() {
       'module.exports = { importToWorkspace }'
     ].join('\n')
   )
-  fs.writeFileSync(
-    path.join(stubDir, 'ipcShared.js'),
-    [
-      'function broadcastAssetChanged() {',
-      '  globalThis.__blockoutProbe.broadcastCount += 1',
-      '}',
-      'module.exports = { broadcastAssetChanged }'
-    ].join('\n')
-  )
   return stubDir
 }
 
-// 转译产物里的 ../assets/manager、../ipc/shared 重定向到 stub（真实现链拖进
-// workspace/store 全家，本探针只验工具语义，发布细节靠 stub 断言）
+// 将素材导入服务替换为桩，隔离工作区持久化实现。
 let stubDir
 const origResolve = Module._resolveFilename
 Module._resolveFilename = function (request, parent, ...rest) {
   if (parent && String(parent.filename).includes('blockout-tool-probe-tmp')) {
     if (request === '../assets/manager') return path.join(stubDir, 'manager.js')
-    if (request === '../ipc/shared') return path.join(stubDir, 'ipcShared.js')
   }
   return origResolve.call(this, request, parent, ...rest)
 }
@@ -151,7 +140,10 @@ async function main() {
   fast.shots.hero.durationS = 2
   fs.writeFileSync(path.join(WS, 'scenes', 'perfume-fast.author.json'), JSON.stringify(fast, null, 2))
 
-  const tool = assembleBlockoutTool({ currentDir: () => WS })
+  const tool = assembleBlockoutTool({
+    currentDir: () => WS,
+    notifyAssetsChanged: () => { globalThis.__blockoutProbe.broadcastCount += 1 }
+  })
   const run = (params, signal, onUpdate) => tool.execute('probe-call', params, signal, onUpdate)
 
   await check('工具面：name/description/action 枚举且无 promptSnippet', () => {
@@ -165,7 +157,7 @@ async function main() {
   })
 
   await check('环境失败：无工作区返回指引文本', async () => {
-    const bare = assembleBlockoutTool({ currentDir: () => null })
+    const bare = assembleBlockoutTool({ currentDir: () => null, notifyAssetsChanged: () => {} })
     const result = await bare.execute('c', { action: 'check', scene: 'x.json' })
     assert(firstText(result).includes('尚未打开工作区'), firstText(result).slice(0, 80))
   })

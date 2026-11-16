@@ -53,7 +53,7 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
       onStateChange: (listener) =>
         subscribe(IpcChannel.WindowStateChanged, (payload) => listener(payload as WindowStateInfo)),
 
-      confirmCloseFlush: () => invoke(IpcChannel.AppFlushDone).then(() => undefined)
+      confirmCloseFlush: (saved) => invoke(IpcChannel.AppFlushDone, { saved }).then(() => undefined)
     },
 
     chat: {
@@ -110,9 +110,15 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
 
       reveal: (relPath) => invoke(IpcChannel.WorkspaceReveal, { relPath }),
 
-      saveCanvas: (snapshot) => invoke(IpcChannel.WorkspaceCanvasSave, snapshot),
+      saveCanvas: (snapshot, workspacePath, flush) => invoke(
+        IpcChannel.WorkspaceCanvasSave,
+        workspacePath === undefined && !flush ? snapshot : { snapshot, workspacePath, flush }
+      ),
 
-      loadCanvas: () => invoke(IpcChannel.WorkspaceCanvasLoad),
+      loadCanvas: (workspacePath) => invoke(
+        IpcChannel.WorkspaceCanvasLoad,
+        workspacePath === undefined ? undefined : { workspacePath }
+      ),
 
       setDefaultModel: (modelId) => invoke(IpcChannel.WorkspaceSetDefaultModel, { modelId })
     },
@@ -187,9 +193,12 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
     media: {
       providers: () => invoke(IpcChannel.MediaProviders),
 
-      generate: (request) => invoke(IpcChannel.MediaGenerate, request),
+      generate: (request, workspacePath) => invoke(
+        IpcChannel.MediaGenerate,
+        workspacePath === undefined ? request : { request, workspacePath }
+      ),
 
-      cancel: (jobId) => invoke(IpcChannel.MediaCancel, { jobId }),
+      cancel: (jobId, workspacePath) => invoke(IpcChannel.MediaCancel, { jobId, workspacePath }),
 
       jobs: () => invoke(IpcChannel.MediaJobs),
 

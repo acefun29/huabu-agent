@@ -10,7 +10,7 @@ import { MEDIA_GEN_MODES, MEDIA_RATIOS, MEDIA_REF_ROLES } from '../../../shared/
 import { adapterDefaultAuthEnv, adapterSupportedKinds, isRegisteredAdapterType } from '../adapters/registry'
 import type { AdapterModelConfig, AdapterProviderConfig } from '../adapters/registry'
 import type { BuiltinProviderDef } from './types'
-import type { MediaModelOverride, WorkspaceMediaProviderConfig } from '../../workspace/store'
+import type { MediaModelOverride, WorkspaceMediaProviderConfig } from '../../workspace/types'
 
 /**
  * 合并层：内置目录（代码数据）+ 用户覆盖层（workspace.json）→ 生效供应商清单。

@@ -153,6 +153,7 @@ export function buildExpertToolDefinitions(params: {
   /** 任务写区（派单信封的 lane 前缀） */
   lane: readonly string[]
   currentDir: () => string
+  isWorkspaceActive?: (workspaceDir: string) => boolean
   supportsImages: () => boolean
   /** 媒体装配依赖；专家没有 `media` 能力时不会用到 */
   media: SuperAgentMediaDeps | null
@@ -176,7 +177,8 @@ export function buildExpertToolDefinitions(params: {
       // 编排器的 isPathAllowed 判越界——已经付费生成，却交付不了
       ...(laneDir ? { outputDirFor: () => laneDir } : {}),
       sessionModelSupportsImages: () => params.supportsImages(),
-      currentDir: params.currentDir
+      currentDir: params.currentDir,
+      isWorkspaceActive: params.isWorkspaceActive
     })
     tools.push(...mediaTools, readMediaTool, ...videoTools)
   }
@@ -540,6 +542,7 @@ export class SuperAgentRunner {
           expert,
           lane: context.lane,
           currentDir: () => dir,
+          isWorkspaceActive: (workspaceDir) => this.deps.currentDir() === workspaceDir,
           supportsImages: () => supportsImages,
           // 用任务级快照，不用会随当前工作区漂移的现算版本（A07）
           media: { ...this.deps.media, mediaContext: () => mediaSnapshot }

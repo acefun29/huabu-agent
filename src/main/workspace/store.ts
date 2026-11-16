@@ -1,6 +1,5 @@
 import { app, dialog, shell } from 'electron'
-import { existsSync, mkdirSync, readFileSync, statSync } from 'fs'
-import { copyFile, mkdir } from 'fs/promises'
+import { existsSync, mkdirSync, readFileSync } from 'fs'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import { homedir } from 'os'
 import { randomUUID } from 'crypto'
@@ -13,242 +12,21 @@ import type {
   WorkspaceStateInfo,
   WorkspaceSummary
 } from '../../shared/ipc'
-import type { MediaProviderType, MediaRatio, ModelCapabilities } from '../../shared/media'
-import { MEDIA_RATIOS } from '../../shared/media'
 import { MEDIA_ROOT_REL } from '../../shared/assets'
-import { sanitizeFacetSchemas, type FacetSchema } from '../../shared/facets'
-import type {
-  ChatMigrationInput,
-  ChatMigrationPlan,
-  LegacyModelsFile
-} from '../models/migrate'
-import { migrateChatConfig } from '../models/migrate'
-import type { WorkspaceChatConfig } from '../models/types'
-import {
-  sanitizeHiddenBuiltin as sanitizeChatHiddenBuiltin,
-  sanitizeModelOverrides as sanitizeChatModelOverrides,
-  sanitizeUserProviders as sanitizeChatUserProviders
-} from '../models/catalog'
-import {
-  sanitizeHiddenBuiltin,
-  sanitizeModelOverrides,
-  sanitizeUserProviders
-} from '../media/catalog/merge'
+import type { FacetSchema } from '../../shared/facets'
+import { readChatConfig, readWorkspaceMeta, writeChatSegment, writeWorkspaceMeta } from './metadata'
+import type { WorkspaceLibrary, WorkspaceMediaConfig, WorkspaceMetaFile } from './types'
+export type { MediaModelOverride, WorkspaceMediaProviderConfig, WorkspaceMediaConfig, WorkspaceFacetsConfig, WorkspaceSkillsConfig, WorkspaceAgentConfig, WorkspaceLibrary } from './types'
+export { readChatConfig, readChatMigrationPlan, readRawMetaFile, writeChatSegment } from './metadata'
 import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
+import { CanvasPersistence } from './canvasPersistence'
 
 /**
- * 工作区存储：一个工作区 = 一张画布 + 一个磁盘目录（开发计划 2.1）。
- *
- * M5 扩展的核心状态都在这里：
- * - 当前工作区（单例）：所有会话 cwd、画布持久化、凭据都锚定在它上面
- * - 最近列表 + 上次工作区（应用重启后恢复）
- * - `.huabu/canvas.json` 的原子读写（临时文件 + rename，强杀不产生半写文件）
- * - `.huabu/workspace.json`（版本、聊天模型覆盖层 `chat`、媒体 provider 覆盖层 `media`、素材库映射）
- *
- * 本类不持有 electron BrowserWindow 之外的运行时状态；AgentHost 的会话释放
- * 由 ipc.ts 编排（先问本类拿 dispose 数，再切 current），避免两个模块互相持有引用。
+ * 管理当前工作区、最近列表和画布快照；工作区元数据由 metadata.ts 持久化。
+ * 工作区切换时会话的释放由 IPC 装配层负责。
  */
 
 const CANVAS_VERSIONS = [1, 2, 3] as const
-
-/** canvas.json 写盘防抖窗口：合并窗口内的多次 invoke 为一次序列化 + 原子写 */
-const CANVAS_WRITE_DEBOUNCE_MS = 200
-
-/**
- * canvas.json 的写盘防抖状态（与 metaCache 同理放模块级，last-write-wins）：
- * 200ms 窗口内的多次 saveCanvas 合并为一次 stringify + 原子写——新调用只覆盖
- * pending 快照、不重置定时器（合并而非顺延）。崩溃最多丢 200ms 的画布快照；
- * 渲染端 autosave 已有 800ms 防抖，这里只防直接高频 invoke 的重复序列化。
- *
- * pending 连目标 file 一起捕获：到点写盘时 this.current 可能已切到别的工作区，
- * 写盘目标必须锚定排期那一刻的画布文件，而不是当下正在打开的工作区。
- */
-let canvasSaveTimer: ReturnType<typeof setTimeout> | null = null
-let canvasSavePending: { file: string; snapshot: CanvasSnapshot } | null = null
-
-/**
- * 立即冲刷未落盘的 pending 画布保存（防抖定时器与 loadCanvas 读前都会调用）：
- * 取走 pending 并同步写盘。pending 为空时是空操作。
- */
-function flushCanvasSave(): void {
-  if (canvasSaveTimer) {
-    clearTimeout(canvasSaveTimer)
-    canvasSaveTimer = null
-  }
-  const pending = canvasSavePending
-  canvasSavePending = null
-  if (!pending) return
-  try {
-    const serialized = JSON.stringify(pending.snapshot)
-    if (serialized.length > 32 * 1024 * 1024) {
-      console.error('[workspace] 画布快照体积超过 32MB 上限，已跳过本次写盘')
-      return
-    }
-    atomicWriteSync(pending.file, serialized)
-  } catch (error) {
-    // 防抖后写盘失败已无法抛回 invoke 调用方，只能记日志：宁可丢一拍，
-    // 也不能让定时器里的异常变成主进程未捕获错误
-    console.error('[workspace] canvas.json 写盘失败：', error)
-  }
-}
-
-/**
- * workspace.json 的读取缓存（key = 工作区目录）：readMeta 是热路径——每个
- * huabu-media:// 协议请求都会经 mediaDir() 读一次 meta，不缓存的话反复读盘 + 解析。
- *
- * 放在模块级而不是 WorkspaceStore 实例字段：写路径除了实例方法 writeMeta，还有
- * 模块级函数 writeChatSegment（host 与 models/overlay 都在调），后者拿不到实例
- * 私有字段，而它的写盘同样要失效缓存。
- *
- * 正确性依据：读路径全在主进程单线程内；对 workspace.json 的写入全在本文件
- * （writeMeta / writeChatSegment），写前显式失效；mtimeMs 双保险兜住进程外的
- * 意外改动（用户手改、其他实例）。
- */
-const metaCache = new Map<string, { mtimeMs: number; value: WorkspaceMetaFile }>()
-
-/** workspace.json 的 media.userProviders 条目（M11；用户自建供应商，文件持久化形态） */
-export interface WorkspaceMediaProviderConfig {
-  id: string
-  /** 必须是已注册的适配器类型；单一声明处在 shared/media.ts */
-  type: MediaProviderType
-  label?: string
-  /** 凭据存储键后缀（safeStorage 存储 media:<authKey>），缺省 = id */
-  authKey?: string
-  /** 环境变量名（缺省按适配器约定，gateway-dashscope 为 DASHSCOPE_KEY），已录入存储 Key 时优先 */
-  authEnv?: string
-  /** 网关基址（协议家族适配器用，如 gateway-openai-compat）；缺省 = 适配器官方默认 */
-  baseUrl?: string
-  /** 认证头风格（gateway-openai-compat 消费的通用协议字段）：bearer | x-api-key；缺省 = bearer */
-  authStyle?: 'bearer' | 'x-api-key'
-  /**
-   * 模型表：键 = 发给网关的模型标识。裸 slug（'wan2.7-image'）或带供应商前缀的
-   * 全 id（'dashscope/wan2.7-image'，覆盖/恢复内置模型时用）都合法——合并层按
-   * 内置目录同一条规则剥前缀得出实际请求标识（catalog/merge.ts）。
-   * kind 必须落在该适配器类型支持的端点族内（越界的模型条目会被清洗层丢弃）。
-   */
-  models: Record<
-    string,
-    {
-      kind: 'image' | 'video' | 'audio'
-      label?: string
-      /** 能力元数据（比例/时长档位等，浏览目录「添加」时透传；驱动渲染端参数面板） */
-      capabilities?: ModelCapabilities
-      /** 一句人话的成本提示，展示在参数面板 */
-      costHint?: string
-    }
-  >
-}
-
-/** 对内置模型（按用户可见 id，如 'dashscope/wan2.7-image'）的展示覆盖 */
-export interface MediaModelOverride {
-  label?: string
-}
-
-/**
- * workspace.json 的 media 段。
- *
- * 模型清单的单一事实来源是内置目录（src/main/media/catalog），本段只存**覆盖层**：
- * userProviders（用户自建供应商）、hiddenBuiltin（隐藏的内置模型）、modelOverrides
- * （展示覆盖）。生效清单由 catalog/merge.ts 的 mergeCatalog 运行时合并。
- *
- * 旧字段 `providers` 已改名 `userProviders`：readMeta 读旧写新（读入时迁移），
- * 老工作区无感升级，写入一律用新字段名。
- */
-export interface WorkspaceMediaConfig {
-  /** 高成本确认闸门：Agent 视频生成工具是否需要确认（M13） */
-  confirmVideo?: boolean
-  /**
-   * Agent 媒体访问模式：full = 直接执行（现状，视频仍受 confirmVideo 约束）；
-   * confirm = 变更前确认（所有生成提交前弹确认卡，取代视频对话闸门）。缺省 full。
-   */
-  accessMode?: 'full' | 'confirm'
-  /** Agent 媒体工具使用的 provider（缺省走内置目录真实网关） */
-  agentProvider?: string
-  /**
-   * 各 kind 的默认模型，记法统一为 `provider:模型id` 复合串（可跨供应商指定）。
-   * 旧版存的裸模型 id 由 shared/mediaResolve 的 matchBareModelId 兼容解析，下次写入自动升级。
-   */
-  agentModels?: Partial<Record<'image' | 'video' | 'audio', string>>
-  userProviders?: WorkspaceMediaProviderConfig[]
-  /** 被用户隐藏的内置模型 id（如 'dashscope/wan2.7-image'） */
-  hiddenBuiltin?: string[]
-  /** 对内置模型的展示覆盖（按用户可见模型 id） */
-  modelOverrides?: Record<string, MediaModelOverride>
-  /** 产物输出目录（相对工作区根；空/缺省 = .huabu/media） */
-  outputDir?: string
-  /** 同时进行的生成任务数上限（1..8；缺省 3） */
-  concurrency?: number
-  /** 新建生成卡片的默认图片比例 */
-  defaultRatio?: MediaRatio
-  /** 新建生成卡片的默认时长（秒） */
-  defaultDuration?: number
-  /** 全局默认落库素材库 id（libraries 段的条目 id；空 = 公共库/工作目录兜底） */
-  defaultLibraryId?: string
-  /** 按媒体大类的默认落库素材库 id（优先级高于全局默认） */
-  kindLibraryDefaults?: Partial<Record<'image' | 'video' | 'audio', string>>
-}
-
-interface WorkspaceMetaFile {
-  version: 1
-  /**
-   * @deprecated 旧顶层字段：只出现在 `readMeta` 解析出的 `raw` 里，作为一次性迁移输入。
-   * readMeta 的返回值**不含**这两个字段（回填就是双轨），所以任何写入路径都不会再产生它们。
-   */
-  defaultModel?: string
-  /** @deprecated 同 defaultModel：迁移进 chat.hiddenBuiltin，读取后即弃 */
-  hiddenModels?: string[]
-  /**
-   * 聊天模型清单的**覆盖层**（架构计划 §3）：自定义供应商、隐藏项、展示覆盖、默认模型。
-   * 内置清单不在这里——那是 src/main/models/catalog 的代码数据，运行时由 mergeChatCatalog 合并。
-   * 缺省时 readMeta 会从旧三处（顶层两字段 + .huabu/models.json）一次性迁移得到，见 chatMigration()。
-   */
-  chat?: WorkspaceChatConfig
-  media?: WorkspaceMediaConfig
-  /**
-   * 工作区技能段（agentskills.io 规范，技能本体在 .huabu/skills/<name>/SKILL.md）：
-   * 这里只存禁用名单；清单每次现扫目录（与会话加载同源，防两套解析漂移）。
-   */
-  skills?: WorkspaceSkillsConfig
-  /** Agent 运行时 feature flag（Mastra 迁移计划 v1.2 §14.1）：缺省 = pi */
-  agent?: WorkspaceAgentConfig
-  /** 素材分级结构（工作区自定义；决定层级叫什么：集/场/镜 还是任何别的） */
-  facets?: WorkspaceFacetsConfig
-  /** 素材库映射（新原型同步）：名字 → 工作区内相对路径。公共库首个建库时播种 */
-  libraries?: WorkspaceLibrary[]
-}
-
-/**
- * workspace.json 的 facets 段：分级结构（工作区自定义，产品不内置任何方案）
- * 与当前生效的那一套。
- */
-export interface WorkspaceFacetsConfig {
-  /** 当前生效的 schema id；缺省/失效 = 列表第一套 */
-  schemaId?: string
-  /** 这个工作区定义的全部分级结构（由用户或 Agent 创建） */
-  schemas?: FacetSchema[]
-}
-
-/** workspace.json 的 skills 段 */
-export interface WorkspaceSkillsConfig {
-  /** 被禁用的技能名（= SKILL.md frontmatter name = 目录名） */
-  disabled?: string[]
-}
-
-/** workspace.json 的 agent 段：运行时开关（工作区级灰度 / 回滚） */
-export interface WorkspaceAgentConfig {
-  /** pi = 现有运行时（默认，回滚路径）；mastra = 新运行时（灰度） */
-  runtime?: AgentRuntimeKind
-}
-
-/** workspace.json 的 libraries 段条目（素材库 = 名字 → 相对路径的映射，不复制文件） */
-export interface WorkspaceLibrary {
-  id: string
-  name: string
-  /** 工作区内相对路径（POSIX 风格，如 素材库/海报产出） */
-  path: string
-  /** 公共素材库：默认落库的兜底，不可删除 */
-  isPublic?: boolean
-}
 
 interface RecentsFile {
   version: 1
@@ -263,11 +41,11 @@ function isNonEmptyString(value: unknown): value is string {
 /* 状态目录/凭据路径已拆到 stateDir.ts（轻量模块，避免无关闭包）；此处 re-export 保住既有引用 */
 export { getCredentialsFile } from './stateDir'
 import { getAppStateDir, getCredentialsFile } from './stateDir'
-import type { AgentRuntimeKind } from '../agent/runtime'
 
 export class WorkspaceStore {
   private current: WorkspaceInfo | null = null
   private recents: WorkspaceSummary[] = []
+  private readonly canvasPersistence = new CanvasPersistence()
 
   /** 应用启动时调用：恢复上次工作区。返回是否恢复了工作区（渲染端据此决定显示画布还是选择页） */
   bootstrap(): boolean {
@@ -369,6 +147,8 @@ export class WorkspaceStore {
       this.writeMeta(dir, meta)
     }
 
+    // 待写画布只保留一份；切换前先落盘，避免新工作区的保存覆盖旧工作区的待写快照。
+    if (this.current?.path !== dir) this.canvasPersistence.flush()
     this.current = info
     this.remember(dir)
     console.log(
@@ -398,44 +178,8 @@ export class WorkspaceStore {
   }
 
   private readMeta(dir: string): WorkspaceMetaFile {
-    const file = join(dir, '.huabu', 'workspace.json')
-    // 先 stat 拿 mtime：文件不存在（还没初始化的工作区）走缺省返回，且不缓存负结果
-    let mtimeMs: number
-    try {
-      mtimeMs = statSync(file).mtimeMs
-    } catch {
-      return { version: 1 }
-    }
-    const cached = metaCache.get(dir)
-    if (cached && cached.mtimeMs === mtimeMs) return cached.value
-    let raw: Partial<WorkspaceMetaFile>
-    try {
-      raw = JSON.parse(readFileSync(file, 'utf8')) as Partial<WorkspaceMetaFile>
-    } catch {
-      // 文件在但读不出/解析失败（半写残留等瞬态）：按缺省处理，同样不缓存，下次重读
-      return { version: 1 }
-    }
-    const chat = resolveChatSegment(dir, raw)
-    const meta: WorkspaceMetaFile = {
-      version: 1,
-      // 顶层 defaultModel/hiddenModels **不回填**：它们是旧位置，只作为迁移输入被读取一次。
-      // 读出来再写回去就是双轨（T1 刚清掉一次双轨），所以本方法唯一的输出形态是 chat 段。
-      ...(Object.keys(chat).length > 0 ? { chat } : {}),
-      ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
-      ...(raw.skills !== undefined ? { skills: normalizeSkillsSegment(raw.skills) } : {}),
-      ...(raw.agent !== undefined ? { agent: normalizeAgentSegment(raw.agent) } : {}),
-      ...(raw.facets !== undefined ? { facets: normalizeFacetsSegment(raw.facets) } : {}),
-      ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
-    }
-    metaCache.set(dir, { mtimeMs, value: meta })
-    return meta
+    return readWorkspaceMeta(dir)
   }
-
-  /**
-   * 聊天模型覆盖层的读取/落盘都在模块级函数（readChatConfig / writeChatSegment /
-   * readChatMigrationPlan）：host 与 models/overlay 手里只有 workspaceDir，
-   * 走实例方法会把「当前工作区」这个隐式状态引进来。本类只保留画布与 media/libraries 的读写。
-   */
 
   /* ---------------------------------------------------------------------- */
   /* 素材库映射（libraries 段）：名字 → 工作区内相对路径                        */
@@ -611,12 +355,7 @@ export class WorkspaceStore {
   }
 
   writeMeta(dir: string, meta: WorkspaceMetaFile): void {
-    const file = join(dir, '.huabu', 'workspace.json')
-    // 写前先失效缓存：调用方（addLibrary 等）会原地改写 readMeta 返回的对象再传进来，
-    // 写盘若失败（磁盘满等），不能让缓存残留这个已被改写的脏对象；单线程内同步写，
-    // 失效与写盘之间没有别的读路径能插进来
-    metaCache.delete(dir)
-    atomicWriteSync(file, JSON.stringify(meta, null, 2))
+    writeWorkspaceMeta(dir, meta)
   }
 
   /** 修改工作区默认聊天模型（写 chat 段）；只影响新建会话（DoD：已存在会话不变） */
@@ -637,10 +376,8 @@ export class WorkspaceStore {
   /* ---------------------------------------------------------------------- */
 
   /**
-   * 画布快照落盘（200ms 防抖合并写）：形状/节点数校验保持同步——invoke 当场把
-   * 非法输入抛回渲染端；序列化 + 原子写延迟到定时器合并执行。崩溃最多丢 200ms
-   * 的画布快照；渲染端 autosave 已有 800ms 防抖，这里只防直接高频 invoke 的
-   * 重复序列化与写盘。
+   * 校验并安排画布快照写入。默认合并短时间内的写入；需要确认落盘的调用方
+   * 随后调用 flushPendingWrites，写入失败会抛错且快照仍保留在内存中。
    */
   saveCanvas(snapshot: CanvasSnapshot): void {
     if (!this.current) throw new Error('尚未打开工作区，画布无处可存')
@@ -651,11 +388,7 @@ export class WorkspaceStore {
     if (snapshot.nodes.length > 2000) {
       throw new Error(`画布节点数超过上限（${snapshot.nodes.length} > 2000）`)
     }
-    // last-write-wins：pending 只留最新快照引用（渲染端每次传新对象），
-    // 已有定时器不重置——合并而非顺延
-    canvasSavePending = { file: this.current.canvasFile, snapshot }
-    if (canvasSaveTimer) return
-    canvasSaveTimer = setTimeout(flushCanvasSave, CANVAS_WRITE_DEBOUNCE_MS)
+    this.canvasPersistence.schedule(this.current.canvasFile, snapshot)
   }
 
   /**
@@ -663,7 +396,7 @@ export class WorkspaceStore {
    * 渲染端 800ms 防抖 + 这里 200ms 合并是两层缓冲，退出时必须两层都冲刷。
    */
   flushPendingWrites(): void {
-    flushCanvasSave()
+    this.canvasPersistence.flush()
   }
 
   loadCanvas(): CanvasSnapshot | null {
@@ -671,13 +404,12 @@ export class WorkspaceStore {
     // 读前先冲刷未落盘的 pending 保存：saveCanvas 有 200ms 防抖窗口，
     // 「保存后立刻读取」必须读到刚存的内容（e2e 的 canvas 往返用例与未来任何
     // 直接 invoke 方都依赖读后写语义），不能让窗口内的 load 拿到旧文件
-    flushCanvasSave()
+    this.canvasPersistence.flush()
     if (!existsSync(this.current.canvasFile)) return null
     try {
       const raw = JSON.parse(readFileSync(this.current.canvasFile, 'utf8')) as CanvasSnapshot
       if (!raw || !(CANVAS_VERSIONS as readonly number[]).includes(raw?.version) || !Array.isArray(raw.nodes)) {
-        console.warn('[workspace] canvas.json 版本或形状不识别，按空画布处理')
-        return null
+        throw new Error('画布版本或数据形状不受支持')
       }
       return raw
     } catch (error) {
@@ -749,246 +481,4 @@ export class WorkspaceStore {
     if (dir === resolve(this.workspacesRoot())) return '不能删除工作区根目录'
     return null
   }
-}
-
-/** libraries 段读入清洗：逐条校验字段形状，坏条目丢弃（素材库映射与媒体覆盖层同款容错） */
-function sanitizeLibraries(raw: unknown[]): WorkspaceLibrary[] {
-  const out: WorkspaceLibrary[] = []
-  for (const item of raw) {
-    if (!item || typeof item !== 'object') continue
-    const rec = item as Record<string, unknown>
-    if (!isNonEmptyString(rec.id) || !isNonEmptyString(rec.name) || !isNonEmptyString(rec.path)) continue
-    // path 必须是工作区内相对路径（POSIX 风格），拒绝绝对路径与越界
-    if (isAbsolute(rec.path) || rec.path.includes('..')) continue
-    out.push({
-      id: rec.id,
-      name: rec.name,
-      path: rec.path,
-      ...(rec.isPublic === true ? { isPublic: true } : {})
-    })
-  }
-  return out
-}
-
-/** agent 段读入清洗：只认 pi/mastra，坏值丢弃（读取侧 normalizeAgentRuntime 兜底 pi） */
-function normalizeAgentSegment(raw: unknown): WorkspaceAgentConfig {
-  const runtime = (raw as { runtime?: unknown } | null)?.runtime
-  return runtime === 'pi' || runtime === 'mastra' ? { runtime } : {}
-}
-
-/**
- * facets 段读入清洗：结构定义逐套收敛（sanitizeFacetSchemas），生效 id 必须
- * 在列表里真实存在，否则丢弃（读取侧回落第一套）。
- * 用「存在性校验」而不是形状校验：id 拼错时宁可回落到第一套，也不要让整个
- * UI 因为找不到 schema 而停止渲染分级。
- */
-function normalizeFacetsSegment(raw: unknown): WorkspaceFacetsConfig {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
-  const rec = raw as { schemaId?: unknown; schemas?: unknown }
-  const schemas = sanitizeFacetSchemas(rec.schemas)
-  if (schemas.length === 0) return {}
-  const schemaId = typeof rec.schemaId === 'string' && schemas.some((s) => s.id === rec.schemaId) ? rec.schemaId : undefined
-  return { ...(schemaId ? { schemaId } : {}), schemas }
-}
-
-/* -------------------------------------------------------------------------- */
-/* chat 段（模型清单覆盖层）：清洗 + 旧三处一次性迁移                            */
-/* -------------------------------------------------------------------------- */
-
-/** 迁移提示只在本进程打印一次：readMeta 会被高频调用，逐次刷同一句 note 是噪音 */
-const migrationNotesPrinted = new Set<string>()
-
-/** chat 段：磁盘上有就用（逐字段清洗）；没有则从旧三处一次性迁移得到 */
-function resolveChatSegment(dir: string, raw: Partial<WorkspaceMetaFile>): WorkspaceChatConfig {
-  if (raw.chat !== undefined) return normalizeChatSegment(raw.chat)
-  const plan = migrateChatConfig(legacyChatInput(dir, raw))
-  if (!migrationNotesPrinted.has(dir)) {
-    migrationNotesPrinted.add(dir)
-    for (const note of plan.notes) console.warn(`[workspace] 模型配置迁移：${note}`)
-  }
-  return plan.config
-}
-
-function legacyChatInput(dir: string, raw: Partial<WorkspaceMetaFile>): ChatMigrationInput {
-  const modelsFile = readLegacyModelsFile(dir)
-  return {
-    ...(isNonEmptyString(raw.defaultModel) ? { defaultModel: raw.defaultModel } : {}),
-    ...(Array.isArray(raw.hiddenModels) ? { hiddenModels: raw.hiddenModels.filter(isNonEmptyString) } : {}),
-    ...(modelsFile ? { modelsFile } : {})
-  }
-}
-
-/**
- * 旧 `.huabu/models.json`（Pi 原生格式）。
- *
- * 读不到或解析失败一律按"无遗留"处理：这个文件已经不再被任何运行时路径消费（旧读取方
- * `agent/customModels.ts` 已随 T5 拆除），它剩下的唯一身份是**迁移输入**——一次坏 JSON
- * 不该让工作区连配置都读不出来。
- */
-function readLegacyModelsFile(dir: string): LegacyModelsFile | null {
-  try {
-    const parsed = JSON.parse(readFileSync(join(dir, '.huabu', 'models.json'), 'utf8')) as LegacyModelsFile | null
-    return parsed && typeof parsed === 'object' && parsed.providers && typeof parsed.providers === 'object' ? parsed : null
-  } catch {
-    return null
-  }
-}
-
-/**
- * 按目录读聊天覆盖层（不需要 WorkspaceStore 实例）。
- *
- * host 与模型覆盖层的写入方都按这个口子取用：它们手里只有 workspaceDir，
- * 拿单例 store 会把「当前工作区」这个隐式状态引进来——切工作区时最容易错的就是这种隐式状态。
- */
-export function readChatConfig(dir: string): WorkspaceChatConfig {
-  return resolveChatSegment(dir, readRawMetaFile(dir))
-}
-
-/** 只读磁盘原文（不清洗、不迁移）：迁移判定与 readMeta 的容错都要它 */
-export function readRawMetaFile(dir: string): Partial<WorkspaceMetaFile> {
-  try {
-    return JSON.parse(readFileSync(join(dir, '.huabu', 'workspace.json'), 'utf8')) as Partial<WorkspaceMetaFile>
-  } catch {
-    return {}
-  }
-}
-
-/** 待执行的一次性迁移计划（`chat` 段已落盘或无可迁内容时为 null） */
-export function readChatMigrationPlan(dir: string): ChatMigrationPlan | null {
-  const raw = readRawMetaFile(dir)
-  if (raw.chat !== undefined) return null
-  if (!isNonEmptyString(raw.defaultModel) && !Array.isArray(raw.hiddenModels) && !readLegacyModelsFile(dir)) return null
-  return migrateChatConfig(legacyChatInput(dir, raw))
-}
-
-/**
- * 落盘聊天覆盖层（其余段原样保留）。
- *
- * 空对象也照写：`chat` 段存在与否就是"迁移已落地"的标记，靠"空就不写"会让下次启动
- * 再迁移一遍，notes 反复刷屏。media/libraries 走与 readMeta 相同的归一化，避免这条
- * 写入路径把旧字段（media.providers 之类）原样搬回去。
- */
-export function writeChatSegment(dir: string, chat: WorkspaceChatConfig): void {
-  const raw = readRawMetaFile(dir)
-  const meta: WorkspaceMetaFile = {
-    version: 1,
-    chat: normalizeChatSegment(chat),
-    ...(raw.media !== undefined ? { media: normalizeMediaSegment(raw.media) } : {}),
-    ...(raw.skills !== undefined ? { skills: normalizeSkillsSegment(raw.skills) } : {}),
-    ...(raw.agent !== undefined ? { agent: normalizeAgentSegment(raw.agent) } : {}),
-    ...(raw.facets !== undefined ? { facets: normalizeFacetsSegment(raw.facets) } : {}),
-    ...(Array.isArray(raw.libraries) ? { libraries: sanitizeLibraries(raw.libraries) } : {})
-  }
-  // 本文件对 workspace.json 的另一条写路径：同样写前失效 metaCache。mtime 兜底在
-  // 粗粒度文件系统上可能吞掉同刻的两次变更，本文件内的写入就该显式失效
-  metaCache.delete(dir)
-  atomicWriteSync(join(dir, '.huabu', 'workspace.json'), JSON.stringify(meta, null, 2))
-}
-
-/** 磁盘上的 chat 段清洗：规则全在 models/catalog/merge 的 sanitize 里，这里只决定"空就不写" */
-function normalizeChatSegment(raw: unknown): WorkspaceChatConfig {  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    console.warn('[workspace] chat 段不是对象，已按空覆盖层处理')
-    return {}
-  }
-  const source = raw as Record<string, unknown>
-  const chat: WorkspaceChatConfig = {}
-  if (isNonEmptyString(source.defaultModel)) chat.defaultModel = source.defaultModel.trim()
-  const userProviders = sanitizeChatUserProviders(source.userProviders)
-  if (userProviders.length > 0) chat.userProviders = userProviders
-  const hiddenBuiltin = sanitizeChatHiddenBuiltin(source.hiddenBuiltin)
-  if (hiddenBuiltin.length > 0) chat.hiddenBuiltin = hiddenBuiltin
-  const modelOverrides = sanitizeChatModelOverrides(source.modelOverrides)
-  if (Object.keys(modelOverrides).length > 0) chat.modelOverrides = modelOverrides
-  return chat
-}
-
-/**
- * media 段读入归一化（读旧写新）：
- * - 旧字段 `providers` 迁移为 `userProviders`（老工作区无感升级，写入一律新字段名）
- * - 覆盖层字段逐条清洗，坏配置丢弃并给出「哪条哪个字段错了」的警告（catalog 架构 §5）
- * - 其余标量字段轻量类型收敛，未知字段不透传
- */
-function normalizeMediaSegment(raw: unknown): WorkspaceMediaConfig {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    console.warn('[workspace] media 段不是对象，已按默认配置处理')
-    return { confirmVideo: true }
-  }
-  const rawMedia = raw as Record<string, unknown>
-  // 字段名迁移：providers（旧）→ userProviders（新）；两者同时存在时新字段优先
-  const userProvidersRaw = rawMedia.userProviders ?? rawMedia.providers
-  if (rawMedia.providers !== undefined && rawMedia.userProviders !== undefined) {
-    console.warn('[workspace] media.providers（旧字段）与 media.userProviders 并存，已采用 userProviders')
-  }
-  const userProviders = sanitizeUserProviders(userProvidersRaw)
-  const hiddenBuiltin = sanitizeHiddenBuiltin(rawMedia.hiddenBuiltin)
-  const modelOverrides = sanitizeModelOverrides(rawMedia.modelOverrides)
-  const media: WorkspaceMediaConfig = {
-    ...(typeof rawMedia.confirmVideo === 'boolean' ? { confirmVideo: rawMedia.confirmVideo } : { confirmVideo: true }),
-    // 访问模式：只认 'confirm' 这个显式值，其余（含缺省）一律回落 'full'（现状行为）
-    ...(rawMedia.accessMode === 'confirm' ? { accessMode: 'confirm' as const } : { accessMode: 'full' as const }),
-    // 已下架的内置供应商（第三方聚合中转平台，生产环境移除）：存量配置视为未设置，回落默认
-    ...(isNonEmptyString(rawMedia.agentProvider) && rawMedia.agentProvider !== 'mock' && rawMedia.agentProvider !== 'muapi'
-      ? { agentProvider: rawMedia.agentProvider }
-      : {}),
-    ...normalizeAgentModels(rawMedia.agentModels),
-    ...(userProviders.length > 0 ? { userProviders } : {}),
-    ...(hiddenBuiltin.length > 0 ? { hiddenBuiltin } : {}),
-    ...(Object.keys(modelOverrides).length > 0 ? { modelOverrides } : {}),
-    ...(isNonEmptyString(rawMedia.outputDir) ? { outputDir: rawMedia.outputDir } : {}),
-    ...(typeof rawMedia.concurrency === 'number' ? { concurrency: rawMedia.concurrency } : {}),
-    ...normalizeDefaultRatio(rawMedia.defaultRatio),
-    ...(typeof rawMedia.defaultDuration === 'number' ? { defaultDuration: rawMedia.defaultDuration } : {}),
-    ...(isNonEmptyString(rawMedia.defaultLibraryId) ? { defaultLibraryId: rawMedia.defaultLibraryId } : {}),
-    ...normalizeKindLibraryDefaults(rawMedia.kindLibraryDefaults)
-  }
-  return media
-}
-
-function normalizeKindLibraryDefaults(raw: unknown): Pick<WorkspaceMediaConfig, 'kindLibraryDefaults'> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
-  const defaults: NonNullable<WorkspaceMediaConfig['kindLibraryDefaults']> = {}
-  for (const kind of ['image', 'video', 'audio'] as const) {
-    const value = (raw as Record<string, unknown>)[kind]
-    if (isNonEmptyString(value)) defaults[kind] = value
-  }
-  return Object.keys(defaults).length > 0 ? { kindLibraryDefaults: defaults } : {}
-}
-
-function normalizeAgentModels(raw: unknown): Pick<WorkspaceMediaConfig, 'agentModels'> {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
-  const models: NonNullable<WorkspaceMediaConfig['agentModels']> = {}
-  for (const kind of ['image', 'video', 'audio'] as const) {
-    const value = (raw as Record<string, unknown>)[kind]
-    if (isNonEmptyString(value)) models[kind] = value
-  }
-  return Object.keys(models).length > 0 ? { agentModels: models } : {}
-}
-
-function normalizeDefaultRatio(raw: unknown): Pick<WorkspaceMediaConfig, 'defaultRatio'> {
-  return typeof raw === 'string' && (MEDIA_RATIOS as readonly string[]).includes(raw)
-    ? { defaultRatio: raw as MediaRatio }
-    : {}
-}
-
-/** skills 段读入归一化：只收 disabled 字符串数组，其余丢弃 */
-function normalizeSkillsSegment(raw: unknown): WorkspaceSkillsConfig {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
-  const disabled = (raw as { disabled?: unknown }).disabled
-  if (!Array.isArray(disabled)) return {}
-  const cleaned = [...new Set(disabled.filter((name): name is string => typeof name === 'string' && name.length > 0))]
-  return cleaned.length > 0 ? { disabled: cleaned } : {}
-}
-
-/** 原子写已收口到 src/main/fsutil/atomic（tmp+rename；Windows 占用时挪 .bak 腾位，
- * 绝不先删旧文件）。本文件此前的本地实现在 rename 失败时退化为 rm-then-rename，
- * rm 与 rename 之间崩溃会把原文件彻底丢掉，已删除，改为从 fsutil/atomic 导入。 */
-
-/** copyFile 的目录自备版（fs/promises）：导入媒体/资产时先把目标目录建好。
- * 收口为 async 的出处：同步 copy 允许到 512MB（MAX_IMPORT_BYTES），跑在主进程会
- * 冻结全部 IPC/UI 数秒（性能优化 P0：素材/导入链路去同步 IO） */
-export async function copyIntoDir(src: string, destDir: string, destName: string): Promise<string> {
-  await mkdir(destDir, { recursive: true })
-  const dest = join(destDir, destName)
-  await copyFile(src, dest)
-  return dest
 }

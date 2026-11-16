@@ -18,7 +18,6 @@
 const { app } = require('electron')
 const fs = require('node:fs')
 const path = require('node:path')
-const Module = require('node:module')
 const ts = require('typescript')
 
 const PROJECT_ROOT = path.resolve(__dirname, '..')
@@ -65,34 +64,6 @@ function transpileToTmp(relSources) {
   }
 }
 
-// manager.ts 值导入了 workspace/store（copyIntoDir）；真身拖 electron app 链，
-// 探针给同语义 stub（fs/promises copyFile 的目录自备 async 版，见 store.ts copyIntoDir）。
-// stub 文件在 transpileToTmp（它会清空 TMP）之后写入。
-const origResolve = Module._resolveFilename
-Module._resolveFilename = function (request, parent, ...rest) {
-  if (request === '../workspace/store') {
-    return origResolve.call(this, path.join(TMP, 'stubs', 'workspace-store.js'), parent, ...rest)
-  }
-  return origResolve.call(this, request, parent, ...rest)
-}
-function writeWorkspaceStoreStub() {
-  fs.mkdirSync(path.join(TMP, 'stubs'), { recursive: true })
-  fs.writeFileSync(
-    path.join(TMP, 'stubs', 'workspace-store.js'),
-    [
-      "const fs = require('node:fs')",
-      'module.exports.copyIntoDir = async function copyIntoDir(src, destDir, destName) {',
-      '  await fs.promises.mkdir(destDir, { recursive: true })',
-      "  const dest = require('node:path').join(destDir, destName)",
-      '  await fs.promises.copyFile(src, dest)',
-      '  return dest',
-      '}',
-      'module.exports.WorkspaceStore = class WorkspaceStore {}'
-    ].join('\n'),
-    'utf8'
-  )
-}
-
 const startedAt = new Date().toISOString()
 
 void app
@@ -101,12 +72,14 @@ void app
     transpileToTmp([
       path.join('src', 'main', 'assets', 'manager.ts'),
       path.join('src', 'main', 'assets', 'tagsIndex.ts'),
+      path.join('src', 'main', 'assets', 'facetsIndex.ts'),
+      path.join('src', 'main', 'fsutil', 'copy.ts'),
+      path.join('src', 'shared', 'facets.ts'),
       // tagsIndex.ts 依赖的原子写（5604bc7 收口到 fsutil；漏登会在 require 阶段挂掉）
       path.join('src', 'main', 'fsutil', 'atomic.ts'),
       path.join('src', 'shared', 'assets.ts'),
       path.join('src', 'shared', 'ipc.ts')
     ])
-    writeWorkspaceStoreStub()
     const { transferToLibrary } = require(path.join(TMP, 'src', 'main', 'assets', 'manager.js'))
     const { renameAsset, deleteAsset } = require(path.join(TMP, 'src', 'main', 'assets', 'manager.js'))
 

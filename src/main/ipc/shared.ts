@@ -16,15 +16,16 @@ import type { WorkspaceStore } from '../workspace/store'
 import type { MediaJobManager } from '../media/manager'
 import type { MediaApprovalInfo } from '../agent/mediaTools'
 import type { McpManager } from '../mcp/manager'
-import type { MediaContextReturnType } from './media'
+import type { MediaContextReturnType } from '../media/runtime'
 import type { SuperAgentRunner } from '../superagent/runner'
-import { 
+import {
   IpcChannel,
   type ChatEvent,
   type ChatNodeRequest,
   type ChatResult,
-  type MediaJobStatus
-, type TaskEvent } from '../../shared/ipc'
+  type MediaJobStatus,
+  type TaskEvent
+} from '../../shared/ipc'
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
@@ -70,62 +71,40 @@ async function guardAsync<T>(fn: () => Promise<T>): Promise<ChatResult<T>> {
   }
 }
 
-/** chat:event 广播：作为运行时与 webBridge 的事件出口（见 src/main/ipc.ts 编排器） */
-export function broadcastChatEvent(event: ChatEvent): void {
+/** 同时发给 Web 桥和所有 Electron 窗口；单个窗口失败不影响其他接收方。 */
+function broadcastToAll(channel: string, label: string, payload: unknown, windowPayload: unknown = payload): void {
   // Web 桥：同一事件转给浏览器（未启用时零开销）
-  forwardEvent(IpcChannel.ChatEvent, event)
+  forwardEvent(channel, payload)
   for (const window of BrowserWindow.getAllWindows()) {
     const contents = window.webContents
     if (contents.isDestroyed()) continue
     try {
-      contents.send(IpcChannel.ChatEvent, event)
+      contents.send(channel, windowPayload)
     } catch (error) {
       // 广播失败不能打断事件链，否则一个坏窗口会让所有会话都收不到后续增量
-      console.error(`[ipc] chat:event 广播失败：${String(error)}`)
+      console.error(`[ipc] ${label} 广播失败：${String(error)}`)
     }
   }
 }
 
-/** task:event 广播：SuperAgent 任务/验收进度（计划 §9.7 新增可选事件，渲染端未接时忽略） */
+/** chat:event 广播：作为运行时与 webBridge 的事件出口（见 src/main/ipc.ts 编排器） */
+export function broadcastChatEvent(event: ChatEvent): void {
+  broadcastToAll(IpcChannel.ChatEvent, 'chat:event', event)
+}
+
+/** task:event 广播：SuperAgent 任务/验收进度（渲染端未接时忽略） */
 export function broadcastTaskEvent(event: TaskEvent): void {
-  forwardEvent(IpcChannel.TaskEvent, event)
-  for (const window of BrowserWindow.getAllWindows()) {
-    const contents = window.webContents
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(IpcChannel.TaskEvent, event)
-    } catch (error) {
-      console.error(`[ipc] task:event 广播失败：${String(error)}`)
-    }
-  }
+  broadcastToAll(IpcChannel.TaskEvent, 'task:event', event)
 }
 
 /** project:changed 广播：项目结构变更后渲染端刷新（层级/状态/进度） */
 export function broadcastProjectChangedEvent(): void {
-  forwardEvent(IpcChannel.ProjectChanged, { at: Date.now() })
-  for (const window of BrowserWindow.getAllWindows()) {
-    const contents = window.webContents
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(IpcChannel.ProjectChanged, { at: Date.now() })
-    } catch (error) {
-      console.error(`[ipc] project:changed 广播失败：${String(error)}`)
-    }
-  }
+  broadcastToAll(IpcChannel.ProjectChanged, 'project:changed', { at: Date.now() })
 }
 
 /** 素材目录变更广播（import/建库/删库后渲染端刷新素材库面板与目录约定） */
 export function broadcastAssetChanged(): void {
-  forwardEvent(IpcChannel.AssetChanged, { at: Date.now() })
-  for (const window of BrowserWindow.getAllWindows()) {
-    const contents = window.webContents
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(IpcChannel.AssetChanged, { at: new Date().toISOString() })
-    } catch (error) {
-      console.error(`[ipc] asset:changed 广播失败：${String(error)}`)
-    }
-  }
+  broadcastToAll(IpcChannel.AssetChanged, 'asset:changed', { at: Date.now() }, { at: new Date().toISOString() })
 }
 
 /**
@@ -135,44 +114,16 @@ export function broadcastAssetChanged(): void {
  * 避免事件里再维护一份形状（那样迟早和投影漂开）。
  */
 export function broadcastWorkChanged(): void {
-  forwardEvent(IpcChannel.WorkChanged, { at: Date.now() })
-  for (const window of BrowserWindow.getAllWindows()) {
-    const contents = window.webContents
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(IpcChannel.WorkChanged, { at: new Date().toISOString() })
-    } catch (error) {
-      console.error(`[ipc] work:changed 广播失败：${String(error)}`)
-    }
-  }
+  broadcastToAll(IpcChannel.WorkChanged, 'work:changed', { at: Date.now() }, { at: new Date().toISOString() })
 }
 
 export function broadcastMediaJob(job: MediaJobStatus): void {
-  // Web 桥：同一事件转给浏览器（未启用时零开销）
-  forwardEvent(IpcChannel.MediaJobEvent, job)
-  for (const window of BrowserWindow.getAllWindows()) {
-    const contents = window.webContents
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(IpcChannel.MediaJobEvent, job)
-    } catch (error) {
-      console.error(`[ipc] media:job 广播失败：${String(error)}`)
-    }
-  }
+  broadcastToAll(IpcChannel.MediaJobEvent, 'media:job', job)
 }
 
 /** MCP 服务器状态变化广播（连接中/已连接/失败），设置页徽章实时更新 */
 export function broadcastMcpStatus(): void {
-  forwardEvent('mcp:status', { at: Date.now() })
-  for (const window of BrowserWindow.getAllWindows()) {
-    const contents = window.webContents
-    if (contents.isDestroyed()) continue
-    try {
-      contents.send(IpcChannel.McpStatusEvent, { at: new Date().toISOString() })
-    } catch (error) {
-      console.error(`[ipc] mcp:status 广播失败：${String(error)}`)
-    }
-  }
+  broadcastToAll('mcp:status', 'mcp:status', { at: Date.now() }, { at: new Date().toISOString() })
 }
 
 /**
@@ -182,9 +133,9 @@ export function broadcastMcpStatus(): void {
 export interface IpcContext {
   store: WorkspaceStore
   /**
-   * 工作区模型目录/凭据服务（**不依赖 pi**）。
-   * Mastra 运行时的模型清单与凭据走这里，而不是 host——host 那条路径要先成功加载 pi，
-   * 一旦 pi 出问题，模型下拉与 Key 录入会跟着一起失效。
+   * 工作区模型目录与凭据服务。
+   * Mastra 运行时的模型清单与凭据从这里取，不经过 Agent 运行时装配，
+   * 避免运行器故障时模型下拉与 Key 录入一起失效。
    */
   models: WorkspaceModels
   currentDir: () => string | null

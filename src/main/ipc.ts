@@ -14,7 +14,9 @@ import {
 import { registerWindowAppIpc } from './ipc/windowApp'
 import { registerWorkspaceIpc } from './ipc/workspace'
 import { registerAssetIpc } from './ipc/asset'
-import { registerMediaIpc, createMediaRuntime, requestMediaApproval } from './ipc/media'
+import { registerMediaIpc } from './ipc/media'
+import { requestMediaApproval } from './ipc/mediaApproval'
+import { createMediaRuntime } from './media/runtime'
 import { registerChatIpc, disposeChatSessions } from './ipc/chat'
 import { registerProjectIpc } from './ipc/project'
 import { registerSuperAgentIpc } from './ipc/superagent'
@@ -85,11 +87,11 @@ export function registerIpcHandlers(): void {
   mcpManagerSingleton = mcpManager
   mcpManager.sync()
 
-  // SuperAgent 运行器：IPC 域与 Agent 派单工具共用（模型解析/工具装配/取消都在这层）
+  // SuperAgent 运行器：媒体任务编排与任务板共用（模型解析/工具装配/取消都在这层）
   const superAgent = new SuperAgentRunner({
     currentDir,
     defaultModelId: () => store.currentWorkspace?.defaultModel,
-    // SuperAgent 的专家模型解析走 WorkspaceModels（与 pi 解耦）
+    // 专家模型解析走 WorkspaceModels，不依赖会话运行时是否已创建
     modelManagerFor: (dir) => models.managerFor(dir),
     media: { store, mediaManager, mediaContext, requestApproval: requestMediaApproval, inboxRoot },
     broadcastTaskEvent

@@ -81,6 +81,8 @@ export interface MediaApprovalInfo {
 }
 
 export interface MediaToolContext {
+  /** 工作区不再属于当前会话时，不展示确认卡或提交任务。 */
+  workspaceAvailable?: () => boolean
   /**
    * 提交任务并等待终态（宿主实现：解析 provider/model → 编排层 submit → waitForCompletion）。
    * 抛错 = 提交阶段失败（无工作区/无可用模型/凭据缺失/参数非法），工具会把错误转成指引文本。
@@ -99,7 +101,7 @@ export interface MediaToolContext {
   accessMode?: () => MediaAccessMode
   /**
    * 变更前确认的宿主实现：向渲染端发确认卡并等待回执（接受 = true）。
-   * signal 中止时宿主应立即返回 false；缺省实现视为无条件接受（不拦截）。
+   * signal 中止时宿主应立即返回 false；缺少实现时按未获确认处理。
    */
   requestApproval?: (
     kind: MediaKind,
@@ -111,7 +113,7 @@ export interface MediaToolContext {
   /** 当前会话的对话模型是否支持图片输入（决定成功结果是否携带产物图片） */
   supportsImageInput?: () => boolean
   /** 读取媒体产物为缩放后的 base64（主进程内完成，路径越界返回 undefined）；IO 异步 */
-  readArtifactAsBase64?: (relPath: string, maxEdge?: number) => Promise<{ data: string; mimeType: string } | undefined>
+  readArtifactAsBase64?: (relPath: string, maxEdge?: number, artifactDirRel?: string) => Promise<{ data: string; mimeType: string } | undefined>
   /** 读取视频产物首帧关键帧为 base64（宿主在主进程抽帧；失败/不支持返回 undefined，绝不影响生成成功结果） */
   readVideoPosterAsBase64?: (artifact: {
     relPath: string
@@ -374,6 +376,12 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
           : '根据文字描述生成一段音频（音效/配乐），可选 voice 指定音色。调用会阻塞到生成完成，结果里包含实际参数与产物路径；产物会作为媒体卡片钉在画布上。',
     parameters,
     execute: async (_toolCallId, params, signal, onUpdate) => {
+      if (ctx.workspaceAvailable && !ctx.workspaceAvailable()) {
+        return {
+          content: [{ type: 'text', text: '工作区已切换，媒体任务未提交。请在当前工作区重新发起请求。' }],
+          details: { submitted: false, reason: 'workspace-changed' }
+        }
+      }
       const input = params as ToolParams
       const refs = collectToolRefs(input, kind)
       // 变更前确认模式：所有生成提交前先弹确认卡（取代视频对话闸门 —— 反正都要用户点头）。
@@ -502,14 +510,14 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
 
       if (final.state === 'cancelled') {
         return {
-          content: [{ type: 'text', text: '生成已取消（用户中断）。请告知用户任务已停止，如需继续可重新发起。' }],
+          content: [{ type: 'text', text: `生成已取消（用户中断）。请告知用户任务已停止，如需继续可重新发起。${final.persistenceWarning ?? ''}` }],
           details: { submitted: true, jobId: final.jobId, state: final.state }
         }
       }
       if (final.state !== 'succeeded' || !final.artifact) {
         // 抛错而非返回：pi 会把工具结果标为 error（卡片红色失败态），错误文本照样进模型上下文
         throw new Error(
-          failureGuidance(kind, final.error ?? final.message, {
+          failureGuidance(kind, [final.error ?? final.message, final.persistenceWarning].filter(Boolean).join('；') || undefined, {
             provider: final.provider,
             model: final.model
           })
@@ -524,6 +532,7 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         `${final.artifact.width ? `，${final.artifact.width}×${final.artifact.height}px` : ''}` +
         `${final.artifact.durationSeconds ? `，${final.artifact.durationSeconds}s` : ''}），` +
         `已作为媒体卡片钉在画布上（贴近参考图落位）；本次用到的参考素材已由系统自动连成引用链，把这张卡再引用进上下文时携带它的血脉信息。`
+      if (final.persistenceWarning) text += `注意：${final.persistenceWarning}`
       // 参考素材的处置留痕必须转告：用户挂了 5 张而模型只吃 1 张时，"生成成功"不等于
       // "按全部参考生成"——不说清就是Agent 在替网关撒谎
       if (final.notes?.length) {
@@ -536,8 +545,12 @@ function makeTool(kind: MediaKind, ctx: MediaToolContext): ToolDefinition {
         ctx.readArtifactAsBase64 &&
         final.artifact.mime.startsWith('image/')
       ) {
-        const image = await ctx.readArtifactAsBase64(final.artifact.relPath)
-        if (image) images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+        try {
+          const image = await ctx.readArtifactAsBase64(final.artifact.relPath, undefined, final.artifactDirRel)
+          if (image) images.push({ type: 'image', data: image.data, mimeType: image.mimeType })
+        } catch {
+          // 图片回传是附加能力，不改变生成任务的成功结果。
+        }
       }
       // 视频生成成本最高、动辄数分钟，成功后 Agent"看不到"产物就得再手动调 read_media：
       // 抽 1 帧首帧随结果回传自检（P2）。抽帧挂在成功路径上，失败绝不能连累生成结果 ——

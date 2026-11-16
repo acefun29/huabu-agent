@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto'
-import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'fs'
+import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync } from 'fs'
 import { basename, relative, resolve, sep } from 'path'
 import { Readable } from 'stream'
 import { pipeline } from 'stream/promises'
@@ -16,24 +16,23 @@ import {
   ratioToPixels,
   sanitizeMediaExtra
 } from '../../shared/media'
-import type { WorkspaceMediaConfig } from '../workspace/store'
-import { atomicWriteSync, recoverAtomicBackup } from '../fsutil/atomic'
+import type { WorkspaceMediaConfig } from '../workspace/types'
 import type { AdapterProviderConfig } from './adapters/registry'
 import { adapterRefCaps } from './adapters/registry'
 import { imageSizeOf } from './imageSize'
+import { readJobLedger, writeJobLedger } from './jobLedger'
 import { resolveMediaRefs } from './mediaRefs'
 import type { ProviderSubmitInput } from './provider'
 import { extForUrl, mimeForKind, type MediaProviderAdapter } from './provider'
 
 /**
- * MediaJobManager：媒体生成任务的异步编排（M11）。
+ * MediaJobManager 负责媒体生成任务的异步编排。
  *
  * 与聊天的同步流式不同，媒体生成是 submit -> task_id -> poll -> 媒体 URL -> 下载落盘。
  * 本类负责：队列并发上限、轮询指数退避、整体超时、取消、产物原子落盘、
  * 状态事件推送（media:job）、重启后未完成任务标记失效（jobs.json 对账）。
  *
- * 产物一律落到当前工作区 `.huabu/media/<jobId><ext>`，用临时 .part 文件写完再改名
- * ——强杀进程也不会留下半截媒体文件被当成品。
+ * 产物落到提交时选定的工作区目录；下载先写临时文件，再改名为最终文件。
  */
 
 const POLL_BASE_MS = 1200
@@ -44,6 +43,8 @@ const TIMEOUT_MS: Record<string, number> = { image: 240_000, audio: 300_000, vid
 
 /** jobs 账本里终态任务最多保留条数（按 updatedAt 淘汰更早的，防跨会话只进不出） */
 const TERMINAL_JOBS_KEEP = 50
+/** 所有工作区合计的运行中任务上限。 */
+const MAX_RUNNING_JOBS = 8
 
 interface JobRecord {
   status: MediaJobStatus
@@ -56,14 +57,9 @@ interface JobRecord {
   cancelRequested?: boolean
   /** 本任务的落库目录（绝对路径；缺省 = 媒体产物目录），submit 时校验过越界 */
   outputDirAbs?: string
-  /**
-   * 任务所属工作区与它的媒体目录（R04：提交时钉住，之后不再随"当前工作区"漂移）。
-   *
-   * 共享的 manager 一直在用 `this.context()`——切到工作区 B 之后，A 的**在途任务**
-   * 会用 B 的媒体目录算产物路径、把账本写进 B 的 jobs.json。工作区归属必须跟着任务走。
-   */
+  /** 提交时固定工作区和媒体目录，切换工作区后仍写入原位置。 */
   workspaceDir?: string
-  mediaDirAbs?: string
+  mediaDirAbs: string
   /** 净化后的产物文件主名（不含扩展名）；缺省 = jobId（随机 id 命名） */
   artifactName?: string
 }
@@ -93,7 +89,10 @@ export interface MediaJobContext {
 export class MediaJobManager {
   private readonly jobs = new Map<string, JobRecord>()
   private readonly running = new Set<string>()
+  private readonly runningByWorkspace = new Map<string, number>()
+  private readonly concurrencyByWorkspace = new Map<string, number>()
   private readonly pending: string[] = []
+  private readonly loadedLedgers = new Set<string>()
   /** waitForCompletion 的订阅者（patch 时全量通知，订阅者自行按 jobId/终态过滤） */
   private readonly waiters = new Set<(job: MediaJobStatus) => void>()
 
@@ -111,16 +110,18 @@ export class MediaJobManager {
    * 全部来自合并目录（内置 + 用户覆盖层），按清单顺序列出。
    */
   async providers(): Promise<MediaProviderInfo[]> {
+    // 整次查询使用同一工作区快照，避免等待凭据时混入切换后的配置。
+    const context = this.context()
     const list: MediaProviderInfo[] = []
-    for (const adapter of this.adapters()) {
+    for (const adapter of context.adapters) {
       // 凭据探测要解密存储/查环境变量，逐个 await（清单最多几家，串行可忽略）
       const ready = adapter.isReady ? await adapter.isReady() : adapter.isConfigured()
-      const conf = this.context().providers.find((p) => p.id === adapter.id)
+      const conf = context.providers.find((p) => p.id === adapter.id)
       // authHint 反映实际凭据来源（存储 Key / 环境变量 / 未配置）：适配器静态值
       // 只区分「有没有声明 authKey」，merge 层已把 authKey 缺省化为 id，恒真不可用
       let authHint = adapter.authHint()
-      if (this.context().keySourceOf && conf) {
-        const source = await this.context().keySourceOf!({ authKey: conf.authKey, authEnv: conf.authEnv })
+      if (context.keySourceOf && conf) {
+        const source = await context.keySourceOf({ authKey: conf.authKey, authEnv: conf.authEnv })
         authHint = source === 'environment' ? `environment:${conf.authEnv}` : source
       }
       list.push({
@@ -136,30 +137,70 @@ export class MediaJobManager {
     return list
   }
 
-  private adapters(): MediaProviderAdapter[] {
-    return this.context().adapters
+  /** 传输时附带归属；账本依目录区分，不需要写入绝对路径。 */
+  private publicStatus(job: JobRecord): MediaJobStatus {
+    const { persistenceWarning: _warning, persistenceScope: _scope, workspacePath: _workspace, ...status } = job.status
+    return {
+      ...status,
+      ...(job.workspaceDir ? { workspacePath: job.workspaceDir } : {}),
+      persistenceScope: relative(job.workspaceDir ?? job.mediaDirAbs, job.mediaDirAbs).split('\\').join('/') || '.',
+      ...(this.reportedLedgerErrors.has(job.mediaDirAbs)
+        ? { persistenceWarning: '任务状态保存失败，正在重试；请检查磁盘空间和权限。' }
+        : {})
+    }
+  }
+
+  /** 广播失败不应改变任务状态或阻断等待者。 */
+  private emitStatus(job: JobRecord): void {
+    try {
+      this.emit(this.publicStatus(job))
+    } catch (error) {
+      console.error('[media-jobs] 状态广播失败：', error)
+    }
+  }
+
+  /** 账本首次写入失败时，选一条任务通知界面；无需重复广播整本账本。 */
+  private emitLedgerWarning(mediaDir: string): void {
+    const jobs = [...this.jobs.values()].filter((job) => job.mediaDirAbs === mediaDir)
+    const job = jobs.find((item) => item.status.state === 'queued' || item.status.state === 'running') ?? jobs[0]
+    if (job) {
+      this.ledgerWarningJobs.set(mediaDir, job)
+      this.emitStatus(job)
+    }
   }
 
   list(): MediaJobStatus[] {
-    return [...this.jobs.values()].map((job) => ({ ...job.status }))
+    this.ensureLedgerLoaded(this.context())
+    return [...this.jobs.values()].map((job) => this.publicStatus(job))
   }
 
   get(jobId: string): MediaJobStatus | undefined {
     const job = this.jobs.get(jobId)
-    return job ? { ...job.status } : undefined
+    return job ? this.publicStatus(job) : undefined
+  }
+
+  /** 按工作区定位内存中的任务，供取消入口校验归属。 */
+  getForWorkspace(jobId: string, workspacePath: string): MediaJobStatus | undefined {
+    const job = [...this.jobs.values()].find((item) => item.status.jobId === jobId && item.workspaceDir === workspacePath)
+    return job ? this.publicStatus(job) : undefined
   }
 
   /* ------------------------------------------------------------------ */
   /* 提交 / 取消                                                          */
   /* ------------------------------------------------------------------ */
 
-  async submit(request: MediaGenerateRequest): Promise<{ jobId: string }> {
+  async submit(request: MediaGenerateRequest, expectedWorkspace?: string, signal?: AbortSignal): Promise<{ jobId: string }> {
     const ctx = this.context()
     if (!ctx.ready || !ctx.mediaDir) throw new Error('尚未打开工作区，无法提交媒体生成任务')
-    const mediaDir = ctx.mediaDir
+    if (expectedWorkspace !== undefined && ctx.workspaceDir !== expectedWorkspace) {
+      throw new Error('工作区已切换，媒体任务未提交')
+    }
+    if (signal?.aborted) throw new Error('媒体任务已取消')
+    this.ensureLedgerLoaded(ctx)
+    const mediaDir = resolve(ctx.mediaDir)
     const prompt = request.prompt?.trim()
     if (!prompt) throw new Error('生成提示词不能为空')
-    const adapter = this.adapters().find((a) => a.id === request.provider)
+    const adapter = ctx.adapters.find((a) => a.id === request.provider)
     if (!adapter) throw new Error(`未知媒体 provider：${request.provider}`)
     const model = adapter.models.find((m) => m.id === request.model)
     if (!model) throw new MediaFailureError(`provider ${request.provider} 下没有模型 ${request.model}（清单见 media:providers）`, 'params')
@@ -201,7 +242,10 @@ export class MediaJobManager {
       )
     }
 
-    const jobId = randomUUID()
+    let jobId: string
+    do {
+      jobId = randomUUID()
+    } while ([...this.jobs.values()].some((job) => job.status.jobId === jobId))
     const now = new Date().toISOString()
     // 落库目录（可选）：必须解析后仍在工作区之内，越界请求直接拒绝
     let outputDirAbs: string | undefined
@@ -240,6 +284,10 @@ export class MediaJobManager {
         ...(conf?.baseUrl ? { baseUrl: conf.baseUrl } : {})
       }
     )
+    if (signal?.aborted) throw new Error('媒体任务已取消')
+    if (expectedWorkspace !== undefined && this.context().workspaceDir !== expectedWorkspace) {
+      throw new Error('工作区已切换，媒体任务未提交')
+    }
     const input: ProviderSubmitInput = {
       prompt,
       ...(request.ratio ? { ratio: request.ratio } : {}),
@@ -290,9 +338,17 @@ export class MediaJobManager {
       ...(outputDirAbs ? { outputDirAbs } : {}),
       ...(artifactName ? { artifactName } : {})
     }
+    this.concurrencyByWorkspace.set(this.workspaceKey(record), this.normalizeConcurrency(ctx.config.concurrency))
     this.jobs.set(jobId, record)
-    this.persistJobs()
-    this.emit({ ...record.status })
+    this.dirtyLedgers.add(record.mediaDirAbs)
+    try {
+      this.persistJobs(record.mediaDirAbs)
+    } catch (error) {
+      this.jobs.delete(jobId)
+      this.emitLedgerWarning(record.mediaDirAbs)
+      throw error
+    }
+    this.emitStatus(record)
 
     // 先提交拿远端 id（排队等并发槽位），再进入轮询队列
     this.pending.push(jobId)
@@ -300,32 +356,65 @@ export class MediaJobManager {
     return { jobId }
   }
 
-  /** 并发上限：workspace.json media.concurrency 可覆盖，越界回退默认 */
-  private maxConcurrent(): number {
-    const configured = this.context().config.concurrency
+  /** 任务队列按工作区计数；缺少工作区时退回任务的媒体目录。 */
+  private workspaceKey(record: JobRecord): string {
+    return record.workspaceDir ?? record.mediaDirAbs
+  }
+
+  private normalizeConcurrency(configured: unknown): number {
     if (typeof configured === 'number' && configured >= 1 && configured <= 8) {
       return Math.round(configured)
     }
     return DEFAULT_MEDIA_CONCURRENCY
   }
 
-  /** 并发槽位调度：串行化 drain，避免多个完成事件同时触发超额启动 */
+  /** 按工作区限制调度，跳过已满的工作区，避免阻塞其他工作区的队列。 */
   private draining = false
   private async drain(): Promise<void> {
     if (this.draining) return
     this.draining = true
     try {
-      while (this.pending.length > 0 && this.running.size < this.maxConcurrent()) {
-        const jobId = this.pending.shift()
-        if (!jobId) break
+      const current = this.context()
+      const currentKey = current.workspaceDir ?? current.mediaDir
+      if (currentKey) {
+        this.concurrencyByWorkspace.set(currentKey, this.normalizeConcurrency(current.config.concurrency))
+      }
+      while (this.pending.length > 0 && this.running.size < MAX_RUNNING_JOBS) {
+        let selected = -1
+        for (let index = 0; index < this.pending.length; index += 1) {
+          const record = this.jobs.get(this.pending[index])
+          if (!record || record.status.state !== 'queued') {
+            this.pending.splice(index, 1)
+            index -= 1
+            continue
+          }
+          const key = this.workspaceKey(record)
+          const running = this.runningByWorkspace.get(key) ?? 0
+          const limit = this.concurrencyByWorkspace.get(key) ?? DEFAULT_MEDIA_CONCURRENCY
+          if (running < limit) {
+            selected = index
+            break
+          }
+        }
+        if (selected < 0) break
+        const [jobId] = this.pending.splice(selected, 1)
         const record = this.jobs.get(jobId)
-        if (!record || record.status.state === 'cancelled') continue
+        if (!record) continue
+        const key = this.workspaceKey(record)
         this.running.add(jobId)
-        void this.runJob(record).finally(() => {
+        this.runningByWorkspace.set(key, (this.runningByWorkspace.get(key) ?? 0) + 1)
+        void this.runJob(record).catch((error) => {
+          console.error('[media-jobs] 任务执行异常：', error)
+        }).finally(() => {
           this.running.delete(jobId)
+          const remaining = (this.runningByWorkspace.get(key) ?? 1) - 1
+          if (remaining > 0) this.runningByWorkspace.set(key, remaining)
+          else this.runningByWorkspace.delete(key)
           void this.drain()
         })
       }
+    } catch (error) {
+      console.error('[media-jobs] 队列调度失败：', error)
     } finally {
       this.draining = false
     }
@@ -335,8 +424,7 @@ export class MediaJobManager {
   private async runJob(record: JobRecord): Promise<void> {
     const { status, adapter } = record
     // 任务的媒体目录在提交时钉住（R04）：切工作区后 A 的在途任务仍落在 A 的目录
-    const mediaDir = record.mediaDirAbs ?? this.context().mediaDir
-    if (!mediaDir) return this.finish(record, 'failed', undefined, '工作区已关闭，任务中止')
+    const mediaDir = record.mediaDirAbs
     // 落库目录优先于默认产物目录（jobs.json 索引仍放默认目录，只有产物文件换位）
     const artifactDir = record.outputDirAbs ?? mediaDir
     const startedAt = Date.now()
@@ -366,7 +454,14 @@ export class MediaJobManager {
           // 落进素材库目录的产物要广播：素材库面板只扫 assets/<分类> 与自建库，
           // 不广播就得重开工作区才看得到。落进默认产物区的不广播（那里本就不在扫描范围，
           // 广播只是白扫一遍全库）。
-          if (record.outputDirAbs) this.context().notifyAssetsChanged()
+          if (record.outputDirAbs) {
+            try {
+              const context = this.context()
+              if (context.workspaceDir === record.workspaceDir) context.notifyAssetsChanged()
+            } catch (error) {
+              console.error('[media-jobs] 素材刷新通知失败：', error)
+            }
+          }
           return
         }
         this.patch(record, {
@@ -465,22 +560,23 @@ export class MediaJobManager {
     this.patch(record, patch)
   }
 
-  /** 统一的状态更新口：改记录、落账本（终态同步写/进度防抖写）、广播事件、唤醒等待者，四处永远一致 */
+  /** 更新状态并安排账本写入，然后广播并唤醒等待者；写盘失败时保留待重试标记。 */
   private patch(record: JobRecord, patch: Partial<MediaJobStatus>): void {
     record.status = { ...record.status, ...patch, updatedAt: new Date().toISOString() }
+    this.dirtyLedgers.add(record.mediaDirAbs)
     const state = record.status.state
     if (state === 'succeeded' || state === 'failed' || state === 'cancelled') {
-      // 终态立即同步落盘：崩溃也不丢结果，因此无需退出钩子补写
+      // 终态立即尝试落盘；失败时保留脏标记并重试。
       this.evictTerminalJobs()
       this.persistJobs()
     } else {
       // 非终态进度不逐次写盘：轮询期 1.2s~10s 一次 patch，500ms 防抖合并足够
       this.schedulePersist()
     }
-    this.emit({ ...record.status })
+    this.emitStatus(record)
     for (const waiter of this.waiters) {
       try {
-        waiter({ ...record.status })
+        waiter(this.publicStatus(record))
       } catch {
         /* 等待者异常不影响任务推进 */
       }
@@ -503,7 +599,7 @@ export class MediaJobManager {
     if (!record) return Promise.reject(new Error(`任务不存在：${jobId}`))
     const terminal = (state: MediaJobState) =>
       state === 'succeeded' || state === 'failed' || state === 'cancelled'
-    if (terminal(record.status.state)) return Promise.resolve({ ...record.status })
+    if (terminal(record.status.state)) return Promise.resolve(this.publicStatus(record))
 
     const timeoutMs = (TIMEOUT_MS[record.status.kind] ?? 300_000) + 30_000
     return new Promise<MediaJobStatus>((resolvePromise, rejectPromise) => {
@@ -557,133 +653,120 @@ export class MediaJobManager {
   /* 重启恢复（DoD：未完成任务状态可恢复或明确标记失效）                     */
   /* ------------------------------------------------------------------ */
 
-  /**
-   * 任务账本落在媒体目录（随工作区走）。启动时调用：
-   * 上次进程遗留的非终态任务已无人轮询，明确标记失效，让渲染端占位节点能对账收尾。
-   */
+  /** 恢复当前媒体目录的任务账本；同一目录在本进程中只恢复一次。 */
   reconcilePersistedJobs(): void {
-    const { mediaDir } = this.context()
-    if (!mediaDir) return
-    const file = resolve(mediaDir, 'jobs.json')
-    // 读前先做崩溃恢复：上次若停在「旧文件挪成 .bak、新文件未落位」之间，账本在此还原
-    recoverAtomicBackup(file)
-    if (!existsSync(file)) return
-    try {
-      const parsed = JSON.parse(readFileSync(file, 'utf8')) as { jobs?: MediaJobStatus[] }
-      const jobs = Array.isArray(parsed.jobs) ? parsed.jobs : []
-      const ownerDir = this.context().workspaceDir ?? undefined
-      // 历史记录只需要一个占位 adapter（永不再次提交），不依赖清单顺序之外的任何类型
-      const placeholderAdapter = this.adapters()[0]
-      let dirty = 0
-      for (const old of jobs) {
-        if (old.state === 'succeeded' || old.state === 'failed' || old.state === 'cancelled') {
-          if (!this.jobs.has(old.jobId)) {
-            this.jobs.set(old.jobId, {
-              status: old,
-              adapter: placeholderAdapter,
-              input: { prompt: old.prompt },
-              mediaDirAbs: mediaDir,
-              ...(ownerDir ? { workspaceDir: ownerDir } : {})
-            })
-          }
-          continue
-        }
-        const revived: MediaJobStatus = {
-          ...old,
-          state: 'failed',
-          error: '应用重启，任务已中断；请重新提交',
-          updatedAt: new Date().toISOString()
-        }
-        // 保留更新时间最大的那条（避免同 jobId 被旧账本覆盖本次会话的状态）
-        const existing = this.jobs.get(old.jobId)
-        if (!existing) {
-          this.jobs.set(old.jobId, {
-            status: revived,
-            adapter: placeholderAdapter,
-            input: { prompt: old.prompt },
-            mediaDirAbs: mediaDir,
-            ...(ownerDir ? { workspaceDir: ownerDir } : {})
-          })
-        }
-        dirty += 1
+    this.ensureLedgerLoaded(this.context())
+  }
+
+  private ensureLedgerLoaded(context: MediaJobContext): void {
+    if (!context.mediaDir) return
+    const mediaDir = resolve(context.mediaDir)
+    if (this.loadedLedgers.has(mediaDir)) return
+    const jobs = readJobLedger(mediaDir)
+
+    const ownerDir = context.workspaceDir ?? undefined
+    const placeholderAdapter = context.adapters[0]
+    const interrupted: JobRecord[] = []
+    for (const old of jobs) {
+      // 复制工作区可能产生相同的历史任务 ID，必须分别保存两份账本。
+      const direct = this.jobs.get(old.jobId)
+      const key = direct && direct.mediaDirAbs !== mediaDir ? JSON.stringify([mediaDir, old.jobId]) : old.jobId
+      if (this.jobs.has(key)) continue
+      const isTerminal = old.state === 'succeeded' || old.state === 'failed' || old.state === 'cancelled'
+      const status: MediaJobStatus = isTerminal ? old : {
+        ...old,
+        state: 'failed',
+        error: '应用重启，任务已中断；请重新提交',
+        updatedAt: new Date().toISOString()
       }
-      if (dirty > 0) {
-        this.persistJobs()
-        for (const job of this.jobs.values()) {
-          if (job.status.state === 'failed') this.emit({ ...job.status })
-        }
+      const record: JobRecord = {
+        status,
+        adapter: placeholderAdapter,
+        input: { prompt: old.prompt },
+        mediaDirAbs: mediaDir,
+        ...(ownerDir ? { workspaceDir: ownerDir } : {})
       }
-      console.log(`[media-jobs] 对账完成：标记失效 ${dirty} 个遗留任务`)
-    } catch (error) {
-      console.warn(`[media-jobs] jobs.json 解析失败，忽略：${String(error)}`)
+      this.jobs.set(key, record)
+      if (!isTerminal) interrupted.push(record)
+    }
+    this.loadedLedgers.add(mediaDir)
+    if (interrupted.length > 0) {
+      this.dirtyLedgers.add(mediaDir)
+      this.persistJobs()
+      for (const job of interrupted) this.emitStatus(job)
     }
   }
 
-  /**
-   * 淘汰历史终态任务：jobs Map 只进不出（重启后 reconcile 还会把旧账本灌回来），
-   * 终态记录按 updatedAt 降序只保留最近 TERMINAL_JOBS_KEEP 条，其余移除。
-   * running/pending 绝不动；只影响 jobs.json 账本与后续 list()/get() 查询，
-   * 不影响本次 patch 正在 emit 的事件。
-   */
+  /** 每个媒体目录各自保留最近的终态记录；运行中和排队中的任务不淘汰。 */
   private evictTerminalJobs(): void {
-    const terminal = [...this.jobs.values()]
-      .filter((job) => job.status.state === 'succeeded' || job.status.state === 'failed' || job.status.state === 'cancelled')
-      .sort((a, b) => b.status.updatedAt.localeCompare(a.status.updatedAt))
-    for (const job of terminal.slice(TERMINAL_JOBS_KEEP)) this.jobs.delete(job.status.jobId)
+    const groups = new Map<string, Array<[string, JobRecord]>>()
+    for (const entry of this.jobs) {
+      const job = entry[1]
+      if (job.status.state !== 'succeeded' && job.status.state !== 'failed' && job.status.state !== 'cancelled') continue
+      const dir = job.mediaDirAbs
+      const group = groups.get(dir) ?? []
+      group.push(entry)
+      groups.set(dir, group)
+    }
+    for (const entries of groups.values()) {
+      entries.sort((a, b) => b[1].status.updatedAt.localeCompare(a[1].status.updatedAt))
+      for (const [key] of entries.slice(TERMINAL_JOBS_KEEP)) this.jobs.delete(key)
+    }
   }
 
-  /** 进度防抖写盘的定时器与脏标记：500ms 窗口内的多次 patch 合并为一次写 */
+  /** 只重写发生变化的账本；失败的目录保持脏状态并延迟重试。 */
+  private readonly dirtyLedgers = new Set<string>()
+  private readonly reportedLedgerErrors = new Set<string>()
+  private readonly ledgerWarningJobs = new Map<string, JobRecord>()
   private persistTimer: ReturnType<typeof setTimeout> | null = null
-  private persistDirty = false
 
-  private schedulePersist(): void {
-    this.persistDirty = true
-    if (this.persistTimer) return
+  private schedulePersist(delayMs = 500): void {
+    if (this.persistTimer || this.dirtyLedgers.size === 0) return
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null
-      if (!this.persistDirty) return
-      this.persistDirty = false
       this.persistJobs()
-    }, 500)
+    }, delayMs)
+    this.persistTimer.unref()
   }
 
-  /**
-   * 全量写任务账本。写盘策略：终态更新在 patch 里立即同步写（崩溃不丢结果，免去退出钩子），
-   * 非终态进度经 schedulePersist 500ms 防抖合并写。写入走 fsutil/atomic 的 tmp+rename
-   * （Windows 占用时旧文件挪 .bak 腾位），绝不先删旧文件再改名。
-   */
-  private persistJobs(): void {
-    // 同步写已覆盖最新全量状态：取消已排期的防抖写，避免白写一遍
+  /** 提交新任务时要求其账本写入成功，其他目录的失败不阻断该任务。 */
+  private persistJobs(requiredDirectory?: string): void {
     if (this.persistTimer) {
       clearTimeout(this.persistTimer)
       this.persistTimer = null
     }
-    this.persistDirty = false
-    /*
-     * 账本按**任务所属工作区**分文件（R04）：共享 manager 里的任务可能来自不同工作区，
-     * 一律写到"当前"媒体目录会把 A 的任务记进 B 的 jobs.json。按 mediaDirAbs 分组，
-     * 每组写到自己的目录；没有归属信息的（历史/占位记录）落当前目录。
-     */
-    const currentMediaDir = this.context().mediaDir
-    const groups = new Map<string, MediaJobStatus[]>()
-    for (const job of this.jobs.values()) {
-      const dir = job.mediaDirAbs ?? currentMediaDir
-      if (!dir) continue
-      const bucket = groups.get(dir)
-      if (bucket) bucket.push(job.status)
-      else groups.set(dir, [job.status])
-    }
-    for (const [mediaDir, jobs] of groups) {
+    let requiredError: unknown
+    let requiredFailed = false
+    for (const mediaDir of [...this.dirtyLedgers]) {
+      const jobs = [...this.jobs.values()]
+        .filter((job) => job.mediaDirAbs === mediaDir)
+        .map((job) => job.status)
       try {
-        mkdirSync(mediaDir, { recursive: true })
-        const file = resolve(mediaDir, 'jobs.json')
-        const payload = JSON.stringify({ version: 1, savedAt: new Date().toISOString(), jobs })
-        atomicWriteSync(file, payload)
+        writeJobLedger(mediaDir, jobs)
+        this.dirtyLedgers.delete(mediaDir)
+        const recovered = this.reportedLedgerErrors.delete(mediaDir)
+        const warningJob = this.ledgerWarningJobs.get(mediaDir)
+        this.ledgerWarningJobs.delete(mediaDir)
+        if (recovered && warningJob) this.emitStatus(warningJob)
       } catch (error) {
-        console.warn(`[media-jobs] 任务账本写入失败：${String(error)}`)
+        if (!this.reportedLedgerErrors.has(mediaDir)) {
+          console.warn(`[media-jobs] 任务账本写入失败：${String(error)}`)
+          this.reportedLedgerErrors.add(mediaDir)
+          if (mediaDir !== requiredDirectory) this.emitLedgerWarning(mediaDir)
+        }
+        if (mediaDir === requiredDirectory) {
+          requiredFailed = true
+          requiredError = error
+        }
       }
     }
+    if (this.dirtyLedgers.size > 0) this.schedulePersist(5000)
+    if (requiredFailed) {
+      const reason = requiredError instanceof Error ? requiredError.message : String(requiredError)
+      throw new Error(`媒体任务账本写入失败，任务未提交：${reason}`)
+    }
   }
+
 }
 
 function sleep(ms: number): Promise<void> {

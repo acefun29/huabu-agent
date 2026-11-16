@@ -9,17 +9,11 @@ import {
   applyEditModel,
   pruneChatConfig
 } from './overlayConfig'
-import { readChatConfig, writeChatSegment } from '../workspace/store'
+import { readChatConfig, writeChatSegment } from '../workspace/metadata'
 
 /**
- * `chat` 覆盖层的落盘胶水：读磁盘 → 交给 overlayConfig 的纯规则改 → 写回 → 通知 host 重注册。
- *
- * 规则本身在 `overlayConfig.ts`（那份不依赖 electron，能被 `pnpm chat-catalog:check` 直接跑）。
- * 这里只保留"必须碰磁盘"的两件事，因此本文件每个函数都短到不值得单独出错——
- * 出错的地方在规则里，而规则是有断言的。
- *
- * 取代旧的 `agent/customModels.ts`：那份写 `.huabu/models.json`（Pi 原生格式），清单由三方
- * 合成，既不可审计也没法表达 pi 没有的概念。现在目录是代码、覆盖层是配置，写这里就是写清单本身。
+ * 读取工作区的聊天模型覆盖层，应用 overlayConfig 的规则并写回。
+ * 内置目录保持只读，用户更改仅保存在 workspace.json 的 chat 段。
  */
 
 function mutate(dir: string, apply: (chat: WorkspaceChatConfig) => void): WorkspaceChatConfig {

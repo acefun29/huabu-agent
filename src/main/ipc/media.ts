@@ -1,670 +1,36 @@
-/**
- * media 域 IPC（M11/M12 生成与导入；M13 确认闸门）。
- *
- * 覆盖通道：
- * - 确认闸门：media:confirm-resolve（回执；请求经 requestMediaApproval 发 media:confirm-request）
- * - 状态/配置：settings:media-status / media:set-config / media:set-confirm-video /
- *   media:set-access-mode
- * - 用户供应商/模型管理（写 workspace.json 覆盖层）：media:user-add-provider /
- *   media:user-remove-provider / media:user-add-model / media:user-remove-model /
- *   media:user-restore-model / media:browse-catalog
- * - 媒体 Key（Settings 前缀的 media 通道）：settings:media-set-key / settings:media-remove-key
- * - 运行时：media:providers / media:generate / media:cancel / media:jobs / media:import
- *
- * 另承载：确认闸门（pendingApprovals / requestMediaApproval / settleApprovalsForNode）、
- * 运行时工厂 createMediaRuntime（编排器在 chat 域注册前调用）、
- * MediaImport 专用的四个纯函数工具（guessKind/mimeFromExt/defaultMime/sanitizeName）。
- */
-import { BrowserWindow } from 'electron'
+/** 媒体任务、导入和审批回执的 IPC 入口。 */
 import { ipcMain } from './ipcMainBridge'
 import { randomUUID } from 'crypto'
 import { mkdirSync, statSync } from 'fs'
 import { writeFile } from 'fs/promises'
-import { basename, extname, join, resolve, sep } from 'path'
-import type { WorkspaceModels } from '../agent/workspaceModels'
-import type { MediaApprovalInfo } from '../agent/mediaTools'
-import { MediaJobManager } from '../media/manager'
-import type { MediaProviderAdapter } from '../media/provider'
-import {
-  adapterSupportedKinds,
-  createAdapters,
-  getAdapterKindMatrix,
-  isRegisteredAdapterType,
-  type AdapterHostDeps,
-  type AdapterProviderConfig
-} from '../media/adapters'
-import {
-  BUILTIN_PROVIDERS,
-  browseCatalog,
-  mergeCatalog,
-  MODEL_ID_PATTERN,
-  PROVIDER_ID_PATTERN,
-  sanitizeCapabilities,
-  sanitizeUserProvider
-} from '../media/catalog'
+import { basename, extname, join, resolve } from 'path'
 import { buildMediaUrl } from '../media/protocol'
-import { copyIntoDir, type WorkspaceStore } from '../workspace/store'
-import { MEDIA_ROOT_REL } from '../../shared/assets'
+import { copyIntoDir } from '../fsutil/copy'
 import { IpcChannel } from '../../shared/ipc'
 import type {
   ChatResult,
-  MediaConfigPatch,
-  MediaConfirmPayload,
   MediaGenerateRequest,
   MediaImportRequest,
   MediaJobStatus,
-  MediaProviderInfo,
-  MediaProviderStatus,
-  MediaSettingsStatus,
-  MediaUserModelInput,
-  MediaUserProviderInput
+  MediaProviderInfo
 } from '../../shared/ipc'
 import type { MediaKind, MediaRatio, MediaRefInput, MediaRefRole } from '../../shared/media'
 import {
-  DEFAULT_MEDIA_CONCURRENCY,
-  DEFAULT_MEDIA_DURATION_S,
-  DEFAULT_MEDIA_RATIO,
   MEDIA_EXT_KIND_MIME,
   MEDIA_RATIOS,
   MEDIA_REF_ROLES,
   mediaKindOfPath
 } from '../../shared/media'
-import { resolveMediaTarget } from '../../shared/mediaResolve'
 import type { IpcContext } from './shared'
 import { describe, guardSync, invalidPayload, isNonEmptyString, ok } from './shared'
 import { consumeSourcePath } from './workspace'
-import { forwardEvent } from '../webBridge/server'
-
-// ---------------------------------------------------------------- media 域：Agent 变更前确认（accessMode=confirm）
-
-/** 变更前确认的挂起表：requestId → { nodeId, resolve }；回执/中止任一路径都会 settle */
-const pendingApprovals = new Map<string, { nodeId: string; resolve: (accepted: boolean) => void }>()
-
-/** 发确认卡事件并等待渲染端回执；signal 中止 = 拒绝。settle 后广播 media:confirm-resolved 供渲染端撤卡（幂等） */
-export const requestMediaApproval = (
-  kind: 'image' | 'video' | 'audio',
-  info: MediaApprovalInfo,
-  nodeId: string,
-  signal: AbortSignal | undefined
-): Promise<boolean> => {
-  const requestId = randomUUID()
-  return new Promise<boolean>((resolvePromise) => {
-    let settled = false
-    const settle = (accepted: boolean) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout) // 超时兜底与回执/中止谁先到都收敛在同一路径，settle 幂等
-      pendingApprovals.delete(requestId)
-      resolvePromise(accepted)
-      // 撤卡广播：用户点击（本窗口已 resolve）、中止清理都要让所有窗口收卡
-      for (const window of BrowserWindow.getAllWindows()) {
-        try {
-          window.webContents.send(IpcChannel.MediaConfirmResolvedEvent, { requestId })
-        } catch {
-          /* 窗口可能正在销毁 */
-        }
-      }
-      // Web 模式同样要撤卡（D5）
-      forwardEvent(IpcChannel.MediaConfirmResolvedEvent, { requestId })
-    }
-    pendingApprovals.set(requestId, { nodeId, resolve: settle })
-    // 10 分钟兜底超时：回执与 signal 中止都不来的话（渲染端假死、事件丢失），
-    // Promise 永久悬挂会把 agent 工具的 execute 一起挂死；超时按拒绝处理并撤卡
-    const timeout = setTimeout(() => settle(false), 10 * 60 * 1000)
-    const confirmPayload = {
-      requestId,
-      nodeId,
-      kind,
-      prompt: info.prompt,
-      ...(info.provider ? { provider: info.provider } : {}),
-      ...(info.model ? { model: info.model } : {}),
-      ...(info.ratio ? { ratio: info.ratio } : {}),
-      ...(info.durationSeconds ? { durationSeconds: info.durationSeconds } : {}),
-      refSummary: info.refSummary
-    } satisfies MediaConfirmPayload
-    for (const window of BrowserWindow.getAllWindows()) {
-      try {
-        window.webContents.send(IpcChannel.MediaConfirmRequest, confirmPayload)
-      } catch {
-        /* 窗口可能正在销毁 */
-      }
-    }
-    // Web 模式（headless 不建窗口）：确认卡只经 webContents.send 是发不出去的，
-    // 浏览器端永远看不到卡，审批会挂满 10 分钟按拒绝返回（D5）
-    forwardEvent(IpcChannel.MediaConfirmRequest, confirmPayload)
-    if (signal) {
-      if (signal.aborted) settle(false)
-      else signal.addEventListener('abort', () => settle(false), { once: true })
-    }
-  })
-}
-
-/** chat:dispose 成功后调用：该会话不会再有回执，其挂起的确认请求按拒绝 settle，防孤儿挂起 */
-export function settleApprovalsForNode(nodeId: string): void {
-  for (const entry of pendingApprovals.values()) {
-    if (entry.nodeId === nodeId) entry.resolve(false)
-  }
-}
-
-// ---------------------------------------------------------------- media 域（M11/M12）
-
-/** mediaContext 的返回形态（MediaJobManager 与 Agent 媒体工具装配共同消费） */
-export type MediaContextReturnType = {
-  mediaDir: string | null
-  workspaceDir: string | null
-  config: ReturnType<WorkspaceStore['mediaConfig']>
-  providers: AdapterProviderConfig[]
-  adapters: MediaProviderAdapter[]
-  ready: boolean
-  /**
-   * 凭据来源探测：加密存储优先，其次 authEnv 环境变量。
-   * media:providers 的真实 authHint 据此组装（适配器静态值不反映实际录入）。
-   */
-  keySourceOf: (auth: { authKey?: string; authEnv?: string }) => Promise<'workspace-store' | 'environment' | 'none'>
-  /** 凭据明文读取（上传通道换临时引用用）；与适配器 resolveKey 同一闭包 */
-  resolveKey: (auth: { authKey?: string; authEnv?: string }) => Promise<string | undefined>
-  notifyAssetsChanged: () => void
-}
-
-/** createMediaRuntime 的依赖：由编排器（src/main/ipc.ts）在注册各域 handler 前提供 */
-export interface MediaRuntimeDeps {
-  store: WorkspaceStore
-  /** 媒体凭据走 WorkspaceModels（与 pi 解耦）：方法名与原先 host 上的同名转出一致 */
-  models: WorkspaceModels
-  currentDir: () => string | null
-  broadcastAssetChanged: () => void
-  broadcastMediaJob: (job: MediaJobStatus) => void
-}
-
-/**
- * 创建 media 域运行时：凭据解析、适配器缓存、mediaContext 与 MediaJobManager
- * （含启动时 reconcile 持久化任务）。chat 域的 assembleMediaTools 也消费这里的
- * mediaManager/mediaContext，因此必须在各域 handler 注册之前调用。
- */
-export function createMediaRuntime(
-  deps: MediaRuntimeDeps
-): { mediaManager: MediaJobManager; mediaContext: () => MediaContextReturnType } {
-  const { store, models, currentDir, broadcastAssetChanged, broadcastMediaJob } = deps
-
-  /**
-   * 媒体凭据读取：加密存储优先，退回供应商声明的环境变量（合并层已按
-   * 目录 auth.env / 适配器默认值缺省化，这里不再写死任何厂商约定）。
-   *
-   * `workspace` = **适配器所属**工作区（R04）。此前这个闭包内部读全局 `currentDir()`，
-   * 切到工作区 B 之后，A 的在途任务会拿 B 的 Key 去请求供应商——快照只固定了配置对象，
-   * 没有固定闭包内部的依赖。
-   */
-  const resolveMediaKey = async (
-    auth: { authKey?: string; authEnv?: string },
-    workspace: string | null
-  ): Promise<string | undefined> => {
-    const dir = workspace ?? currentDir()
-    if (!dir) return undefined
-    if (auth.authKey) {
-      const stored = await models.getMediaKey(dir, auth.authKey)
-      if (stored) return stored
-    }
-    return auth.authEnv ? process.env[auth.authEnv] : undefined
-  }
-
-  const adapterDeps: AdapterHostDeps = {
-    mediaDir: () => store.mediaDir(),
-    resolveKey: resolveMediaKey
-  }
-
-  /**
-   * 适配器按「工作区 + 合并清单指纹」缓存：config 指纹不变则复用实例，
-   * 避免每次 context() 都重建全部适配器。
-   */
-  let adapterCache: { workspace: string | null; fingerprint: string; adapters: MediaProviderAdapter[] } | null = null
-
-  const mediaContext = (): MediaContextReturnType => {
-    const mediaDir = store.mediaDir()
-    const config = store.mediaConfig()
-    const workspace = currentDir()
-    // mergeCatalog 是清单的唯一入口：内置目录 + workspace.json 覆盖层 → 生效供应商
-    const providers = mergeCatalog(BUILTIN_PROVIDERS, config)
-    const fingerprint = JSON.stringify(providers)
-    if (!adapterCache || adapterCache.workspace !== workspace || adapterCache.fingerprint !== fingerprint) {
-      adapterCache = {
-        workspace,
-        fingerprint,
-        adapters: createAdapters(providers, adapterDeps, workspace)
-      }
-    }
-    return {
-      mediaDir,
-      workspaceDir: workspace,
-      config,
-      providers,
-      adapters: adapterCache.adapters,
-      ready: Boolean(workspace),
-      // 上传通道换临时引用时要读凭据明文（与适配器共用同一个解析闭包，绑定本工作区 —— R04）
-      resolveKey: (auth) => resolveMediaKey(auth, workspace),
-      keySourceOf: async (auth) => {
-        if (!workspace) return 'none'
-        if (auth.authKey && (await models.hasMediaKey(workspace, auth.authKey))) return 'workspace-store'
-        return auth.authEnv && process.env[auth.authEnv] ? 'environment' : 'none'
-      },
-      // 产物落进素材库目录后由 MediaJobManager 调用，面板才会即时出现新文件（否则要重开工作区）
-      notifyAssetsChanged: broadcastAssetChanged
-    }
-  }
-
-  const mediaManager = new MediaJobManager(broadcastMediaJob, mediaContext)
-  mediaManager.reconcilePersistedJobs()
-
-  return { mediaManager, mediaContext }
-}
+import { resolveMediaApproval } from './mediaApproval'
+import { registerMediaSettingsIpc } from './mediaSettings'
 
 export function registerMediaIpc(ctx: IpcContext): void {
   const store = ctx.store
-  const models = ctx.models
-  const currentDir = ctx.currentDir
   const mediaManager = ctx.mediaManager
-
-  ipcMain.handle(IpcChannel.SettingsMediaStatus, async (): Promise<ChatResult<MediaSettingsStatus>> => {
-    const dir = currentDir()
-    if (!dir) return invalidPayload('尚未打开工作区')
-    try {
-      const config = store.mediaConfig()
-      const effective = mergeCatalog(BUILTIN_PROVIDERS, config)
-      const providers: MediaProviderStatus[] = []
-      for (const entry of effective) {
-        const hasStored = await models.hasMediaKey(dir, entry.authKey)
-        const keySource: MediaProviderStatus['keySource'] = hasStored
-          ? 'workspace-store'
-          : entry.authEnv && process.env[entry.authEnv]
-            ? 'environment'
-            : 'none'
-        providers.push({
-          id: entry.id,
-          label: entry.label,
-          type: entry.type,
-          source: entry.source,
-          modelCount: entry.models.length,
-          keySource
-        })
-      }
-      return {
-        ok: true,
-        value: {
-          confirmVideo: config.confirmVideo ?? true,
-          accessMode: config.accessMode ?? 'full',
-          providers,
-          config: {
-            // 不再兜底 DEFAULT_MEDIA_PROVIDER：未设置就如实缺省，UI 显示"请选择供应商"
-            //（媒体配置强制化后，"看起来已配置"的假象比缺配置更误事）
-            ...(config.agentProvider ? { agentProvider: config.agentProvider } : {}),
-            agentModels: config.agentModels ?? {},
-            outputDir: config.outputDir ?? MEDIA_ROOT_REL,
-            concurrency: normalizeConcurrency(config.concurrency),
-            defaultRatio: config.defaultRatio ?? DEFAULT_MEDIA_RATIO,
-            defaultDuration: config.defaultDuration ?? DEFAULT_MEDIA_DURATION_S,
-            ...(config.defaultLibraryId ? { defaultLibraryId: config.defaultLibraryId } : {}),
-            ...(config.kindLibraryDefaults ? { kindLibraryDefaults: config.kindLibraryDefaults } : {}),
-            ...(config.hiddenBuiltin?.length ? { hiddenBuiltin: config.hiddenBuiltin } : {})
-          }
-        }
-      }
-    } catch (error) {
-      return { ok: false, code: 'unknown', error: describe(error) }
-    }
-  })
-
-  function normalizeConcurrency(value: unknown): number {
-    return typeof value === 'number' && value >= 1 && value <= 8 ? Math.round(value) : DEFAULT_MEDIA_CONCURRENCY
-  }
-
-  ipcMain.handle(IpcChannel.MediaSetConfig, (_event, payload: unknown) => {
-    const patch = (payload ?? {}) as MediaConfigPatch
-    if (typeof patch !== 'object' || patch === null) return invalidPayload('media:set-config 需要配置对象')
-    const clean: Record<string, unknown> = {}
-    // agentProvider / agentModels 做存在性校验（强制配置的写入口）：指向不存在的
-    // 供应商/模型的配置宁可不落盘，也不能让"配置好了"的假象流进解析链
-    if (isNonEmptyString(patch.agentProvider)) {
-      if (!mergeCatalog(BUILTIN_PROVIDERS, store.mediaConfig()).some((p) => p.id === patch.agentProvider)) {
-        return invalidPayload(`media:set-config 的 agentProvider 不在供应商清单里：${patch.agentProvider}`)
-      }
-      clean.agentProvider = patch.agentProvider
-    }
-    if (patch.agentModels && typeof patch.agentModels === 'object') {
-      const catalog = mergeCatalog(BUILTIN_PROVIDERS, store.mediaConfig())
-      const models: Record<string, string> = {}
-      for (const kind of ['image', 'video', 'audio'] as const) {
-        const value = patch.agentModels[kind]
-        if (!isNonEmptyString(value)) continue
-        // 复用解析链校验（复合串/旧裸 id 都能命中，kind 匹配一并检查），落盘统一规范化为复合串
-        const hit = resolveMediaTarget(catalog, { kind, agentModels: { [kind]: value } })
-        if (!hit) {
-          return invalidPayload(`media:set-config 的 agentModels.${kind} 不指向任何可用模型：${value}`)
-        }
-        models[kind] = hit.ref
-      }
-      clean.agentModels = models
-    }
-    if (patch.outputDir !== undefined) {
-      if (!isNonEmptyString(patch.outputDir)) {
-        clean.outputDir = MEDIA_ROOT_REL
-      } else {
-        const normalized = patch.outputDir.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')
-        const resolved = resolve(currentDir() ?? '', normalized)
-        const base = resolve(currentDir() ?? '')
-        if (!normalized || resolved === base || !resolved.startsWith(base + sep)) {
-          return invalidPayload('media:set-config 的 outputDir 必须是工作区内的相对路径')
-        }
-        clean.outputDir = normalized
-      }
-    }
-    if (patch.concurrency !== undefined) {
-      if (typeof patch.concurrency !== 'number' || patch.concurrency < 1 || patch.concurrency > 8) {
-        return invalidPayload('media:set-config 的 concurrency 需在 1..8')
-      }
-      clean.concurrency = Math.round(patch.concurrency)
-    }
-    if (patch.defaultRatio !== undefined) {
-      if (!(MEDIA_RATIOS as readonly string[]).includes(patch.defaultRatio)) {
-        return invalidPayload('media:set-config 的 defaultRatio 不合法')
-      }
-      clean.defaultRatio = patch.defaultRatio
-    }
-    if (patch.defaultDuration !== undefined) {
-      if (typeof patch.defaultDuration !== 'number' || patch.defaultDuration < 1 || patch.defaultDuration > 60) {
-        return invalidPayload('media:set-config 的 defaultDuration 需在 1..60 秒')
-      }
-      clean.defaultDuration = Math.round(patch.defaultDuration)
-    }
-    if (typeof patch.confirmVideo === 'boolean') clean.confirmVideo = patch.confirmVideo
-    if (patch.defaultLibraryId !== undefined) {
-      // 空串清除；特殊值 builtin-assets（画布素材）/ none（仅产物目录）；
-      // 其余必须是现存素材库 id（防拼出指向不存在库的僵尸默认）
-      if (!isNonEmptyString(patch.defaultLibraryId)) {
-        clean.defaultLibraryId = ''
-      } else if (
-        patch.defaultLibraryId !== 'builtin-assets' &&
-        patch.defaultLibraryId !== 'none' &&
-        !store.getLibraries().some((l) => l.id === patch.defaultLibraryId)
-      ) {
-        return invalidPayload('media:set-config 的 defaultLibraryId 不是现存素材库')
-      } else {
-        clean.defaultLibraryId = patch.defaultLibraryId
-      }
-    }
-    if (patch.kindLibraryDefaults !== undefined) {
-      const known = new Set(store.getLibraries().map((l) => l.id))
-      known.add('builtin-assets')
-      known.add('none')
-      const defaults: Record<string, string> = {}
-      for (const kind of ['image', 'video', 'audio'] as const) {
-        const value = patch.kindLibraryDefaults[kind]
-        if (!isNonEmptyString(value)) continue
-        if (!known.has(value)) return invalidPayload(`media:set-config 的 kindLibraryDefaults.${kind} 不是现存素材库`)
-        defaults[kind] = value
-      }
-      clean.kindLibraryDefaults = defaults
-    }
-    return guardSync(() => {
-      // 空串 defaultLibraryId = 清除语义：setMediaConfig 是 merge，undefined 覆盖后
-      // JSON.stringify 会丢掉该键，达到删除效果
-      if (clean.defaultLibraryId === '') {
-        store.setMediaConfig({ defaultLibraryId: undefined })
-        delete clean.defaultLibraryId
-      }
-      return store.setMediaConfig(clean)
-    })
-  })
-
-  // ------------------------------------------------ media 域：用户供应商/模型管理（写 workspace.json 覆盖层）
-
-  /**
-   * 校验+清洗用的小工具：kind 只认三类媒体。这里的校验刻意与 merge.ts 的清洗
-   * 同源（PROVIDER/MODEL_ID_PATTERN），用户输入错误给可读的错误文本。
-   */
-  const asMediaKind = (value: unknown): 'image' | 'video' | 'audio' | null =>
-    value === 'image' || value === 'video' || value === 'audio' ? value : null
-
-  ipcMain.handle(IpcChannel.MediaUserAddProvider, (_event, payload: unknown) => {
-    const request = payload as Partial<MediaUserProviderInput> | null
-    const rawId = request?.id
-    if (!isNonEmptyString(rawId) || !PROVIDER_ID_PATTERN.test(rawId.trim())) {
-      return invalidPayload('供应商 id 不合法（只允许字母/数字/点/横线/下划线）')
-    }
-    const providerId = rawId.trim()
-    const type = request?.type
-    if (typeof type !== 'string' || !isRegisteredAdapterType(type)) {
-      return invalidPayload('type 必须是已实现的适配器类型（如 gateway-openai-compat）')
-    }
-    const first = request?.firstModel
-    const firstModelId = first?.id
-    if (!isNonEmptyString(firstModelId) || !MODEL_ID_PATTERN.test(firstModelId.trim())) {
-      return invalidPayload('首个模型 id 不合法（只允许字母/数字/点/横线/下划线/斜杠）')
-    }
-    const firstKind = asMediaKind(first?.kind)
-    if (!firstKind) return invalidPayload('firstModel.kind 需要 image|video|audio')
-    const supported = adapterSupportedKinds(type)
-    if (!supported.includes(firstKind)) {
-      return invalidPayload(`接入类型 ${type} 只有 ${supported.join('/')} 端点，不支持 ${firstKind} 模型`)
-    }
-    const label = isNonEmptyString(request?.label) ? request.label : undefined
-    const baseUrl = isNonEmptyString(request?.baseUrl) ? request.baseUrl : undefined
-    const authEnv = isNonEmptyString(request?.authEnv) ? request.authEnv : undefined
-    const authStyle = request?.authStyle === 'bearer' || request?.authStyle === 'x-api-key' ? request.authStyle : undefined
-    const firstLabel = isNonEmptyString(first?.label) ? first.label : undefined
-    // capabilities/costHint 与 MediaUserAddModel 同一清洗口径（sanitizeCapabilities 同源）
-    const firstCapabilities = sanitizeCapabilities(first?.capabilities)
-    const firstCostHint = isNonEmptyString(first?.costHint) ? first.costHint.trim() : undefined
-    return guardSync(() => {
-      const config = store.mediaConfig()
-      if ((config.userProviders ?? []).some((p) => p.id === providerId)) {
-        throw new Error(`用户供应商 ${providerId} 已存在；如需替换请先删除`)
-      }
-      // 结构化后仍过一遍 sanitize（baseUrl 等形态兜底；关键字段已手校，不会触发 warn）
-      const sanitized = sanitizeUserProvider({
-        id: providerId,
-        type,
-        ...(label ? { label } : {}),
-        ...(baseUrl ? { baseUrl } : {}),
-        ...(authEnv ? { authEnv } : {}),
-        ...(authStyle ? { authStyle } : {}),
-        models: {
-          [firstModelId.trim()]: {
-            kind: firstKind,
-            ...(firstLabel ? { label: firstLabel } : {}),
-            ...(firstCostHint ? { costHint: firstCostHint } : {}),
-            ...(firstCapabilities ? { capabilities: firstCapabilities } : {})
-          }
-        }
-      })
-      if (!sanitized) throw new Error('供应商配置不合法，已拦截')
-      return store.setMediaConfig({ userProviders: [...(config.userProviders ?? []), sanitized] })
-    })
-  })
-
-  ipcMain.handle(IpcChannel.MediaUserRemoveProvider, (_event, payload: unknown) => {
-    const providerId = (payload as { providerId?: unknown } | null)?.providerId
-    if (!isNonEmptyString(providerId)) return invalidPayload('需要 providerId')
-    return guardSync(() => {
-      const config = store.mediaConfig()
-      const existing = config.userProviders ?? []
-      const next = existing.filter((p) => p.id !== providerId)
-      if (next.length === existing.length) {
-        throw new Error(`没有用户供应商 ${providerId}（内置供应商不能删除，只能移除它的模型）`)
-      }
-      return store.setMediaConfig({ userProviders: next })
-    })
-  })
-
-  ipcMain.handle(IpcChannel.MediaUserAddModel, (_event, payload: unknown) => {
-    const request = payload as Partial<MediaUserModelInput> | null
-    const providerId = request?.providerId
-    if (!isNonEmptyString(providerId)) return invalidPayload('需要 providerId')
-    const rawModelId = request?.id
-    if (!isNonEmptyString(rawModelId) || !MODEL_ID_PATTERN.test(rawModelId.trim())) {
-      return invalidPayload('模型 id 不合法（只允许字母/数字/点/横线/下划线/斜杠）')
-    }
-    const modelId = rawModelId.trim()
-    const kind = asMediaKind(request?.kind)
-    if (!kind) return invalidPayload('kind 需要 image|video|audio')
-    const label = isNonEmptyString(request?.label) ? request.label : undefined
-    const costHint = isNonEmptyString(request?.costHint) ? request.costHint.trim() : undefined
-    const capabilities = sanitizeCapabilities(request?.capabilities)
-    return guardSync(() => {
-      const config = store.mediaConfig()
-      const effective = mergeCatalog(BUILTIN_PROVIDERS, config)
-      const provider = effective.find((p) => p.id === providerId)
-      if (!provider) throw new Error(`供应商不存在：${providerId}`)
-      const supported = adapterSupportedKinds(provider.type)
-      if (!supported.includes(kind)) {
-        throw new Error(`${providerId} 的接入类型 ${provider.type} 只有 ${supported.join('/')} 端点，不支持 ${kind} 模型`)
-      }
-      // 查重要同时比对稳定 id 与网关标识：用户在内置供应商下手输裸 slug
-      // （如 'wan2.7-image'）与内置带前缀 id（'dashscope/wan2.7-image'）发给网关的是
-      // 同一个标识，直接放行会在适配器模型表里撞键、静默顶掉内置模型条目
-      const bareId = modelId.startsWith(`${providerId}/`) ? modelId.slice(providerId.length + 1) : modelId
-      const conflict = provider.models.find(
-        (m) => m.id === modelId || m.id === bareId || m.requestModel === modelId || m.requestModel === bareId
-      )
-      if (conflict) {
-        throw new Error(`已有同网关标识的模型：${conflict.id}（发给网关的标识都是 ${conflict.requestModel ?? conflict.id}）`)
-      }
-      const modelDef = {
-        kind,
-        ...(label ? { label } : {}),
-        ...(costHint ? { costHint } : {}),
-        ...(capabilities ? { capabilities } : {})
-      }
-      const userProviders = [...(config.userProviders ?? [])]
-      const entryIndex = userProviders.findIndex((p) => p.id === providerId)
-      if (entryIndex >= 0) {
-        userProviders[entryIndex] = {
-          ...userProviders[entryIndex],
-          models: { ...userProviders[entryIndex].models, [modelId]: modelDef }
-        }
-      } else {
-        // 内置供应商：经同名用户条目追加模型（type 跟随内置目录，合并层语义即覆盖子集）
-        userProviders.push({
-          id: providerId,
-          type: provider.type,
-          models: { [modelId]: modelDef }
-        })
-      }
-      return store.setMediaConfig({ userProviders })
-    })
-  })
-
-  ipcMain.handle(IpcChannel.MediaUserRemoveModel, (_event, payload: unknown) => {
-    const request = payload as { providerId?: unknown; modelId?: unknown } | null
-    const providerId = request?.providerId
-    if (!isNonEmptyString(providerId)) return invalidPayload('需要 providerId')
-    const modelId = request?.modelId
-    if (!isNonEmptyString(modelId)) return invalidPayload('需要 modelId')
-    return guardSync(() => {
-      const config = store.mediaConfig()
-      const effective = mergeCatalog(BUILTIN_PROVIDERS, config)
-      const provider = effective.find((p) => p.id === providerId)
-      if (!provider?.models.some((m) => m.id === modelId)) {
-        throw new Error(`${providerId} 下没有模型 ${modelId}`)
-      }
-      // 用户配置里的同 id 模型删除；模型被删光的用户供应商整个清掉
-      const userProviders = (config.userProviders ?? [])
-        .map((p) => {
-          if (p.id !== providerId || !(modelId in p.models)) return p
-          const models = { ...p.models }
-          delete models[modelId]
-          return { ...p, models }
-        })
-        .filter((p) => Object.keys(p.models).length > 0)
-      const patch: Record<string, unknown> = { userProviders }
-      // 同时是内置模型 → 进隐藏清单（不删除目录条目，恢复随时可做）
-      const isBuiltin = BUILTIN_PROVIDERS.some(
-        (p) => p.id === providerId && p.models.some((m) => m.id === modelId)
-      )
-      if (isBuiltin) {
-        patch.hiddenBuiltin = [...new Set([...(config.hiddenBuiltin ?? []), modelId])]
-      }
-      return store.setMediaConfig(patch)
-    })
-  })
-
-  ipcMain.handle(IpcChannel.MediaUserRestoreModel, (_event, payload: unknown) => {
-    const request = payload as { providerId?: unknown; modelId?: unknown } | null
-    if (!isNonEmptyString(request?.providerId)) return invalidPayload('需要 providerId')
-    const modelId = request?.modelId
-    if (!isNonEmptyString(modelId)) return invalidPayload('需要 modelId')
-    return guardSync(() => {
-      const config = store.mediaConfig()
-      const hiddenBuiltin = (config.hiddenBuiltin ?? []).filter((id) => id !== modelId)
-      return store.setMediaConfig({ hiddenBuiltin })
-    })
-  })
-
-  /**
-   * 浏览供应商的全量模型目录（随应用打包的只读数据，见 catalog/browse.ts）。
-   * enabled 标注按生效清单计算：条目 id（即发给网关的 endpoint）命中任一
-   * 生效模型的 id 或 requestModel 即视为已添加；没有目录的供应商返回空数组。
-   */
-  ipcMain.handle(IpcChannel.MediaBrowseCatalog, (_event, payload: unknown) => {
-    const providerId = (payload as { providerId?: unknown } | null)?.providerId
-    if (!isNonEmptyString(providerId)) return invalidPayload('需要 providerId')
-    return guardSync(() => {
-      const source = browseCatalog(providerId.trim())
-      if (source.length === 0) return []
-      const config = store.mediaConfig()
-      const effective = mergeCatalog(BUILTIN_PROVIDERS, config)
-      const provider = effective.find((p) => p.id === providerId.trim())
-      const enabledKeys = new Set<string>()
-      for (const m of provider?.models ?? []) {
-        enabledKeys.add(m.id)
-        if (m.requestModel) enabledKeys.add(m.requestModel)
-      }
-      return source.map((item) => ({ ...item, enabled: enabledKeys.has(item.id) }))
-    })
-  })
-
-  ipcMain.handle(IpcChannel.MediaAdapterKinds, () => {
-    // 注册表运行时事实来源（kind 越界配置在清洗层/上面的 add handler 已被拦截）
-    return { ok: true, value: getAdapterKindMatrix() } satisfies ChatResult<Record<string, MediaKind[]>>
-  })
-
-  /**
-   * 凭据存储键 = 生效清单里该供应商的 authKey（workspace.json 可覆盖；内置目录缺省
-   * 同 id）。按 providerId 直存会和读取路径 media:<authKey> 错位——手改过 authKey 的
-   * 工作区会出现「Key 保存成功但一直报缺凭据」。查不到条目时回落 providerId。
-   */
-  const authKeyOf = (providerId: string): string => {
-    try {
-      return mergeCatalog(BUILTIN_PROVIDERS, store.mediaConfig()).find((p) => p.id === providerId)?.authKey ?? providerId
-    } catch {
-      return providerId
-    }
-  }
-
-  ipcMain.handle(IpcChannel.SettingsMediaSetKey, async (_event, payload: unknown) => {
-    const request = payload as { providerId?: unknown; apiKey?: unknown } | null
-    if (!isNonEmptyString(request?.providerId)) return invalidPayload('需要 providerId')
-    if (!isNonEmptyString(request.apiKey)) return invalidPayload('需要 apiKey')
-    const dir = currentDir()
-    if (!dir) return invalidPayload('尚未打开工作区')
-    try {
-      await models.setMediaKey(dir, authKeyOf(request.providerId), request.apiKey)
-      return ok()
-    } catch (error) {
-      return { ok: false, code: 'unknown', error: describe(error) }
-    }
-  })
-
-  ipcMain.handle(IpcChannel.SettingsMediaRemoveKey, async (_event, payload: unknown) => {
-    const providerId = (payload as { providerId?: unknown } | null)?.providerId
-    if (!isNonEmptyString(providerId)) return invalidPayload('需要 providerId')
-    const dir = currentDir()
-    if (!dir) return invalidPayload('尚未打开工作区')
-    try {
-      await models.removeMediaKey(dir, authKeyOf(providerId))
-      return ok()
-    } catch (error) {
-      return { ok: false, code: 'unknown' as const, error: describe(error) }
-    }
-  })
+  registerMediaSettingsIpc(ctx)
 
   ipcMain.handle(IpcChannel.MediaProviders, async (): Promise<ChatResult<MediaProviderInfo[]>> => {
     try {
@@ -678,7 +44,13 @@ export function registerMediaIpc(ctx: IpcContext): void {
   ipcMain.handle(
     IpcChannel.MediaGenerate,
     async (_event, payload: unknown): Promise<ChatResult<{ jobId: string }>> => {
-      const request = payload as Partial<MediaGenerateRequest> | null
+      const wrapped = payload !== null && typeof payload === 'object' && 'request' in payload
+      const envelope = payload as { request?: unknown; workspacePath?: unknown } | null
+      if (wrapped && !isNonEmptyString(envelope?.workspacePath)) {
+        return invalidPayload('media:generate 需要有效的 workspacePath')
+      }
+      const expectedWorkspace = wrapped ? envelope?.workspacePath as string : undefined
+      const request = (wrapped ? envelope?.request : payload) as Partial<MediaGenerateRequest> | null
       if (!isNonEmptyString(request?.provider)) return invalidPayload('media:generate 需要 provider')
       if (!isNonEmptyString(request.model)) return invalidPayload('media:generate 需要 model')
       if (!isNonEmptyString(request.prompt)) return invalidPayload('media:generate 需要 prompt')
@@ -744,7 +116,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
       // 产物命名：净化与重名序号在 MediaJobManager.submit/materialize 内收口
       if (isNonEmptyString(request.name)) generateRequest.name = request.name
       try {
-        return { ok: true, value: await mediaManager.submit(generateRequest) }
+        return { ok: true, value: await mediaManager.submit(generateRequest, expectedWorkspace) }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         return { ok: false, code: 'unknown', error: message }
@@ -753,8 +125,17 @@ export function registerMediaIpc(ctx: IpcContext): void {
   )
 
   ipcMain.handle(IpcChannel.MediaCancel, async (_event, payload: unknown) => {
-    const jobId = (payload as { jobId?: unknown } | null)?.jobId
+    const request = payload as { jobId?: unknown; workspacePath?: unknown } | null
+    const jobId = request?.jobId
     if (!isNonEmptyString(jobId)) return invalidPayload('media:cancel 需要 jobId')
+    if (request?.workspacePath !== undefined && !isNonEmptyString(request.workspacePath)) {
+      return invalidPayload('media:cancel 的 workspacePath 不合法')
+    }
+    const workspace = request?.workspacePath ?? ctx.currentDir()
+    const job = workspace ? mediaManager.getForWorkspace(jobId, workspace) : undefined
+    if (!job || (job.state !== 'queued' && job.state !== 'running')) {
+      return { ok: false, code: 'unknown' as const, error: '任务不存在或已结束' }
+    }
     const cancelled = await mediaManager.cancel(jobId)
     return {
       ok: cancelled,
@@ -763,24 +144,10 @@ export function registerMediaIpc(ctx: IpcContext): void {
   })
 
   ipcMain.handle(IpcChannel.MediaJobs, () => {
-    return { ok: true, value: mediaManager.list() } satisfies ChatResult<MediaJobStatus[]>
-  })
-
-  ipcMain.handle(IpcChannel.MediaSetConfirmVideo, (_event, payload: unknown) => {
-    const confirm = (payload as { confirm?: unknown } | null)?.confirm
-    if (typeof confirm !== 'boolean') return invalidPayload('media:set-confirm-video 需要 confirm:boolean')
-    return guardSync(() => store.setMediaConfig({ confirmVideo: confirm }))
-  })
-
-  ipcMain.handle(IpcChannel.MediaSetAccessMode, (_event, payload: unknown) => {
-    const mode = (payload as { mode?: unknown } | null)?.mode
-    if (mode !== 'full' && mode !== 'confirm') {
-      return invalidPayload('media:set-access-mode 需要 mode=full|confirm')
-    }
     return guardSync(() => {
-      store.setMediaConfig({ accessMode: mode as 'full' | 'confirm' })
-      return undefined
-    })
+      const workspace = ctx.currentDir()
+      return mediaManager.list().filter((job) => workspace && job.workspacePath === workspace)
+    }) satisfies ChatResult<MediaJobStatus[]>
   })
 
   ipcMain.handle(IpcChannel.MediaConfirmResolve, (_event, payload: unknown) => {
@@ -789,7 +156,7 @@ export function registerMediaIpc(ctx: IpcContext): void {
       return invalidPayload('media:confirm-resolve 需要 requestId 与 accepted:boolean')
     }
     // 未知 requestId 静默 ok：回执可能晚于中止/清理的先行 settle，幂等
-    pendingApprovals.get(request.requestId)?.resolve(request.accepted === true)
+    resolveMediaApproval(request.requestId, request.accepted)
     return ok()
   })
 

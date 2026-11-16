@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { Moon, Plus, RotateCw, Sun, Trash2 } from 'lucide-react'
-import { useSettings } from '../../store/settingsStore'
+import { useAppearanceSettings, useSettings } from '../../store/settingsStore'
 import { Field, Row, Toggle, inputCls } from './ui'
 
 /* -------------------------------------------------------------------------- */
@@ -221,7 +221,7 @@ export function McpTab() {
 }
 
 export function AppearanceTab() {
-  const { appearance, setAppearance } = useSettings()
+  const { appearance, setAppearance } = useAppearanceSettings()
   const themes = [
     { key: 'light' as const, label: '浅色', icon: <Sun size={13} /> },
     { key: 'dark' as const, label: '深色', icon: <Moon size={13} /> },
