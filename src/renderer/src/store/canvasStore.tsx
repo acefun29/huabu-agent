@@ -962,10 +962,17 @@ function useCanvasBootstrap() {
     })
     /*
      * 关闭前收口：主进程拦下 close 后发这个事件，把 800ms 防抖里还没推上去的
-     * 画布/会话快照立刻写下去——否则关窗成功能量全在内存里，重启就回到上一版。
+     * 画布/会话快照立刻写下去，写完后回执让主进程继续关闭。
+     * 回执是「本次关闭」的确认——旧快照的落盘事件不算数，否则会丢最新编辑。
      */
     const unsubFlushBeforeClose = window.huabu.onEvent(IpcChannel.AppFlushBeforeClose, () => {
-      void useCanvasStore.getState().saveCanvasNow()
+      void (async () => {
+        try {
+          await useCanvasStore.getState().saveCanvasNow()
+        } finally {
+          await window.huabu.window.confirmCloseFlush()
+        }
+      })()
     })
     const unsubConfirm = window.huabu.media.onConfirmRequest((payload) =>
       useCanvasStore.setState((s) =>

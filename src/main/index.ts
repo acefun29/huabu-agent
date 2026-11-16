@@ -6,6 +6,7 @@ import { IpcChannel } from '../shared/ipc'
 import { initMediaProtocol, registerMediaSchemePrivileged } from './media/protocol'
 import { inboxRoot } from './assets/manager'
 import { readOrCreateDevToken, devBridgePort } from './devBridgeToken'
+import { requestCloseFlushConfirmation } from './ipc/closeFlush'
 
 /**
  * 主进程入口。
@@ -137,16 +138,18 @@ const CLOSE_FLUSH_TIMEOUT_MS = 1500
 
 /**
  * 关窗收口：渲染端 800ms 防抖 → 主进程 200ms 合并，两层缓冲都要在退出前冲刷。
- * 没有打开工作区时不必等（没有东西可存）。
+ * 放行信号只认渲染端对**本次**关闭请求的回执（app:flush-done）或超时：
+ * 合并窗口里可能躺着更早的快照，它的落盘事件不能当作「最新编辑已保存」的证据。
  */
 async function finishWindowClose(window: BrowserWindow): Promise<void> {
   const store = getWorkspaceStore()
-  const hasWorkspace = Boolean(store?.currentDir)
-  if (hasWorkspace && !window.isDestroyed()) {
+  if (store?.currentDir && !window.isDestroyed()) {
+    // 先挂等待者再发事件：渲染端的回执可能比等待者就位更早到
+    const confirmed = requestCloseFlushConfirmation(CLOSE_FLUSH_TIMEOUT_MS)
     window.webContents.send(IpcChannel.AppFlushBeforeClose)
-    await store?.waitForCanvasSave(CLOSE_FLUSH_TIMEOUT_MS)
+    await confirmed
   }
-  // 主进程侧最后一道：包含「刚接受到、还没到 200ms 写盘点」的那一版快照
+  // 主进程侧最后一道：把渲染端刚交上来（或更早）的最后一版快照写盘
   store?.flushPendingWrites()
   if (!window.isDestroyed()) window.destroy()
 }

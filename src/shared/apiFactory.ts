@@ -51,7 +51,9 @@ export function createHuabuApi(runtime: ApiRuntime): HuabuApi {
       },
 
       onStateChange: (listener) =>
-        subscribe(IpcChannel.WindowStateChanged, (payload) => listener(payload as WindowStateInfo))
+        subscribe(IpcChannel.WindowStateChanged, (payload) => listener(payload as WindowStateInfo)),
+
+      confirmCloseFlush: () => invoke(IpcChannel.AppFlushDone).then(() => undefined)
     },
 
     chat: {

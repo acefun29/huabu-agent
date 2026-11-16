@@ -65,15 +65,6 @@ const CANVAS_WRITE_DEBOUNCE_MS = 200
  */
 let canvasSaveTimer: ReturnType<typeof setTimeout> | null = null
 let canvasSavePending: { file: string; snapshot: CanvasSnapshot } | null = null
-/** 关闭流程里等「下一次画布快照真正落盘」的等待者；落盘后一次性放行 */
-let canvasSaveWaiters: Array<() => void> = []
-
-/** 放行等待者：快照已经写进磁盘，退出流程可以继续 */
-function notifyCanvasSaved(): void {
-  const waiters = canvasSaveWaiters
-  canvasSaveWaiters = []
-  for (const resolve of waiters) resolve()
-}
 
 /**
  * 立即冲刷未落盘的 pending 画布保存（防抖定时器与 loadCanvas 读前都会调用）：
@@ -94,7 +85,6 @@ function flushCanvasSave(): void {
       return
     }
     atomicWriteSync(pending.file, serialized)
-    notifyCanvasSaved()
   } catch (error) {
     // 防抖后写盘失败已无法抛回 invoke 调用方，只能记日志：宁可丢一拍，
     // 也不能让定时器里的异常变成主进程未捕获错误
@@ -674,25 +664,6 @@ export class WorkspaceStore {
    */
   flushPendingWrites(): void {
     flushCanvasSave()
-  }
-
-  /**
-   * 等下一次画布快照真正落盘（关闭流程用：等渲染端把防抖中的快照推上来再退）。
-   * 超时返回 false —— 渲染端卡住时不能把退出无限挂住。
-   */
-  waitForCanvasSave(timeoutMs: number): Promise<boolean> {
-    return new Promise<boolean>((resolve) => {
-      let timer: ReturnType<typeof setTimeout> | null = null
-      const waiter = (): void => {
-        if (timer) clearTimeout(timer)
-        resolve(true)
-      }
-      timer = setTimeout(() => {
-        canvasSaveWaiters = canvasSaveWaiters.filter((entry) => entry !== waiter)
-        resolve(false)
-      }, timeoutMs)
-      canvasSaveWaiters.push(waiter)
-    })
   }
 
   loadCanvas(): CanvasSnapshot | null {

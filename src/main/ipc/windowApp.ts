@@ -13,6 +13,7 @@ import {
   type WindowStateInfo
 } from '../../shared/ipc'
 import type { IpcContext } from './shared'
+import { confirmCloseFlush } from './closeFlush'
 
 export function registerWindowAppIpc(_ctx: IpcContext): void {
   ipcMain.handle(IpcChannel.AppPing, () => 'pong')
@@ -53,5 +54,10 @@ export function registerWindowAppIpc(_ctx: IpcContext): void {
   ipcMain.handle(IpcChannel.WindowState, (event): WindowStateInfo => {
     const window = windowOf(event)
     return { maximized: window?.isMaximized() ?? false }
+  })
+
+  // 关窗冲刷回执：渲染端把最新快照交给主进程后调用，主进程据此放行关闭
+  ipcMain.handle(IpcChannel.AppFlushDone, () => {
+    confirmCloseFlush()
   })
 }

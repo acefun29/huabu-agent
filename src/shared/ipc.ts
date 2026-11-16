@@ -32,6 +32,11 @@ export const IpcChannel = {
    * 渲染端收到后用 workspace:saveCanvas 把防抖中的快照推上来，主进程等它落盘再退。
    */
   AppFlushBeforeClose: 'app:flush-before-close',
+  /**
+   * 渲染进程 -> 主进程：关窗冲刷回执。渲染端把最新快照交给主进程后调用，
+   * 主进程收到才继续关闭；只等「本次关闭请求」的确认，不看任何全局落盘事件。
+   */
+  AppFlushDone: 'app:flush-done',
 
   /** Agent 运行时状态与可用模型清单（含认证状态，不含任何密钥内容） */
   ChatRuntime: 'chat:runtime',

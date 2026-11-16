@@ -137,6 +137,13 @@ export interface WindowApi {
 
   /** 订阅最大化状态变化，返回取消订阅函数 */
   onStateChange(listener: (state: WindowStateInfo) => void): () => void
+
+  /**
+   * 关窗收口回执：收到 app:flush-before-close 后，把最新画布快照交给主进程，
+   * 再调用它。主进程只认这个确认（或超时）才继续关闭——不能用「任意一次落盘」
+   * 当证据，否则合并窗口里的旧快照提前放行就会丢掉最新编辑。
+   */
+  confirmCloseFlush(): Promise<void>
 }
 
 /**
