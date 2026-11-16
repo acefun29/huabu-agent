@@ -38,9 +38,10 @@ Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、�
 - **上下文四段装配**：每轮注入按「常驻（项目结构索引）/ 轮换（当前 scope 子节点）/
   队列（待处理任务）/ 注入（素材库 + 画布态势）」分段生成，逐段去重——
   与上轮一致就折叠成一行占位。
-- **媒体生成**：内置阿里云百炼（DashScope）、阿里云 Token Plan（订阅制）、火山引擎（ARK）、
-  MiniMax、腾讯云、OpenAI 兼容六类供应商，覆盖文生图 / 图生图 / 图生视频；
-  生成卡片自带内联参数控制台，变更类操作走「确认闸门」逐条放行，产物自动回喂素材库并广播。
+- **媒体生成**：内置百炼、Token Plan、火山方舟、MiniMax、腾讯混元、腾讯 TokenHub、
+  OpenAI、Vidu、百度千帆、拍我 AI 和智谱等媒体供应商。按模型支持文生图、图生图、
+  文生视频、图生视频、首尾帧、参考生视频和语音合成；可用能力以设置中的模型为准。
+  生成卡片自带参数控制台，产物自动归档到素材库；Agent 的媒体访问模式可设为「变更前确认」。
 - **Agent 能看图看视频**：`read_media` 按路径把图片交给 Agent 看；`skim_video` 全片粗扫
   （带时间戳低清关键帧）、`read_video_frames` 定点精读，素材引用契约闭环——拖入即参考。
 - **聊天模型目录**：内置 Anthropic / DeepSeek / GLM / Kimi / OpenAI / Qwen / Token Plan 目录，
@@ -61,13 +62,35 @@ Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、�
 | `huabu-*-portable.exe` | 绿色便携版，双击即用 |
 
 首次启动后选择一个目录作为**工作区**（一个工作区 = 一张画布 + 一个磁盘目录，目录即 Agent 的 cwd），
-然后在「设置」里配置模型 Key 即可开始对话与生成。
+然后在「设置 → 模型供应商」配置对话模型，在「设置 → 媒体生成」配置媒体供应商和各类型的默认模型。
+媒体和对话使用各自的供应商配置；未选择默认模型的媒体类型不能直接生成。
+
+### 内置媒体供应商
+
+| 供应商 | 当前内置能力与代表模型 |
+| --- | --- |
+| 阿里云百炼 | 千问图像、通义万相和 HappyHorse 图片 / 视频模型 |
+| 阿里云 Token Plan | 千问图像、万相图片与视频、HappyHorse 文生 / 首帧 / 参考图生视频 |
+| 火山方舟 | Seedream 图片、Seedance 视频 |
+| MiniMax | image-01 图片、H3 视频 |
+| 腾讯混元 | 混元图片和视频，使用腾讯云 API 签名凭据 |
+| 腾讯 TokenHub | 混元 Image 3.5、WAND-Vega 图片、可灵 V4 和 PixVerse V6/C1 视频 |
+| OpenAI | GPT Image 图片、Sora 视频和 TTS 语音；另支持自建 OpenAI 兼容媒体供应商 |
+| Vidu 生数科技 | Vidu Q2 图片、Q3 Turbo 视频 |
+| 百度千帆 | MuseSteamer Air 图片和 MuseSteamer 图生视频 |
+| 拍我 AI | PixVerse V6 / C1 文生、首帧及首尾帧生视频 |
+| 智谱 | GLM-Image 图片、CogVideoX-3 视频 |
+
+各模型支持的比例、时长、参考素材类型和数量不同；请在生成卡片或设置中查看当前模型的能力。
+可灵官方直连尚未接入；当前可通过腾讯 TokenHub 使用已内置的可灵视频模型。TokenHub 只接入了上表所列的部分模型族。
+Token Plan 的 HappyHorse 首帧 / 参考图视频请求形态参考同族官方 API，尚未通过真实套餐 Key 验证。
+调用前请在对应官方平台开通模型并查看地域、额度与价格。
 
 ## API Key 配置
 
 两种方式，任选其一：
 
-1. **设置面板录入**（推荐）：Key 存于工作区存储，任何日志 / IPC / 画布快照中均不出现明文。
+1. **设置面板录入**（推荐）：Key 在提交时由设置界面传给主进程，使用 Electron safeStorage 加密后保存在应用状态目录，并按工作区隔离；系统加密不可用时拒绝明文保存。
 2. **环境变量**：未录入时按供应商回退到对应环境变量——
 
 | 用途 | 环境变量 |
@@ -77,8 +100,17 @@ Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、�
 | 火山引擎（媒体） | `ARK_KEY` |
 | MiniMax（媒体） | `MINIMAX_KEY` |
 | 腾讯云（媒体） | `TENCENT_KEY` |
-| OpenAI 兼容（媒体） | `OPENAI_API_KEY` |
+| 腾讯 TokenHub（媒体） | `TOKENHUB_KEY` |
+| OpenAI 内置媒体供应商 | `OPENAI_KEY` |
+| 自建 OpenAI 兼容媒体供应商 | `OPENAI_API_KEY`（未自定义环境变量时） |
+| Vidu（媒体） | `VIDU_KEY` |
+| 百度千帆（媒体） | `QIANFAN_KEY` |
+| 拍我 AI（媒体） | `PIXVERSE_KEY` |
+| 智谱（媒体） | `ZHIPU_MEDIA_KEY` |
 | 对话模型 | 走运行时的凭据约定，如 `ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY` 等；Token Plan 订阅通道用 `TOKEN_PLAN_KEY` |
+
+腾讯混元的 `TENCENT_KEY` 使用 `SecretId:SecretKey` 格式；腾讯 TokenHub 使用独立的 API Key，
+两者不能互换。百炼按量 API Key 与 Token Plan 套餐 Key 也分别配置。具体申请入口见媒体生成设置页。
 
 ## 从源码构建
 
@@ -89,7 +121,7 @@ Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、�
 
 ```bash
 git clone https://github.com/acefun29/huabu-agent.git
-cd huabu
+cd huabu-agent
 pnpm install     # 国内网络建议官方源：pnpm install --registry https://registry.npmjs.org/
 pnpm dev         # 开发模式（主进程 + 渲染进程 HMR）
 ```
@@ -139,7 +171,7 @@ pnpm bench              # 性能基准
   直连 GitHub Releases 下载 Electron 常失败）；若二进制缺失，执行
   `node node_modules/electron/install.js` 补下载。
 - pnpm 10 默认拦截依赖构建脚本，`package.json` 的 `pnpm.onlyBuiltDependencies`
-  已放行 `electron`、`esbuild`、`electron-winstaller`。
+  已放行 `electron`、`esbuild`、`electron-winstaller` 和 `ffmpeg-static`。
 
 ## 技术栈
 
@@ -180,14 +212,17 @@ huabu/
 
 - `contextIsolation: true`、`nodeIntegration: false`，渲染进程只能通过 `window.huabu` 访问原生能力；
   事件类 IPC 通道需在 preload 白名单登记后才可订阅。
-- **工具白名单** `['ls','read','write']`：不给 `bash` / `edit`，Agent 无法执行命令或改既有文件。
-  自定义工具必须同时在白名单里列名才会激活。
+- **文件工具边界**：内置 `ls`、`read`、`write` 和 `patch` 使用工作区相对路径；
+  `write` 可覆盖已有文本，`patch` 可精确修改已有文本。启用的 MCP 服务器还可提供额外工具，
+  应仅接入信任的服务器。
 - **`cwd` 越界一律拒绝**（错误码 `cwd_rejected`），不做「悄悄纠正到默认目录」。
-- **载荷与日志零密钥**：认证信息只暴露 `{ configured, source, label }`（`label` 是环境变量名，不是值）。
+- **凭据保护**：保存时通过 IPC 将用户输入的 Key 交给主进程加密；查询配置状态时只返回
+  `{ configured, source, label }` 等元数据，不返回已保存的 Key。
 - **单一运行时**：主进程只实例化 Mastra，没有运行时开关；模型目录/凭据由
   `agent/workspaceModels.ts` 自持（不依赖任何外部 Agent SDK）。
 - **Web 桥仅开发期启用**（`--huabu-headless` / `HUABU_WEB_BRIDGE=1`）：只监听 `127.0.0.1`、
-  每次启动随机 token、CORS 限本机、事件转发按通道白名单过滤，绝不在生产构建中开启。
+  每次启动随机 token、CORS 限本机、事件转发按通道白名单过滤；默认关闭，
+  显式设置 `HUABU_WEB_BRIDGE=1` 或启动 headless 模式可启用。
 
 ## English Summary
 
@@ -195,9 +230,10 @@ Huabu ("canvas" in Chinese) is an Electron desktop app that turns an infinite ca
 agent workspace: asset files live on the canvas as reference cards (not copies), and a right-side
 panel hosts both the chat sessions (create / switch / fork) and the asset library as two mutually
 exclusive pages. The agent runtime (Mastra) is embedded directly in the main process — no subprocess, no external CLI.
-It ships built-in media-generation providers (Alibaba DashScope, Alibaba Token Plan,
-Volcengine ARK, MiniMax, Tencent, OpenAI-compatible) for text-to-image / image-to-image /
-image-to-video with a confirmation gate, a taggable asset library with a user-defined
+It includes media-generation providers for Alibaba DashScope and Token Plan, Volcengine ARK,
+MiniMax, Tencent Hunyuan and TokenHub, OpenAI, Vidu, Baidu Qianfan, PixVerse and Zhipu.
+Available image, video and speech capabilities depend on the selected model. It also offers
+a taggable asset library with a user-defined
 classification schema (position coordinates such as episode / scene / shot, defined per workspace
 rather than built in), structured session replay with context-usage transparency, and built-in
 chat-model catalogs (Anthropic / DeepSeek / GLM / Kimi / OpenAI / Qwen) plus custom multi-protocol
