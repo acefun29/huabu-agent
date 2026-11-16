@@ -74,7 +74,7 @@ export interface MastraRuntimeDeps {
    *
    * 实现方应保证：**读失败不能让会话建不起来**（记忆是增强项，聊天是主能力）。
    */
-  workspaceContext?(dir: string): Promise<string>
+  workspaceContext?(dir: string, nodeId: string): Promise<string>
 }
 
 interface MastraSession {
@@ -162,7 +162,7 @@ export class MastraAgentRuntime implements AgentRuntime {
    * 代价是每轮多一次文件读 + journal 读（都是小文件），换来的是记忆永远不过期。
    */
   private async composeInstructions(session: MastraSession): Promise<string> {
-    const context = await this.loadWorkspaceContext(session.workspaceDir)
+    const context = await this.loadWorkspaceContext(session.workspaceDir, session.nodeId)
     return context ? `${session.instructions}\n\n${context}` : session.instructions
   }
 
@@ -173,11 +173,11 @@ export class MastraAgentRuntime implements AgentRuntime {
    * 记忆是增强项，聊天本身是主能力。失败按「这轮没有记忆」处理并留一条 warn，
    * 而不是把错误抛给用户——这属于「能力可用性」，不是「质量判断」（§12）。
    */
-  private async loadWorkspaceContext(dir: string): Promise<string> {
+  private async loadWorkspaceContext(dir: string, nodeId: string): Promise<string> {
     const provider = this.deps.workspaceContext
     if (!provider) return ''
     try {
-      return await provider(dir)
+      return await provider(dir, nodeId)
     } catch (error) {
       console.warn(`[mastra] 项目记忆装配失败，本轮按无记忆继续：${String(error)}`)
       return ''

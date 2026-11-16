@@ -13,7 +13,8 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { WorkspaceJournal } from '../superagent/journal'
-import { activeTask, artifactOf, projectWork, type WorkEventType, type WorkState } from '../store/tasks'
+import { artifactOf, projectWork, type WorkEventType, type WorkState } from '../store/tasks'
+import { taskForSession } from './sessionTask'
 import { buildTurnContext } from './context'
 import type { TaskToolDeps } from '../tools/taskTools'
 import { STUDIO_FILE_REL } from '../core/memory'
@@ -48,9 +49,14 @@ function currentArtifactPathOf(state: WorkState, task: Task): { currentArtifactP
 export async function buildWorkspaceContext(input: {
   dir: string
   journal: () => WorkspaceJournal
+  /**
+   * 会话 id：本轮上下文里展示的任务跟着会话走。
+   * 同一工作区多会话并行时，全局「最近开工」会让 A 的上下文串成 B 的任务。
+   */
+  nodeId?: string
 }): Promise<string> {
   const [studio, state] = await Promise.all([readStudioContent(input.dir), loadWorkState(input.journal())])
-  const task = activeTask(state)
+  const task = taskForSession(state, input.nodeId)
   return buildTurnContext({
     studioContent: studio,
     ...(task ? { task, ...currentArtifactPathOf(state, task) } : {})
@@ -69,6 +75,10 @@ export function taskToolDeps(options: {
   newTaskId: () => string
   /** 事实追加成功后通知渲染端（宿主播 `work:changed`） */
   onAppend?: () => void
+  /** 任务开工/继续：把它绑定到当前会话（宿主注入，见 loop/sessionTask.ts） */
+  onTaskStarted?: (taskId: string) => void
+  /** 任务收工/放弃：解除该会话的绑定 */
+  onTaskClosed?: (taskId: string) => void
 }): TaskToolDeps {
   return {
     currentDir: options.currentDir,
@@ -77,6 +87,8 @@ export function taskToolDeps(options: {
     append: async (type: WorkEventType, taskId: string, payload?: Record<string, unknown>) => {
       await options.journal().append(type, taskId, 'main', payload ?? {})
       options.onAppend?.()
-    }
+    },
+    ...(options.onTaskStarted ? { onTaskStarted: options.onTaskStarted } : {}),
+    ...(options.onTaskClosed ? { onTaskClosed: options.onTaskClosed } : {})
   }
 }

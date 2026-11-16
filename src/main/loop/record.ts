@@ -8,9 +8,13 @@
  * 所以由系统**观测**工具回执：工具说它产出了什么，系统就把这条事实记到正在做的任务上。
  * 这不是质量判断，是数据完整性（§12）——产物必须能追溯到哪个任务产出的。
  *
- * 两条产出路径的识别方式不同：
+ * 产出必须由**产出工具自己显式报告**，两种来源：
  * - 生成类工具：`details.artifactPath` + `details.artifact`（mime/bytes 齐备）
- * - `write`：`details.path` + `details.bytes`（文本产物，仅当任务本身是文本任务时记）
+ * - 文本产出类（`write` / `patch` / `create_note`）：`details.artifact = { path, bytes }`
+ *
+ * 只有真的写了东西的工具才声明 `artifact`。`read` / `ls` 这类只读工具的 details
+ * 里也有 path/bytes（给模型与 UI 看），但它们不是产出——靠形状猜会把「读了一遍」
+ * 记成「产出了一版」，任务就会在零产出时误判完成。
  *
  * 刻意不做的事：
  * - 不判断产物好不好（§12）
@@ -20,13 +24,19 @@
 import type { ToolDefinition } from '../agent/contracts'
 import type { WorkspaceJournal } from '../superagent/journal'
 import { loadWorkState } from './run'
-import { activeTask } from '../store/tasks'
+import { taskForSession } from './sessionTask'
 import { isWithinLane } from '../core/task'
 import { normalizeArtifactPath } from '../core/artifact'
 
 export interface RecordArtifactDeps {
   journal: () => WorkspaceJournal
-  /** 观测到候选产物时的旁路通知（测试与调试用；生产可省） */
+  /**
+   * 这次工具调用属于哪个会话。产物记到**该会话正在做的任务**上：
+   * 同一工作区多会话并行时，全局「最近开工」会把 A 的产物记给 B。
+   * 缺省（没有会话上下文，如单测）按全局最近开工。
+   */
+  nodeId?: () => string | undefined
+  /** 观测到候选产物时的旁路通知（测试与调试用；生产用它广播刷新） */
   onRecorded?: (info: { taskId: string; path: string }) => void
 }
 
@@ -37,7 +47,7 @@ export function artifactFromToolResult(details: unknown): {
   mime: string
   bytes: number
   params?: Record<string, unknown>
-  /** 生成类工具（有 artifactPath）；write 类没有 */
+  /** 生成类工具（有 artifactPath）；文本产出类没有 */
   generated: boolean
 } | null {
   if (!details || typeof details !== 'object') return null
@@ -63,11 +73,15 @@ export function artifactFromToolResult(details: unknown): {
     }
   }
 
-  // 写入类：details.path + details.bytes（fileTools.write）
-  if (typeof record.path === 'string' && record.path.trim() && typeof record.bytes === 'number') {
-    const path = normalizeArtifactPath(record.path)
-    if (!path || record.bytes <= 0) return null
-    return { path, kind: 'text', mime: mimeOfText(path), bytes: record.bytes, generated: false }
+  // 文本产出类：产出工具在 details.artifact 里显式声明（fileTools.write / patch / noteTool.create_note）
+  const produced = (record.artifact ?? null) as Record<string, unknown> | null
+  if (produced) {
+    const rawPath = typeof produced.path === 'string' ? produced.path.trim() : ''
+    const bytes = typeof produced.bytes === 'number' ? produced.bytes : 0
+    if (!rawPath || bytes <= 0) return null
+    const path = normalizeArtifactPath(rawPath)
+    if (!path) return null
+    return { path, kind: 'text', mime: mimeOfText(path), bytes, generated: false }
   }
 
   return null
@@ -99,7 +113,7 @@ export type RecordOutcome =
  * - 回执里没有产物路径
  * - 当前没有正在做的任务
  * - 路径不在任务写区内
- * - 是 `write` 的文本产物但任务本身不是文本任务（避免把中间文件当交付物）
+ * - 是文本产出但任务本身不是文本任务（避免把中间文件当交付物）
  */
 export async function recordToolArtifact(
   deps: RecordArtifactDeps,
@@ -110,12 +124,12 @@ export async function recordToolArtifact(
 
   const journal = deps.journal()
   const state = await loadWorkState(journal)
-  const task = activeTask(state)
+  const task = taskForSession(state, deps.nodeId?.())
   if (!task) return { recorded: false, reason: '当前没有正在做的任务' }
   if (!isWithinLane(task.lane, candidate.path)) {
     return { recorded: false, reason: `产物不在任务写区 ${task.lane}/ 内` }
   }
-  // write 的文本产物只记到文本任务上：图片任务里顺手写的提示词文件不是交付物
+  // 文本产出只记到文本任务上：图片任务里顺手写的提示词文件不是交付物
   if (!candidate.generated && task.kind !== 'text') {
     return { recorded: false, reason: '文本写入不记入非文本任务' }
   }

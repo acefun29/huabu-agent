@@ -46,12 +46,15 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
 
   /** 拉取任务板投影（事件触发 / 浮层打开 / 工作区切换后都走它） */
   const refreshSuperAgent = async (): Promise<void> => {
-    if (!BRIDGE_AVAILABLE || !get().workspace) return
+    const dir = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !dir) return
     const result = await window.huabu.superagent.board()
     if (!result.ok) {
       // 未打开工作区是常态（选择页），不当错误提示
       return
     }
+    // 工作区已切换：旧请求的回包按「不属于当前画布」丢弃，不能把旧板刷回来
+    if (get().workspace?.path !== dir) return
     applySnapshot(result.value)
   }
 
@@ -62,9 +65,12 @@ export function createSuperAgentOps(deps: SuperAgentOpsDeps) {
    * 归属表在这里算好，画布卡片按路径查，避免每张卡各算一遍。
    */
   const refreshWorkItems = async (): Promise<void> => {
-    if (!BRIDGE_AVAILABLE || !get().workspace) return
+    const dir = get().workspace?.path
+    if (!BRIDGE_AVAILABLE || !dir) return
     const result = await window.huabu.superagent.workState()
     if (!result.ok) return
+    // 同上：切换工作区后到达的旧投影直接丢，否则新画布会短暂显示别的工作区的任务
+    if (get().workspace?.path !== dir) return
     const state = result.value
     set({
       workState: state,

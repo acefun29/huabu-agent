@@ -67,6 +67,23 @@ function createMainWindow(): BrowserWindow {
   mainWindow.on('maximize', sendWindowState)
   mainWindow.on('unmaximize', sendWindowState)
 
+  /*
+   * 正常关窗先收口再退。
+   *
+   * 渲染端画布自动保存有 800ms 防抖、主进程写盘还有 200ms 合并窗口，直接 close
+   * 会把「刚新建的会话 / 刚改的卡片」丢在内存里（实测窗口内关闭只留下上一版）。
+   * 这里拦一次 close：请渲染端立刻冲刷，等快照真正落盘（或超时兜底）后亲手 destroy。
+   */
+  let closing = false
+  mainWindow.on('close', (event) => {
+    // 收口期间的所有 close 都走同一条路径：destroy 由 finishWindowClose 自己调，
+    // 避免「连点关闭」绕过冲刷（repeat 事件也只挂起、不再排一次收口）
+    event.preventDefault()
+    if (closing) return
+    closing = true
+    void finishWindowClose(mainWindow)
+  })
+
   mainWindow.on('ready-to-show', () => {
     mainWindow.show()
   })
@@ -113,6 +130,25 @@ function createMainWindow(): BrowserWindow {
   }
 
   return mainWindow
+}
+
+/** 关闭前等渲染端冲刷画布快照的上限：超过就按「渲染端已卡住」直接退，不能把退出挂死 */
+const CLOSE_FLUSH_TIMEOUT_MS = 1500
+
+/**
+ * 关窗收口：渲染端 800ms 防抖 → 主进程 200ms 合并，两层缓冲都要在退出前冲刷。
+ * 没有打开工作区时不必等（没有东西可存）。
+ */
+async function finishWindowClose(window: BrowserWindow): Promise<void> {
+  const store = getWorkspaceStore()
+  const hasWorkspace = Boolean(store?.currentDir)
+  if (hasWorkspace && !window.isDestroyed()) {
+    window.webContents.send(IpcChannel.AppFlushBeforeClose)
+    await store?.waitForCanvasSave(CLOSE_FLUSH_TIMEOUT_MS)
+  }
+  // 主进程侧最后一道：包含「刚接受到、还没到 200ms 写盘点」的那一版快照
+  store?.flushPendingWrites()
+  if (!window.isDestroyed()) window.destroy()
 }
 
 // scheme 特权必须在 ready 前注册；处理器在 ready 后绑定当前工作区的媒体目录
@@ -171,6 +207,8 @@ app.on('window-all-closed', () => {
 // 退出前释放会话：Mastra 的两张表（sessions + OM bindings）。will-quit 里无法阻塞
 // 等待，所以这里只做同步收口 + 触发异步关停（Pi 侧已随运行时移除）。
 app.on('will-quit', () => {
+  // 画布快照最后一道冲刷：窗口 close 流程之外的退出路径（系统关机、Cmd+Q）也覆盖
+  getWorkspaceStore()?.flushPendingWrites()
   disposeChatSessions()
   // MCP 子进程关停（关 stdin → 等 SDK 兜底 kill）；close 异步但触发即算完成职责
   getMcpManager()?.disposeAll()

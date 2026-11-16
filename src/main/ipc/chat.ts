@@ -16,9 +16,14 @@ import { assembleBlockoutTool, resolveBuiltinSkillsRoots } from '../agent/blocko
 import { assembleNoteTool } from '../agent/noteTool'
 import { assembleFacetTools } from '../agent/facetTools'
 import { assembleTaskTools } from '../tools/taskTools'
-import { buildWorkspaceContext, taskToolDeps } from '../loop/run'
+import { buildWorkspaceContext, loadWorkState, taskToolDeps } from '../loop/run'
 import { withArtifactRecording } from '../loop/record'
-import { assembleMediaTools } from '../agent/mediaToolAssembly'
+import {
+  bindSessionTask,
+  taskForSession,
+  unbindSessionTask
+} from '../loop/sessionTask'
+import { assembleMediaTools, laneOutputDir } from '../agent/mediaToolAssembly'
 import { createFileTools } from '../agent/fileTools'
 import { MastraAgentRuntime } from '../agent/mastra/runtime'
 import type { AgentRuntime } from '../agent/runtime'
@@ -76,19 +81,22 @@ export function registerChatIpc(ctx: IpcContext): void {
      * journal / `.huabu/memory/studio.md` 里，读盘细节留在 loop/run.ts。
      * 这里的 catch 是**能力可用性**：记忆读不出来也要能聊天（§12）。
      */
-    workspaceContext: async (dir) => {
+    workspaceContext: async (dir, nodeId) => {
       try {
-        return await buildWorkspaceContext({ dir, journal: () => ctx.superAgent.journalHandle(dir) })
+        return await buildWorkspaceContext({
+          dir,
+          journal: () => ctx.superAgent.journalHandle(dir),
+          nodeId
+        })
       } catch (error) {
         console.warn(`[chat] 项目记忆装配失败，按无记忆继续：${String(error)}`)
         return ''
       }
     },
-    // 工具装配（Phase 3 迁移面）：复用与 Pi 侧同一批组装函数——文件三件套 + blockout
-    // + 媒体三件套 + read_media + 视频两工具 + create_note + 分级 + 派单。
-    // 唯一的差异是不装 MCP（计划 §11.3 迁移期移除）。vision 已通（toModelOutput
-    // content/media）：按会话模型目录 input 声明判定（与 Pi 侧同一份数据），模型不支持时
-    // 工具内自动降级元数据
+    // 工具装配（Phase 3 迁移面）：文件三件套 + blockout + 媒体三件套 + read_media
+    // + 视频两工具 + create_note + 分级 + 任务四件套 + MCP（设置页接进来的服务器）。
+    // vision 已通（toModelOutput content/media）：按会话模型目录 input 声明判定
+    // （与 Pi 侧同一份数据），模型不支持时工具内自动降级元数据
     assembleTools: async (nodeId) => {
       const { mediaTools, readMediaTool, videoTools } = assembleMediaTools(nodeId, {
         store,
@@ -97,7 +105,22 @@ export function registerChatIpc(ctx: IpcContext): void {
         sessionModelSupportsImages: (nid) => mastraRuntime.sessionSupportsImages(nid),
         currentDir,
         mediaContext,
-        inboxRoot
+        inboxRoot,
+        /*
+         * 媒体落盘跟随**本会话正在做的任务**（提交边界现取，不缓存）：
+         * 有同类任务时生成直接落进 lane，记账才追得上——否则默认库路径在写区外，
+         * 生成成功也不会成为任务产物。没有任务（手动/闲聊生成）沿用默认落库链。
+         */
+        outputDirFor: async (kind) => {
+          const dir = currentDir()
+          if (!dir) return undefined
+          const task = taskForSession(
+            await loadWorkState(ctx.superAgent.journalHandle(dir)),
+            nodeId
+          )
+          // 只认同类任务：文本任务里顺手生成的参考图仍走默认库，不该记成文本任务的版本
+          return task && task.kind === kind ? laneOutputDir([task.lane]) : undefined
+        }
       })
       const noteTool = assembleNoteTool({ currentDir })
       const facetTools = assembleFacetTools({
@@ -130,7 +153,10 @@ export function registerChatIpc(ctx: IpcContext): void {
             return ctx.superAgent.journalHandle(dir)
           },
           newTaskId: () => `task-${randomUUID().slice(0, 8)}`,
-          onAppend: broadcastWorkChanged
+          onAppend: broadcastWorkChanged,
+          // 任务归属是会话级的：开工/继续把任务绑到本会话，收工/放弃解绑
+          onTaskStarted: (taskId) => bindSessionTask(nodeId, taskId),
+          onTaskClosed: (taskId) => unbindSessionTask(nodeId, taskId)
         })
       )
       // blockout 粗模/运镜引擎：Pi 侧靠「read 命中技能目录 → 增量激活」做惰性注册，
@@ -144,6 +170,12 @@ export function registerChatIpc(ctx: IpcContext): void {
       // write」，渲染端的「写的媒体文件自动上画布」也挂在 write 的工具事件上。
       // 守卫在 fileTools.ts 里（工作区相对路径 + realpath 防符号链接逃逸 + 读写上限）。
       const fileTools = createFileTools({ currentDir })
+      /*
+       * MCP 工具：设置页接进来的服务器必须真的能进模型手里，否则「已连接」只是个徽章。
+       * 连接状态与启用开关由 manager 自己判定（未连接/未启用/已 disposed → 空数组），
+       * 这里不做二次过滤。名字已由 manager 统一成 mcp_<server>_<tool>，不与内置工具冲突。
+       */
+      const mcpTools = await ctx.mcpManager.assembleTools()
       const tools = [
         ...fileTools,
         blockoutTool,
@@ -152,7 +184,8 @@ export function registerChatIpc(ctx: IpcContext): void {
         ...videoTools,
         noteTool,
         ...facetTools,
-        ...taskTools
+        ...taskTools,
+        ...mcpTools
       ]
       /*
        * 产物记账（施工计划 v4）：工具说它产出了文件，系统就把这条事实记到正在做的任务上。
@@ -164,7 +197,12 @@ export function registerChatIpc(ctx: IpcContext): void {
           const dir = currentDir()
           if (!dir) throw new Error('尚未打开工作区')
           return ctx.superAgent.journalHandle(dir)
-        }
+        },
+        // 产物归属跟着会话走：多会话并行时不能记到「全局最近开工」的那个任务上
+        nodeId: () => nodeId,
+        // 记账成功即广播：长轮次里产物一落盘，工作项与角标就该刷新，
+        // 不能等 finish_task 才有动静（那时可能已经过去几十秒）。
+        onRecorded: () => broadcastWorkChanged()
       })
     }
   })
@@ -227,6 +265,7 @@ export function registerChatIpc(ctx: IpcContext): void {
     // dispose 成功后该会话不会再有回执：挂起的确认请求按拒绝 settle，防孤儿挂起
     if (result.ok) {
       sessionRuntimes.delete(request.nodeId)
+      unbindSessionTask(request.nodeId)
       settleApprovalsForNode(request.nodeId)
     }
     return result

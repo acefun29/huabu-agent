@@ -28,5 +28,6 @@ export const EVENT_CHANNEL_ALLOWLIST: readonly string[] = [
   IpcChannel.WindowStateChanged,
   IpcChannel.ProjectChanged,
   IpcChannel.TaskEvent,
-  IpcChannel.WorkChanged
+  IpcChannel.WorkChanged,
+  IpcChannel.AppFlushBeforeClose
 ]

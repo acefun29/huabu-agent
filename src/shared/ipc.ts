@@ -27,6 +27,11 @@ export const IpcChannel = {
   WindowState: 'window:state',
   /** 事件类：主进程 -> 渲染进程，最大化状态变化时推送 */
   WindowStateChanged: 'window:state-changed',
+  /**
+   * 事件类：主进程 -> 渲染进程，正常关窗前请立刻冲刷画布自动保存。
+   * 渲染端收到后用 workspace:saveCanvas 把防抖中的快照推上来，主进程等它落盘再退。
+   */
+  AppFlushBeforeClose: 'app:flush-before-close',
 
   /** Agent 运行时状态与可用模型清单（含认证状态，不含任何密钥内容） */
   ChatRuntime: 'chat:runtime',

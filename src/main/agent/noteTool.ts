@@ -17,6 +17,8 @@ import type { ToolDefinitionLike } from './mediaTools'
  * 落点与用户手建笔记同一约定（libraryOps.createNote）：assets/documents/<标题>.md，
  * 重名自动加序号。钉卡由渲染端完成：execute 返回 details.published
  * （与 blockout 成片同一通道，chatRuntime 对任何带 published 的成功 tool_end 钉卡）。
+ * 记账由解耦的产出契约完成：同一份 details.artifact 让 loop/record 把这张卡记为任务产物，
+ * 否则文本卡已上画布、finish_task 仍会判「这一轮没有产出」。
  */
 
 export interface NoteToolDeps {
@@ -83,7 +85,11 @@ export function assembleNoteTool(deps: NoteToolDeps): ToolDefinitionLike {
             text: `文本卡片已创建并钉在用户画布上：${relPath}（标题「${title}」）。请基于真实创建结果回复用户。`
           }
         ],
-        details: { created: true, published: { relPath, name, kind: 'doc' } }
+        details: {
+          created: true,
+          published: { relPath, name, kind: 'doc' },
+          artifact: { path: relPath, bytes: Buffer.byteLength(content, 'utf8') }
+        }
       }
     }
   }

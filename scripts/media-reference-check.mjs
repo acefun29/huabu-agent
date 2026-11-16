@@ -84,11 +84,10 @@ const SRC_FILES = [
   'src/renderer/src/lib/agent.ts',
   'src/renderer/src/lib/mediaReferenceGraph.ts',
   'src/renderer/src/lib/genMigration.ts',
+  'src/renderer/src/lib/workspacePath.ts',
   'src/renderer/src/store/canvas/shared.ts',
   'src/renderer/src/store/canvas/nodeOps.ts',
-  // jobRuntime 依赖它判定「专家产物先记候选、验收后才激活」（A01）：
-  // 转译列表必须跟着实现走，否则 jobRuntime.js 的 require('./activationPolicy.js') 找不到文件
-  'src/renderer/src/store/canvas/activationPolicy.ts',
+  // 0.4.0 起产物生成成功即当前版本：jobRuntime 不再依赖候选/验收策略模块
   'src/renderer/src/store/canvas/jobRuntime.ts'
 ]
 transpileAll(SRC_FILES)
@@ -591,62 +590,31 @@ check('运行时：Agent 任务（job.refs 回执 absPath 反查）自动成链�
   assert(graph.getCardReferences(state.nodesById.get(spawned2.id), state.nodes).length === 0, '画布外参考不画链')
 })
 
-check('运行时：专家产物先记候选，等 task.activated 才激活（A01）', async () => {
+check('运行时：产物生成成功即当前版本（v4 无候选、无验收等待）', async () => {
   const { state, rt, bridge } = runtimeFixture([])
   const TASK = 'task-a01'
-  // 专家来源的媒体任务（sourceChatId = superagent-<taskId>）
-  const job = bridge.mkJob({ kind: 'image', prompt: 'expert gen' }, 'queued', {
+  // Agent 来源的媒体任务（sourceChatId = superagent-<taskId>）
+  const job = bridge.mkJob({ kind: 'image', prompt: 'agent gen' }, 'queued', {
     sourceChatId: `superagent-${TASK}`
   })
   rt.handleJobEvent(job)
   const card = state.nodes.find((n) => n.data.pendingJob?.jobId === job.jobId)
-  assert(card, '专家任务应建卡承接')
+  assert(card, 'Agent 任务应建卡承接')
+  // 任务绑定：承接卡记住发起它的来源（任务板据此把卡片认领回工作项）
+  assert(card.data.fromChatId === `superagent-${TASK}`, `承接卡应绑定任务来源，实际 ${card.data.fromChatId}`)
   bridge.advance(job.jobId, { state: 'succeeded' })
   rt.handleJobEvent(bridge.jobs.get(job.jobId))
 
   const data = state.nodesById.get(card.id).data
   assert(data.versions?.length === 1, `成功应写一版，实际 ${data.versions?.length}`)
-  assert(data.versions[0].candidate === true, '专家产物必须标记为候选')
-  assert(data.versions[0].taskId === TASK, `候选应绑定任务 id，实际 ${data.versions[0].taskId}`)
-  assert(!data.activeVersionId, '候选不得写 activeVersionId（画布不自行下结论）')
-  // 关键：候选不能通过 activeVersionOf 的回退成为「当前版本」
-  assert(graph.activeVersionOf(state.nodesById.get(card.id)) === undefined, '只有候选时不应有激活版本')
-
-  // 权威激活结论到达（主进程验收通过后发 task.activated，带产物路径 —— R01）
-  const artifactPath = data.versions[0].path
-  rt.activateCandidateForTask(TASK, artifactPath)
-  const after = state.nodesById.get(card.id).data
-  assert(after.activeVersionId === after.versions[0].id, '激活后 activeVersionId 应指向该版本')
-  assert(after.versions[0].candidate === false, '激活后应清候选标记')
-  assert(after.path === after.versions[0].path, '激活后卡片路径应与激活版本一致')
-  assert(graph.activeVersionOf(state.nodesById.get(card.id))?.id === after.versions[0].id, '激活后 activeVersionOf 应命中')
-  // 重复事件幂等
-  rt.activateCandidateForTask(TASK, artifactPath)
-  assert(state.nodesById.get(card.id).data.versions.length === 1, '重复激活不得重复入版')
-})
-
-check('运行时：激活事件早于产物落卡时不丢（pending 激活）', async () => {
-  const { state, rt, bridge } = runtimeFixture([])
-  const TASK = 'task-early'
-  // 权威结论先到（跨通道先后不确定）：事件带的是**产物路径**（R01）
-  // 版本路径取自 job.artifact.relPath（无 outputDir 时）：先按将要写入的文件名登记 pending
-  const earlyPath = 'early.png'
-  rt.activateCandidateForTask(TASK, earlyPath)
-  const job = bridge.mkJob({ kind: 'image', prompt: 'early activation' }, 'queued', {
-    sourceChatId: `superagent-${TASK}`
-  })
-  rt.handleJobEvent(job)
-  const card = state.nodes.find((n) => n.data.pendingJob?.jobId === job.jobId)
-  assert(card, '应建卡')
-  bridge.advance(job.jobId, {
-    state: 'succeeded',
-    artifact: { relPath: 'early.png', name: 'early.png', mime: 'image/png', bytes: 3 }
-  })
+  const version = data.versions[0]
+  assert(version.candidate === undefined, 'v4 不再有候选态')
+  assert(data.activeVersionId === version.id, '产物落地即当前版本')
+  assert(data.path === version.path, '卡片路径应与当前版本一致')
+  assert(graph.activeVersionOf(state.nodesById.get(card.id))?.id === version.id, 'activeVersionOf 应命中当前版本')
+  // 重复终态事件幂等
   rt.handleJobEvent(bridge.jobs.get(job.jobId))
-  const data = state.nodesById.get(card.id).data
-  assert(data.versions[0].path === earlyPath, `版本路径应与激活事件一致，实际 `)
-  assert(data.activeVersionId, '结论先到时，产物落卡即应激活')
-  assert(data.versions[0].candidate === false, '落卡即激活不应留候选标记')
+  assert(state.nodesById.get(card.id).data.versions.length === 1, '重复终态不得重复入版')
 })
 
 check('运行时：失败保留 pendingJob + 运行态，retryGeneration 按定格快照重交', async () => {
@@ -761,7 +729,7 @@ check('nodeOps：删除清理 jobStates 与索引；undo 恢复任务绑定', ()
 
 /* ---------------- 汇总 ---------------- */
 
-check('运行时：同任务两个候选，激活只改变通过的那一份（R01）', async () => {
+check('运行时：同任务的两次尝试各自成卡，各自就地成为当前版本', async () => {
   const { state, rt, bridge } = runtimeFixture([])
   const TASK = 'task-r01'
   const runJob = (relPath, name) => {
@@ -773,19 +741,23 @@ check('运行时：同任务两个候选，激活只改变通过的那一份（R
     rt.handleJobEvent(bridge.jobs.get(job.jobId))
     return state.nodes.find((n) => n.data.pendingJob === undefined && n.data.versions?.some((v) => v.path === relPath))
   }
-  // 同一业务任务的两次尝试：A 未通过验收，B 通过
+  // 同一业务任务的两次尝试：v4 不设候选，两次都各自落地即成品
   const cardA = runJob('attempt-a.png', 'A')
   const cardB = runJob('attempt-b.png', 'B')
-  assert(cardA && cardB && cardA.id !== cardB.id, '两次尝试应在不同卡片上产候选')
-  assert(cardA.data.versions[0].candidate === true && cardB.data.versions[0].candidate === true, '两者都应是候选')
-  assert(cardA.data.versions[0].taskId === TASK && cardB.data.versions[0].taskId === TASK, '两者共享同一任务 id')
-
-  // 只有 B 的验收通过（task.activated 带 B 的路径）
-  rt.activateCandidateForTask(TASK, 'attempt-b.png')
-  assert(!state.nodesById.get(cardA.id).data.activeVersionId, '未通过的 A 不得被激活')
-  assert(state.nodesById.get(cardA.id).data.versions[0].candidate === true, 'A 应继续保持候选')
-  assert(state.nodesById.get(cardB.id).data.activeVersionId, '通过的 B 应被激活')
-  assert(state.nodesById.get(cardB.id).data.versions[0].candidate === false, 'B 应清候选标记')
+  assert(cardA && cardB && cardA.id !== cardB.id, '两次尝试应在不同卡片上产出')
+  assert(cardA.data.activeVersionId && cardB.data.activeVersionId, '两张卡各自有当前版本')
+  assert(
+    cardA.data.versions[0].candidate === undefined && cardB.data.versions[0].candidate === undefined,
+    '不再有候选态'
+  )
+  assert(
+    cardA.data.fromChatId === `superagent-${TASK}` && cardB.data.fromChatId === `superagent-${TASK}`,
+    '两次尝试都绑定同一任务来源'
+  )
+  assert(
+    cardA.data.versions[0].path === 'attempt-a.png' && cardB.data.versions[0].path === 'attempt-b.png',
+    '各自保留自己的产物路径'
+  )
 })
 
 for (const t of tests) {

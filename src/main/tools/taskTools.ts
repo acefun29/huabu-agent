@@ -1,10 +1,12 @@
 /**
  * 任务工具（施工计划 v4 §10 第 5 步）。
  *
- * 模型和「任务」这个原子的全部接触面，就三个动作：
+ * 模型和「任务」这个原子的全部接触面，就这几个动作：
  *
  *   create_task  开一个任务 → 立刻开工（work.created + work.started）
+ *   start_task   继续一个退回待办的任务（同一个 taskId，work.started）
  *   finish_task  收工（有产物 → done；没产出 → 回到 todo）
+ *   drop_task    放弃
  *   list_tasks   看现在有哪些任务
  *
  * 刻意**没有**：批准、驳回、验收、评分。判定是动作（模型看图 / 用户看图），
@@ -43,6 +45,10 @@ export interface TaskToolDeps {
   load: () => Promise<WorkState>
   /** 生成任务 id（模型也可以自己指定，如 V-02） */
   newTaskId: () => string
+  /** 开工/继续：宿主把任务绑定到当前会话（产物归属靠它，见 loop/sessionTask.ts） */
+  onTaskStarted?: (taskId: string) => void
+  /** 收工/放弃：解除会话绑定 */
+  onTaskClosed?: (taskId: string) => void
 }
 
 function ok(text: string, details: Record<string, unknown> = {}): {
@@ -113,10 +119,61 @@ export function assembleTaskTools(deps: TaskToolDeps): ToolDefinition[] {
         kind
       })
       await deps.append('work.started', taskId)
+      deps.onTaskStarted?.(taskId)
       return ok(
         `已开工：${taskId}（${KIND_LABEL[kind] ?? kind}，写区 ${String(raw.lane).trim()}/）。` +
           `产出后调 finish_task（taskId=${taskId}）收工。`,
         { taskId }
+      )
+    }
+  }
+
+  /**
+   * 继续一个退回待办的任务。
+   *
+   * 为什么需要它：finish_task 在零产出时把任务放回 todo（不伪造完成），
+   * 但 create_task 拒绝既有 id、界面上只有「放弃」——任务就此卡住、没有回程。
+   * 这里直接复用 core/task 的 startTask 迁移：只补一条 work.started 事实，
+   * 不产生第二条创建事实，任务号与写区都不变；终态仍不可重开。
+   */
+  const startTaskTool: ToolDefinition = {
+    name: 'start_task',
+    label: '继续任务',
+    description:
+      '把一个退回待办的任务重新开工，沿用原来的 taskId 与写区。\n' +
+      '什么时候用：finish_task 说「这一轮没有产出，已回到待办」，而你还要接着做——用它，不要用 create_task 重开新任务。\n' +
+      '已完成或已放弃的任务不能重开。',
+    parameters: Type.Object({
+      taskId: Type.String({ description: '要继续的任务号（list_tasks 可查）' })
+    }),
+    execute: async (_toolCallId, params) => {
+      const dir = deps.currentDir()
+      if (!dir) return err(NO_WORKSPACE_TEXT)
+      const taskId = String((params as { taskId?: unknown } | null)?.taskId ?? '').trim()
+      if (!taskId) return err('需要 taskId：先用 list_tasks 看现有任务。')
+
+      const state = await deps.load()
+      const task = state.tasks.find((entry) => entry.id === taskId)
+      if (!task) return err(`没有任务 ${taskId}。先用 list_tasks 看现有任务。`)
+      if (task.status === 'doing') {
+        return ok(`任务 ${taskId} 已经在做（写区 ${task.lane}/），直接继续产出即可。`, {
+          taskId,
+          status: 'doing',
+          lane: task.lane
+        })
+      }
+      if (task.status === 'done' || task.status === 'dropped') {
+        return err(
+          `任务 ${taskId} 已是「${STATUS_LABEL[task.status]}」，不能重开。要改方向请用 create_task 开一个新任务。`
+        )
+      }
+
+      await deps.append('work.started', taskId)
+      deps.onTaskStarted?.(taskId)
+      return ok(
+        `任务 ${taskId} 已重新开工（${KIND_LABEL[task.kind] ?? task.kind}，写区 ${task.lane}/）。` +
+          '产出后用 finish_task 收工。',
+        { taskId, status: 'doing', lane: task.lane, kind: task.kind }
       )
     }
   }
@@ -147,6 +204,7 @@ export function assembleTaskTools(deps: TaskToolDeps): ToolDefinition[] {
       }
 
       await deps.append('work.finished', taskId)
+      deps.onTaskClosed?.(taskId)
       const produced = task.artifacts.length
       return produced > 0
         ? ok(`任务 ${taskId} 完成（共产出 ${produced} 个版本）。`, { taskId, status: 'done', versions: produced })
@@ -183,6 +241,7 @@ export function assembleTaskTools(deps: TaskToolDeps): ToolDefinition[] {
       }
 
       await deps.append('work.dropped', taskId)
+      deps.onTaskClosed?.(taskId)
       return ok(
         `任务 ${taskId} 已放弃。${task.artifacts.length > 0 ? `（它留下过 ${task.artifacts.length} 个版本，仍在。）` : ''}`,
         { taskId, status: 'dropped' }
@@ -227,5 +286,5 @@ export function assembleTaskTools(deps: TaskToolDeps): ToolDefinition[] {
     }
   }
 
-  return [createTaskTool, finishTaskTool, dropTaskTool, listTasksTool]
+  return [createTaskTool, startTaskTool, finishTaskTool, dropTaskTool, listTasksTool]
 }

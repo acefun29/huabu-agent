@@ -185,6 +185,67 @@ describe('drop_task', () => {
   })
 })
 
+describe('start_task', () => {
+  it('零产出收工回到待办后，用原 taskId 接着开工：只有一条创建事实，编号不变', async () => {
+    const { deps, events } = fakeDeps()
+    await run(deps, 'create_task', { title: 't', brief: 'b', lane: 'story', kind: 'text', id: 'V-02' })
+    await run(deps, 'finish_task', { taskId: 'V-02' })
+    expect(projectWork(events).tasks[0]!.status).toBe('todo')
+
+    const result = await run(deps, 'start_task', { taskId: 'V-02' })
+    expect(result.isError).toBe(false)
+    expect(result.text).toContain('重新开工')
+
+    const state = projectWork(events)
+    expect(state.tasks).toHaveLength(1)
+    expect(state.tasks[0]!.id).toBe('V-02')
+    expect(state.tasks[0]!.status).toBe('doing')
+    expect(events.filter((entry) => entry.type === 'work.created')).toHaveLength(1)
+  })
+
+  it('已经在做 → 幂等提示，不再写事实', async () => {
+    const { deps, events } = fakeDeps()
+    await run(deps, 'create_task', { title: 't', brief: 'b', lane: 'story', kind: 'text', id: 'V-02' })
+    const before = events.length
+    const result = await run(deps, 'start_task', { taskId: 'V-02' })
+    expect(result.isError).toBe(false)
+    expect(result.text).toContain('已经在做')
+    expect(events).toHaveLength(before)
+  })
+
+  it('终态（已放弃）不可重开', async () => {
+    const { deps } = fakeDeps()
+    await run(deps, 'create_task', { title: 't', brief: 'b', lane: 'story', kind: 'text', id: 'V-02' })
+    await run(deps, 'drop_task', { taskId: 'V-02' })
+    const result = await run(deps, 'start_task', { taskId: 'V-02' })
+    expect(result.isError).toBe(true)
+    expect(result.text).toContain('不能重开')
+  })
+
+  it('任务不存在 → 拒绝', async () => {
+    const { deps } = fakeDeps()
+    const result = await run(deps, 'start_task', { taskId: 'ghost' })
+    expect(result.isError).toBe(true)
+  })
+})
+
+describe('会话绑定回调', () => {
+  it('开工/继续通知绑定，收工/放弃通知解绑（归属跟着会话走）', async () => {
+    const events: string[] = []
+    const base = fakeDeps()
+    const deps: TaskToolDeps = {
+      ...base.deps,
+      onTaskStarted: (taskId) => events.push(`start:${taskId}`),
+      onTaskClosed: (taskId) => events.push(`close:${taskId}`)
+    }
+    await run(deps, 'create_task', { title: 't', brief: 'b', lane: 'story', kind: 'text', id: 'V-09' })
+    await run(deps, 'finish_task', { taskId: 'V-09' })
+    await run(deps, 'start_task', { taskId: 'V-09' })
+    await run(deps, 'drop_task', { taskId: 'V-09' })
+    expect(events).toEqual(['start:V-09', 'close:V-09', 'start:V-09', 'close:V-09'])
+  })
+})
+
 describe('list_tasks', () => {
   it('空任务板给出下一步指引', async () => {
     const { deps } = fakeDeps()
@@ -215,10 +276,10 @@ describe('list_tasks', () => {
 })
 
 describe('无工作区', () => {
-  it('三个工具都给出明确提示而不是抛错', async () => {
+  it('五个工具都给出明确提示而不是抛错', async () => {
     const { deps } = fakeDeps()
     const noWs: TaskToolDeps = { ...deps, currentDir: () => null }
-    for (const name of ['create_task', 'finish_task', 'list_tasks']) {
+    for (const name of ['create_task', 'start_task', 'finish_task', 'drop_task', 'list_tasks']) {
       const result = await run(noWs, name, { title: 't', brief: 'b', lane: 'l', kind: 'text', taskId: 'x' })
       expect(result.isError).toBe(true)
       expect(result.text).toContain('尚未打开工作区')

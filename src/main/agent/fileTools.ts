@@ -222,7 +222,7 @@ export function createFileTools(deps: FileToolDeps): ToolDefinition[] {
         await writeFile(real, next, 'utf8')
         return ok(
           `已修改 ${displayPath(root, real)}（第 ${previous.slice(0, first).split('\n').length} 行附近，${bytes} 字节）`,
-          { path: displayPath(root, real), bytes }
+          { path: displayPath(root, real), bytes, artifact: { path: displayPath(root, real), bytes } }
         )
       } catch (error) {
         return fail(`写入失败：${error instanceof Error ? error.message : String(error)}`)
@@ -265,7 +265,8 @@ export function createFileTools(deps: FileToolDeps): ToolDefinition[] {
         await writeFile(real, content, 'utf8')
         return ok(`已写入 ${displayPath(root, real)}（${bytes} 字节）`, {
           path: displayPath(root, real),
-          bytes
+          bytes,
+          artifact: { path: displayPath(root, real), bytes }
         })
       } catch (error) {
         return fail(`写入失败：${error instanceof Error ? error.message : String(error)}`)

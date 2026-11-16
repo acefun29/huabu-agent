@@ -18,6 +18,7 @@ import type {
 import type { ArtifactOwner } from '../lib/artifactOwnership'
 import type { MediaKind, ResolvedRefCaps } from '@shared/media'
 import type { Facet, FacetSchema } from '@shared/facets'
+import { IpcChannel } from '@shared/ipc'
 import { useSettings, useSettingsUi } from './settingsStore'
 import type {
   AssetData,
@@ -558,6 +559,9 @@ export const useCanvasStore = create<CanvasState>()(
       superagent.resetSuperAgent()
       void superagent.refreshSuperAgentExperts()
       void superagent.refreshSuperAgent()
+      // 新任务模型的投影也要立刻拉一次：否则要等第一个 work:changed 才有工作项，
+      // 已有历史 doing/产物的工作区冷启动会显示成「还没有任务」。
+      void superagent.refreshWorkItems()
       // 项目快照同样按工作区重建（常驻段/轮换段的数据来源）
       void project.refreshProject(null)
     }
@@ -956,6 +960,13 @@ function useCanvasBootstrap() {
     const unsubWork = window.huabu.superagent.onWorkChanged(() => {
       void useCanvasStore.getState().refreshWorkItems()
     })
+    /*
+     * 关闭前收口：主进程拦下 close 后发这个事件，把 800ms 防抖里还没推上去的
+     * 画布/会话快照立刻写下去——否则关窗成功能量全在内存里，重启就回到上一版。
+     */
+    const unsubFlushBeforeClose = window.huabu.onEvent(IpcChannel.AppFlushBeforeClose, () => {
+      void useCanvasStore.getState().saveCanvasNow()
+    })
     const unsubConfirm = window.huabu.media.onConfirmRequest((payload) =>
       useCanvasStore.setState((s) =>
         s.pendingApprovals.some((p) => p.requestId === payload.requestId)
@@ -974,6 +985,7 @@ function useCanvasBootstrap() {
       unsubJob()
       unsubAsset()
       unsubWork()
+      unsubFlushBeforeClose()
       unsubConfirm()
       unsubConfirmResolved()
       unsubTask()

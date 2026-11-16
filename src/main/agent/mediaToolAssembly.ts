@@ -85,13 +85,18 @@ export interface MediaAssemblyDeps {
     signal: AbortSignal | undefined
   ) => Promise<boolean>
   /**
-   * 产物落盘目录覆盖（**专家 = 任务 lane**，A02）。返回 undefined = 走默认落库链。
+   * 产物落盘目录覆盖（**任务 = 任务 lane**）。返回 undefined = 走默认落库链。
    *
-   * 缺了它会发生什么：专家按默认库把图写到 `assets/images`，而任务 lane 是
-   * `scenes/s3/`，编排器随后用 `isPathAllowed()` 判越界——钱已经花了，产物却
-   * 过不了验收。所有有写入副作用的工具都必须遵守同一任务写区。
+   * 缺了它会发生什么：按默认库把图写到 `assets/images`，而任务 lane 是
+   * `scenes/s3/`，记账因路径不在写区内直接跳过——钱已经花了，产物却不属于任何任务。
+   * 所有有写入副作用的工具都必须遵守同一任务写区。
+   *
+   * 允许异步：调用侧要在**提交边界**现取当前任务（任务可能刚开工），
+   * 不必为这一条查询在装配期引入额外状态。
    */
-  outputDirFor?: (kind: 'image' | 'video' | 'audio') => string | undefined
+  outputDirFor?: (
+    kind: 'image' | 'video' | 'audio'
+  ) => string | undefined | Promise<string | undefined>
 }
 
 /**
@@ -172,10 +177,10 @@ export function assembleMediaTools(nodeId: string, deps: MediaAssemblyDeps) {
       const resolution = resolveAgentMedia(effective, config, input.kind)
       // Agent 生成同样走落库链（类型默认 > 全局默认 > 公共库 > 画布素材分类），
       // 与画布卡片/设置页同一套语义——否则 Agent 生成的产物永远留在隐藏产物目录。
-      // 专家有任务写区时以 lane 为准（A02）：生成必须落在自己的 lane 内，否则会被
-      // 编排器判越界——钱花了、产物却过不了验收。
-      const outputLibrary =
-        deps.outputDirFor?.(input.kind) ?? resolveOutputLibrary(store, config, input.kind)
+      // 有正在做的同类任务时以 lane 为准（提交边界现取）：产物必须落在任务写区内，
+      // 否则记账会跳过——钱花了、产物却不属于任何任务。
+      const override = deps.outputDirFor ? await deps.outputDirFor(input.kind) : undefined
+      const outputLibrary = override ?? resolveOutputLibrary(store, config, input.kind)
       const { jobId } = await mediaManager.submit({
         kind: input.kind,
         provider: resolution.provider,
