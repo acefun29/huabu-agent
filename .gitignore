@@ -39,7 +39,9 @@ Thumbs.db
 .huabu/
 
 # 本地设计文档（不提交）
-docs/
+docs/*
+# README 媒体资源（logo、宣传视频）需要入库
+!docs/assets/
 image-context-eviction-plan.md
 blockout-integration-plan.md
 

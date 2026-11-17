@@ -13,6 +13,25 @@
 右侧栏承载与 Agent 的会话（可新建 / 切换 / fork）与素材库，素材按绝对路径引用进对话。
 Agent 运行时（Mastra）以库的形式嵌入主进程，不走子进程、不依赖外部 CLI。
 
+## 宣传片
+
+<table>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <a href="https://cdn.jsdelivr.net/gh/acefun29/huabu-agent@main/docs/assets/videos/huabu-promo-1080p.mp4">
+        <img src="docs/assets/videos/huabu-promo-poster.jpg" alt="Huabu 宣传片" width="100%" />
+      </a>
+      <sub><b>Huabu 宣传片</b> · 0:40 · 点击封面播放</sub>
+    </td>
+    <td width="50%" align="center" valign="top">
+      <a href="https://cdn.jsdelivr.net/gh/acefun29/huabu-agent@main/docs/assets/videos/huabu-skills-1080p.mp4">
+        <img src="docs/assets/videos/huabu-skills-poster.jpg" alt="Huabu 技能体系：12 个工种" width="100%" />
+      </a>
+      <sub><b>Huabu 技能体系</b> · 1:04 · 点击封面播放</sub>
+    </td>
+  </tr>
+</table>
+
 ## 核心特性
 
 - **无限画布**：素材卡片平移/缩放/框选/批量拖拽；卡片是对磁盘文件的**引用**而非副本，
@@ -201,7 +220,7 @@ huabu/
 ├── resources/skills/          # 随应用分发的技能（blockout-shot 等）
 ├── scripts/                   # 自检/探针/基准脚本（见 package.json scripts）
 ├── build/icon.png             # 应用图标
-├── docs/assets/               # README 图片资源（logo 等）
+├── docs/assets/               # README 媒体资源（logo、宣传视频等）
 ├── electron.vite.config.ts
 ├── electron-builder.yml
 └── package.json
